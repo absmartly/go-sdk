@@ -83,7 +83,7 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 		} else if lhs.Kind() == reflect.Map {
 			var entry = lhs.MapRange()
 			var rentry = rhs.MapRange()
-			for entry.Next() != false {
+			for entry.Next() {
 				rentry.Next()
 				if entry.Key().Interface() != rentry.Key().Interface() ||
 					entry.Value().Interface() != rentry.Value().Interface() {
@@ -101,7 +101,7 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 		return 0
 	}
 
-	if lhs.IsValid() == false && rhs.IsValid() == false {
+	if !lhs.IsValid() && !rhs.IsValid() {
 		return 0
 	}
 
@@ -175,13 +175,13 @@ func (e Evaluator) ExtractVar(path string) interface{} {
 					return nil
 				}
 				var tmp = vlof.Index(int(result))
-				if tmp.IsValid() && tmp.IsZero() == false {
+				if tmp.IsValid() && !tmp.IsZero() {
 					value = tmp.Interface()
 				}
 			}
 		} else if tp.Kind() == reflect.Map {
 			var tmp = vlof.MapIndex(reflect.ValueOf(frags[i]))
-			if tmp.IsValid() && tmp.IsZero() == false {
+			if tmp.IsValid() && !tmp.IsZero() {
 				value = tmp.Interface()
 			}
 		}

@@ -13,5 +13,5 @@ func (v NotOperator) Unary(evaluator eval.Evaluator, arg interface{}) interface{
 	if arg == nil {
 		return nil
 	}
-	return evaluator.BooleanConvert(reflect.ValueOf(arg)) == false
+	return !evaluator.BooleanConvert(reflect.ValueOf(arg))
 }

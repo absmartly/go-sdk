@@ -21,16 +21,12 @@ func DigestOffset(key []int8, offset int, len int, seed int) int {
 	switch len & 3 {
 	case 3:
 		hash ^= scramble32(GetUInt24(key, i))
-		break
 	case 2:
 		hash ^= scramble32(GetUInt16(key, i))
-		break
 	case 1:
 		hash ^= scramble32(GetUInt8(key, i))
-		break
 	case 0:
 	default:
-		break
 	}
 	hash ^= len
 	hash = fmix32(hash)

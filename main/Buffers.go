@@ -43,13 +43,6 @@ func EncodeUTF8(buf []byte, offset int, value string) int {
 			out++
 			buf[out] = (c & 63) | 128
 			out++
-		} else {
-			buf[out] = (c >> 12) | 224
-			out++
-			buf[out] = ((c >> 6) & 63) | 128
-			out++
-			buf[out] = (c & 63) | 128
-			out++
 		}
 	}
 	return out - offset
