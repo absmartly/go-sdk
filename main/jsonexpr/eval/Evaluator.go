@@ -17,12 +17,10 @@ func (e Evaluator) Evaluate(expr reflect.Value) interface{} {
 		return e.Operators["and"].Evaluate(e, expr.Interface())
 	} else if expr.Kind() == reflect.Map {
 		var entry = expr.MapRange()
-		for entry.Next() != false {
-			var op = e.Operators[entry.Key().String()]
-			if op != nil {
-				return op.Evaluate(e, entry.Value().Interface())
-			}
-			break
+		entry.Next()
+		var op = e.Operators[entry.Key().String()]
+		if op != nil {
+			return op.Evaluate(e, entry.Value().Interface())
 		}
 	}
 	return nil
