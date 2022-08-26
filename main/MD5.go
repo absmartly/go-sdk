@@ -182,19 +182,15 @@ func md5state(key []int8, offset int, len int, block []int32, state []int32) []i
 	case 3:
 		block[w] = int32(GetUInt24(key, i) | 0x80000000)
 		w++
-		break
 	case 2:
 		block[w] = int32(GetUInt16(key, i) | 0x800000)
 		w++
-		break
 	case 1:
 		block[w] = int32(GetUInt8(key, i) | 0x8000)
 		w++
-		break
 	default:
 		block[w] = 0x80
 		w++
-		break
 	}
 
 	if w > 14 {

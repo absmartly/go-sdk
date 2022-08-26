@@ -11,7 +11,7 @@ type AndCombinator struct {
 
 func (v AndCombinator) Combine(evaluator eval.Evaluator, args reflect.Value) bool {
 	for i := 0; i < args.Len(); i++ {
-		if evaluator.BooleanConvert(reflect.ValueOf(evaluator.Evaluate(reflect.ValueOf(args.Index(i).Interface())))) == false {
+		if !evaluator.BooleanConvert(reflect.ValueOf(evaluator.Evaluate(reflect.ValueOf(args.Index(i).Interface())))) {
 			return false
 		}
 	}
