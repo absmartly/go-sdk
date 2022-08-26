@@ -9,7 +9,7 @@ golangci-lint version
 cd main
 echo "run golang lint"
 golangci-lint run
-echo "run golang tests"
-go test ./...
 echo "run golang fmt"
 go fmt ./...
+echo "run golang tests"
+go test ./...
