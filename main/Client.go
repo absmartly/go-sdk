@@ -8,6 +8,11 @@ import (
 	"github.com/go-resty/resty/v2"
 )
 
+type ClientI interface {
+	GetContextData() *future.Future
+	Publish(event jsonmodels.PublishEvent) *future.Future
+}
+
 type Client struct {
 	url_          string
 	query_        map[string]string
@@ -15,6 +20,7 @@ type Client struct {
 	httpClient_   HTTPClient
 	deserializer_ ContextDataDeserializer
 	serializer_   ContextEventSerializer
+	ClientI
 }
 
 func CreateDefaultClient(config ClientConfig) Client {

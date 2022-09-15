@@ -112,8 +112,10 @@ func (e Evaluator) BooleanConvert(x reflect.Value) bool {
 	} else if x.Kind() == reflect.String {
 		var str = x.String()
 		return str != "false" && str != "0" && str != ""
-	} else if x.Kind() == reflect.Int || x.Kind() == reflect.Float64 {
+	} else if x.Kind() == reflect.Int {
 		return x.Int() != 0
+	} else if x.Kind() == reflect.Float64 {
+		return x.Float() != 0
 	} else if x.IsValid() && (x.Interface() == false || x.Interface() == "false" || x.Interface() == "[false]") {
 		return false
 	} else if x.IsValid() && (x.Interface() == true || x.Interface() == "true" || x.Interface() == "[true]") {
