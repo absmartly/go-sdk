@@ -44,7 +44,7 @@ var Operators = map[string]eval.Operator{
 	},
 }
 
-func EvaluateBooleanExpr(expr interface{}, vars map[string]interface{}) interface{} {
+func EvaluateBooleanExpr(expr interface{}, vars map[string]interface{}) bool {
 	var eval = eval.Evaluator{Operators: Operators, Vars: vars}
 	return eval.BooleanConvert(reflect.ValueOf(eval.Evaluate(reflect.ValueOf(expr))))
 }

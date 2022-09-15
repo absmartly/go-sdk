@@ -24,7 +24,7 @@ type Future struct {
 // New constructs new Future.
 func New() (*Future, SetResultFunc) {
 	f := &Future{ready: make(chan struct{})}
-	return f, f.setResult
+	return f, f.SetResult
 }
 
 // Get returns value when it's ready. Will return error when the ctx signal a cancelation.
@@ -53,7 +53,7 @@ func (f *Future) Ready() bool {
 	}
 }
 
-func (f *Future) setResult(v Value, err error) {
+func (f *Future) SetResult(v Value, err error) {
 	select {
 	case <-f.ready:
 	default:
