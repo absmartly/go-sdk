@@ -59,7 +59,7 @@ func (f *Future) SetResult(v Value, err error) {
 	default:
 		f.val, f.err = v, err
 		close(f.ready)
-		f.notifyCallbacks()
+		f.NotifyCallbacks()
 	}
 }
 
@@ -75,11 +75,20 @@ func (f *Future) Listen(callback SetResultFunc) {
 	}
 }
 
-func (f *Future) notifyCallbacks() {
+func (f *Future) NotifyCallbacks() {
 	f.mu.Lock()
 	for _, callback := range f.callbacks {
 		callback(f.val, f.err)
 	}
+	f.mu.Unlock()
+}
+
+func (f *Future) Join() {
+	f.mu.Lock()
+	for _, callback := range f.callbacks {
+		callback(f.val, f.err)
+	}
+	close(f.ready)
 	f.mu.Unlock()
 }
 

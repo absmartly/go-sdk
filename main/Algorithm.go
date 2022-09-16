@@ -1,6 +1,6 @@
 package main
 
-func MapSetToArray(set map[interface{}]bool, array []interface{}, mapper MapperInt) interface{} {
+func MapSetToArray(set []interface{}, array []interface{}, mapper MapperInt) interface{} {
 	var size = len(set)
 	if len(array) < size {
 		array = make([]interface{}, size)
