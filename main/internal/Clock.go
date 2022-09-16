@@ -10,15 +10,15 @@ type SystemClockUTC struct {
 	Clock
 }
 
-func (s SystemClockUTC) millis() int64 {
+func (s SystemClockUTC) Millis() int64 {
 	return time.Now().UnixNano() / int64(time.Millisecond)
 }
 
 type FixedClock struct {
 	Clock
-	millis_ int64
+	Millis_ int64
 }
 
-func (f FixedClock) millis() int64 {
-	return f.millis_
+func (f FixedClock) Millis() int64 {
+	return f.Millis_
 }

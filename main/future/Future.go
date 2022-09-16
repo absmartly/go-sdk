@@ -83,12 +83,12 @@ func (f *Future) NotifyCallbacks() {
 	f.mu.Unlock()
 }
 
-func (f *Future) Join() {
+func (f *Future) Join(ctx context.Context) {
 	f.mu.Lock()
+	f.Get(ctx)
 	for _, callback := range f.callbacks {
 		callback(f.val, f.err)
 	}
-	close(f.ready)
 	f.mu.Unlock()
 }
 
