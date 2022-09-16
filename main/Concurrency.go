@@ -4,8 +4,8 @@ import "sync"
 
 func ComputeIfAbsentRW(lock *sync.RWMutex, maps map[interface{}]interface{}, key interface{}, computer MapperInt) interface{} {
 	lock.RLock()
-	var value = maps[key]
-	if value != nil {
+	var value, exist = maps[key]
+	if exist {
 		lock.RUnlock()
 		return value
 	}
@@ -20,9 +20,14 @@ func ComputeIfAbsentRW(lock *sync.RWMutex, maps map[interface{}]interface{}, key
 
 func GetRW(lock *sync.RWMutex, maps map[interface{}]interface{}, key interface{}) interface{} {
 	lock.RLock()
-	var value = maps[key]
-	lock.RUnlock()
-	return value
+	var value, exist = maps[key]
+	if exist {
+		lock.RUnlock()
+		return value
+	} else {
+		lock.RUnlock()
+		return nil
+	}
 }
 
 func PutRW(lock *sync.RWMutex, maps map[interface{}]interface{}, key interface{}, value interface{}) interface{} {
