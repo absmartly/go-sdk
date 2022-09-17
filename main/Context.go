@@ -23,7 +23,8 @@ type Context struct {
 	VariableParser_  VariableParser
 	AudienceMatcher_ AudienceMatcher
 	Units_           map[string]string
-	Failed_          bool
+	Failed_          *atomic.Bool
+	Ready_           *atomic.Bool
 	DataLock         *sync.RWMutex
 	Data_            jsonmodels.ContextData
 	Index_           map[string]ExperimentVariables
@@ -76,7 +77,7 @@ type Assignment struct {
 
 func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *future.Future, dataProvider ContextDataProvider,
 	eventHandler ContextEventHandler, eventLogger ContextEventLogger, variableParser VariableParser,
-	audienceMatcher AudienceMatcher, buff [512]byte, block [16]int32, st [4]int32) Context {
+	audienceMatcher AudienceMatcher, buff [512]byte, block [16]int32, st [4]int32) *Context {
 	var cntx = Context{Clock_: clock, PublishDelay_: config.PublishDelay_, RefreshInterval_: config.RefreshInterval_,
 		EventHandler_: eventHandler, DataProvider_: dataProvider, VariableParser_: variableParser,
 		AudienceMatcher_: audienceMatcher, Units_: map[string]string{}}
@@ -90,6 +91,8 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	cntx.Closed_ = &atomic.Bool{}
 	cntx.Closing_ = &atomic.Bool{}
 	cntx.Refreshing_ = &atomic.Bool{}
+	cntx.Ready_ = &atomic.Bool{}
+	cntx.Failed_ = &atomic.Bool{}
 	cntx.PendingCount_ = &atomic.Int32{}
 	cntx.DataLock = &sync.RWMutex{}
 	cntx.ContextLock_ = &sync.RWMutex{}
@@ -103,7 +106,7 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 
 	var units = config.Units_
 	if units != nil {
-		cntx.SetUnits(units)
+		var _ = cntx.SetUnits(units)
 	}
 
 	cntx.Assigners_ = map[interface{}]interface{}{}
@@ -111,7 +114,7 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 
 	var attributes = config.Attributes_
 	if attributes != nil {
-		cntx.SetAttributes(attributes)
+		var _ = cntx.SetAttributes(attributes)
 	}
 
 	var overrides = config.Overrides_
@@ -139,14 +142,15 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	}
 
 	if dataFuture.Ready() {
+		var tmp = &cntx
 		dataFuture.Listen(func(val future.Value, err error) {
 			if err == nil {
 				var result = val.(*jsonmodels.ContextData)
-				cntx.SetData(result)
-				cntx.LogEvent(Ready, result)
+				tmp.SetData(result)
+				tmp.LogEvent(Ready, result)
 			} else {
-				cntx.SetDataFailed(err)
-				cntx.LogError(err)
+				tmp.SetDataFailed(err)
+				tmp.LogError(err)
 			}
 
 		})
@@ -158,43 +162,44 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 			if err == nil {
 				var result = val.(*jsonmodels.ContextData)
 				tmp.SetData(result)
-				readyFutureDone(nil, nil)
+				readyFutureDone(result, nil)
+				cntx.ReadyFuture_ = nil
 				tmp.LogEvent(Ready, result)
 
 				if tmp.GetPendingCount() > 0 {
 					tmp.SetTimeout(buff, block, st)
 				}
 			} else {
-				tmp.Data_ = jsonmodels.ContextData{}
 				tmp.SetDataFailed(err)
 				readyFutureDone(nil, err)
+				cntx.ReadyFuture_ = nil
 				tmp.LogError(err)
 			}
 
 		})
 	}
 
-	return cntx
+	return &cntx
 }
 
-func (c Context) IsReady() bool {
-	return reflect.DeepEqual(c.Data_, jsonmodels.ContextData{})
+func (c *Context) IsReady() bool {
+	return c.Ready_.Load()
 }
 
-func (c Context) IsFailed() bool {
-	return c.Failed_
+func (c *Context) IsFailed() bool {
+	return c.Failed_.Load()
 }
 
-func (c Context) IsClosed() bool {
+func (c *Context) IsClosed() bool {
 	return c.Closed_.Load()
 }
 
-func (c Context) IsClosing() bool {
+func (c *Context) IsClosing() bool {
 	return !c.Closed_.Load() && c.Closing_.Load()
 }
 
-func (c Context) WaitUntilReadyAsync() *future.Future {
-	if reflect.DeepEqual(c.Data_, jsonmodels.ContextData{}) {
+func (c *Context) WaitUntilReadyAsync() *future.Future {
+	if c.Ready_.Load() {
 		return future.Call(func() (future.Value, error) {
 			return c, nil
 		})
@@ -206,17 +211,17 @@ func (c Context) WaitUntilReadyAsync() *future.Future {
 	}
 }
 
-func (c Context) WaitUntilReady() Context {
-	if !reflect.DeepEqual(c.Data_, jsonmodels.ContextData{}) {
+func (c *Context) WaitUntilReady() Context {
+	if !c.Ready_.Load() {
 		var ft = c.ReadyFuture_
 		if ft != nil && !ft.Ready() {
 			ft.Join(context.Background())
 		}
 	}
-	return c
+	return *c
 }
 
-func (c Context) GetExperiments() ([]string, error) {
+func (c *Context) GetExperiments() ([]string, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
@@ -233,7 +238,7 @@ func (c Context) GetExperiments() ([]string, error) {
 	return experimentNames, nil
 }
 
-func (c Context) GetData() (*jsonmodels.ContextData, error) {
+func (c *Context) GetData() (*jsonmodels.ContextData, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
 		return &jsonmodels.ContextData{}, err
@@ -243,7 +248,7 @@ func (c Context) GetData() (*jsonmodels.ContextData, error) {
 
 }
 
-func (c Context) SetOverride(experimentName string, variant int) error {
+func (c *Context) SetOverride(experimentName string, variant int) error {
 	var err = c.CheckNotClosed()
 	if err != nil {
 		return err
@@ -253,11 +258,17 @@ func (c Context) SetOverride(experimentName string, variant int) error {
 	return nil
 }
 
-func (c Context) GetOverride(experimentName string) int {
-	return GetRW(c.ContextLock_, c.Overrides_, experimentName).(int)
+func (c *Context) GetOverride(experimentName string) (int, error) {
+	var result = GetRW(c.ContextLock_, c.Overrides_, experimentName)
+	if result != nil {
+		return result.(int), nil
+	} else {
+		return -1, errors.New("override not found")
+	}
+
 }
 
-func (c Context) SetOverrides(overrides map[string]int) error {
+func (c *Context) SetOverrides(overrides map[string]int) error {
 	for key, value := range overrides {
 		var err = c.SetOverride(key, value)
 		if err != nil {
@@ -267,7 +278,7 @@ func (c Context) SetOverrides(overrides map[string]int) error {
 	return nil
 }
 
-func (c Context) SetCustomAssignment(experimentName string, variant int) error {
+func (c *Context) SetCustomAssignment(experimentName string, variant int) error {
 	var err = c.CheckNotClosed()
 	if err != nil {
 		return err
@@ -277,11 +288,16 @@ func (c Context) SetCustomAssignment(experimentName string, variant int) error {
 	return nil
 }
 
-func (c Context) GetCustomAssignment(experimentName string) int {
-	return GetRW(c.ContextLock_, c.Cassignments_, experimentName).(int)
+func (c *Context) GetCustomAssignment(experimentName string) (int, error) {
+	var result = GetRW(c.ContextLock_, c.Cassignments_, experimentName)
+	if result != nil {
+		return result.(int), nil
+	} else {
+		return -1, errors.New("customAssignment not found")
+	}
 }
 
-func (c Context) SetCustomAssignments(customAssignments map[string]int) error {
+func (c *Context) SetCustomAssignments(customAssignments map[string]int) error {
 	for key, value := range customAssignments {
 		var err = c.SetCustomAssignment(key, value)
 		if err != nil {
@@ -291,20 +307,22 @@ func (c Context) SetCustomAssignments(customAssignments map[string]int) error {
 	return nil
 }
 
-func (c Context) SetUnit(unitType string, uid string) error {
+func (c *Context) SetUnit(unitType string, uid string) error {
 	var err = c.CheckNotClosed()
 	if err != nil {
 		return err
 	}
 
 	c.ContextLock_.Lock()
-	var previous = c.Units_[unitType]
-	if len(previous) > 0 && previous != uid {
+	var previous, exist = c.Units_[unitType]
+	if exist && previous != uid {
+		c.ContextLock_.Unlock()
 		return errors.New("unit already set")
 	}
 
 	var trimmed = strings.TrimSpace(uid)
 	if len(trimmed) <= 0 {
+		c.ContextLock_.Unlock()
 		return errors.New("unit  UID must not be blank.")
 	}
 
@@ -313,7 +331,7 @@ func (c Context) SetUnit(unitType string, uid string) error {
 	return nil
 }
 
-func (c Context) SetUnits(units map[string]string) error {
+func (c *Context) SetUnits(units map[string]string) error {
 	for key, value := range units {
 		var err = c.SetUnit(key, value)
 		if err != nil {
@@ -323,7 +341,7 @@ func (c Context) SetUnits(units map[string]string) error {
 	return nil
 }
 
-func (c Context) SetAttribute(name string, value interface{}) error {
+func (c *Context) SetAttribute(name string, value interface{}) error {
 	var err = c.CheckNotClosed()
 	if err != nil {
 		return err
@@ -333,7 +351,7 @@ func (c Context) SetAttribute(name string, value interface{}) error {
 	return nil
 }
 
-func (c Context) SetAttributes(attributes map[string]interface{}) error {
+func (c *Context) SetAttributes(attributes map[string]interface{}) error {
 	for key, value := range attributes {
 		var err = c.SetAttribute(key, value)
 		if err != nil {
@@ -343,12 +361,11 @@ func (c Context) SetAttributes(attributes map[string]interface{}) error {
 	return nil
 }
 
-func (c Context) GetTreatment(experimentName string, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) (int, error) {
+func (c *Context) GetTreatment(experimentName string, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) (int, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
 		return -1, err
 	}
-
 	var assignment = c.GetAssignment(experimentName, buff, block, st, assignBuff)
 	if !assignment.Exposed.Load() {
 		c.QueueExposure(assignment, buff, block, st)
@@ -357,7 +374,7 @@ func (c Context) GetTreatment(experimentName string, buff [512]byte, block [16]i
 	return assignment.Variant, nil
 }
 
-func (c Context) QueueExposure(assignment Assignment, buff [512]byte, block [16]int32, st [4]int32) {
+func (c *Context) QueueExposure(assignment *Assignment, buff [512]byte, block [16]int32, st [4]int32) {
 	if assignment.Exposed.CompareAndSwap(false, true) {
 		var exposure = jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
 			Variant: assignment.Variant, ExposedAt: c.Clock_.Millis(), Assigned: assignment.Assigned,
@@ -375,7 +392,7 @@ func (c Context) QueueExposure(assignment Assignment, buff [512]byte, block [16]
 	}
 }
 
-func (c Context) PeekTreatent(experimentName string, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) (int, error) {
+func (c *Context) PeekTreatment(experimentName string, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) (int, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
 		return -1, err
@@ -384,7 +401,7 @@ func (c Context) PeekTreatent(experimentName string, buff [512]byte, block [16]i
 	return c.GetAssignment(experimentName, buff, block, st, assignBuff).Variant, nil
 }
 
-func (c Context) GetVariableKeys() (map[string]string, error) {
+func (c *Context) GetVariableKeys() (map[string]string, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
@@ -400,7 +417,7 @@ func (c Context) GetVariableKeys() (map[string]string, error) {
 	return variableKeys, nil
 }
 
-func (c Context) GetVariableValue(key string, defaultValue interface{}, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) (interface{}, error) {
+func (c *Context) GetVariableValue(key string, defaultValue interface{}, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) (interface{}, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
@@ -408,21 +425,20 @@ func (c Context) GetVariableValue(key string, defaultValue interface{}, buff [51
 
 	var assignment, errres = c.GetVariableAssignment(key, buff, block, st, assignBuff)
 	if errres == nil {
-		if assignment.Variables != nil {
-			if !assignment.Exposed.Load() {
-				c.QueueExposure(assignment, buff, block, st)
-			}
-
-			var value, exist = assignment.Variables[key]
-			if exist {
-				return value, nil
-			}
+		if !assignment.Exposed.Load() {
+			c.QueueExposure(assignment, buff, block, st)
 		}
+
+		var value, exist = assignment.Variables[key]
+		if exist {
+			return value, nil
+		}
+
 	}
 	return defaultValue, nil
 }
 
-func (c Context) PeekVariableValue(key string, defaultValue interface{}, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) (interface{}, error) {
+func (c *Context) PeekVariableValue(key string, defaultValue interface{}, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) (interface{}, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
@@ -430,17 +446,15 @@ func (c Context) PeekVariableValue(key string, defaultValue interface{}, buff [5
 
 	var assignment, errres = c.GetVariableAssignment(key, buff, block, st, assignBuff)
 	if errres == nil {
-		if assignment.Variables != nil {
-			var value, exist = assignment.Variables[key]
-			if exist {
-				return value, nil
-			}
+		var value, exist = assignment.Variables[key]
+		if exist {
+			return value, nil
 		}
 	}
 	return defaultValue, nil
 }
 
-func (c Context) Track(goalName string, properties map[string]interface{}, buff [512]byte, block [16]int32, st [4]int32) error {
+func (c *Context) Track(goalName string, properties map[string]interface{}, buff [512]byte, block [16]int32, st [4]int32) error {
 	var err = c.CheckNotClosed()
 	if err != nil {
 		return err
@@ -469,7 +483,7 @@ func (c Context) Track(goalName string, properties map[string]interface{}, buff 
 	return nil
 }
 
-func (c Context) PublishAsync(buff [512]byte, block [16]int32, st [4]int32) (*future.Future, error) {
+func (c *Context) PublishAsync(buff [512]byte, block [16]int32, st [4]int32) (*future.Future, error) {
 	var err = c.CheckNotClosed()
 	if err != nil {
 		return nil, err
@@ -478,7 +492,7 @@ func (c Context) PublishAsync(buff [512]byte, block [16]int32, st [4]int32) (*fu
 	return c.Flush(buff, block, st), nil
 }
 
-func (c Context) Publish(buff [512]byte, block [16]int32, st [4]int32) error {
+func (c *Context) Publish(buff [512]byte, block [16]int32, st [4]int32) error {
 	var result, err = c.PublishAsync(buff, block, st)
 	if err == nil {
 		result.Join(context.Background())
@@ -488,11 +502,11 @@ func (c Context) Publish(buff [512]byte, block [16]int32, st [4]int32) error {
 	}
 }
 
-func (c Context) GetPendingCount() int32 {
+func (c *Context) GetPendingCount() int32 {
 	return c.PendingCount_.Load()
 }
 
-func (c Context) RefreshAsync() *future.Future {
+func (c *Context) RefreshAsync() *future.Future {
 
 	var err = c.CheckNotClosed()
 	if err != nil {
@@ -528,11 +542,11 @@ func (c Context) RefreshAsync() *future.Future {
 	return tempfuture
 }
 
-func (c Context) Refresh() {
+func (c *Context) Refresh() {
 	c.RefreshAsync().Join(context.Background())
 }
 
-func (c Context) CloseAsync(buff [512]byte, block [16]int32, st [4]int32) (*future.Future, error) {
+func (c *Context) CloseAsync(buff [512]byte, block [16]int32, st [4]int32) (*future.Future, error) {
 	if !c.Closed_.Load() {
 		if c.Closing_.CompareAndSwap(false, true) {
 			c.ClearRefreshTimer()
@@ -540,7 +554,6 @@ func (c Context) CloseAsync(buff [512]byte, block [16]int32, st [4]int32) (*futu
 			if c.PendingCount_.Load() > 0 {
 				var tempFuture, done = future.New()
 				c.ClosingFuture_ = tempFuture
-
 				c.Flush(buff, block, st).Listen(func(value future.Value, err error) {
 					if err == nil {
 						c.Closed_.Store(true)
@@ -575,14 +588,14 @@ func (c Context) CloseAsync(buff [512]byte, block [16]int32, st [4]int32) (*futu
 	return tempFuture, nil
 }
 
-func (c Context) Close(buff [512]byte, block [16]int32, st [4]int32) {
+func (c *Context) Close(buff [512]byte, block [16]int32, st [4]int32) {
 	var fut, err = c.CloseAsync(buff, block, st)
 	if err == nil {
 		fut.Join(context.Background())
 	}
 }
 
-func (c Context) GetAssignment(experimentName string, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) Assignment {
+func (c *Context) GetAssignment(experimentName string, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) *Assignment {
 
 	c.ContextLock_.RLock()
 	if assignment, found := c.AssignmentCache[experimentName]; found {
@@ -592,21 +605,22 @@ func (c Context) GetAssignment(experimentName string, buff [512]byte, block [16]
 
 		if ofound {
 			if assignment.Overridden && assignment.Variant == override.(int) {
-				return assignment
+				c.ContextLock_.RUnlock()
+				return &assignment
 			}
 		} else if !efound {
 			if !assignment.Assigned {
-				return assignment
+				c.ContextLock_.RUnlock()
+				return &assignment
 			}
 		} else if !cfound || custom.(int) == assignment.Variant {
 			if c.ExperimentMatches(experiment.Data, assignment) {
-				return assignment
+				c.ContextLock_.RUnlock()
+				return &assignment
 			}
 		}
 	}
-
 	c.ContextLock_.RUnlock()
-
 	// cache miss or out-dated
 	c.ContextLock_.Lock()
 
@@ -647,9 +661,8 @@ func (c Context) GetAssignment(experimentName string, buff [512]byte, block [16]
 			} else if experiment.Data.FullOnVariant == 0 {
 				var uid, ufound = c.Units_[experiment.Data.UnitType]
 				if ufound {
-					var unitHash = c.GetUnitHash(unitType, uid, buff, block, st)
-
-					var assigner = c.GetVariantAssigner(unitType, unitHash)
+					var unitHash = c.GetUnitHash(unitType, uid, buff, block, st, false)
+					var assigner = c.GetVariantAssigner(unitType, unitHash, false)
 					var eligible = assigner.Assign(experiment.Data.TrafficSplit, experiment.Data.TrafficSeedHi,
 						experiment.Data.TrafficSeedLo, assignBuff[:]) == 1
 					if eligible {
@@ -686,22 +699,22 @@ func (c Context) GetAssignment(experimentName string, buff [512]byte, block [16]
 
 	c.AssignmentCache[experimentName] = assignment
 	c.ContextLock_.Unlock()
-	return assignment
+	return &assignment
 }
 
-func (c Context) ClearRefreshTimer() {
+func (c *Context) ClearRefreshTimer() {
 	if c.RefreshTimer_ != nil {
 		c.RefreshTimer_ <- true
 		c.RefreshTimer_ = nil
 	}
 }
 
-func (c Context) GetExperiment(experimentName string) (ExperimentVariables, bool) {
+func (c *Context) GetExperiment(experimentName string) (ExperimentVariables, bool) {
 	var result, found = c.Index_[experimentName]
 	return result, found
 }
 
-func (c Context) ExperimentMatches(experiment jsonmodels.Experiment, assignment Assignment) bool {
+func (c *Context) ExperimentMatches(experiment jsonmodels.Experiment, assignment Assignment) bool {
 	return experiment.Id == assignment.Id &&
 		experiment.UnitType == assignment.UnitType &&
 		experiment.Iteration == assignment.Iteration &&
@@ -709,7 +722,7 @@ func (c Context) ExperimentMatches(experiment jsonmodels.Experiment, assignment 
 		reflect.DeepEqual(experiment.TrafficSplit, assignment.TrafficSplit)
 }
 
-func (c Context) CheckNotClosed() error {
+func (c *Context) CheckNotClosed() error {
 	if c.Closed_.Load() {
 		return errors.New("ABSmartly Context is closed")
 	} else if c.Closing_.Load() {
@@ -718,7 +731,7 @@ func (c Context) CheckNotClosed() error {
 	return nil
 }
 
-func (c Context) CheckReady(expectNotClosed bool) error {
+func (c *Context) CheckReady(expectNotClosed bool) error {
 	if !c.IsReady() {
 		return errors.New("ABSmartly Context is not yet ready")
 	} else if expectNotClosed {
@@ -727,18 +740,18 @@ func (c Context) CheckReady(expectNotClosed bool) error {
 	return nil
 }
 
-func (c Context) SetData(data *jsonmodels.ContextData) {
+func (c *Context) SetData(data *jsonmodels.ContextData) {
 	var index = map[string]ExperimentVariables{}
 	var indexVariables = map[interface{}]interface{}{}
 
 	for _, experiment := range data.Experiments {
 		var experiemntVariables = ExperimentVariables{}
 		experiemntVariables.Data = experiment
-		experiemntVariables.Variables = make([]map[string]interface{}, len(experiment.Variants))
+		experiemntVariables.Variables = make([]map[string]interface{}, 0)
 
 		for _, variant := range experiment.Variants {
 			if len(variant.Config) > 0 {
-				var variables = c.VariableParser_.Parse(c, experiment.Name, variant.Name, variant.Config)
+				var variables = c.VariableParser_.Parse(*c, experiment.Name, variant.Name, variant.Config)
 				for key := range variables {
 					indexVariables[key] = experiemntVariables
 				}
@@ -756,36 +769,38 @@ func (c Context) SetData(data *jsonmodels.ContextData) {
 	c.Index_ = index
 	c.IndexVariables_ = indexVariables
 	c.Data_ = *data
+	c.Ready_.Store(true)
 
 	c.SetRefreshTimer()
 	c.DataLock.Unlock()
 }
 
-func (c Context) LogEvent(event EventType, data interface{}) {
+func (c *Context) LogEvent(event EventType, data interface{}) {
 	if c.EventLogger_ != nil {
-		c.EventLogger_.HandleEvent(c, event, data)
+		c.EventLogger_.HandleEvent(*c, event, data)
 	}
 }
 
-func (c Context) LogError(err error) {
+func (c *Context) LogError(err error) {
 	if c.EventLogger_ != nil {
-		c.EventLogger_.HandleEvent(c, Error, err)
+		c.EventLogger_.HandleEvent(*c, Error, err)
 	}
 }
 
-func (c Context) SetDataFailed(err error) {
+func (c *Context) SetDataFailed(err error) {
 	c.DataLock.Lock()
 	c.Index_ = map[string]ExperimentVariables{}
 	c.IndexVariables_ = map[interface{}]interface{}{}
 	c.Data_ = jsonmodels.ContextData{}
-	c.Failed_ = true
+	c.Ready_.Store(true)
+	c.Failed_.Store(true)
 	c.DataLock.Unlock()
 }
 
-func (c Context) Flush(buff [512]byte, block [16]int32, st [4]int32) *future.Future {
+func (c *Context) Flush(buff [512]byte, block [16]int32, st [4]int32) *future.Future {
 	c.ClearTimeout()
 
-	if !c.Failed_ {
+	if !c.Failed_.Load() {
 		if c.PendingCount_.Load() > 0 {
 			var exposures = make([]jsonmodels.Exposure, 0)
 			var achievements = make([]jsonmodels.GoalAchievement, 0)
@@ -818,7 +833,7 @@ func (c Context) Flush(buff [512]byte, block [16]int32, st [4]int32) *future.Fut
 					entrySet = append(entrySet, Pair{a: key, b: value})
 				}
 
-				var mapper = FlushMapper{Context: c, buff: buff, block: block, st: st}
+				var mapper = FlushMapper{Context: *c, buff: buff, block: block, st: st}
 				var temp = MapSetToArray(entrySet, make([]interface{}, 0), mapper)
 				event.Units = make([]jsonmodels.Unit, 0)
 				for _, value := range temp {
@@ -835,7 +850,7 @@ func (c Context) Flush(buff [512]byte, block [16]int32, st [4]int32) *future.Fut
 
 				result, done := future.New()
 
-				c.EventHandler_.Publish(c, event).Listen(
+				c.EventHandler_.Publish(*c, event).Listen(
 					func(value future.Value, err error) {
 						if err != nil {
 							c.LogEvent(Publish, event)
@@ -872,24 +887,26 @@ type FlushMapper struct {
 func (f FlushMapper) Apply(value interface{}) interface{} {
 	var key = value.(Pair).a
 	var val = value.(Pair).b
-	var uid = Context.GetUnitHash(f.Context, key, val, f.buff, f.block, f.st)
+	var cntx = &f.Context
+	var uid = cntx.GetUnitHash(key, val, f.buff, f.block, f.st, false)
 	var dst = make([]byte, len(uid))
 	var res = strconv.QuoteToASCII(string(dst))
 	return jsonmodels.Unit{Type: value.(Pair).a, Uid: res}
 }
 
-func (c Context) ClearTimeout() {
+func (c *Context) ClearTimeout() {
 	if c.Timeout_ != nil {
 		c.TimeoutLock_.Lock()
 		if c.Timeout_ != nil {
-			c.Timeout_ <- true
+			//	c.Timeout_ <- true
+			close(c.Timeout_)
 			c.Timeout_ = nil
 		}
 		c.TimeoutLock_.Unlock()
 	}
 }
 
-func (c Context) SetTimeout(buff [512]byte, block [16]int32, st [4]int32) {
+func (c *Context) SetTimeout(buff [512]byte, block [16]int32, st [4]int32) {
 	if c.IsReady() {
 		if c.Timeout_ == nil {
 			c.TimeoutLock_.Lock()
@@ -914,7 +931,7 @@ func (c Context) SetTimeout(buff [512]byte, block [16]int32, st [4]int32) {
 
 }
 
-func (c Context) SetRefreshTimer() {
+func (c *Context) SetRefreshTimer() {
 	if c.RefreshInterval_ > 0 && c.RefreshTimer_ == nil {
 		c.RefreshTimer_ = make(chan bool)
 		go func() {
@@ -932,9 +949,9 @@ func (c Context) SetRefreshTimer() {
 	}
 }
 
-func (c Context) GetUnitHash(unitType string, unitUID string, buff [512]byte, block [16]int32, st [4]int32) []byte {
+func (c *Context) GetUnitHash(unitType string, unitUID string, buff [512]byte, block [16]int32, st [4]int32, needlock bool) []byte {
 	var computer = ComputerUnitHash{St: st, Block: block, Buff: buff, UnitUID: unitUID}
-	var result = ComputeIfAbsentRW(c.ContextLock_, c.HashedUnits_, unitType, computer).([]int8)
+	var result = ComputeIfAbsentRW(c.ContextLock_, needlock, c.HashedUnits_, unitType, computer).([]int8)
 	var data = make([]byte, len(result))
 	for i, val := range result {
 		data[i] = byte(val)
@@ -942,21 +959,21 @@ func (c Context) GetUnitHash(unitType string, unitUID string, buff [512]byte, bl
 	return data
 }
 
-func (c Context) GetVariantAssigner(unitType string, hash []byte) VariantAssigner {
+func (c *Context) GetVariantAssigner(unitType string, hash []byte, needlock bool) *VariantAssigner {
 	var computer = ComputerVariantAssigner{Hash: hash}
-	return ComputeIfAbsentRW(c.ContextLock_, c.Assigners_, unitType, computer).(VariantAssigner)
+	return ComputeIfAbsentRW(c.ContextLock_, needlock, c.Assigners_, unitType, computer).(*VariantAssigner)
 }
 
-func (c Context) GetVariableAssignment(key string, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) (Assignment, error) {
+func (c *Context) GetVariableAssignment(key string, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) (*Assignment, error) {
 	var experiment, err = c.GetVariableExperiment(key)
 
 	if err == nil {
 		return c.GetAssignment(experiment.Data.Name, buff, block, st, assignBuff), nil
 	}
-	return Assignment{Exposed: &atomic.Bool{}}, err
+	return &Assignment{Exposed: &atomic.Bool{}}, err
 }
 
-func (c Context) GetVariableExperiment(key string) (ExperimentVariables, error) {
+func (c *Context) GetVariableExperiment(key string) (ExperimentVariables, error) {
 	var result = GetRW(c.DataLock, c.IndexVariables_, key)
 	if result == nil {
 		return ExperimentVariables{}, errors.New("result is nil")
