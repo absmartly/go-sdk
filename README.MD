@@ -10,10 +10,10 @@ It provides both a blocking and an asynchronous interfaces.
 
 ## Installation
 
-# Go Modules
+### Go Modules
 require github.com/absmartly/go-sdk
 
-# Dependencies
+### Dependencies
 sh ./run.sh
 
 ## Getting Started
@@ -25,18 +25,18 @@ This example assumes an Api Key, an Application, and an Environment have been cr
 ```go
 
 func main() {
-		var clientConfig = ClientConfig{
-			Endpoint_:    "https://acme.absmartly.io/v1",
-			ApiKey_:     "YOUR-API-KEY",
-			Application_: "website", // created in the ABSmartly web console
-			Environment_: "development", // created in the ABSmartly web console
-		}
+	var clientConfig = ClientConfig{
+		Endpoint_:    "https://acme.absmartly.io/v1",
+		ApiKey_:     "YOUR-API-KEY",
+		Application_: "website", // created in the ABSmartly web console
+		Environment_: "development", // created in the ABSmartly web console
+	}
 
-		var sdkConfig = ABSmartlyConfig{Client_: CreateDefaultClient(clientConfig)}
+	var sdkConfig = ABSmartlyConfig{Client_: CreateDefaultClient(clientConfig)}
 
-		var sdk = Create(sdkConfig)
+	var sdk = Create(sdkConfig)
 
-		// ...
+	// ...
 }
 ```
 
@@ -46,14 +46,14 @@ func main() {
 var contextConfig = ContextConfig{Units_: map[string]string{
 		"session_id": "bf06d8cb5d8137290c4abb64155584fbdb64d8",
 		"user_id":    "123456",
-	}}
+}}
 
-	var buff [512]byte
-	var block [16]int32
-	var st [4]int32
-	var assignBuf [12]int8
-	var ctx = sdk.CreateContext(contextConfig, buff, block, st)
-	ctx.WaitUntilReady()
+var buff [512]byte
+var block [16]int32
+var st [4]int32
+var assignBuf [12]int8
+var ctx = sdk.CreateContext(contextConfig, buff, block, st)
+ctx.WaitUntilReady()
 ```
 
 #### Creating a new Context asynchronously
@@ -62,14 +62,14 @@ var contextConfig = ContextConfig{Units_: map[string]string{
 var contextConfig = ContextConfig{Units_: map[string]string{
 		"session_id": "bf06d8cb5d8137290c4abb64155584fbdb64d8",
 		"user_id":    "123456",
-	}}
+}}
 
-	var buff [512]byte
-	var block [16]int32
-	var st [4]int32
-	var assignBuf [12]int8
-	var ctx = sdk.CreateContext(contextConfig, buff, block, st)
-	ctx.WaitUntilReadyAsync()
+var buff [512]byte
+var block [16]int32
+var st [4]int32
+var assignBuf [12]int8
+var ctx = sdk.CreateContext(contextConfig, buff, block, st)
+ctx.WaitUntilReadyAsync()
 ```
 
 #### Setting extra units for a context
@@ -89,30 +89,30 @@ context.setUnits(map[string]string{
 #### Setting context attributes
 The `SetAttribute()` and `SetAttributes()` methods can be called before the context is ready.
 ```go
-    context.SetAttribute("user_agent", req.GetHeader("User-Agent"));
+context.SetAttribute("user_agent", req.GetHeader("User-Agent"));
 
-    context.setAttributes(map[string]string{
+context.setAttributes(map[string]string{
         "customer_age": "new_customer",
-    }
+}
 ```
 
 #### Selecting a treatment
 ```go
-    var res, _ = context.GetTreament("exp_test_experiment", buff, block, st, assignBuf)
-    if res == 0 {
+var res, _ = context.GetTreament("exp_test_experiment", buff, block, st, assignBuf)
+if res == 0 {
         // user is in control group (variant 0)
-    } else {
+} else {
         // user is in treatment group
-    }
+}
 ```
 
 #### Tracking a goal achievement
 Goals are created in the A/B Smartly web console.
 ```go
-    context.Track("payment", map[string]interface{}{
+context.Track("payment", map[string]interface{}{
         "item_count": 1,
         "total_amount": 1999.99
-    }, buff, block, st)
+}, buff, block, st)
 ```
 
 #### Publishing pending data
@@ -125,7 +125,7 @@ You can explicitly call the `Publish()` or `PublishAsync()` methods.
 #### Finalizing
 The `Close()` and `CloseAsync()` methods will ensure all events have been published to the A/B Smartly collector, like `Publish()`, and will also "seal" the context, throwing an error if any method that could generate an event is called.
 ```go
-    context.Close(buff, block, st);
+context.Close(buff, block, st);
 ```
 
 #### Refreshing the context with fresh experiment data
@@ -134,23 +134,23 @@ However, any experiments being tracked in your production code, but started afte
 To mitigate this, we can use the `setRefreshInterval()` method on the context config.
 
 ```go
-    var contextConfig = ContextConfig{Units_: map[string]string{
+var contextConfig = ContextConfig{Units_: map[string]string{
 		"session_id": "bf06d8cb5d8137290c4abb64155584fbdb64d8",
 		"user_id":    "123456",
-	}, RefreshInteval_: 4 * Time.Hour}
+}, RefreshInteval_: 4 * Time.Hour}
 ```
 
 Alternatively, the `Refresh()` method can be called manually.
 The `Refresh()` method pulls updated experiment data from the A/B Smartly collector and will trigger recently started experiments when `GetTreatment()` is called again.
 ```go
-    context.Refresh();
+context.Refresh();
 ```
 
 #### Using a custom Event Logger
 The A/B Smartly SDK can be instantiated with an event logger used for all contexts.
 In addition, an event logger can be specified when creating a particular context, in the `ContextConfig`.
 ```go
-   type ContextEventLogger interface {
+type ContextEventLogger interface {
 	HandleEvent(context Context, types EventType, data interface{})
 }
 
@@ -185,28 +185,28 @@ Although generally not recommended, it is sometimes necessary to peek at a treat
 The A/B Smartly SDK provides a `PeekTreatment()` method for that.
 
 ```go
-    var res, _ = context.PeekTreatment("exp_test_experiment", buff, block, st, assignBuf)
-    if res == 0 {
-        // user is in control group (variant 0)
-    } else {
-        // user is in treatment group
-    }
+var res, _ = context.PeekTreatment("exp_test_experiment", buff, block, st, assignBuf)
+if res == 0 {
+	// user is in control group (variant 0)
+} else {
+	// user is in treatment group
+}
 ```
 
 ##### Peeking at variables
 ```go
-   var variable = context.PeekVariable("my_variable",  buff, block, st, assignBuf)
+var variable = context.PeekVariable("my_variable",  buff, block, st, assignBuf)
 ```
 
 #### Overriding treatment variants
 During development, for example, it is useful to force a treatment for an experiment. This can be achieved with the `Override()` and/or `Overrides()` methods.
 The `SetOverride()` and `SetOverrides()` methods can be called before the context is ready.
 ```go
-    context.SetOverride("exp_test_experiment", 1) // force variant 1 of treatment
-    context.SetOverrides(map[string]int{
-        "exp_test_experiment": 1,
-        "exp_another_experiment": 0
-    })
+context.SetOverride("exp_test_experiment", 1) // force variant 1 of treatment
+context.SetOverrides(map[string]int{
+	"exp_test_experiment": 1,
+	"exp_another_experiment": 0
+})
 ```
 
 ## About A/B Smartly
