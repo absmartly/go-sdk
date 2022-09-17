@@ -31,9 +31,9 @@ func TestCreateContext(t *testing.T) {
 	var buff [512]byte
 	var block [16]int32
 	var st [4]int32
-	var result = abs.CreateContext(contextConfig, buff, block, st)
-	assertAny(true, result.ReadyFuture_ != nil, t)
-	assertAny(true, result.Cassignments_ != nil, t)
+	var temp = abs.CreateContext(contextConfig, buff, block, st)
+	var result = temp
+	assertAny(true, result != nil, t)
 }
 
 func TestContextWith(t *testing.T) {

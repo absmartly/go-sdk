@@ -23,7 +23,7 @@ func (c Computer) Apply(value interface{}) interface{} {
 func TestComputeIfAbsentRW(t *testing.T) {
 	var mp = map[interface{}]interface{}{}
 	var computer = Computer{}
-	var result = ComputeIfAbsentRW(&rwLock, mp, 1, computer)
+	var result = ComputeIfAbsentRW(&rwLock, true, mp, 1, computer)
 	assert(5, result.(int), t)
 }
 
@@ -34,7 +34,7 @@ type ComputerSecond struct {
 func TestComputeIfAbsentRWPresent(t *testing.T) {
 	var mp = map[interface{}]interface{}{1: 5}
 	var computer = ComputerSecond{}
-	var result = ComputeIfAbsentRW(&rwLock, mp, 1, computer)
+	var result = ComputeIfAbsentRW(&rwLock, true, mp, 1, computer)
 	assert(5, result.(int), t)
 }
 
@@ -44,7 +44,7 @@ func TestComputeIfAbsentRWPresentAfterLock(t *testing.T) {
 	rLock.RLock()
 	assertAny(true, rLock.TryRLock(), t)
 	rLock.RUnlock()
-	var result = ComputeIfAbsentRW(&rwLock, mp, 1, computer)
+	var result = ComputeIfAbsentRW(&rwLock, true, mp, 1, computer)
 	assert(5, result.(int), t)
 }
 

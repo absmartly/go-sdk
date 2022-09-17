@@ -85,7 +85,7 @@ func (f *Future) NotifyCallbacks() {
 
 func (f *Future) Join(ctx context.Context) {
 	f.mu.Lock()
-	f.Get(ctx)
+	var _, _ = f.Get(ctx)
 	for _, callback := range f.callbacks {
 		callback(f.val, f.err)
 	}

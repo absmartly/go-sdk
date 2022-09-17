@@ -2,20 +2,31 @@ package main
 
 import "sync"
 
-func ComputeIfAbsentRW(lock *sync.RWMutex, maps map[interface{}]interface{}, key interface{}, computer MapperInt) interface{} {
-	lock.RLock()
-	var value, exist = maps[key]
-	if exist {
+func ComputeIfAbsentRW(lock *sync.RWMutex, needlock bool, maps map[interface{}]interface{}, key interface{}, computer MapperInt) interface{} {
+	if needlock {
+		lock.RLock()
+		var value, exist = maps[key]
+		if exist {
+			lock.RUnlock()
+			return value
+		}
 		lock.RUnlock()
-		return value
-	}
-	lock.RUnlock()
 
-	lock.Lock()
-	var newValue = computer.Apply(key)
-	maps[key] = newValue
-	lock.Unlock()
-	return newValue
+		lock.Lock()
+		var newValue = computer.Apply(key)
+		maps[key] = newValue
+		lock.Unlock()
+		return newValue
+	} else {
+		var value, exist = maps[key]
+		if exist {
+			return value
+		}
+
+		var newValue = computer.Apply(key)
+		maps[key] = newValue
+		return newValue
+	}
 }
 
 func GetRW(lock *sync.RWMutex, maps map[interface{}]interface{}, key interface{}) interface{} {
