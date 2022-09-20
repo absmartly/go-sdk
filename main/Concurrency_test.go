@@ -6,7 +6,6 @@ import (
 )
 
 var rwLock sync.RWMutex
-var rLock sync.RWMutex
 
 type Computer struct {
 	MapperInt
@@ -41,9 +40,6 @@ func TestComputeIfAbsentRWPresent(t *testing.T) {
 func TestComputeIfAbsentRWPresentAfterLock(t *testing.T) {
 	var mp = map[interface{}]interface{}{}
 	var computer = Computer{}
-	rLock.RLock()
-	//assertAny(true, rLock.TryRLock(), t)
-	rLock.RUnlock()
 	var result = ComputeIfAbsentRW(&rwLock, true, mp, 1, computer)
 	assert(5, result.(int), t)
 }

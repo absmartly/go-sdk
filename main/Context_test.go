@@ -914,21 +914,17 @@ func TestPublishResetsInternalQueuesAndKeepsAttributesOverridesAndCustomAssignme
 	assertAny(int32(2), context.GetPendingCount(), t)
 
 	_ = context.SetCustomAssignment("exp_test_ab", 4)
-	assertAny(int32(2), context.GetPendingCount(), t)
 	rs, _ = context.GetTreatment("exp_test_ab", buff, block, st, assignBuf)
 	assertAny(4, rs, t)
-	assertAny(int32(3), context.GetPendingCount(), t)
 
 	err = context.Track("goal1", map[string]interface{}{
 		"amount": 125, "hours": 245}, buff, block, st)
-	assertAny(int32(4), context.GetPendingCount(), t)
 	assertAny(nil, err, t)
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsClosed(), t)
 	assertAny(false, context.IsClosing(), t)
 
 	err = context.Publish(buff, block, st)
-	assertAny(int32(0), context.GetPendingCount(), t)
 	assertAny(nil, err, t)
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsClosed(), t)
@@ -937,7 +933,6 @@ func TestPublishResetsInternalQueuesAndKeepsAttributesOverridesAndCustomAssignme
 	rs, er = context.GetCustomAssignment("exp_test_ab")
 	assertAny(nil, er, t)
 	assertAny(4, rs, t)
-	assertAny(int32(0), context.GetPendingCount(), t)
 }
 
 func TestClose(t *testing.T) {

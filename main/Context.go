@@ -382,10 +382,10 @@ func (c *Context) GetTreatment(experimentName string, buff [512]byte, block [16]
 
 func (c *Context) QueueExposure(assignment *Assignment, buff [512]byte, block [16]int32, st [4]int32) {
 	var res = assignment.Exposed.Load().(bool)
-	if res == false {
+	if !res {
 		assignment.Exposed.Store(true)
 	}
-	if res == false {
+	if !res {
 		var exposure = jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
 			Variant: assignment.Variant, ExposedAt: c.Clock_.Millis(), Assigned: assignment.Assigned,
 			Eligible: assignment.Eligible, Overridden: assignment.Overridden, FullOn: assignment.FullOn,
@@ -524,10 +524,10 @@ func (c *Context) RefreshAsync() *future.Future {
 	}
 
 	var res = c.Refreshing_.Load().(bool)
-	if res == false {
+	if !res {
 		c.Refreshing_.Store(true)
 	}
-	if res == false {
+	if !res {
 		var tempfuture, donefun = future.New()
 		c.RefreshFuture_ = tempfuture
 
@@ -563,10 +563,10 @@ func (c *Context) Refresh() {
 func (c *Context) CloseAsync(buff [512]byte, block [16]int32, st [4]int32) (*future.Future, error) {
 	if !c.Closed_.Load().(bool) {
 		var res = c.Closing_.Load().(bool)
-		if res == false {
+		if !res {
 			c.Closing_.Store(true)
 		}
-		if res == false {
+		if !res {
 			c.ClearRefreshTimer()
 
 			if c.PendingCount_.Load().(int32) > 0 {
