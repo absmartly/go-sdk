@@ -23,8 +23,8 @@ type Context struct {
 	VariableParser_  VariableParser
 	AudienceMatcher_ AudienceMatcher
 	Units_           map[string]string
-	Failed_          *atomic.Bool
-	Ready_           *atomic.Bool
+	Failed_          *atomic.Value
+	Ready_           *atomic.Value
 	DataLock         *sync.RWMutex
 	Data_            jsonmodels.ContextData
 	Index_           map[string]ExperimentVariables
@@ -39,10 +39,10 @@ type Context struct {
 	Attributes_      []interface{}
 	Overrides_       map[interface{}]interface{}
 	Cassignments_    map[interface{}]interface{}
-	PendingCount_    *atomic.Int32
-	Closing_         *atomic.Bool
-	Closed_          *atomic.Bool
-	Refreshing_      *atomic.Bool
+	PendingCount_    *atomic.Value
+	Closing_         *atomic.Value
+	Closed_          *atomic.Value
+	Refreshing_      *atomic.Value
 	ReadyFuture_     *future.Future
 	ClosingFuture_   *future.Future
 	RefreshFuture_   *future.Future
@@ -72,7 +72,7 @@ type Assignment struct {
 	Custom           bool
 	AudienceMismatch bool
 	Variables        map[string]interface{}
-	Exposed          *atomic.Bool
+	Exposed          *atomic.Value
 }
 
 func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *future.Future, dataProvider ContextDataProvider,
@@ -88,12 +88,18 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 		cntx.EventLogger_ = eventLogger
 	}
 
-	cntx.Closed_ = &atomic.Bool{}
-	cntx.Closing_ = &atomic.Bool{}
-	cntx.Refreshing_ = &atomic.Bool{}
-	cntx.Ready_ = &atomic.Bool{}
-	cntx.Failed_ = &atomic.Bool{}
-	cntx.PendingCount_ = &atomic.Int32{}
+	cntx.Closed_ = &atomic.Value{}
+	cntx.Closed_.Store(false)
+	cntx.Closing_ = &atomic.Value{}
+	cntx.Closing_.Store(false)
+	cntx.Refreshing_ = &atomic.Value{}
+	cntx.Refreshing_.Store(false)
+	cntx.Ready_ = &atomic.Value{}
+	cntx.Ready_.Store(false)
+	cntx.Failed_ = &atomic.Value{}
+	cntx.Failed_.Store(false)
+	cntx.PendingCount_ = &atomic.Value{}
+	cntx.PendingCount_.Store(int32(0))
 	cntx.DataLock = &sync.RWMutex{}
 	cntx.ContextLock_ = &sync.RWMutex{}
 	cntx.EventLock_ = &sync.Mutex{}
@@ -183,23 +189,23 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 }
 
 func (c *Context) IsReady() bool {
-	return c.Ready_.Load()
+	return c.Ready_.Load().(bool)
 }
 
 func (c *Context) IsFailed() bool {
-	return c.Failed_.Load()
+	return c.Failed_.Load().(bool)
 }
 
 func (c *Context) IsClosed() bool {
-	return c.Closed_.Load()
+	return c.Closed_.Load().(bool)
 }
 
 func (c *Context) IsClosing() bool {
-	return !c.Closed_.Load() && c.Closing_.Load()
+	return !c.Closed_.Load().(bool) && c.Closing_.Load().(bool)
 }
 
 func (c *Context) WaitUntilReadyAsync() *future.Future {
-	if c.Ready_.Load() {
+	if c.Ready_.Load().(bool) {
 		return future.Call(func() (future.Value, error) {
 			return c, nil
 		})
@@ -212,7 +218,7 @@ func (c *Context) WaitUntilReadyAsync() *future.Future {
 }
 
 func (c *Context) WaitUntilReady() Context {
-	if !c.Ready_.Load() {
+	if !c.Ready_.Load().(bool) {
 		var ft = c.ReadyFuture_
 		if ft != nil && !ft.Ready() {
 			ft.Join(context.Background())
@@ -367,7 +373,7 @@ func (c *Context) GetTreatment(experimentName string, buff [512]byte, block [16]
 		return -1, err
 	}
 	var assignment = c.GetAssignment(experimentName, buff, block, st, assignBuff)
-	if !assignment.Exposed.Load() {
+	if !assignment.Exposed.Load().(bool) {
 		c.QueueExposure(assignment, buff, block, st)
 	}
 
@@ -375,14 +381,18 @@ func (c *Context) GetTreatment(experimentName string, buff [512]byte, block [16]
 }
 
 func (c *Context) QueueExposure(assignment *Assignment, buff [512]byte, block [16]int32, st [4]int32) {
-	if assignment.Exposed.CompareAndSwap(false, true) {
+	var res = assignment.Exposed.Load().(bool)
+	if res == false {
+		assignment.Exposed.Store(true)
+	}
+	if res == false {
 		var exposure = jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
 			Variant: assignment.Variant, ExposedAt: c.Clock_.Millis(), Assigned: assignment.Assigned,
 			Eligible: assignment.Eligible, Overridden: assignment.Overridden, FullOn: assignment.FullOn,
 			Custom: assignment.Custom, AudienceMismatch: assignment.AudienceMismatch}
 
 		c.EventLock_.Lock()
-		c.PendingCount_.Add(1)
+		c.PendingCount_.Store(c.PendingCount_.Load().(int32) + 1)
 		c.Exposures_ = append(c.Exposures_, exposure)
 		c.EventLock_.Unlock()
 
@@ -425,7 +435,7 @@ func (c *Context) GetVariableValue(key string, defaultValue interface{}, buff [5
 
 	var assignment, errres = c.GetVariableAssignment(key, buff, block, st, assignBuff)
 	if errres == nil {
-		if !assignment.Exposed.Load() {
+		if !assignment.Exposed.Load().(bool) {
 			c.QueueExposure(assignment, buff, block, st)
 		}
 
@@ -473,7 +483,7 @@ func (c *Context) Track(goalName string, properties map[string]interface{}, buff
 	}
 
 	c.EventLock_.Lock()
-	c.PendingCount_.Add(1)
+	c.PendingCount_.Store(c.PendingCount_.Load().(int32) + 1)
 	c.Achievements_ = append(c.Achievements_, achievement)
 	c.EventLock_.Unlock()
 
@@ -503,7 +513,7 @@ func (c *Context) Publish(buff [512]byte, block [16]int32, st [4]int32) error {
 }
 
 func (c *Context) GetPendingCount() int32 {
-	return c.PendingCount_.Load()
+	return c.PendingCount_.Load().(int32)
 }
 
 func (c *Context) RefreshAsync() *future.Future {
@@ -513,7 +523,11 @@ func (c *Context) RefreshAsync() *future.Future {
 		return nil
 	}
 
-	if c.Refreshing_.CompareAndSwap(false, true) {
+	var res = c.Refreshing_.Load().(bool)
+	if res == false {
+		c.Refreshing_.Store(true)
+	}
+	if res == false {
 		var tempfuture, donefun = future.New()
 		c.RefreshFuture_ = tempfuture
 
@@ -547,11 +561,15 @@ func (c *Context) Refresh() {
 }
 
 func (c *Context) CloseAsync(buff [512]byte, block [16]int32, st [4]int32) (*future.Future, error) {
-	if !c.Closed_.Load() {
-		if c.Closing_.CompareAndSwap(false, true) {
+	if !c.Closed_.Load().(bool) {
+		var res = c.Closing_.Load().(bool)
+		if res == false {
+			c.Closing_.Store(true)
+		}
+		if res == false {
 			c.ClearRefreshTimer()
 
-			if c.PendingCount_.Load() > 0 {
+			if c.PendingCount_.Load().(int32) > 0 {
 				var tempFuture, done = future.New()
 				c.ClosingFuture_ = tempFuture
 				c.Flush(buff, block, st).Listen(func(value future.Value, err error) {
@@ -628,7 +646,9 @@ func (c *Context) GetAssignment(experimentName string, buff [512]byte, block [16
 	var override, ofound = c.Overrides_[experimentName]
 	var experiment, efound = c.GetExperiment(experimentName)
 
-	var assignment = Assignment{Exposed: &atomic.Bool{}}
+	var exposed = &atomic.Value{}
+	exposed.Store(false)
+	var assignment = Assignment{Exposed: exposed}
 	assignment.Name = experimentName
 	assignment.Eligible = true
 
@@ -723,9 +743,9 @@ func (c *Context) ExperimentMatches(experiment jsonmodels.Experiment, assignment
 }
 
 func (c *Context) CheckNotClosed() error {
-	if c.Closed_.Load() {
+	if c.Closed_.Load().(bool) {
 		return errors.New("ABSmartly Context is closed")
-	} else if c.Closing_.Load() {
+	} else if c.Closing_.Load().(bool) {
 		return errors.New("ABSmartly Context is closing")
 	}
 	return nil
@@ -800,14 +820,14 @@ func (c *Context) SetDataFailed(err error) {
 func (c *Context) Flush(buff [512]byte, block [16]int32, st [4]int32) *future.Future {
 	c.ClearTimeout()
 
-	if !c.Failed_.Load() {
-		if c.PendingCount_.Load() > 0 {
+	if !c.Failed_.Load().(bool) {
+		if c.PendingCount_.Load().(int32) > 0 {
 			var exposures = make([]jsonmodels.Exposure, 0)
 			var achievements = make([]jsonmodels.GoalAchievement, 0)
 			var eventCount int32
 
 			c.EventLock_.Lock()
-			eventCount = c.PendingCount_.Load()
+			eventCount = c.PendingCount_.Load().(int32)
 
 			if eventCount > 0 {
 				if len(c.Exposures_) > 0 {
@@ -820,7 +840,7 @@ func (c *Context) Flush(buff [512]byte, block [16]int32, st [4]int32) *future.Fu
 					c.Achievements_ = nil
 				}
 
-				c.PendingCount_.Store(0)
+				c.PendingCount_.Store(int32(0))
 			}
 			c.EventLock_.Unlock()
 
@@ -868,7 +888,7 @@ func (c *Context) Flush(buff [512]byte, block [16]int32, st [4]int32) *future.Fu
 		c.EventLock_.Lock()
 		c.Exposures_ = nil
 		c.Achievements_ = nil
-		c.PendingCount_.Store(0)
+		c.PendingCount_.Store(int32(0))
 		c.EventLock_.Unlock()
 	}
 	result, done := future.New()
@@ -970,7 +990,9 @@ func (c *Context) GetVariableAssignment(key string, buff [512]byte, block [16]in
 	if err == nil {
 		return c.GetAssignment(experiment.Data.Name, buff, block, st, assignBuff), nil
 	}
-	return &Assignment{Exposed: &atomic.Bool{}}, err
+	var exposed = &atomic.Value{}
+	exposed.Store(false)
+	return &Assignment{Exposed: exposed}, err
 }
 
 func (c *Context) GetVariableExperiment(key string) (ExperimentVariables, error) {
