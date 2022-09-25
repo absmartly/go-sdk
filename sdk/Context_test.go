@@ -82,10 +82,10 @@ var eventLogger ContextEventLogger
 var variableParser DefaultVariableParser
 var audienceMatcher AudienceMatcher
 
-var buff [512]byte
-var block [16]int32
-var st [4]int32
-var assignBuf [12]int8
+var buff = make([]byte, 512)     // should be 512 bytes
+var block = make([]int32, 16)    // should be 16 bytes
+var st = make([]int32, 4)        // should be 4 bytes
+var assignBuf = make([]int8, 12) // should be 12 bytes
 
 func setUp() {
 	content, _ := ioutil.ReadFile("../context.json")
