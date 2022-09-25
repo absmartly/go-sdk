@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/absmartly/go-sdk/sdk"
 	"os"
+	"reflect"
 )
 
 func main() {
@@ -26,11 +27,11 @@ func main() {
 
 	//This is alternative to Java ThreadLocal buffers,
 	//Go best practices is just passing  them to methods due to lack of ThreadLocal implementations
-	var buff [512]byte
-	var block [16]int32
-	var st [4]int32
-	var assignBuf [12]int8
-
+	var buff = make([]byte, 512)     // should be 512 bytes
+	var block = make([]int32, 16)    // should be 16 bytes
+	var st = make([]int32, 4)        // should be 4 bytes
+	var assignBuf = make([]int8, 12) // should be 12 bytes
+	fmt.Println(reflect.ValueOf(buff).Kind())
 	var ctx = sd.CreateContext(contextConfig, buff, block, st)
 	ctx.WaitUntilReady()
 

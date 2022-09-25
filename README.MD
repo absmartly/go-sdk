@@ -48,10 +48,10 @@ var contextConfig = ContextConfig{Units_: map[string]string{
 		"user_id":    "123456",
 }}
 
-var buff [512]byte
-var block [16]int32
-var st [4]int32
-var assignBuf [12]int8
+var buff = make([]byte, 512)     // should be 512 bytes
+var block = make([]int32, 16)    // should be 16 bytes
+var st = make([]int32, 4)        // should be 4 bytes
+var assignBuf = make([]int8, 12) // should be 12 bytes
 var ctx = sdk.CreateContext(contextConfig, buff, block, st)
 ctx.WaitUntilReady()
 ```
@@ -64,10 +64,10 @@ var contextConfig = ContextConfig{Units_: map[string]string{
 		"user_id":    "123456",
 }}
 
-var buff [512]byte
-var block [16]int32
-var st [4]int32
-var assignBuf [12]int8
+var buff = make([]byte, 512)     // should be 512 bytes
+var block = make([]int32, 16)    // should be 16 bytes
+var st = make([]int32, 4)        // should be 4 bytes
+var assignBuf = make([]int8, 12) // should be 12 bytes
 var ctx = sdk.CreateContext(contextConfig, buff, block, st)
 ctx.WaitUntilReadyAsync()
 ```
