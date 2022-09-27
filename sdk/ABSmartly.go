@@ -45,10 +45,9 @@ func Create(config ABSmartlyConfig) ABSmartly {
 //block should be 16 bytes
 //st should be 4 bytes
 //assignBuf should be 12 bytes
-func (abs ABSmartly) CreateContext(config ContextConfig, buff []byte, block []int32, st []int32) *Context {
+func (abs ABSmartly) CreateContext(config ContextConfig) *Context {
 	return CreateContext(internal.SystemClockUTC{}, config, abs.ContextDataProvider_.GetContextData(), abs.ContextDataProvider_,
-		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_},
-		buff, block, st)
+		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_})
 }
 
 // CreateContextWith
@@ -56,12 +55,11 @@ func (abs ABSmartly) CreateContext(config ContextConfig, buff []byte, block []in
 //block should be 16 bytes
 //st should be 4 bytes
 //assignBuf should be 12 bytes
-func (abs ABSmartly) CreateContextWith(config ContextConfig, data jsonmodels.ContextData, buff []byte, block []int32, st []int32) *Context {
+func (abs ABSmartly) CreateContextWith(config ContextConfig, data jsonmodels.ContextData) *Context {
 	var ft, done = future.New()
-	done(&data, nil)
+	done(data, nil)
 	return CreateContext(internal.SystemClockUTC{}, config, ft, abs.ContextDataProvider_,
-		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_},
-		buff, block, st)
+		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_})
 }
 
 func (abs ABSmartly) GetContextData() *future.Future {
