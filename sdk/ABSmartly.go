@@ -41,20 +41,12 @@ func Create(config ABSmartlyConfig) ABSmartly {
 }
 
 // CreateContext
-//buff should be 512 bytes
-//block should be 16 bytes
-//st should be 4 bytes
-//assignBuf should be 12 bytes
 func (abs ABSmartly) CreateContext(config ContextConfig) *Context {
 	return CreateContext(internal.SystemClockUTC{}, config, abs.ContextDataProvider_.GetContextData(), abs.ContextDataProvider_,
 		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_})
 }
 
 // CreateContextWith
-//buff should be 512 bytes
-//block should be 16 bytes
-//st should be 4 bytes
-//assignBuf should be 12 bytes
 func (abs ABSmartly) CreateContextWith(config ContextConfig, data jsonmodels.ContextData) *Context {
 	var ft, done = future.New()
 	done(data, nil)
