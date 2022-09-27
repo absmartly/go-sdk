@@ -16,7 +16,7 @@ type ClientContextMock struct {
 var experiment = jsonmodels.Experiment{Name: "test"}
 
 var fut = future.Call(func() (future.Value, error) {
-	return &jsonmodels.ContextData{
+	return jsonmodels.ContextData{
 		Experiments: []jsonmodels.Experiment{experiment},
 	}, nil
 })
@@ -82,31 +82,26 @@ var eventLogger ContextEventLogger
 var variableParser DefaultVariableParser
 var audienceMatcher AudienceMatcher
 
-var buff = make([]byte, 512)     // should be 512 bytes
-var block = make([]int32, 16)    // should be 16 bytes
-var st = make([]int32, 4)        // should be 4 bytes
-var assignBuf = make([]int8, 12) // should be 12 bytes
-
 func setUp() {
-	content, _ := ioutil.ReadFile("../context.json")
-	contentstrict, _ := ioutil.ReadFile("../context-strict.json")
-	refreshed, _ := ioutil.ReadFile("../refreshed.json")
+	content, _ := ioutil.ReadFile("testAssets/context.json")
+	contentstrict, _ := ioutil.ReadFile("testAssets/context-strict.json")
+	refreshed, _ := ioutil.ReadFile("testAssets/refreshed.json")
 	data, _ = deser.Deserialize(content)
 	audienceStrictData, _ = deser.Deserialize(contentstrict)
 	refreshData, _ = deser.Deserialize(refreshed)
 	var tempdataFutureReady, donefunc = future.New()
 	dataFutureReady = tempdataFutureReady
-	donefunc(&data, nil)
+	donefunc(data, nil)
 	dataFuture, _ = future.New()
 	var tempdataFutureFailed, donefuncfailed = future.New()
 	dataFutureFailed = tempdataFutureFailed
 	donefuncfailed(nil, errors.New("FAILED"))
 	var tempdataFutureReadys, donefuncs = future.New()
 	dataFutureSrict = tempdataFutureReadys
-	donefuncs(&audienceStrictData, nil)
+	donefuncs(audienceStrictData, nil)
 	var tempdataFutureReadyr, donefuncr = future.New()
 	dataFutureRefresh = tempdataFutureReadyr
-	donefuncr(&refreshData, nil)
+	donefuncr(refreshData, nil)
 
 	clock = internal.FixedClock{Millis_: 1_620_000_000_000}
 	var client = ClientContextMock{}
@@ -118,8 +113,7 @@ func setUp() {
 }
 
 func CreateTestContext(config ContextConfig, dataFuture *future.Future) *Context {
-	return CreateContext(clock, config, dataFuture, dataProvider, eventHandler, eventLogger, variableParser, audienceMatcher,
-		buff, block, st)
+	return CreateContext(clock, config, dataFuture, dataProvider, eventHandler, eventLogger, variableParser, audienceMatcher)
 }
 
 func TestConstructorSetsOverrides(t *testing.T) {
@@ -158,7 +152,7 @@ func TestBecomesReadyWithCompletedFuture(t *testing.T) {
 	var context = CreateTestContext(config, dataFutureReady)
 	var dt, err = context.GetData()
 	assertAny(nil, err, t)
-	assertAny(&data, dt, t)
+	assertAny(data, dt, t)
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
 
@@ -172,7 +166,7 @@ func TestBecomesReadyExceptionallyWithCompletedFuture(t *testing.T) {
 	var context = CreateTestContext(config, dataFutureFailed)
 	var dt, err = context.GetData()
 	assertAny(nil, err, t)
-	assertAny(&jsonmodels.ContextData{}, dt, t)
+	assertAny(jsonmodels.ContextData{}, dt, t)
 	assertAny(true, context.IsReady(), t)
 	assertAny(true, context.IsFailed(), t)
 
@@ -186,11 +180,11 @@ func TestBecomesReadyWithException(t *testing.T) {
 	var context = CreateTestContext(config, dataFuture)
 	assertAny(false, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
-	dataFuture.SetResult(&jsonmodels.ContextData{}, errors.New("FAILED"))
+	dataFuture.SetResult(jsonmodels.ContextData{}, errors.New("FAILED"))
 	context.WaitUntilReady()
 	var dt, err = context.GetData()
 	assertAny(nil, err, t)
-	assertAny(&jsonmodels.ContextData{}, dt, t)
+	assertAny(jsonmodels.ContextData{}, dt, t)
 	assertAny(true, context.IsReady(), t)
 	assertAny(true, context.IsFailed(), t)
 
@@ -204,11 +198,11 @@ func TestBecomesReadyWithoutException(t *testing.T) {
 	var context = CreateTestContext(config, dataFuture)
 	assertAny(false, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
-	dataFuture.SetResult(&data, nil)
+	dataFuture.SetResult(data, nil)
 	context.WaitUntilReady()
 	var dt, err = context.GetData()
 	assertAny(nil, err, t)
-	assertAny(&data, dt, t)
+	assertAny(data, dt, t)
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
 
@@ -222,7 +216,7 @@ func TestWaitUntilReady(t *testing.T) {
 	assertAny(false, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
 	go func() {
-		dataFuture.SetResult(&data, nil)
+		dataFuture.SetResult(data, nil)
 	}()
 
 	context.WaitUntilReady()
@@ -230,7 +224,7 @@ func TestWaitUntilReady(t *testing.T) {
 	assertAny(false, context.IsFailed(), t)
 	var dt, err = context.GetData()
 	assertAny(nil, err, t)
-	assertAny(&data, dt, t)
+	assertAny(data, dt, t)
 
 }
 
@@ -247,7 +241,7 @@ func TestWaitUntilReadyCompleted(t *testing.T) {
 	assertAny(false, context.IsFailed(), t)
 	var dt, err = context.GetData()
 	assertAny(nil, err, t)
-	assertAny(&data, dt, t)
+	assertAny(data, dt, t)
 
 }
 
@@ -264,14 +258,14 @@ func TestWaitUntilReadyAsync(t *testing.T) {
 	assertAny(false, context.IsFailed(), t)
 
 	go func() {
-		dataFuture.SetResult(&data, nil)
+		dataFuture.SetResult(data, nil)
 	}()
 	future.Join(context2.Background())
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
 	var dt, err = context.GetData()
 	assertAny(nil, err, t)
-	assertAny(&data, dt, t)
+	assertAny(data, dt, t)
 
 }
 
@@ -284,17 +278,17 @@ func TestWaitUntilReadyAsynCompleted(t *testing.T) {
 	assertAny(false, context.IsFailed(), t)
 	var dt, err = context.GetData()
 	assertAny(nil, err, t)
-	assertAny(&data, dt, t)
+	assertAny(data, dt, t)
 	var future = context.WaitUntilReadyAsync()
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
 	assertAny(nil, err, t)
-	assertAny(&data, dt, t)
+	assertAny(data, dt, t)
 	future.Join(context2.Background())
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
 	assertAny(nil, err, t)
-	assertAny(&data, dt, t)
+	assertAny(data, dt, t)
 }
 
 func TestErrorWhenClosing(t *testing.T) {
@@ -308,12 +302,12 @@ func TestErrorWhenClosing(t *testing.T) {
 
 	var dt, err = context.GetData()
 	assertAny(nil, err, t)
-	assertAny(&data, dt, t)
+	assertAny(data, dt, t)
 
-	var trerr = context.Track("goal1", map[string]interface{}{"amount": 125, "hours": 245}, buff, block, st)
+	var trerr = context.Track("goal1", map[string]interface{}{"amount": 125, "hours": 245})
 	assertAny(nil, trerr, t)
 
-	var _, er = context.CloseAsync(buff, block, st)
+	var _, er = context.CloseAsync()
 	assertAny(nil, er, t)
 
 	var resErr = context.SetAttribute("attr1", "value1")
@@ -321,12 +315,12 @@ func TestErrorWhenClosing(t *testing.T) {
 	assertAny(true, context.IsClosing(), t)
 	assertAny(false, context.IsClosed(), t)
 
-	_, resErr = context.GetTreatment("attr1", buff, block, st, assignBuf)
+	_, resErr = context.GetTreatment("attr1")
 	assertAny("ABSmartly Context is closing", resErr.Error(), t)
 	assertAny(true, context.IsClosing(), t)
 	assertAny(false, context.IsClosed(), t)
 
-	_, resErr = context.PeekVariableValue("attr1", jsonmodels.ContextData{}, buff, block, st, assignBuf)
+	_, resErr = context.PeekVariableValue("attr1", jsonmodels.ContextData{})
 	assertAny("ABSmartly Context is closing", resErr.Error(), t)
 	assertAny(true, context.IsClosing(), t)
 	assertAny(false, context.IsClosed(), t)
@@ -343,24 +337,24 @@ func TestErrorWhenClosed(t *testing.T) {
 
 	var dt, err = context.GetData()
 	assertAny(nil, err, t)
-	assertAny(&data, dt, t)
+	assertAny(data, dt, t)
 
-	var trerr = context.Track("goal1", map[string]interface{}{"amount": 125, "hours": 245}, buff, block, st)
+	var trerr = context.Track("goal1", map[string]interface{}{"amount": 125, "hours": 245})
 	assertAny(nil, trerr, t)
 
-	context.Close(buff, block, st)
+	context.Close()
 
 	var resErr = context.SetAttribute("attr1", "value1")
 	assertAny("ABSmartly Context is closed", resErr.Error(), t)
 	assertAny(false, context.IsClosing(), t)
 	assertAny(true, context.IsClosed(), t)
 
-	_, resErr = context.GetTreatment("attr1", buff, block, st, assignBuf)
+	_, resErr = context.GetTreatment("attr1")
 	assertAny("ABSmartly Context is closed", resErr.Error(), t)
 	assertAny(false, context.IsClosing(), t)
 	assertAny(true, context.IsClosed(), t)
 
-	_, resErr = context.PeekVariableValue("attr1", jsonmodels.ContextData{}, buff, block, st, assignBuf)
+	_, resErr = context.PeekVariableValue("attr1", jsonmodels.ContextData{})
 	assertAny("ABSmartly Context is closed", resErr.Error(), t)
 	assertAny(false, context.IsClosing(), t)
 	assertAny(true, context.IsClosed(), t)
@@ -377,7 +371,7 @@ func TestGetExperiments(t *testing.T) {
 
 	var dt, err = context.GetData()
 	assertAny(nil, err, t)
-	assertAny(&data, dt, t)
+	assertAny(data, dt, t)
 
 	assertAny(data.Experiments, dt.Experiments, t)
 }
@@ -390,7 +384,7 @@ func TestRefreshTimerWhenReady(t *testing.T) {
 	assertAny(false, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
 
-	dataFuture.SetResult(&data, nil)
+	dataFuture.SetResult(data, nil)
 	var futu = context.RefreshAsync()
 	context.WaitUntilReady()
 	assertAny(true, context.IsReady(), t)
@@ -459,7 +453,7 @@ func TestSetOverrides(t *testing.T) {
 	assertAny("override not found", er.Error(), t)
 	assertAny(-1, res, t)
 
-	dataFuture.SetResult(&data, nil)
+	dataFuture.SetResult(data, nil)
 	context.WaitUntilReady()
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
@@ -510,7 +504,7 @@ func TestSetOverridesClearAssignmentCache(t *testing.T) {
 	var res, er = context.GetOverride("db_user_id")
 	assertAny(nil, er, t)
 	assertAny(1, res, t)
-	res, er = context.GetTreatment("db_user_id", buff, block, st, assignBuf)
+	res, er = context.GetTreatment("db_user_id")
 	assertAny(nil, er, t)
 	var dbover, _ = context.GetOverride("db_user_id")
 	assertAny(dbover, res, t)
@@ -521,7 +515,7 @@ func TestSetOverridesClearAssignmentCache(t *testing.T) {
 	assertAny(nil, er, t)
 	assertAny(2, res, t)
 
-	res, er = context.GetTreatment("db_user_id", buff, block, st, assignBuf)
+	res, er = context.GetTreatment("db_user_id")
 	assertAny(nil, er, t)
 	dbover, _ = context.GetOverride("db_user_id")
 	assertAny(dbover, res, t)
@@ -581,7 +575,7 @@ func TestSetCustomAssignments(t *testing.T) {
 	assertAny("customAssignment not found", er.Error(), t)
 	assertAny(-1, res, t)
 
-	dataFuture.SetResult(&data, nil)
+	dataFuture.SetResult(data, nil)
 	context.WaitUntilReady()
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
@@ -608,11 +602,11 @@ func TestCustomAssignmentDoesNotOverrideFullOnOrNotEligibleAssignments(t *testin
 	err = context.SetCustomAssignments(map[string]int{"exp_test_fullon": 3})
 	assertAny(nil, err, t)
 
-	var rs, er = context.GetTreatment("exp_test_not_eligible", buff, block, st, assignBuf)
+	var rs, er = context.GetTreatment("exp_test_not_eligible")
 	assertAny(nil, er, t)
 	assertAny(0, rs, t)
 
-	rs, er = context.GetTreatment("exp_test_fullon", buff, block, st, assignBuf)
+	rs, er = context.GetTreatment("exp_test_fullon")
 	assertAny(nil, er, t)
 	assertAny(2, rs, t)
 }
@@ -633,17 +627,17 @@ func TestCustomAssignmentPendingAssignmentCache(t *testing.T) {
 	assertAny(nil, err, t)
 
 	assertAny(int32(0), context.GetPendingCount(), t)
-	var rs, er = context.GetTreatment("exp_test_ab", buff, block, st, assignBuf)
+	var rs, er = context.GetTreatment("exp_test_ab")
 	assertAny(nil, er, t)
 	assertAny(2, rs, t)
 	assertAny(int32(1), context.GetPendingCount(), t)
 
-	rs, er = context.GetTreatment("exp_test_abc", buff, block, st, assignBuf)
+	rs, er = context.GetTreatment("exp_test_abc")
 	assertAny(nil, er, t)
 	assertAny(3, rs, t)
 
 	_ = context.SetCustomAssignment("exp_test_ab", 4)
-	rs, _ = context.GetTreatment("exp_test_ab", buff, block, st, assignBuf)
+	rs, _ = context.GetTreatment("exp_test_ab")
 	assertAny(4, rs, t)
 }
 
@@ -657,12 +651,12 @@ func TestPeekTreatment(t *testing.T) {
 	assertAny(false, context.IsFailed(), t)
 
 	for _, experiment := range data.Experiments {
-		var res, err = context.PeekTreatment(experiment.Name, buff, block, st, assignBuf)
+		var res, err = context.PeekTreatment(experiment.Name)
 		assertAny(nil, err, t)
 		assertAny(expectedVariants[experiment.Name], res, t)
 	}
 
-	var res, err = context.PeekTreatment("not_found", buff, block, st, assignBuf)
+	var res, err = context.PeekTreatment("not_found")
 	assertAny(nil, err, t)
 	assertAny(0, res, t)
 }
@@ -685,7 +679,7 @@ func TestPeekVariable(t *testing.T) {
 	assertAny(false, context.IsFailed(), t)
 
 	for key, value := range variableExperiments {
-		var res, err = context.PeekVariableValue(key, 17, buff, block, st, assignBuf)
+		var res, err = context.PeekVariableValue(key, 17)
 		assertAny(nil, err, t)
 		if value != "exp_test_not_eligible" && stringInSlice(value, data.Experiments) {
 			assertAny(expectedVariables[key], res, t)
@@ -704,7 +698,7 @@ func TestPeekVariableStrict(t *testing.T) {
 	var context = CreateTestContext(config, dataFutureSrict)
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
-	var res, err = context.PeekVariableValue("banner.size", "small", buff, block, st, assignBuf)
+	var res, err = context.PeekVariableValue("banner.size", "small")
 	assertAny(nil, err, t)
 	assertAny("small", res, t)
 
@@ -720,7 +714,7 @@ func TestGetVariable(t *testing.T) {
 	assertAny(false, context.IsFailed(), t)
 
 	for key, value := range variableExperiments {
-		var res, err = context.GetVariableValue(key, 17, buff, block, st, assignBuf)
+		var res, err = context.GetVariableValue(key, 17)
 		assertAny(nil, err, t)
 		if value != "exp_test_not_eligible" && stringInSlice(value, data.Experiments) {
 			assertAny(expectedVariables[key], res, t)
@@ -738,7 +732,7 @@ func TestGetVariableStrict(t *testing.T) {
 	var context = CreateTestContext(config, dataFutureSrict)
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
-	var res, err = context.GetVariableValue("banner.size", "small", buff, block, st, assignBuf)
+	var res, err = context.GetVariableValue("banner.size", "small")
 	assertAny(nil, err, t)
 	assertAny("small", res, t)
 
@@ -771,10 +765,10 @@ func TestPeekTreatmentOverrideVariant(t *testing.T) {
 	var _ = context.SetOverride("not_found", 3)
 
 	for _, experiment := range data.Experiments {
-		var res, _ = context.PeekTreatment(experiment.Name, buff, block, st, assignBuf)
+		var res, _ = context.PeekTreatment(experiment.Name)
 		assertAny(expectedVariants[experiment.Name]+11, res, t)
 	}
-	var res, _ = context.PeekTreatment("not_found", buff, block, st, assignBuf)
+	var res, _ = context.PeekTreatment("not_found")
 	assertAny(3, res, t)
 
 	assertAny(int32(0), context.GetPendingCount(), t)
@@ -793,19 +787,19 @@ func TestGetTreatmentOverrideVariant(t *testing.T) {
 	var _ = context.SetOverride("not_found", 3)
 
 	for _, experiment := range data.Experiments {
-		var res, _ = context.GetTreatment(experiment.Name, buff, block, st, assignBuf)
+		var res, _ = context.GetTreatment(experiment.Name)
 		assertAny(expectedVariants[experiment.Name]+11, res, t)
 	}
-	var res, _ = context.GetTreatment("not_found", buff, block, st, assignBuf)
+	var res, _ = context.GetTreatment("not_found")
 	assertAny(3, res, t)
 
-	var err = context.Publish(buff, block, st)
+	var err = context.Publish()
 	assertAny(int32(0), context.GetPendingCount(), t)
 	assertAny(nil, err, t)
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsClosed(), t)
 	assertAny(false, context.IsClosing(), t)
-	context.Close(buff, block, st)
+	context.Close()
 	assertAny(true, context.IsReady(), t)
 	assertAny(true, context.IsClosed(), t)
 	assertAny(false, context.IsClosing(), t)
@@ -820,27 +814,27 @@ func TestTrack(t *testing.T) {
 	assertAny(false, context.IsFailed(), t)
 
 	var err = context.Track("goal1", map[string]interface{}{
-		"amount": 125, "hours": 245}, buff, block, st)
+		"amount": 125, "hours": 245})
 	assertAny(int32(1), context.GetPendingCount(), t)
 	assertAny(nil, err, t)
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsClosed(), t)
 	assertAny(false, context.IsClosing(), t)
 	err = context.Track("goal2", map[string]interface{}{
-		"tries": 7}, buff, block, st)
+		"tries": 7})
 	assertAny(nil, err, t)
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsClosed(), t)
 	assertAny(false, context.IsClosing(), t)
 
-	err = context.Publish(buff, block, st)
+	err = context.Publish()
 	assertAny(int32(0), context.GetPendingCount(), t)
 	assertAny(nil, err, t)
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsClosed(), t)
 	assertAny(false, context.IsClosing(), t)
 
-	context.Close(buff, block, st)
+	context.Close()
 	assertAny(true, context.IsReady(), t)
 	assertAny(true, context.IsClosed(), t)
 	assertAny(false, context.IsClosing(), t)
@@ -855,28 +849,28 @@ func TestTrackNotReady(t *testing.T) {
 	assertAny(false, context.IsFailed(), t)
 
 	var err = context.Track("goal1", map[string]interface{}{
-		"amount": 125, "hours": 245}, buff, block, st)
+		"amount": 125, "hours": 245})
 	assertAny(int32(1), context.GetPendingCount(), t)
 	assertAny(nil, err, t)
 	assertAny(false, context.IsReady(), t)
 	assertAny(false, context.IsClosed(), t)
 	assertAny(false, context.IsClosing(), t)
 	err = context.Track("goal2", map[string]interface{}{
-		"tries": 7}, buff, block, st)
+		"tries": 7})
 	assertAny(int32(2), context.GetPendingCount(), t)
 	assertAny(nil, err, t)
 	assertAny(false, context.IsReady(), t)
 	assertAny(false, context.IsClosed(), t)
 	assertAny(false, context.IsClosing(), t)
 
-	err = context.Publish(buff, block, st)
+	err = context.Publish()
 	assertAny(int32(0), context.GetPendingCount(), t)
 	assertAny(nil, err, t)
 	assertAny(false, context.IsReady(), t)
 	assertAny(false, context.IsClosed(), t)
 	assertAny(false, context.IsClosing(), t)
 
-	context.Close(buff, block, st)
+	context.Close()
 	assertAny(false, context.IsReady(), t)
 	assertAny(true, context.IsClosed(), t)
 	assertAny(false, context.IsClosing(), t)
@@ -898,26 +892,26 @@ func TestPublishResetsInternalQueuesAndKeepsAttributesOverridesAndCustomAssignme
 	assertAny(nil, err, t)
 
 	assertAny(int32(0), context.GetPendingCount(), t)
-	var rs, er = context.GetTreatment("exp_test_ab", buff, block, st, assignBuf)
+	var rs, er = context.GetTreatment("exp_test_ab")
 	assertAny(nil, er, t)
 	assertAny(2, rs, t)
 
-	rs, er = context.GetTreatment("exp_test_abc", buff, block, st, assignBuf)
+	rs, er = context.GetTreatment("exp_test_abc")
 	assertAny(nil, er, t)
 	assertAny(3, rs, t)
 
 	_ = context.SetCustomAssignment("exp_test_ab", 4)
-	rs, _ = context.GetTreatment("exp_test_ab", buff, block, st, assignBuf)
+	rs, _ = context.GetTreatment("exp_test_ab")
 	assertAny(4, rs, t)
 
 	err = context.Track("goal1", map[string]interface{}{
-		"amount": 125, "hours": 245}, buff, block, st)
+		"amount": 125, "hours": 245})
 	assertAny(nil, err, t)
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsClosed(), t)
 	assertAny(false, context.IsClosing(), t)
 
-	err = context.Publish(buff, block, st)
+	err = context.Publish()
 	assertAny(nil, err, t)
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsClosed(), t)
@@ -937,19 +931,19 @@ func TestClose(t *testing.T) {
 	assertAny(false, context.IsFailed(), t)
 
 	var err = context.Track("goal1", map[string]interface{}{
-		"amount": 125, "hours": 245}, buff, block, st)
+		"amount": 125, "hours": 245})
 	assertAny(int32(1), context.GetPendingCount(), t)
 	assertAny(nil, err, t)
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsClosed(), t)
 	assertAny(false, context.IsClosing(), t)
 
-	context.Close(buff, block, st)
+	context.Close()
 	assertAny(true, context.IsReady(), t)
 	assertAny(true, context.IsClosed(), t)
 	assertAny(false, context.IsClosing(), t)
 
-	context.Close(buff, block, st)
+	context.Close()
 	assertAny(true, context.IsReady(), t)
 	assertAny(true, context.IsClosed(), t)
 	assertAny(false, context.IsClosing(), t)
@@ -966,7 +960,7 @@ func TestCloseStopRefreshTimer(t *testing.T) {
 	assertAny(false, context.IsFailed(), t)
 
 	assertAny(false, context.RefreshTimer_ == nil, t)
-	context.Close(buff, block, st)
+	context.Close()
 	assertAny(true, context.RefreshTimer_ == nil, t)
 	assertAny(true, context.IsReady(), t)
 	assertAny(true, context.IsClosed(), t)
@@ -985,7 +979,7 @@ func TestCloseStopRefreshTimerAsync(t *testing.T) {
 	assertAny(false, context.IsFailed(), t)
 
 	assertAny(false, context.RefreshTimer_ == nil, t)
-	var _, err = context.CloseAsync(buff, block, st)
+	var _, err = context.CloseAsync()
 	assertAny(nil, err, t)
 	assertAny(true, context.RefreshTimer_ == nil, t)
 	assertAny(true, context.IsReady(), t)
@@ -1048,11 +1042,11 @@ func TestRefreshClearAssignmentCacheForStartedExperiment(t *testing.T) {
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
 
-	var res, err = context.GetTreatment("exp_test_new", buff, block, st, assignBuf)
+	var res, err = context.GetTreatment("exp_test_new")
 	assertAny(0, res, t)
 	assertAny(nil, err, t)
 
-	res, err = context.GetTreatment("not_found", buff, block, st, assignBuf)
+	res, err = context.GetTreatment("not_found")
 	assertAny(0, res, t)
 	assertAny(nil, err, t)
 
@@ -1069,11 +1063,11 @@ func TestRefreshClearAssignmentCacheForStartedExperiment(t *testing.T) {
 	assertAny(nil, er, t)
 	assertAny([]string{"exp_test_ab", "exp_test_abc", "exp_test_not_eligible", "exp_test_fullon", "exp_test_new"}, rs, t)
 
-	res, err = context.GetTreatment("exp_test_new", buff, block, st, assignBuf)
+	res, err = context.GetTreatment("exp_test_new")
 	assertAny(1, res, t)
 	assertAny(nil, err, t)
 
-	res, err = context.GetTreatment("not_found", buff, block, st, assignBuf)
+	res, err = context.GetTreatment("not_found")
 	assertAny(0, res, t)
 	assertAny(nil, err, t)
 
@@ -1089,11 +1083,11 @@ func TestClearAssignmentCacheForExperimentIdChange(t *testing.T) {
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
 
-	var res, err = context.GetTreatment("exp_test_new", buff, block, st, assignBuf)
+	var res, err = context.GetTreatment("exp_test_new")
 	assertAny(1, res, t)
 	assertAny(nil, err, t)
 
-	res, err = context.GetTreatment("not_found", buff, block, st, assignBuf)
+	res, err = context.GetTreatment("not_found")
 	assertAny(0, res, t)
 	assertAny(nil, err, t)
 
@@ -1107,7 +1101,7 @@ func TestClearAssignmentCacheForExperimentIdChange(t *testing.T) {
 	context.Data_.Experiments[4].SeedLo = 34737352
 	experiment = context.Data_.Experiments[4]
 	fut = future.Call(func() (future.Value, error) {
-		return &jsonmodels.ContextData{
+		return jsonmodels.ContextData{
 			Experiments: []jsonmodels.Experiment{experiment},
 		}, nil
 	})
@@ -1123,11 +1117,11 @@ func TestClearAssignmentCacheForExperimentIdChange(t *testing.T) {
 	assertAny(nil, er, t)
 	assertAny([]string{"exp_test_new"}, rs, t)
 
-	res, err = context.GetTreatment("exp_test_new", buff, block, st, assignBuf)
+	res, err = context.GetTreatment("exp_test_new")
 	assertAny(1, res, t)
 	assertAny(nil, err, t)
 
-	res, err = context.GetTreatment("not_found", buff, block, st, assignBuf)
+	res, err = context.GetTreatment("not_found")
 	assertAny(0, res, t)
 	assertAny(nil, err, t)
 }

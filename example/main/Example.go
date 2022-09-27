@@ -3,16 +3,16 @@ package main
 import (
 	"fmt"
 	"github.com/absmartly/go-sdk/sdk"
+	"io/ioutil"
 	"os"
-	"reflect"
 )
 
 func main() {
 	var clientConfig = sdk.ClientConfig{
-		Endpoint_:    "https://acme.absmartly.io/v1",
-		ApiKey_:      os.Getenv("ABSMARTLY_APIKEY"),
-		Application_: os.Getenv("website"),     // created in the ABSmartly web console
-		Environment_: os.Getenv("development"), // created in the ABSmartly web console
+		Endpoint_:    "https://sandbox.absmartly.io/v1",
+		ApiKey_:      "R54OsOwR9wwtWYhDXwdtp4iuD3pvtIUoHz4BakCuBl0t3E9kA0R6jzTW6cffQC9O",
+		Application_: "www",  // created in the ABSmartly web console
+		Environment_: "prod", // created in the ABSmartly web console
 	}
 
 	var sdkConfig = sdk.ABSmartlyConfig{Client_: sdk.CreateDefaultClient(clientConfig)}
@@ -25,44 +25,38 @@ func main() {
 			"user_id":    "123456", // a unique id identifying the user
 		}}
 
-	//This is alternative to Java ThreadLocal buffers,
-	//Go best practices is just passing  them to methods due to lack of ThreadLocal implementations
-	var buff = make([]byte, 512)     // should be 512 bytes
-	var block = make([]int32, 16)    // should be 16 bytes
-	var st = make([]int32, 4)        // should be 4 bytes
-	var assignBuf = make([]int8, 12) // should be 12 bytes
-	fmt.Println(reflect.ValueOf(buff).Kind())
-	var ctx = sd.CreateContext(contextConfig, buff, block, st)
+	var ctx = sd.CreateContext(contextConfig)
 	ctx.WaitUntilReady()
 
 	//Creating a new Context with pre-fetched data
-	//var path, _ = os.Getwd()
-	//var content, _ = ioutil.ReadFile(path + "/context.json")
-	//var deser = sdk.DefaultContextDataDeserializer{}
-	//var data, _ = deser.Deserialize(content)
-	//var anotherContextConfig = sdk.ContextConfig{
-	//	Units_: map[string]string{
-	//		"session_id": "e791e240fcd3df7d238cfc285f475e8152fcc0ec",
-	//		"user_id":    "123456789",
-	//		"email":      "bleh@absmartly.com",
-	//	}}
-	//
-	//var anotherCtx = sd.CreateContextWith(anotherContextConfig, data, buff, block, st)
-	//fmt.Println(anotherCtx.IsReady())
-	//fmt.Println(anotherCtx.GetTreatment("exp_test_fullon", buff, block, st, assignBuf))
+	var path, _ = os.Getwd()
+	var content, _ = ioutil.ReadFile(path + "/sdk/testAssets/context.json")
+	var deser = sdk.DefaultContextDataDeserializer{}
+	var data, _ = deser.Deserialize(content)
+	var anotherContextConfig = sdk.ContextConfig{
+		Units_: map[string]string{
+			"session_id": "e791e240fcd3df7d238cfc285f475e8152fcc0ec",
+			"user_id":    "123456789",
+			"email":      "bleh@absmartly.com",
+		}}
 
-	var treatment, _ = ctx.GetTreatment("exp_test_ab", buff, block, st, assignBuf)
+	var anotherCtx = sd.CreateContextWith(anotherContextConfig, data)
+	fmt.Println(anotherCtx.IsReady())
+	fmt.Println(anotherCtx.GetTreatment("exp_test_fullon"))
+
+	var treatment, _ = ctx.GetTreatment("exp_test_ab")
 	fmt.Println(treatment)
+	fmt.Println(ctx.GetData())
 
 	var properties = map[string]interface{}{
 		"value": 125,
 		"fee":   125,
 	}
 
-	var err = ctx.Track("payment", properties, buff, block, st)
+	var err = ctx.Track("payment", properties)
 
 	fmt.Println(err)
 
-	ctx.Close(buff, block, st)
+	ctx.Close()
 
 }
