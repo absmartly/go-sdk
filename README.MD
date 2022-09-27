@@ -27,9 +27,9 @@ This example assumes an Api Key, an Application, and an Environment have been cr
 func main() {
 	var clientConfig = ClientConfig{
 		Endpoint_:    "https://acme.absmartly.io/v1",
-		ApiKey_:     "YOUR-API-KEY",
-		Application_: "website", // created in the ABSmartly web console
-		Environment_: "development", // created in the ABSmartly web console
+		ApiKey_:      os.Getenv("ABSMARTLY_APIKEY"), 
+		Application_: os.Getenv(`ABSMARTLY_APPLICATION`), // created in the ABSmartly web console 
+		Environment_: os.Getenv(`ABSMARTLY_ENVIRONMENT`) // created in the ABSmartly web console
 	}
 
 	var sdkConfig = ABSmartlyConfig{Client_: CreateDefaultClient(clientConfig)}
@@ -48,11 +48,7 @@ var contextConfig = ContextConfig{Units_: map[string]string{
 		"user_id":    "123456",
 }}
 
-var buff = make([]byte, 512)     // should be 512 bytes
-var block = make([]int32, 16)    // should be 16 bytes
-var st = make([]int32, 4)        // should be 4 bytes
-var assignBuf = make([]int8, 12) // should be 12 bytes
-var ctx = sdk.CreateContext(contextConfig, buff, block, st)
+var ctx = sdk.CreateContext(contextConfig)
 ctx.WaitUntilReady()
 ```
 
@@ -64,11 +60,7 @@ var contextConfig = ContextConfig{Units_: map[string]string{
 		"user_id":    "123456",
 }}
 
-var buff = make([]byte, 512)     // should be 512 bytes
-var block = make([]int32, 16)    // should be 16 bytes
-var st = make([]int32, 4)        // should be 4 bytes
-var assignBuf = make([]int8, 12) // should be 12 bytes
-var ctx = sdk.CreateContext(contextConfig, buff, block, st)
+var ctx = sdk.CreateContext(contextConfig)
 ctx.WaitUntilReadyAsync()
 ```
 
@@ -98,7 +90,7 @@ context.setAttributes(map[string]string{
 
 #### Selecting a treatment
 ```go
-var res, _ = context.GetTreament("exp_test_experiment", buff, block, st, assignBuf)
+var res, _ = context.GetTreament("exp_test_experiment")
 if res == 0 {
         // user is in control group (variant 0)
 } else {
@@ -112,20 +104,20 @@ Goals are created in the A/B Smartly web console.
 context.Track("payment", map[string]interface{}{
         "item_count": 1,
         "total_amount": 1999.99
-}, buff, block, st)
+})
 ```
 
 #### Publishing pending data
 Sometimes it is necessary to ensure all events have been published to the A/B Smartly collector, before proceeding.
 You can explicitly call the `Publish()` or `PublishAsync()` methods.
 ```go
-    context.Publish(buff, block, st)
+    context.Publish()
 ```
 
 #### Finalizing
 The `Close()` and `CloseAsync()` methods will ensure all events have been published to the A/B Smartly collector, like `Publish()`, and will also "seal" the context, throwing an error if any method that could generate an event is called.
 ```go
-context.Close(buff, block, st);
+context.Close();
 ```
 
 #### Refreshing the context with fresh experiment data
@@ -185,7 +177,7 @@ Although generally not recommended, it is sometimes necessary to peek at a treat
 The A/B Smartly SDK provides a `PeekTreatment()` method for that.
 
 ```go
-var res, _ = context.PeekTreatment("exp_test_experiment", buff, block, st, assignBuf)
+var res, _ = context.PeekTreatment("exp_test_experiment")
 if res == 0 {
 	// user is in control group (variant 0)
 } else {
@@ -195,7 +187,7 @@ if res == 0 {
 
 ##### Peeking at variables
 ```go
-var variable = context.PeekVariable("my_variable",  buff, block, st, assignBuf)
+var variable = context.PeekVariable("my_variable")
 ```
 
 #### Overriding treatment variants
