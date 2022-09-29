@@ -40,18 +40,18 @@ func Create(config ABSmartlyConfig) ABSmartly {
 	return abs
 }
 
-func (abs ABSmartly) CreateContext(config ContextConfig, buff [512]byte, block [16]int32, st [4]int32) *Context {
+// CreateContext
+func (abs ABSmartly) CreateContext(config ContextConfig) *Context {
 	return CreateContext(internal.SystemClockUTC{}, config, abs.ContextDataProvider_.GetContextData(), abs.ContextDataProvider_,
-		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_},
-		buff, block, st)
+		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_})
 }
 
-func (abs ABSmartly) CreateContextWith(config ContextConfig, data jsonmodels.ContextData, buff [512]byte, block [16]int32, st [4]int32) *Context {
+// CreateContextWith
+func (abs ABSmartly) CreateContextWith(config ContextConfig, data jsonmodels.ContextData) *Context {
 	var ft, done = future.New()
-	done(&data, nil)
+	done(data, nil)
 	return CreateContext(internal.SystemClockUTC{}, config, ft, abs.ContextDataProvider_,
-		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_},
-		buff, block, st)
+		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_})
 }
 
 func (abs ABSmartly) GetContextData() *future.Future {

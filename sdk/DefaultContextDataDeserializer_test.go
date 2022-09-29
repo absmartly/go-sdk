@@ -132,7 +132,7 @@ func TestDeserialize(t *testing.T) {
 		},
 	}
 
-	content, err := ioutil.ReadFile("../context.json")
+	content, err := ioutil.ReadFile("testAssets/context.json")
 	assertAny(nil, err, t)
 	var deser = DefaultContextDataDeserializer{}
 	var result, er = deser.Deserialize(content)
@@ -141,7 +141,7 @@ func TestDeserialize(t *testing.T) {
 }
 
 func TestDeserializeBrokenJson(t *testing.T) {
-	content, err := ioutil.ReadFile("../context-broken.json")
+	content, err := ioutil.ReadFile("testAssets/context-broken.json")
 	assertAny(nil, err, t)
 	var deser = DefaultContextDataDeserializer{}
 	var result, er = deser.Deserialize(content)
