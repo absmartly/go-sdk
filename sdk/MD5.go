@@ -4,11 +4,7 @@ import (
 	"math/bits"
 )
 
-func DigestBase64UrlNoPadding(key []byte, offset int, length int, block []int32, st []int32) []int8 {
-	var dst = make([]int8, len(key))
-	for i := 0; i < len(key); i++ {
-		dst[i] = int8(key[i])
-	}
+func DigestBase64UrlNoPadding(dst []int8, offset int, length int, block []int32, st []int32) []int8 {
 	var state = md5state(dst, offset, length, block, st)
 	var a = state[0]
 	var b = state[1]
