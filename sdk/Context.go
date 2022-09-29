@@ -77,7 +77,7 @@ type Assignment struct {
 
 func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *future.Future, dataProvider ContextDataProvider,
 	eventHandler ContextEventHandler, eventLogger ContextEventLogger, variableParser VariableParser,
-	audienceMatcher AudienceMatcher, buff [512]byte, block [16]int32, st [4]int32) *Context {
+	audienceMatcher AudienceMatcher) *Context {
 	var cntx = Context{Clock_: clock, PublishDelay_: config.PublishDelay_, RefreshInterval_: config.RefreshInterval_,
 		EventHandler_: eventHandler, DataProvider_: dataProvider, VariableParser_: variableParser,
 		AudienceMatcher_: audienceMatcher, Units_: map[string]string{}}
@@ -151,7 +151,7 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 		var tmp = &cntx
 		dataFuture.Listen(func(val future.Value, err error) {
 			if err == nil {
-				var result = val.(*jsonmodels.ContextData)
+				var result = val.(jsonmodels.ContextData)
 				tmp.SetData(result)
 				tmp.LogEvent(Ready, result)
 			} else {
@@ -166,14 +166,14 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 		cntx.ReadyFuture_ = tempFuture
 		dataFuture.Listen(func(val future.Value, err error) {
 			if err == nil {
-				var result = val.(*jsonmodels.ContextData)
+				var result = val.(jsonmodels.ContextData)
 				tmp.SetData(result)
 				readyFutureDone(result, nil)
 				cntx.ReadyFuture_ = nil
 				tmp.LogEvent(Ready, result)
 
 				if tmp.GetPendingCount() > 0 {
-					tmp.SetTimeout(buff, block, st)
+					tmp.SetTimeout()
 				}
 			} else {
 				tmp.SetDataFailed(err)
@@ -244,13 +244,13 @@ func (c *Context) GetExperiments() ([]string, error) {
 	return experimentNames, nil
 }
 
-func (c *Context) GetData() (*jsonmodels.ContextData, error) {
+func (c *Context) GetData() (jsonmodels.ContextData, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
-		return &jsonmodels.ContextData{}, err
+		return jsonmodels.ContextData{}, err
 	}
 
-	return &c.Data_, nil
+	return c.Data_, nil
 
 }
 
@@ -367,20 +367,20 @@ func (c *Context) SetAttributes(attributes map[string]interface{}) error {
 	return nil
 }
 
-func (c *Context) GetTreatment(experimentName string, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) (int, error) {
+func (c *Context) GetTreatment(experimentName string) (int, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
 		return -1, err
 	}
-	var assignment = c.GetAssignment(experimentName, buff, block, st, assignBuff)
+	var assignment = c.GetAssignment(experimentName)
 	if !assignment.Exposed.Load().(bool) {
-		c.QueueExposure(assignment, buff, block, st)
+		c.QueueExposure(assignment)
 	}
 
 	return assignment.Variant, nil
 }
 
-func (c *Context) QueueExposure(assignment *Assignment, buff [512]byte, block [16]int32, st [4]int32) {
+func (c *Context) QueueExposure(assignment *Assignment) {
 	var res = assignment.Exposed.Load().(bool)
 	if !res {
 		assignment.Exposed.Store(true)
@@ -398,17 +398,17 @@ func (c *Context) QueueExposure(assignment *Assignment, buff [512]byte, block [1
 
 		c.LogEvent(Exposure, exposure)
 
-		c.SetTimeout(buff, block, st)
+		c.SetTimeout()
 	}
 }
 
-func (c *Context) PeekTreatment(experimentName string, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) (int, error) {
+func (c *Context) PeekTreatment(experimentName string) (int, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
 		return -1, err
 	}
 
-	return c.GetAssignment(experimentName, buff, block, st, assignBuff).Variant, nil
+	return c.GetAssignment(experimentName).Variant, nil
 }
 
 func (c *Context) GetVariableKeys() (map[string]string, error) {
@@ -427,16 +427,16 @@ func (c *Context) GetVariableKeys() (map[string]string, error) {
 	return variableKeys, nil
 }
 
-func (c *Context) GetVariableValue(key string, defaultValue interface{}, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) (interface{}, error) {
+func (c *Context) GetVariableValue(key string, defaultValue interface{}) (interface{}, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
 	}
 
-	var assignment, errres = c.GetVariableAssignment(key, buff, block, st, assignBuff)
+	var assignment, errres = c.GetVariableAssignment(key)
 	if errres == nil {
 		if !assignment.Exposed.Load().(bool) {
-			c.QueueExposure(assignment, buff, block, st)
+			c.QueueExposure(assignment)
 		}
 
 		var value, exist = assignment.Variables[key]
@@ -448,13 +448,13 @@ func (c *Context) GetVariableValue(key string, defaultValue interface{}, buff [5
 	return defaultValue, nil
 }
 
-func (c *Context) PeekVariableValue(key string, defaultValue interface{}, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) (interface{}, error) {
+func (c *Context) PeekVariableValue(key string, defaultValue interface{}) (interface{}, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
 	}
 
-	var assignment, errres = c.GetVariableAssignment(key, buff, block, st, assignBuff)
+	var assignment, errres = c.GetVariableAssignment(key)
 	if errres == nil {
 		var value, exist = assignment.Variables[key]
 		if exist {
@@ -464,7 +464,7 @@ func (c *Context) PeekVariableValue(key string, defaultValue interface{}, buff [
 	return defaultValue, nil
 }
 
-func (c *Context) Track(goalName string, properties map[string]interface{}, buff [512]byte, block [16]int32, st [4]int32) error {
+func (c *Context) Track(goalName string, properties map[string]interface{}) error {
 	var err = c.CheckNotClosed()
 	if err != nil {
 		return err
@@ -489,21 +489,21 @@ func (c *Context) Track(goalName string, properties map[string]interface{}, buff
 
 	c.LogEvent(Goal, achievement)
 
-	c.SetTimeout(buff, block, st)
+	c.SetTimeout()
 	return nil
 }
 
-func (c *Context) PublishAsync(buff [512]byte, block [16]int32, st [4]int32) (*future.Future, error) {
+func (c *Context) PublishAsync() (*future.Future, error) {
 	var err = c.CheckNotClosed()
 	if err != nil {
 		return nil, err
 	}
 
-	return c.Flush(buff, block, st), nil
+	return c.Flush(), nil
 }
 
-func (c *Context) Publish(buff [512]byte, block [16]int32, st [4]int32) error {
-	var result, err = c.PublishAsync(buff, block, st)
+func (c *Context) Publish() error {
+	var result, err = c.PublishAsync()
 	if err == nil {
 		result.Join(context.Background())
 		return nil
@@ -533,11 +533,12 @@ func (c *Context) RefreshAsync() *future.Future {
 
 		c.DataProvider_.GetContextData().Listen(func(value future.Value, err error) {
 			if err == nil {
-				c.SetData(value.(*jsonmodels.ContextData))
+				var result = value.(jsonmodels.ContextData)
+				c.SetData(result)
 				c.Refreshing_.Store(false)
 				donefun(nil, nil)
 
-				c.LogEvent(Refresh, value.(*jsonmodels.ContextData))
+				c.LogEvent(Refresh, result)
 			} else {
 				c.Refreshing_.Store(false)
 				donefun(nil, err)
@@ -560,7 +561,7 @@ func (c *Context) Refresh() {
 	c.RefreshAsync().Join(context.Background())
 }
 
-func (c *Context) CloseAsync(buff [512]byte, block [16]int32, st [4]int32) (*future.Future, error) {
+func (c *Context) CloseAsync() (*future.Future, error) {
 	if !c.Closed_.Load().(bool) {
 		var res = c.Closing_.Load().(bool)
 		if !res {
@@ -572,7 +573,7 @@ func (c *Context) CloseAsync(buff [512]byte, block [16]int32, st [4]int32) (*fut
 			if c.PendingCount_.Load().(int32) > 0 {
 				var tempFuture, done = future.New()
 				c.ClosingFuture_ = tempFuture
-				c.Flush(buff, block, st).Listen(func(value future.Value, err error) {
+				c.Flush().Listen(func(value future.Value, err error) {
 					if err == nil {
 						c.Closed_.Store(true)
 						c.Closing_.Store(false)
@@ -606,14 +607,14 @@ func (c *Context) CloseAsync(buff [512]byte, block [16]int32, st [4]int32) (*fut
 	return tempFuture, nil
 }
 
-func (c *Context) Close(buff [512]byte, block [16]int32, st [4]int32) {
-	var fut, err = c.CloseAsync(buff, block, st)
+func (c *Context) Close() {
+	var fut, err = c.CloseAsync()
 	if err == nil {
 		fut.Join(context.Background())
 	}
 }
 
-func (c *Context) GetAssignment(experimentName string, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) *Assignment {
+func (c *Context) GetAssignment(experimentName string) *Assignment {
 
 	c.ContextLock_.RLock()
 	if assignment, found := c.AssignmentCache[experimentName]; found {
@@ -676,22 +677,23 @@ func (c *Context) GetAssignment(experimentName string, buff [512]byte, block [16
 				}
 			}
 
+			var assignBuf = make([]int8, 12)
 			if experiment.Data.AudienceStrict && assignment.AudienceMismatch {
 				assignment.Variant = 0
 			} else if experiment.Data.FullOnVariant == 0 {
 				var uid, ufound = c.Units_[experiment.Data.UnitType]
 				if ufound {
-					var unitHash = c.GetUnitHash(unitType, uid, buff, block, st, false)
+					var unitHash = c.GetUnitHash(unitType, uid, false)
 					var assigner = c.GetVariantAssigner(unitType, unitHash, false)
 					var eligible = assigner.Assign(experiment.Data.TrafficSplit, experiment.Data.TrafficSeedHi,
-						experiment.Data.TrafficSeedLo, assignBuff[:]) == 1
+						experiment.Data.TrafficSeedLo, assignBuf) == 1
 					if eligible {
 						if cfound {
 							assignment.Variant = custom.(int)
 							assignment.Custom = true
 						} else {
 							assignment.Variant = assigner.Assign(experiment.Data.Split, experiment.Data.SeedHi,
-								experiment.Data.SeedLo, assignBuff[:])
+								experiment.Data.SeedLo, assignBuf)
 						}
 					} else {
 						assignment.Eligible = false
@@ -760,7 +762,7 @@ func (c *Context) CheckReady(expectNotClosed bool) error {
 	return nil
 }
 
-func (c *Context) SetData(data *jsonmodels.ContextData) {
+func (c *Context) SetData(data jsonmodels.ContextData) {
 	var index = map[string]ExperimentVariables{}
 	var indexVariables = map[interface{}]interface{}{}
 
@@ -788,7 +790,7 @@ func (c *Context) SetData(data *jsonmodels.ContextData) {
 
 	c.Index_ = index
 	c.IndexVariables_ = indexVariables
-	c.Data_ = *data
+	c.Data_ = data
 	c.Ready_.Store(true)
 
 	c.SetRefreshTimer()
@@ -817,7 +819,7 @@ func (c *Context) SetDataFailed(err error) {
 	c.DataLock.Unlock()
 }
 
-func (c *Context) Flush(buff [512]byte, block [16]int32, st [4]int32) *future.Future {
+func (c *Context) Flush() *future.Future {
 	c.ClearTimeout()
 
 	if !c.Failed_.Load().(bool) {
@@ -853,7 +855,7 @@ func (c *Context) Flush(buff [512]byte, block [16]int32, st [4]int32) *future.Fu
 					entrySet = append(entrySet, Pair{a: key, b: value})
 				}
 
-				var mapper = FlushMapper{Context: *c, buff: buff, block: block, st: st}
+				var mapper = FlushMapper{Context: *c}
 				var temp = MapSetToArray(entrySet, make([]interface{}, 0), mapper)
 				event.Units = make([]jsonmodels.Unit, 0)
 				for _, value := range temp {
@@ -899,16 +901,13 @@ func (c *Context) Flush(buff [512]byte, block [16]int32, st [4]int32) *future.Fu
 type FlushMapper struct {
 	MapperInt
 	Context Context
-	buff    [512]byte
-	block   [16]int32
-	st      [4]int32
 }
 
 func (f FlushMapper) Apply(value interface{}) interface{} {
 	var key = value.(Pair).a
 	var val = value.(Pair).b
 	var cntx = &f.Context
-	var uid = cntx.GetUnitHash(key, val, f.buff, f.block, f.st, false)
+	var uid = cntx.GetUnitHash(key, val, false)
 	var dst = make([]byte, len(uid))
 	var res = strconv.QuoteToASCII(string(dst))
 	return jsonmodels.Unit{Type: value.(Pair).a, Uid: res}
@@ -926,7 +925,7 @@ func (c *Context) ClearTimeout() {
 	}
 }
 
-func (c *Context) SetTimeout(buff [512]byte, block [16]int32, st [4]int32) {
+func (c *Context) SetTimeout() {
 	if c.IsReady() {
 		if c.Timeout_ == nil {
 			c.TimeoutLock_.Lock()
@@ -940,7 +939,7 @@ func (c *Context) SetTimeout(buff [512]byte, block [16]int32, st [4]int32) {
 						case <-c.Timeout_:
 							return
 						default:
-							c.Flush(buff, block, st)
+							c.Flush()
 						}
 					}
 				}()
@@ -969,8 +968,8 @@ func (c *Context) SetRefreshTimer() {
 	}
 }
 
-func (c *Context) GetUnitHash(unitType string, unitUID string, buff [512]byte, block [16]int32, st [4]int32, needlock bool) []byte {
-	var computer = ComputerUnitHash{St: st, Block: block, Buff: buff, UnitUID: unitUID}
+func (c *Context) GetUnitHash(unitType string, unitUID string, needlock bool) []byte {
+	var computer = ComputerUnitHash{St: make([]int32, 4), Block: make([]int32, 16), Buff: make([]byte, 512), UnitUID: unitUID}
 	var result = ComputeIfAbsentRW(c.ContextLock_, needlock, c.HashedUnits_, unitType, computer).([]int8)
 	var data = make([]byte, len(result))
 	for i, val := range result {
@@ -984,11 +983,11 @@ func (c *Context) GetVariantAssigner(unitType string, hash []byte, needlock bool
 	return ComputeIfAbsentRW(c.ContextLock_, needlock, c.Assigners_, unitType, computer).(*VariantAssigner)
 }
 
-func (c *Context) GetVariableAssignment(key string, buff [512]byte, block [16]int32, st [4]int32, assignBuff [12]int8) (*Assignment, error) {
+func (c *Context) GetVariableAssignment(key string) (*Assignment, error) {
 	var experiment, err = c.GetVariableExperiment(key)
 
 	if err == nil {
-		return c.GetAssignment(experiment.Data.Name, buff, block, st, assignBuff), nil
+		return c.GetAssignment(experiment.Data.Name), nil
 	}
 	var exposed = &atomic.Value{}
 	exposed.Store(false)
@@ -1019,9 +1018,9 @@ func (c ComputerVariantAssigner) Apply(value interface{}) interface{} {
 
 type ComputerUnitHash struct {
 	MapperInt
-	Buff    [512]byte
-	Block   [16]int32
-	St      [4]int32
+	Buff    []byte
+	Block   []int32
+	St      []int32
 	UnitUID string
 }
 
