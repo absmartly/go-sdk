@@ -29,19 +29,19 @@ func GetUInt8(buf []int8, offset int) uint32 {
 	return uint32(int(byte(buf[offset]) & 0xff))
 }
 
-func EncodeUTF8(buf []byte, offset int, value string) int {
+func EncodeUTF8(buf []int8, offset int, value string) int {
 	var n = len(value)
 
 	var out = offset
 	for i := 0; i < n; i++ {
 		var c = value[i]
 		if c < 0x80 {
-			buf[out] = c
+			buf[out] = int8(c)
 			out++
 		} else if c == 0x80 {
-			buf[out] = (c >> 6) | 192
+			buf[out] = int8((c >> 6) | 192)
 			out++
-			buf[out] = (c & 63) | 128
+			buf[out] = int8((c & 63) | 128)
 			out++
 		}
 	}

@@ -74,16 +74,11 @@ func TestAssignmentsMatch(t *testing.T) {
 		{uint32(0x27d1dc86), uint32(0x845461b9)},
 	}
 
-	var buff [512]byte
-
-	var block [16]int32
-	var st [4]int32
-
-	assign(HashUnit("bleh@absmartly.com", buff[:], block[:], st[:]), l, s,
+	assign(HashUnit("bleh@absmartly.com"), l, s,
 		[]int{0, 1, 0, 0, 0, 0, 1, 0, 2, 0, 0, 0, 1, 1}, t)
-	assign(HashUnit("123456789", buff[:], block[:], st[:]), l, s,
+	assign(HashUnit("123456789"), l, s,
 		[]int{1, 0, 1, 1, 1, 0, 0, 2, 1, 2, 2, 2, 0, 0}, t)
-	assign(HashUnit("e791e240fcd3df7d238cfc285f475e8152fcc0ec", buff[:], block[:], st[:]), l, s,
+	assign(HashUnit("e791e240fcd3df7d238cfc285f475e8152fcc0ec"), l, s,
 		[]int{1, 0, 1, 1, 0, 0, 0, 2, 0, 2, 1, 0, 0, 1}, t)
 }
 
