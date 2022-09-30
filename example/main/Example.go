@@ -9,10 +9,10 @@ import (
 
 func main() {
 	var clientConfig = sdk.ClientConfig{
-		Endpoint_:    "https://sandbox.absmartly.io/v1",
-		ApiKey_:      "R54OsOwR9wwtWYhDXwdtp4iuD3pvtIUoHz4BakCuBl0t3E9kA0R6jzTW6cffQC9O",
-		Application_: "www",  // created in the ABSmartly web console
-		Environment_: "prod", // created in the ABSmartly web console
+		Endpoint_:    "https://acme.absmartly.io/v1",
+		ApiKey_:      os.Getenv("ABSMARTLY_APIKEY"),
+		Application_: os.Getenv(`ABSMARTLY_APPLICATION`), // created in the ABSmartly web console
+		Environment_: os.Getenv(`ABSMARTLY_ENVIRONMENT`), // created in the ABSmartly web console
 	}
 
 	var sdkConfig = sdk.ABSmartlyConfig{Client_: sdk.CreateDefaultClient(clientConfig)}
