@@ -677,23 +677,24 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 				}
 			}
 
-			var assignBuf = make([]int8, 12)
+			var assignBuf [12]int8
 			if experiment.Data.AudienceStrict && assignment.AudienceMismatch {
 				assignment.Variant = 0
 			} else if experiment.Data.FullOnVariant == 0 {
 				var uid, ufound = c.Units_[experiment.Data.UnitType]
 				if ufound {
-					var unitHash = c.GetUnitHash(unitType, uid, false)
+					var data [22]byte
+					var unitHash = c.GetUnitHash(unitType, uid, data[:], false)
 					var assigner = c.GetVariantAssigner(unitType, unitHash, false)
 					var eligible = assigner.Assign(experiment.Data.TrafficSplit, experiment.Data.TrafficSeedHi,
-						experiment.Data.TrafficSeedLo, assignBuf) == 1
+						experiment.Data.TrafficSeedLo, assignBuf[:]) == 1
 					if eligible {
 						if cfound {
 							assignment.Variant = custom.(int)
 							assignment.Custom = true
 						} else {
 							assignment.Variant = assigner.Assign(experiment.Data.Split, experiment.Data.SeedHi,
-								experiment.Data.SeedLo, assignBuf)
+								experiment.Data.SeedLo, assignBuf[:])
 						}
 					} else {
 						assignment.Eligible = false
@@ -907,9 +908,9 @@ func (f FlushMapper) Apply(value interface{}) interface{} {
 	var key = value.(Pair).a
 	var val = value.(Pair).b
 	var cntx = &f.Context
-	var uid = cntx.GetUnitHash(key, val, false)
-	var dst = make([]byte, len(uid))
-	var res = strconv.QuoteToASCII(string(dst))
+	var data [22]byte
+	var uid = cntx.GetUnitHash(key, val, data[:], false)
+	var res = strconv.QuoteToASCII(string(uid))
 	return jsonmodels.Unit{Type: value.(Pair).a, Uid: res}
 }
 
@@ -968,10 +969,9 @@ func (c *Context) SetRefreshTimer() {
 	}
 }
 
-func (c *Context) GetUnitHash(unitType string, unitUID string, needlock bool) []byte {
-	var computer = ComputerUnitHash{St: make([]int32, 4), Block: make([]int32, 16), Buff: make([]byte, 512), UnitUID: unitUID}
+func (c *Context) GetUnitHash(unitType string, unitUID string, data []byte, needlock bool) []byte {
+	var computer = ComputerUnitHash{UnitUID: unitUID}
 	var result = ComputeIfAbsentRW(c.ContextLock_, needlock, c.HashedUnits_, unitType, computer).([]int8)
-	var data = make([]byte, len(result))
 	for i, val := range result {
 		data[i] = byte(val)
 	}
@@ -1018,14 +1018,11 @@ func (c ComputerVariantAssigner) Apply(value interface{}) interface{} {
 
 type ComputerUnitHash struct {
 	MapperInt
-	Buff    []byte
-	Block   []int32
-	St      []int32
 	UnitUID string
 }
 
 func (c ComputerUnitHash) Apply(value interface{}) interface{} {
-	return HashUnit(c.UnitUID, c.Buff[:], c.Block[:], c.St[:])
+	return HashUnit(c.UnitUID)
 }
 
 type Pair struct {
