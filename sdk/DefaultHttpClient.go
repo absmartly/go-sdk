@@ -14,6 +14,14 @@ type DefaultHttpClient struct {
 	httpClient_ *resty.Client
 }
 
+type Logger struct {
+	resty.Logger
+}
+
+func (l Logger) Errorf(format string, v ...interface{}) {}
+func (l Logger) Warnf(format string, v ...interface{})  {}
+func (l Logger) Debugf(format string, v ...interface{}) {}
+
 func CreateDefaultHttpClient() DefaultHttpClient {
 	return DefaultHttpClient{httpClient_: resty.New()}
 }
@@ -27,6 +35,7 @@ func (e DefaultHttpClient) DefaultHttpClientConfig(config DefaultHttpClientConfi
 	e.httpClient_.SetRetryWaitTime(config.RetryInterval_)
 	e.httpClient_.SetTimeout(config.ConnectionRequestTimeout_)
 	e.httpClient_.AddRetryCondition(RetryCondition())
+	e.httpClient_.SetLogger(config.Logger)
 	var tr = &http.Transport{
 		MaxIdleConns: 0,
 		DialContext: defaultTransportDialContext(&net.Dialer{

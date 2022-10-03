@@ -44,7 +44,8 @@ func CreateClient(config ClientConfig, httpClient HTTPClient) Client {
 		"X-Application":         config.Application_,
 		"X-Environment":         config.Environment_,
 		"X-Application-Version": "0",
-		"X-Agent":               "absmartly-java-sdk",
+		"X-Agent":               "absmartly-go-sdk",
+		"Content-Type":          "application/json",
 	}
 	cl.headers_ = headers
 
