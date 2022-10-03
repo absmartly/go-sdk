@@ -31,6 +31,22 @@ func (c ClientContextMock) Publish(event jsonmodels.PublishEvent) *future.Future
 	})
 }
 
+type ClientContextPublishMock struct {
+}
+
+var publishResult future.Value = nil
+
+func (c ClientContextPublishMock) GetContextData() *future.Future {
+	return fut
+}
+
+func (c ClientContextPublishMock) Publish(event jsonmodels.PublishEvent) *future.Future {
+	return future.Call(func() (future.Value, error) {
+		publishResult = event
+		return event, nil
+	})
+}
+
 var expectedVariants = map[string]int{
 	"exp_test_ab":           1,
 	"exp_test_abc":          2,
@@ -114,6 +130,10 @@ func setUp() {
 
 func CreateTestContext(config ContextConfig, dataFuture *future.Future) *Context {
 	return CreateContext(clock, config, dataFuture, dataProvider, eventHandler, eventLogger, variableParser, audienceMatcher)
+}
+
+func CreateTestPublishContext(config ContextConfig, dataFuture *future.Future) *Context {
+	return CreateContext(clock, config, dataFuture, DefaultContextDataProvider{client_: ClientContextPublishMock{}}, DefaultContextEventHandler{client_: ClientContextPublishMock{}}, eventLogger, variableParser, audienceMatcher)
 }
 
 func TestConstructorSetsOverrides(t *testing.T) {
@@ -922,6 +942,99 @@ func TestPublishResetsInternalQueuesAndKeepsAttributesOverridesAndCustomAssignme
 	assertAny(4, rs, t)
 }
 
+func TestStartsPublishTimeoutWhenReadyWithQueueNotEmpty(t *testing.T) {
+	setUp()
+	var config = ContextConfig{}
+	config.Units_ = units
+	config.PublishDelay_ = 333
+	var context = CreateTestContext(config, dataFuture)
+
+	assertAny(false, context.IsReady(), t)
+	assertAny(false, context.IsFailed(), t)
+
+	var err = context.Track("goal1", map[string]interface{}{"amount": 125})
+	assertAny(nil, err, t)
+
+	assertAny(int32(1), context.GetPendingCount(), t)
+
+	dataFuture.SetResult(data, nil)
+	var _ = context.WaitUntilReady()
+	assertAny(int32(1), context.GetPendingCount(), t)
+	assertAny(true, context.IsReady(), t)
+	assertAny(false, context.IsClosed(), t)
+	assertAny(false, context.IsClosing(), t)
+}
+
+func TestPublishSuccess(t *testing.T) {
+	setUp()
+	var config = ContextConfig{}
+	config.Units_ = units
+	config.PublishDelay_ = 333
+	var context = CreateTestPublishContext(config, dataFuture)
+	dataFuture.SetResult(data, nil)
+	var _ = context.WaitUntilReady()
+	assertAny(true, context.IsReady(), t)
+	assertAny(false, context.IsFailed(), t)
+
+	var err = context.Track("goal1", map[string]interface{}{"amount": 125})
+	assertAny(nil, err, t)
+	assertAny(int32(1), context.GetPendingCount(), t)
+
+	var event = jsonmodels.PublishEvent{
+		Hashed: true,
+		Units: []jsonmodels.Unit{{
+			Type: "session_id",
+			Uid:  "pAE3a1i5Drs5mKRNq56adA",
+		}, {
+			Type: "user_id",
+			Uid:  "JfnnlDI7RTiF9RgfG2JNCw",
+		}, {
+			Type: "email",
+			Uid:  "IuqYkNRfEx5yClel4j3NbA",
+		}},
+		PublishedAt: 1620000000000,
+		Exposures: []jsonmodels.Exposure{{
+			Id:               0,
+			Name:             "testAssignment",
+			Unit:             "",
+			Variant:          0,
+			ExposedAt:        1620000000000,
+			Assigned:         false,
+			Eligible:         true,
+			Overridden:       false,
+			FullOn:           false,
+			Custom:           false,
+			AudienceMismatch: false,
+		}},
+		Goals: []jsonmodels.GoalAchievement{{
+			Name:       "goal1",
+			AchievedAt: 1620000000000,
+			Properties: map[string]interface{}{"amount": 125},
+		}},
+		Attributes: []jsonmodels.Attribute{{Name: "test", Value: "value1", SetAt: 1620000000000}},
+	}
+	assertAny(nil, publishResult, t)
+	var attrErr = context.SetAttribute("test", "value1")
+	assertAny(nil, attrErr, t)
+
+	var assErr = context.SetCustomAssignment("testAssignment", 5)
+	assertAny(nil, assErr, t)
+	var tr, _ = context.GetTreatment("testAssignment")
+	assertAny(0, tr, t)
+
+	var publishErr = context.Publish()
+	var resultPublish = publishResult.(jsonmodels.PublishEvent)
+	assertAny(event.Goals, resultPublish.Goals, t)
+	assertAny(event.Exposures, resultPublish.Exposures, t)
+	assertAny(event.Attributes, resultPublish.Attributes, t)
+	assertAny(nil, publishErr, t)
+	assertAny(int32(0), context.GetPendingCount(), t)
+	assertAny(true, context.IsReady(), t)
+	assertAny(false, context.IsClosed(), t)
+	assertAny(false, context.IsClosing(), t)
+
+}
+
 func TestClose(t *testing.T) {
 	setUp()
 	var config = ContextConfig{}
@@ -1078,7 +1191,6 @@ func TestClearAssignmentCacheForExperimentIdChange(t *testing.T) {
 	var config = ContextConfig{}
 	config.Units_ = units
 
-	config.RefreshInterval_ = 5000
 	var context = CreateTestContext(config, dataFutureRefresh)
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
@@ -1105,9 +1217,9 @@ func TestClearAssignmentCacheForExperimentIdChange(t *testing.T) {
 			Experiments: []jsonmodels.Experiment{experiment},
 		}, nil
 	})
-	assertAny(false, context.RefreshTimer_ == nil, t)
+	assertAny(true, context.RefreshTimer_ == nil, t)
 	var ft = context.RefreshAsync()
-	assertAny(false, context.RefreshTimer_ == nil, t)
+	assertAny(true, context.RefreshTimer_ == nil, t)
 
 	ft.Join(context2.Background())
 	assertAny(true, context.IsReady(), t)
