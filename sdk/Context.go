@@ -6,9 +6,7 @@ import (
 	"github.com/absmartly/go-sdk/sdk/future"
 	"github.com/absmartly/go-sdk/sdk/internal"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
-	"github.com/procyon-projects/chrono"
 	"reflect"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,10 +46,11 @@ type Context struct {
 	ClosingFuture_   *future.Future
 	RefreshFuture_   *future.Future
 	TimeoutLock_     *sync.Mutex
-	Timeout_         chrono.ScheduledTask
-	RefreshTimer_    chrono.ScheduledTask
+	Timeout_         *time.Ticker
+	RefreshTimer_    *time.Ticker
+	RefreshDone_     chan bool
+	TimeoutDone_     chan bool
 	Clock_           internal.Clock
-	Scheduler_       chrono.TaskScheduler
 }
 
 type ExperimentVariables struct {
@@ -111,8 +110,6 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	cntx.Achievements_ = make([]jsonmodels.GoalAchievement, 0)
 	cntx.Exposures_ = make([]jsonmodels.Exposure, 0)
 	cntx.Attributes_ = make([]interface{}, 0)
-
-	cntx.Scheduler_ = chrono.NewDefaultTaskScheduler()
 
 	var units = config.Units_
 	if units != nil {
@@ -731,7 +728,8 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 
 func (c *Context) ClearRefreshTimer() {
 	if c.RefreshTimer_ != nil {
-		c.RefreshTimer_.Cancel()
+		c.RefreshTimer_.Stop()
+		c.RefreshDone_ <- true
 		c.RefreshTimer_ = nil
 	}
 }
@@ -881,7 +879,7 @@ func (c *Context) Flush() *future.Future {
 
 				c.EventHandler_.Publish(*c, event).Listen(
 					func(value future.Value, err error) {
-						if err != nil {
+						if err == nil {
 							c.LogEvent(Publish, event)
 							done(nil, nil)
 						} else {
@@ -917,16 +915,26 @@ func (f FlushMapper) Apply(value interface{}) interface{} {
 	var cntx = &f.Context
 	var data [22]byte
 	var uid = cntx.GetUnitHash(key, val, data[:], false)
-	var res = strconv.QuoteToASCII(string(uid))
+	var res = f.forceASCII(string(uid))
 	return jsonmodels.Unit{Type: value.(Pair).a, Uid: res}
+}
+
+func (f FlushMapper) forceASCII(s string) string {
+	rs := make([]rune, 0, len(s))
+	for _, r := range s {
+		if r <= 127 {
+			rs = append(rs, r)
+		}
+	}
+	return string(rs)
 }
 
 func (c *Context) ClearTimeout() {
 	if c.Timeout_ != nil {
 		c.TimeoutLock_.Lock()
 		if c.Timeout_ != nil {
-			//	c.Timeout_ <- true
-			c.Timeout_.Cancel()
+			c.Timeout_.Stop()
+			c.TimeoutDone_ <- true
 			c.Timeout_ = nil
 		}
 		c.TimeoutLock_.Unlock()
@@ -939,11 +947,20 @@ func (c *Context) SetTimeout() {
 			c.TimeoutLock_.Lock()
 			if c.Timeout_ == nil {
 				var delay = uint64(c.PublishDelay_ * int64(time.Millisecond))
-				now := time.Now()
-				startTime := now.Add(time.Duration(delay))
-				c.Timeout_, _ = c.Scheduler_.Schedule(func(ctx context.Context) {
-					c.Flush()
-				}, chrono.WithTime(startTime))
+				c.Timeout_ = time.NewTicker(time.Duration(delay))
+				c.TimeoutDone_ = make(chan bool)
+				go func() {
+					for {
+						select {
+						case <-c.TimeoutDone_:
+							return
+						case <-c.Timeout_.C:
+							c.Flush()
+							c.Timeout_.Stop()
+							c.TimeoutDone_ <- true
+						}
+					}
+				}()
 			}
 			c.TimeoutLock_.Unlock()
 		}
@@ -954,11 +971,18 @@ func (c *Context) SetTimeout() {
 func (c *Context) SetRefreshTimer() {
 	if c.RefreshInterval_ > 0 && c.RefreshTimer_ == nil {
 		var rate = time.Duration(uint64(c.RefreshInterval_ * int64(time.Millisecond)))
-		now := time.Now()
-		startTime := now.Add(rate)
-		c.RefreshTimer_, _ = c.Scheduler_.ScheduleAtFixedRate(func(ctx context.Context) {
-			c.RefreshAsync()
-		}, rate, chrono.WithTime(startTime))
+		c.RefreshTimer_ = time.NewTicker(rate)
+		c.RefreshDone_ = make(chan bool)
+		go func() {
+			for {
+				select {
+				case <-c.RefreshDone_:
+					return
+				case <-c.RefreshTimer_.C:
+					c.RefreshAsync()
+				}
+			}
+		}()
 	}
 }
 
