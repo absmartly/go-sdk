@@ -1,6 +1,8 @@
 package sdk
 
-import "sync"
+import (
+	"sync"
+)
 
 func ComputeIfAbsentRW(lock *sync.RWMutex, needlock bool, maps map[interface{}]interface{}, key interface{}, computer MapperInt) interface{} {
 	if needlock {
@@ -50,7 +52,7 @@ func PutRW(lock *sync.RWMutex, maps map[interface{}]interface{}, key interface{}
 
 func AddRW(lock *sync.RWMutex, list []interface{}, value interface{}) interface{} {
 	lock.Lock()
-	var result = append(list, value)
+	list = append(list, value)
 	lock.Unlock()
-	return result
+	return list
 }

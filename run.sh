@@ -10,6 +10,8 @@ cd main
 echo "install dependencies"
 go get github.com/go-resty/resty/v2@v2.7.0
 go mod download github.com/go-resty/resty/v2
+go get github.com/procyon-projects/chrono
+
 echo "run golang lint"
 golangci-lint run
 echo "run golang fmt"
