@@ -12,8 +12,8 @@ type ContextConfig struct {
 
 func CreateDefaultContextConfig() ContextConfig {
 	var cntx = ContextConfig{}
-	cntx.PublishDelay_ = 100
-	cntx.RefreshInterval_ = 0
+	cntx.PublishDelay_ = 1000
+	cntx.RefreshInterval_ = 1000
 	cntx.Units_ = map[string]string{}
 	cntx.Attributes_ = map[string]interface{}{}
 	cntx.Cassigmnents_ = map[string]int{}

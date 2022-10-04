@@ -139,7 +139,7 @@ func CreateTestPublishContext(config ContextConfig, dataFuture *future.Future) *
 func TestConstructorSetsOverrides(t *testing.T) {
 	setUp()
 	var overrides = map[string]int{"exp_test": 2, "exp_test_1": 1}
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	config.Overrides_ = overrides
 
@@ -153,7 +153,7 @@ func TestConstructorSetsOverrides(t *testing.T) {
 func TestConstructorSetsCustomAssignments(t *testing.T) {
 	setUp()
 	var cassignments = map[string]int{"exp_test": 2, "exp_test_1": 1}
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	config.Cassigmnents_ = cassignments
 
@@ -166,7 +166,7 @@ func TestConstructorSetsCustomAssignments(t *testing.T) {
 
 func TestBecomesReadyWithCompletedFuture(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 
 	var context = CreateTestContext(config, dataFutureReady)
@@ -180,7 +180,7 @@ func TestBecomesReadyWithCompletedFuture(t *testing.T) {
 
 func TestBecomesReadyExceptionallyWithCompletedFuture(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 
 	var context = CreateTestContext(config, dataFutureFailed)
@@ -194,7 +194,7 @@ func TestBecomesReadyExceptionallyWithCompletedFuture(t *testing.T) {
 
 func TestBecomesReadyWithException(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 
 	var context = CreateTestContext(config, dataFuture)
@@ -212,7 +212,7 @@ func TestBecomesReadyWithException(t *testing.T) {
 
 func TestBecomesReadyWithoutException(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 
 	var context = CreateTestContext(config, dataFuture)
@@ -230,7 +230,7 @@ func TestBecomesReadyWithoutException(t *testing.T) {
 
 func TestWaitUntilReady(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFuture)
 	assertAny(false, context.IsReady(), t)
@@ -250,7 +250,7 @@ func TestWaitUntilReady(t *testing.T) {
 
 func TestWaitUntilReadyCompleted(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 	assertAny(true, context.IsReady(), t)
@@ -267,7 +267,7 @@ func TestWaitUntilReadyCompleted(t *testing.T) {
 
 func TestWaitUntilReadyAsync(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFuture)
 	assertAny(false, context.IsReady(), t)
@@ -291,7 +291,7 @@ func TestWaitUntilReadyAsync(t *testing.T) {
 
 func TestWaitUntilReadyAsynCompleted(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 	assertAny(true, context.IsReady(), t)
@@ -313,7 +313,7 @@ func TestWaitUntilReadyAsynCompleted(t *testing.T) {
 
 func TestErrorWhenClosing(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 
@@ -348,7 +348,7 @@ func TestErrorWhenClosing(t *testing.T) {
 
 func TestErrorWhenClosed(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 
@@ -382,7 +382,7 @@ func TestErrorWhenClosed(t *testing.T) {
 
 func TestGetExperiments(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 
@@ -398,7 +398,7 @@ func TestGetExperiments(t *testing.T) {
 
 func TestRefreshTimerWhenReady(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFuture)
 	assertAny(false, context.IsReady(), t)
@@ -418,7 +418,7 @@ func TestRefreshTimerWhenReady(t *testing.T) {
 
 func TestUnitEmpty(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 
@@ -436,7 +436,7 @@ func TestUnitEmpty(t *testing.T) {
 
 func TestSetAttributes(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFuture)
 
@@ -451,7 +451,7 @@ func TestSetAttributes(t *testing.T) {
 
 func TestSetOverrides(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFuture)
 
@@ -487,7 +487,7 @@ func TestSetOverrides(t *testing.T) {
 
 func TestSetOverridesReady(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 
@@ -512,7 +512,7 @@ func TestSetOverridesReady(t *testing.T) {
 
 func TestSetOverridesClearAssignmentCache(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 
@@ -548,7 +548,7 @@ func TestSetOverridesClearAssignmentCache(t *testing.T) {
 
 func TestSetCustomAssignmentsReady(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 
@@ -573,7 +573,7 @@ func TestSetCustomAssignmentsReady(t *testing.T) {
 
 func TestSetCustomAssignments(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFuture)
 
@@ -609,7 +609,7 @@ func TestSetCustomAssignments(t *testing.T) {
 
 func TestCustomAssignmentDoesNotOverrideFullOnOrNotEligibleAssignments(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 
@@ -633,7 +633,7 @@ func TestCustomAssignmentDoesNotOverrideFullOnOrNotEligibleAssignments(t *testin
 
 func TestCustomAssignmentPendingAssignmentCache(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = ContextConfig{RefreshInterval_: 1000, PublishDelay_: 1000}
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 
@@ -663,7 +663,7 @@ func TestCustomAssignmentPendingAssignmentCache(t *testing.T) {
 
 func TestPeekTreatment(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 
@@ -692,7 +692,7 @@ func stringInSlice(a string, list []jsonmodels.Experiment) bool {
 
 func TestPeekVariable(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 	assertAny(true, context.IsReady(), t)
@@ -713,7 +713,7 @@ func TestPeekVariable(t *testing.T) {
 
 func TestPeekVariableStrict(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureSrict)
 	assertAny(true, context.IsReady(), t)
@@ -727,7 +727,7 @@ func TestPeekVariableStrict(t *testing.T) {
 
 func TestGetVariable(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 	assertAny(true, context.IsReady(), t)
@@ -747,7 +747,7 @@ func TestGetVariable(t *testing.T) {
 
 func TestGetVariableStrict(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureSrict)
 	assertAny(true, context.IsReady(), t)
@@ -760,7 +760,7 @@ func TestGetVariableStrict(t *testing.T) {
 
 func TestGetVariableKeys(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureRefresh)
 	assertAny(true, context.IsReady(), t)
@@ -774,7 +774,7 @@ func TestGetVariableKeys(t *testing.T) {
 
 func TestPeekTreatmentOverrideVariant(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 	assertAny(true, context.IsReady(), t)
@@ -796,7 +796,7 @@ func TestPeekTreatmentOverrideVariant(t *testing.T) {
 
 func TestGetTreatmentOverrideVariant(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 	assertAny(true, context.IsReady(), t)
@@ -827,7 +827,7 @@ func TestGetTreatmentOverrideVariant(t *testing.T) {
 
 func TestTrack(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 	assertAny(true, context.IsReady(), t)
@@ -862,7 +862,7 @@ func TestTrack(t *testing.T) {
 
 func TestTrackNotReady(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFuture)
 	assertAny(false, context.IsReady(), t)
@@ -898,7 +898,7 @@ func TestTrackNotReady(t *testing.T) {
 
 func TestPublishResetsInternalQueuesAndKeepsAttributesOverridesAndCustomAssignments(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 
@@ -944,9 +944,9 @@ func TestPublishResetsInternalQueuesAndKeepsAttributesOverridesAndCustomAssignme
 
 func TestStartsPublishTimeoutWhenReadyWithQueueNotEmpty(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
-	config.PublishDelay_ = 333
+	config.PublishDelay_ = 3333
 	var context = CreateTestContext(config, dataFuture)
 
 	assertAny(false, context.IsReady(), t)
@@ -967,7 +967,7 @@ func TestStartsPublishTimeoutWhenReadyWithQueueNotEmpty(t *testing.T) {
 
 func TestPublishSuccess(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	config.PublishDelay_ = 333
 	var context = CreateTestPublishContext(config, dataFuture)
@@ -975,7 +975,6 @@ func TestPublishSuccess(t *testing.T) {
 	var _ = context.WaitUntilReady()
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
-
 	var err = context.Track("goal1", map[string]interface{}{"amount": 125})
 	assertAny(nil, err, t)
 	assertAny(int32(1), context.GetPendingCount(), t)
@@ -1024,6 +1023,7 @@ func TestPublishSuccess(t *testing.T) {
 
 	var publishErr = context.Publish()
 	var resultPublish = publishResult.(jsonmodels.PublishEvent)
+	assertAny(int32(0), context.GetPendingCount(), t)
 	assertAny(event.Goals, resultPublish.Goals, t)
 	assertAny(event.Exposures, resultPublish.Exposures, t)
 	assertAny(event.Attributes, resultPublish.Attributes, t)
@@ -1037,7 +1037,7 @@ func TestPublishSuccess(t *testing.T) {
 
 func TestClose(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = ContextConfig{PublishDelay_: 1000}
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureReady)
 	assertAny(true, context.IsReady(), t)
@@ -1064,7 +1064,7 @@ func TestClose(t *testing.T) {
 
 func TestCloseStopRefreshTimer(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 
 	config.RefreshInterval_ = 5000
@@ -1083,7 +1083,7 @@ func TestCloseStopRefreshTimer(t *testing.T) {
 
 func TestCloseStopRefreshTimerAsync(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 
 	config.RefreshInterval_ = 5000
@@ -1103,7 +1103,7 @@ func TestCloseStopRefreshTimerAsync(t *testing.T) {
 
 func TestRefresh(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 
 	config.RefreshInterval_ = 5000
@@ -1124,7 +1124,7 @@ func TestRefresh(t *testing.T) {
 
 func TestRefreshAsync(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 
 	config.RefreshInterval_ = 5000
@@ -1147,7 +1147,7 @@ func TestRefreshAsync(t *testing.T) {
 
 func TestRefreshClearAssignmentCacheForStartedExperiment(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 
 	config.RefreshInterval_ = 5000
@@ -1188,7 +1188,7 @@ func TestRefreshClearAssignmentCacheForStartedExperiment(t *testing.T) {
 
 func TestClearAssignmentCacheForExperimentIdChange(t *testing.T) {
 	setUp()
-	var config = ContextConfig{}
+	var config = ContextConfig{PublishDelay_: 1000}
 	config.Units_ = units
 
 	var context = CreateTestContext(config, dataFutureRefresh)
