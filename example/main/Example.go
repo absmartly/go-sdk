@@ -23,7 +23,7 @@ func main() {
 		Units_: map[string]string{ // add Unit
 			"session_id": "bf06d8cb5d8137290c4abb64155584fbdb64d8",
 			"user_id":    "123456", // a unique id identifying the user
-		}}
+		}, PublishDelay_: 10000, RefreshInterval_: 5000}
 
 	var ctx = sd.CreateContext(contextConfig)
 	ctx.WaitUntilReady()
@@ -47,14 +47,12 @@ func main() {
 	var treatment, _ = ctx.GetTreatment("exp_test_ab")
 	fmt.Println(treatment)
 	fmt.Println(ctx.GetData())
-
 	var properties = map[string]interface{}{
 		"value": 125,
 		"fee":   125,
 	}
 
 	var err = ctx.Track("payment", properties)
-
 	fmt.Println(err)
 
 	ctx.Close()

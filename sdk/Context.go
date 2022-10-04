@@ -6,6 +6,7 @@ import (
 	"github.com/absmartly/go-sdk/sdk/future"
 	"github.com/absmartly/go-sdk/sdk/internal"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
+	"github.com/procyon-projects/chrono"
 	"reflect"
 	"strconv"
 	"strings"
@@ -47,9 +48,10 @@ type Context struct {
 	ClosingFuture_   *future.Future
 	RefreshFuture_   *future.Future
 	TimeoutLock_     *sync.Mutex
-	Timeout_         chan bool
-	RefreshTimer_    chan bool
+	Timeout_         chrono.ScheduledTask
+	RefreshTimer_    chrono.ScheduledTask
 	Clock_           internal.Clock
+	Scheduler_       chrono.TaskScheduler
 }
 
 type ExperimentVariables struct {
@@ -109,6 +111,8 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	cntx.Achievements_ = make([]jsonmodels.GoalAchievement, 0)
 	cntx.Exposures_ = make([]jsonmodels.Exposure, 0)
 	cntx.Attributes_ = make([]interface{}, 0)
+
+	cntx.Scheduler_ = chrono.NewDefaultTaskScheduler()
 
 	var units = config.Units_
 	if units != nil {
@@ -353,7 +357,7 @@ func (c *Context) SetAttribute(name string, value interface{}) error {
 		return err
 	}
 
-	AddRW(c.ContextLock_, c.Attributes_, jsonmodels.Attribute{Name: name, Value: value, SetAt: c.Clock_.Millis()})
+	c.Attributes_ = AddRW(c.ContextLock_, c.Attributes_, jsonmodels.Attribute{Name: name, Value: value, SetAt: c.Clock_.Millis()}).([]interface{})
 	return nil
 }
 
@@ -727,7 +731,7 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 
 func (c *Context) ClearRefreshTimer() {
 	if c.RefreshTimer_ != nil {
-		c.RefreshTimer_ <- true
+		c.RefreshTimer_.Cancel()
 		c.RefreshTimer_ = nil
 	}
 }
@@ -825,17 +829,17 @@ func (c *Context) Flush() *future.Future {
 
 	if !c.Failed_.Load().(bool) {
 		if c.PendingCount_.Load().(int32) > 0 {
-			var exposures = make([]jsonmodels.Exposure, 0)
-			var achievements = make([]jsonmodels.GoalAchievement, 0)
 			var eventCount int32
 
 			c.EventLock_.Lock()
 			eventCount = c.PendingCount_.Load().(int32)
+			var exposures = make([]jsonmodels.Exposure, len(c.Exposures_))
+			var achievements = make([]jsonmodels.GoalAchievement, len(c.Achievements_))
 
 			if eventCount > 0 {
 				if len(c.Exposures_) > 0 {
 					copy(exposures, c.Exposures_)
-					c.Exposures_ = nil
+					c.Exposures_ = make([]jsonmodels.Exposure, 0)
 				}
 
 				if len(c.Achievements_) > 0 {
@@ -863,13 +867,15 @@ func (c *Context) Flush() *future.Future {
 					event.Units = append(event.Units, value.(jsonmodels.Unit))
 				}
 				if len(c.Attributes_) == 0 {
-					event.Attributes = nil
+					event.Attributes = make([]jsonmodels.Attribute, 0)
 				} else {
+					event.Attributes = make([]jsonmodels.Attribute, len(c.Attributes_))
 					for key, value := range c.Attributes_ {
 						event.Attributes[key] = value.(jsonmodels.Attribute)
 					}
 				}
 				event.Goals = achievements
+				event.Exposures = exposures
 
 				result, done := future.New()
 
@@ -894,6 +900,7 @@ func (c *Context) Flush() *future.Future {
 		c.PendingCount_.Store(int32(0))
 		c.EventLock_.Unlock()
 	}
+
 	result, done := future.New()
 	done(nil, nil)
 	return result
@@ -919,7 +926,7 @@ func (c *Context) ClearTimeout() {
 		c.TimeoutLock_.Lock()
 		if c.Timeout_ != nil {
 			//	c.Timeout_ <- true
-			close(c.Timeout_)
+			c.Timeout_.Cancel()
 			c.Timeout_ = nil
 		}
 		c.TimeoutLock_.Unlock()
@@ -931,19 +938,12 @@ func (c *Context) SetTimeout() {
 		if c.Timeout_ == nil {
 			c.TimeoutLock_.Lock()
 			if c.Timeout_ == nil {
-				c.Timeout_ = make(chan bool)
-				go func() {
-					var delay = c.PublishDelay_ * int64(time.Millisecond)
-					time.Sleep(time.Duration(delay))
-					for {
-						select {
-						case <-c.Timeout_:
-							return
-						default:
-							c.Flush()
-						}
-					}
-				}()
+				var delay = uint64(c.PublishDelay_ * int64(time.Millisecond))
+				now := time.Now()
+				startTime := now.Add(time.Duration(delay))
+				c.Timeout_, _ = c.Scheduler_.Schedule(func(ctx context.Context) {
+					c.Flush()
+				}, chrono.WithTime(startTime))
 			}
 			c.TimeoutLock_.Unlock()
 		}
@@ -953,19 +953,12 @@ func (c *Context) SetTimeout() {
 
 func (c *Context) SetRefreshTimer() {
 	if c.RefreshInterval_ > 0 && c.RefreshTimer_ == nil {
-		c.RefreshTimer_ = make(chan bool)
-		go func() {
-			var delay = c.RefreshInterval_ * int64(time.Millisecond)
-			for {
-				time.Sleep(time.Duration(delay))
-				select {
-				case <-c.RefreshTimer_:
-					return
-				default:
-					c.RefreshAsync()
-				}
-			}
-		}()
+		var rate = time.Duration(uint64(c.RefreshInterval_ * int64(time.Millisecond)))
+		now := time.Now()
+		startTime := now.Add(rate)
+		c.RefreshTimer_, _ = c.Scheduler_.ScheduleAtFixedRate(func(ctx context.Context) {
+			c.RefreshAsync()
+		}, rate, chrono.WithTime(startTime))
 	}
 }
 
