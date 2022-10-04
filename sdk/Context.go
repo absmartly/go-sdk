@@ -947,6 +947,9 @@ func (c *Context) SetTimeout() {
 			c.TimeoutLock_.Lock()
 			if c.Timeout_ == nil {
 				var delay = uint64(c.PublishDelay_ * int64(time.Millisecond))
+				if delay < 1 {
+					delay = 1
+				}
 				c.Timeout_ = time.NewTicker(time.Duration(delay))
 				c.TimeoutDone_ = make(chan bool)
 				go func() {
@@ -971,6 +974,9 @@ func (c *Context) SetTimeout() {
 func (c *Context) SetRefreshTimer() {
 	if c.RefreshInterval_ > 0 && c.RefreshTimer_ == nil {
 		var rate = time.Duration(uint64(c.RefreshInterval_ * int64(time.Millisecond)))
+		if rate < 1 {
+			rate = 1
+		}
 		c.RefreshTimer_ = time.NewTicker(rate)
 		c.RefreshDone_ = make(chan bool)
 		go func() {
