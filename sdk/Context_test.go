@@ -1027,12 +1027,42 @@ func TestPublishSuccess(t *testing.T) {
 	assertAny(event.Goals, resultPublish.Goals, t)
 	assertAny(event.Exposures, resultPublish.Exposures, t)
 	assertAny(event.Attributes, resultPublish.Attributes, t)
+	assertAny(event.Goals, resultPublish.Goals, t)
+	var matches = 0
+	for _, u := range event.Units {
+		for _, uu := range resultPublish.Units {
+			if u == uu {
+				matches = matches + 1
+			}
+		}
+	}
+	assertAny(matches, len(resultPublish.Units), t)
 	assertAny(nil, publishErr, t)
 	assertAny(int32(0), context.GetPendingCount(), t)
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsClosed(), t)
 	assertAny(false, context.IsClosing(), t)
 
+}
+
+func forceASCII(s string) string {
+	rs := make([]rune, 0, len(s))
+	for _, r := range s {
+		if r <= 127 {
+			rs = append(rs, r)
+		}
+	}
+	return string(rs)
+}
+
+func TestFlushMapper(t *testing.T) {
+	var result = "pAE3a1i5Drs5mKRNq56adA"
+	var forced = forceASCII(result)
+	assertAny(result, forced, t)
+
+	result = "pAE3a1i5Drs5%KRNq56adA"
+	forced = forceASCII("pAE3a1i5Drs5%паKRNq56adA")
+	assertAny(result, forced, t)
 }
 
 func TestClose(t *testing.T) {
