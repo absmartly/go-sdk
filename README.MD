@@ -205,7 +205,7 @@ The `SetAttribute()` and `SetAttributes()` methods can be called before the cont
 ```go
     context.SetAttribute("user_agent", req.GetHeader("User-Agent"));
     
-    context.setAttributes(map[string]string{
+    context.SetAttributes(map[string]string{
             "customer_age": "new_customer",
     }
 ```
