@@ -46,10 +46,8 @@ type Context struct {
 	ClosingFuture_   *future.Future
 	RefreshFuture_   *future.Future
 	TimeoutLock_     *sync.Mutex
-	Timeout_         *time.Ticker
-	RefreshTimer_    *time.Ticker
-	RefreshDone_     chan bool
-	TimeoutDone_     chan bool
+	Timeout_         *time.Timer
+	RefreshTimer_    *time.Timer
 	Clock_           internal.Clock
 }
 
@@ -382,11 +380,7 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 }
 
 func (c *Context) QueueExposure(assignment *Assignment) {
-	var res = assignment.Exposed.Load().(bool)
-	if !res {
-		assignment.Exposed.Store(true)
-	}
-	if !res {
+	if assignment.Exposed.CompareAndSwap(false, true) {
 		var exposure = jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
 			Variant: assignment.Variant, ExposedAt: c.Clock_.Millis(), Assigned: assignment.Assigned,
 			Eligible: assignment.Eligible, Overridden: assignment.Overridden, FullOn: assignment.FullOn,
@@ -518,17 +512,12 @@ func (c *Context) GetPendingCount() int32 {
 }
 
 func (c *Context) RefreshAsync() *future.Future {
-
 	var err = c.CheckNotClosed()
 	if err != nil {
 		return nil
 	}
 
-	var res = c.Refreshing_.Load().(bool)
-	if !res {
-		c.Refreshing_.Store(true)
-	}
-	if !res {
+	if !c.Refreshing_.CompareAndSwap(false, true) {
 		var tempfuture, donefun = future.New()
 		c.RefreshFuture_ = tempfuture
 
@@ -564,11 +553,7 @@ func (c *Context) Refresh() {
 
 func (c *Context) CloseAsync() (*future.Future, error) {
 	if !c.Closed_.Load().(bool) {
-		var res = c.Closing_.Load().(bool)
-		if !res {
-			c.Closing_.Store(true)
-		}
-		if !res {
+		if c.Closing_.CompareAndSwap(false, true) {
 			c.ClearRefreshTimer()
 
 			if c.PendingCount_.Load().(int32) > 0 {
@@ -729,7 +714,6 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 func (c *Context) ClearRefreshTimer() {
 	if c.RefreshTimer_ != nil {
 		c.RefreshTimer_.Stop()
-		c.RefreshDone_ <- true
 		c.RefreshTimer_ = nil
 	}
 }
@@ -934,7 +918,6 @@ func (c *Context) ClearTimeout() {
 		c.TimeoutLock_.Lock()
 		if c.Timeout_ != nil {
 			c.Timeout_.Stop()
-			c.TimeoutDone_ <- true
 			c.Timeout_ = nil
 		}
 		c.TimeoutLock_.Unlock()
@@ -945,50 +928,29 @@ func (c *Context) SetTimeout() {
 	if c.IsReady() {
 		if c.Timeout_ == nil {
 			c.TimeoutLock_.Lock()
-			if c.Timeout_ == nil {
+			if c.Timeout_ == nil && c.PublishDelay_ >= 0 {
 				var delay = uint64(c.PublishDelay_ * int64(time.Millisecond))
 				if delay < 1 {
 					delay = 1
 				}
-				c.Timeout_ = time.NewTicker(time.Duration(delay))
-				c.TimeoutDone_ = make(chan bool)
-				go func() {
-					for {
-						select {
-						case <-c.TimeoutDone_:
-							return
-						case <-c.Timeout_.C:
-							c.Flush()
-							c.Timeout_.Stop()
-							c.TimeoutDone_ <- true
-						}
-					}
-				}()
+
+				c.Timeout_ = time.AfterFunc(time.Duration(delay), func() {
+					c.Flush()
+				})
 			}
 			c.TimeoutLock_.Unlock()
 		}
 	}
-
 }
 
 func (c *Context) SetRefreshTimer() {
 	if c.RefreshInterval_ > 0 && c.RefreshTimer_ == nil {
 		var rate = time.Duration(uint64(c.RefreshInterval_ * int64(time.Millisecond)))
-		if rate < 1 {
-			rate = 1
-		}
-		c.RefreshTimer_ = time.NewTicker(rate)
-		c.RefreshDone_ = make(chan bool)
-		go func() {
-			for {
-				select {
-				case <-c.RefreshDone_:
-					return
-				case <-c.RefreshTimer_.C:
-					c.RefreshAsync()
-				}
-			}
-		}()
+
+		c.RefreshTimer_ = time.AfterFunc(rate, func() {
+			c.RefreshTimer_.Reset(rate)
+			c.RefreshAsync()
+		})
 	}
 }
 
