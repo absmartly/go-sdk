@@ -76,17 +76,20 @@ func (c Client) GetContextData() *future.Future {
 func (c Client) Publish(event jsonmodels.PublishEvent) *future.Future {
 	var dataFuture = future.Call(func() (future.Value, error) {
 		var body, er = c.serializer_.Serialize(event)
+		if er != nil {
+			return nil, er
+		}
+
 		var fut = c.httpClient_.Put(c.url_, nil, c.headers_, body)
 		var value, err = fut.Get(context.Background())
-		if err != nil || value.(*resty.Response).StatusCode()/100 != 2 {
-			err = errors.New(value.(*resty.Response).Status())
-			value = nil
+		if err != nil {
+			return nil, err
 		}
-		if er != nil {
-			err = er
-			value = nil
+
+		if value.(*resty.Response).StatusCode()/100 != 2 {
+			return nil, errors.New(value.(*resty.Response).Status())
 		}
-		return value, err
+		return value, nil
 	})
 	return dataFuture
 }
