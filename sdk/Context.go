@@ -517,7 +517,7 @@ func (c *Context) RefreshAsync() *future.Future {
 		return nil
 	}
 
-	if !c.Refreshing_.CompareAndSwap(false, true) {
+	if c.Refreshing_.CompareAndSwap(false, true) {
 		var tempfuture, donefun = future.New()
 		c.RefreshFuture_ = tempfuture
 
