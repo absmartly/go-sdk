@@ -11,6 +11,7 @@ type DefaultHttpClientConfig struct {
 	RetryInterval_            time.Duration
 	ConnectionRequestTimeout_ time.Duration
 	MaxRetries_               int
+	MaxConnectionsPerHost_    int
 	Logger                    resty.Logger
 }
 
@@ -21,6 +22,7 @@ func CreateDefaultHttpClientConfig() DefaultHttpClientConfig {
 		RetryInterval_:            333 * time.Millisecond,
 		ConnectionRequestTimeout_: 1000 * time.Millisecond,
 		MaxRetries_:               5,
+		MaxConnectionsPerHost_:    200,
 		Logger:                    Logger{},
 	}
 	return config
