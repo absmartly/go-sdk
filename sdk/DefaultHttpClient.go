@@ -36,16 +36,17 @@ func (e DefaultHttpClient) DefaultHttpClientConfig(config DefaultHttpClientConfi
 	e.httpClient_.SetTimeout(config.ConnectionRequestTimeout_)
 	e.httpClient_.AddRetryCondition(RetryCondition())
 	e.httpClient_.SetLogger(config.Logger)
-	var tr = &http.Transport{
-		MaxIdleConns: 0,
+	var transport = &http.Transport{
+		MaxIdleConnsPerHost: config.MaxConnectionsPerHost_,
+		MaxIdleConns:        config.MaxConnectionsPerHost_,
 		DialContext: defaultTransportDialContext(&net.Dialer{
 			Timeout:   config.ConnectTimeout_,
 			KeepAlive: config.ConnectionKeepAlive_,
 		}),
 		DisableCompression: true,
-		MaxConnsPerHost:    200,
+		MaxConnsPerHost:    config.MaxConnectionsPerHost_,
 	}
-	e.httpClient_.SetTransport(tr)
+	e.httpClient_.SetTransport(transport)
 	e.httpClient_.SetTLSClientConfig(&tls.Config{})
 }
 
