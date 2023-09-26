@@ -22,7 +22,7 @@ func CreateDefaultHttpClientConfig() DefaultHttpClientConfig {
 		RetryInterval_:            333 * time.Millisecond,
 		ConnectionRequestTimeout_: 1000 * time.Millisecond,
 		MaxRetries_:               5,
-		MaxConnectionsPerHost_:    200,
+		MaxConnectionsPerHost_:    500,
 		Logger:                    Logger{},
 	}
 	return config
