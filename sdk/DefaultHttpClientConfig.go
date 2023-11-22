@@ -1,7 +1,6 @@
 package sdk
 
 import (
-	"github.com/go-resty/resty/v2"
 	"time"
 )
 
@@ -12,7 +11,6 @@ type DefaultHttpClientConfig struct {
 	ConnectionRequestTimeout_ time.Duration
 	MaxRetries_               int
 	MaxConnectionsPerHost_    int
-	Logger                    resty.Logger
 }
 
 func CreateDefaultHttpClientConfig() DefaultHttpClientConfig {
@@ -23,7 +21,6 @@ func CreateDefaultHttpClientConfig() DefaultHttpClientConfig {
 		ConnectionRequestTimeout_: 1000 * time.Millisecond,
 		MaxRetries_:               5,
 		MaxConnectionsPerHost_:    500,
-		Logger:                    Logger{},
 	}
 	return config
 }
