@@ -14,6 +14,11 @@ const (
 	byFullOn assigned = iota
 )
 
+type Assignment interface {
+	Variant() int
+	encode() (json.RawMessage, error)
+}
+
 type assignment struct {
 	id       int
 	variant  int

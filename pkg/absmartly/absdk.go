@@ -83,7 +83,7 @@ func (ab *ABSDK) queueFetch() {
 	}
 }
 
-func (ab *ABSDK) QueueExposure(a *assignment) {
+func (ab *ABSDK) QueueExposure(a Assignment) {
 	msg, err := a.encode()
 	if err != nil {
 		// todo log
@@ -101,7 +101,7 @@ func (ab *ABSDK) QueueExposure(a *assignment) {
 	ab.queueMu.RUnlock()
 }
 
-func (ab *ABSDK) PushExposure(ctx context.Context, a *assignment) error {
+func (ab *ABSDK) PushExposure(ctx context.Context, a Assignment) error {
 	msg, err := a.encode()
 	if err != nil {
 		return err

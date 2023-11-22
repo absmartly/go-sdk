@@ -12,7 +12,7 @@ var ErrExpNotFound = errors.New("experiment not found")
 
 type UnitContext struct {
 	u  Units
-	ab *ABSDK
+	ab SDK
 }
 
 func (uc *UnitContext) GetTreatment(experiment string) (int, error) {
@@ -67,7 +67,7 @@ func (uc *UnitContext) GetAssignment(experiment string) (*assignment, error) {
 	return a, nil
 }
 
-func (uc *UnitContext) QueueExposure(a *assignment) {
+func (uc *UnitContext) QueueExposure(a Assignment) {
 	uc.ab.QueueExposure(a)
 }
 
