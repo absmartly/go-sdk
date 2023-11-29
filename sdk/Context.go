@@ -7,6 +7,8 @@ import (
 	"github.com/absmartly/go-sdk/sdk/internal"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,46 +16,53 @@ import (
 )
 
 type Context struct {
-	PublishDelay_    int64
-	RefreshInterval_ int64
-	EventHandler_    ContextEventHandler
-	EventLogger_     ContextEventLogger
-	DataProvider_    ContextDataProvider
-	VariableParser_  VariableParser
-	AudienceMatcher_ AudienceMatcher
-	Units_           map[string]string
-	Failed_          *atomic.Value
-	Ready_           *atomic.Value
-	DataLock         *sync.RWMutex
-	Data_            jsonmodels.ContextData
-	Index_           map[string]ExperimentVariables
-	IndexVariables_  map[interface{}]interface{}
-	ContextLock_     *sync.RWMutex
-	HashedUnits_     map[interface{}]interface{}
-	Assigners_       map[interface{}]interface{}
-	AssignmentCache  map[string]Assignment
-	EventLock_       *sync.Mutex
-	Exposures_       []jsonmodels.Exposure
-	Achievements_    []jsonmodels.GoalAchievement
-	Attributes_      []interface{}
-	Overrides_       map[interface{}]interface{}
-	Cassignments_    map[interface{}]interface{}
-	PendingCount_    *atomic.Value
-	Closing_         *atomic.Value
-	Closed_          *atomic.Value
-	Refreshing_      *atomic.Value
-	ReadyFuture_     *future.Future
-	ClosingFuture_   *future.Future
-	RefreshFuture_   *future.Future
-	TimeoutLock_     *sync.Mutex
-	Timeout_         *time.Timer
-	RefreshTimer_    *time.Timer
-	Clock_           internal.Clock
+	PublishDelay_        int64
+	RefreshInterval_     int64
+	EventHandler_        ContextEventHandler
+	EventLogger_         ContextEventLogger
+	DataProvider_        ContextDataProvider
+	VariableParser_      VariableParser
+	AudienceMatcher_     AudienceMatcher
+	Units_               map[string]string
+	Failed_              *atomic.Value
+	Ready_               *atomic.Value
+	DataLock             *sync.RWMutex
+	Data_                jsonmodels.ContextData
+	Index_               map[string]ExperimentVariables
+	ContextCustomFields_ map[string]map[string]ContextCustomFieldValue
+	IndexVariables_      map[interface{}]interface{}
+	ContextLock_         *sync.RWMutex
+	HashedUnits_         map[interface{}]interface{}
+	Assigners_           map[interface{}]interface{}
+	AssignmentCache      map[string]Assignment
+	EventLock_           *sync.Mutex
+	Exposures_           []jsonmodels.Exposure
+	Achievements_        []jsonmodels.GoalAchievement
+	Attributes_          []interface{}
+	Overrides_           map[interface{}]interface{}
+	Cassignments_        map[interface{}]interface{}
+	PendingCount_        *atomic.Value
+	Closing_             *atomic.Value
+	Closed_              *atomic.Value
+	Refreshing_          *atomic.Value
+	ReadyFuture_         *future.Future
+	ClosingFuture_       *future.Future
+	RefreshFuture_       *future.Future
+	TimeoutLock_         *sync.Mutex
+	Timeout_             *time.Timer
+	RefreshTimer_        *time.Timer
+	Clock_               internal.Clock
 }
 
 type ExperimentVariables struct {
 	Data      jsonmodels.Experiment
 	Variables []map[string]interface{}
+}
+
+type ContextCustomFieldValue struct {
+	Name  string
+	Type  string
+	Value interface{}
 }
 
 type Assignment struct {
@@ -422,6 +431,82 @@ func (c *Context) GetVariableKeys() (map[string]string, error) {
 	return variableKeys, nil
 }
 
+func removeDuplicateValues(intSlice []string) []string {
+	keys := make(map[string]bool)
+	var list []string
+
+	for _, entry := range intSlice {
+		if _, value := keys[entry]; !value {
+			keys[entry] = true
+			list = append(list, entry)
+		}
+	}
+	return list
+}
+
+func (c *Context) GetCustomFieldValueKeys() ([]string, error) {
+	var err = c.CheckReady(true)
+	if err != nil {
+		return nil, err
+	}
+
+	var keys []string
+
+	c.DataLock.Lock()
+
+	for _, experiment := range c.Data_.Experiments {
+		var customFieldValues = experiment.CustomFieldValues
+		if customFieldValues != nil {
+			for _, customFieldValue := range customFieldValues {
+				keys = append(keys, customFieldValue.Name)
+			}
+		}
+	}
+	c.DataLock.Unlock()
+
+	sort.Strings(keys)
+
+	return removeDuplicateValues(keys), nil
+}
+
+func (c *Context) GetCustomFieldValue(experimentName string, key string) interface{} {
+	var err = c.CheckReady(true)
+	if err != nil {
+		return nil
+	}
+	c.DataLock.Lock()
+	var customFieldValues = c.ContextCustomFields_[experimentName]
+
+	var value interface{} = nil
+	if customFieldValues != nil {
+		field, ok := customFieldValues[key]
+		if ok {
+			value = field.Value
+		}
+	}
+	c.DataLock.Unlock()
+
+	return value
+}
+
+func (c *Context) GetCustomFieldValueType(experimentName string, key string) string {
+	var customFieldValues = c.ContextCustomFields_[experimentName]
+
+	c.DataLock.Lock()
+
+	var fieldType string
+	if customFieldValues != nil {
+		field, ok := customFieldValues[key]
+		if ok {
+			fieldType = field.Type
+		}
+	}
+
+	c.DataLock.Unlock()
+
+	return fieldType
+}
+
 func (c *Context) GetVariableValue(key string, defaultValue interface{}) (interface{}, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
@@ -752,9 +837,11 @@ func (c *Context) CheckReady(expectNotClosed bool) error {
 func (c *Context) SetData(data jsonmodels.ContextData) {
 	var index = map[string]ExperimentVariables{}
 	var indexVariables = map[interface{}]interface{}{}
+	var contextCustomFields = map[string]map[string]ContextCustomFieldValue{}
 
 	for _, experiment := range data.Experiments {
 		var experiemntVariables = ExperimentVariables{}
+		var experimentCustomFields = map[string]ContextCustomFieldValue{}
 		experiemntVariables.Data = experiment
 		experiemntVariables.Variables = make([]map[string]interface{}, 0)
 
@@ -770,12 +857,33 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 			}
 		}
 
+		for _, customFieldValue := range experiment.CustomFieldValues {
+			var value = ContextCustomFieldValue{}
+			value.Type = customFieldValue.Type
+			value.Name = customFieldValue.Name
+			if len(customFieldValue.Value) > 0 {
+				var customValue = customFieldValue.Value
+				if strings.HasPrefix(customFieldValue.Type, "json") {
+					value.Value = c.VariableParser_.Parse(*c, experiment.Name, customFieldValue.Name, customValue)
+				} else if strings.HasPrefix(customFieldValue.Type, "boolean") {
+					value.Value, _ = strconv.ParseBool(customValue)
+				} else if strings.HasPrefix(customFieldValue.Type, "number") {
+					value.Value, _ = strconv.ParseInt(customValue, 10, 64)
+				} else {
+					value.Value = customValue
+				}
+
+				experimentCustomFields[value.Name] = value
+			}
+		}
+		contextCustomFields[experiment.Name] = experimentCustomFields
 		index[experiment.Name] = experiemntVariables
 	}
 
 	c.DataLock.Lock()
 
 	c.Index_ = index
+	c.ContextCustomFields_ = contextCustomFields
 	c.IndexVariables_ = indexVariables
 	c.Data_ = data
 	c.Ready_.Store(true)
