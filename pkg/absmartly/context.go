@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"time"
-
-	"github.com/absmartly/go-sdk/internal/assigner"
 )
 
 var ErrExpNotFound = errors.New("experiment not found")
@@ -50,16 +48,11 @@ func (uc *UnitContext) GetAssignment(experiment string) (*assignment, error) {
 	unitValue, unitFound := uc.u[unitType]
 
 	switch {
-	case exp.FullOnVariant > 0:
-		a.variant = exp.FullOnVariant
+	case exp.Data.FullOnVariant > 0:
+		a.variant = exp.Data.FullOnVariant
 		a.by = byFullOn
 	case unitFound:
-		aner := assigner.Assigner{
-			SeedHi: uint32(exp.SeedHi),
-			SeedLo: uint32(exp.SeedLo),
-			Split:  exp.Split,
-		}
-		a.variant, a.unitHash = aner.Assign(unitValue)
+		a.variant, a.unitHash = exp.Assigner.Assign(unitValue)
 		a.unitType = unitType
 		a.by = byNormal
 	}

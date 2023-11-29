@@ -10,8 +10,19 @@ import (
 )
 
 type Assigner struct {
-	SeedHi, SeedLo uint32
-	Split          []float64
+	seedHi uint32
+	seedLo uint32
+	split  []float64
+}
+
+func New(seedHi, seedLo uint32, split []float64) *Assigner {
+	a := &Assigner{
+		seedHi: seedHi,
+		seedLo: seedLo,
+		split:  split,
+	}
+
+	return a
 }
 
 func (a *Assigner) Assign(unit string) (int, string) {
@@ -19,21 +30,21 @@ func (a *Assigner) Assign(unit string) (int, string) {
 	prob := a.probability(hu)
 	var sum float64
 
-	for i := 0; i < len(a.Split); i++ {
-		sum += a.Split[i]
+	for i := 0; i < len(a.split); i++ {
+		sum += a.split[i]
 		if prob < sum {
 			return i, hu
 		}
 	}
 
-	return len(a.Split) - 1, hu
+	return len(a.split) - 1, hu
 }
 
 func (a *Assigner) probability(unit string) float64 {
 	uh := a.hashMur([]byte(unit), 0)
 	var buff [12]byte
-	binary.LittleEndian.PutUint32(buff[:], a.SeedLo)
-	binary.LittleEndian.PutUint32(buff[4:], a.SeedHi)
+	binary.LittleEndian.PutUint32(buff[:], a.seedLo)
+	binary.LittleEndian.PutUint32(buff[4:], a.seedHi)
 	binary.LittleEndian.PutUint32(buff[8:], uh)
 	h := a.hashMur(buff[:], 0)
 

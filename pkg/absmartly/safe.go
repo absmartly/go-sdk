@@ -3,7 +3,8 @@ package absmartly
 import (
 	"context"
 
-	"github.com/absmartly/go-sdk/internal/model"
+	"github.com/absmartly/go-sdk/internal/experiment"
+	"github.com/absmartly/go-sdk/pkg/absmartly/field"
 )
 
 type SDK interface {
@@ -13,7 +14,8 @@ type SDK interface {
 	PushExposure(ctx context.Context, a Assignment) error
 	Refresh(ctx context.Context) error
 	UnitContext(u Units) *UnitContext
-	getExperiment(name string) (model.Experiment, bool)
+	getExperiment(name string) (experiment.Experiment, bool)
+	CustomFieldValue(experiment string, key string) (field.Field, bool)
 }
 
 type NilSDK struct{}
@@ -35,8 +37,12 @@ func (n *NilSDK) UnitContext(u Units) *UnitContext {
 	}
 }
 
-func (n *NilSDK) getExperiment(_ string) (model.Experiment, bool) {
-	return model.Experiment{}, false
+func (n *NilSDK) getExperiment(_ string) (experiment.Experiment, bool) {
+	return experiment.Experiment{}, false
+}
+
+func (n *NilSDK) CustomFieldValue(_ string, _ string) (field.Field, bool) {
+	return field.Empty(), false
 }
 
 func Safe(sdk *ABSDK, err error) SDK {

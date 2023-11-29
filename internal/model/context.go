@@ -20,6 +20,7 @@ type Experiment struct {
 	Variants       []ExperimentVariant     `json:"variants"`
 	AudienceStrict bool                    `json:"audienceStrict"`
 	Audience       string                  `json:"audience"`
+	CustomFields   []CustomFieldValue      `json:"customFieldValues"`
 }
 
 type ExperimentApplication struct {
@@ -29,4 +30,10 @@ type ExperimentApplication struct {
 type ExperimentVariant struct {
 	Name   string `json:"name"`
 	Config string `json:"config"`
+}
+
+type CustomFieldValue struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+	Type  string `json:"type"`
 }

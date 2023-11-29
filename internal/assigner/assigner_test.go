@@ -146,11 +146,7 @@ func TestAssigner(t *testing.T) {
 	}
 	for unit, sub := range cases {
 		for i, c := range sub {
-			a := &Assigner{
-				SeedHi: c.seedHi,
-				SeedLo: c.seedLo,
-				Split:  c.split,
-			}
+			a := New(c.seedHi, c.seedLo, c.split)
 			variant, _ := a.Assign(unit)
 			assert.Equal(t, c.variant, variant, "%s-%d", unit, i)
 		}

@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/absmartly/go-sdk/internal/api"
+	"github.com/absmartly/go-sdk/internal/experiment"
 	"github.com/absmartly/go-sdk/internal/model"
+	"github.com/absmartly/go-sdk/pkg/absmartly/field"
 )
 
 type dataLoader interface {
@@ -22,7 +24,7 @@ type eventPusher interface {
 
 type ABSDK struct {
 	loader dataLoader
-	// data holds last successful loaded context info with type map[string]model.Experiment
+	// data holds last successful loaded context info with type map[string]experiment.Experiment
 	data atomic.Value
 
 	pusher eventPusher
@@ -114,25 +116,33 @@ func (ab *ABSDK) pushExposureMsg(ctx context.Context, msg json.RawMessage) error
 }
 
 func (ab *ABSDK) Refresh(ctx context.Context) error {
-	// log.Println("Refresh")
-	// debug.PrintStack()
 	data, err := ab.loader.GetContext(ctx)
 	if err != nil {
 		return err
 	}
-	dataMap := make(map[string]model.Experiment, len(data.Experiments))
+	dataMap := make(map[string]experiment.Experiment, len(data.Experiments))
 	for _, exp := range data.Experiments {
-		dataMap[exp.Name] = exp
+		dataMap[exp.Name] = experiment.New(exp)
 	}
 	ab.data.Store(dataMap)
 
 	return nil
 }
 
-func (ab *ABSDK) getExperiment(name string) (model.Experiment, bool) {
-	dataMap := ab.data.Load().(map[string]model.Experiment)
+func (ab *ABSDK) getExperiment(name string) (experiment.Experiment, bool) {
+	dataMap := ab.data.Load().(map[string]experiment.Experiment)
 	exp, found := dataMap[name]
 	return exp, found
+}
+
+func (ab *ABSDK) CustomFieldValue(experiment string, key string) (field.Field, bool) {
+	exp, found := ab.getExperiment(experiment)
+	if !found {
+		return field.Empty(), false
+	}
+	f, found := exp.CustomFields[key]
+
+	return f, found
 }
 
 func (ab *ABSDK) UnitContext(u Units) *UnitContext {
