@@ -2,6 +2,7 @@ package sdk
 
 import (
 	context2 "context"
+	"encoding/json"
 	"errors"
 	"github.com/absmartly/go-sdk/sdk/future"
 	"github.com/absmartly/go-sdk/sdk/internal"
@@ -770,6 +771,58 @@ func TestGetVariableKeys(t *testing.T) {
 	assertAny(variableExperiments, res, t)
 
 	assertAny(int32(0), context.GetPendingCount(), t)
+}
+
+func TestGetCustomFieldValueKeys(t *testing.T) {
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	var context = CreateTestContext(config, dataFutureReady)
+	assertAny(true, context.IsReady(), t)
+	assertAny(false, context.IsFailed(), t)
+
+	var res, _ = context.GetCustomFieldValueKeys()
+	assertAny([]string{"country", "languages", "overrides"}, res, t)
+}
+
+func TestGetCustomFieldValue(t *testing.T) {
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	var context = CreateTestContext(config, dataFutureReady)
+	assertAny(true, context.IsReady(), t)
+	assertAny(false, context.IsFailed(), t)
+
+	assertAny(nil, context.GetCustomFieldValue("not_found", "not_found"), t)
+	assertAny(nil, context.GetCustomFieldValue("exp_test_ab", "not_found"), t)
+
+	assertAny("US,PT,ES,DE,FR", context.GetCustomFieldValue("exp_test_ab", "country"), t)
+	assertAny("string", context.GetCustomFieldValueType("exp_test_ab", "country"), t)
+
+	var js = "{\"123\":1,\"456\":0}"
+	overrides, _ := json.Marshal(context.GetCustomFieldValue("exp_test_ab", "overrides"))
+	var str = string(overrides)
+	assertAny(js, str, t)
+	assertAny("json", context.GetCustomFieldValueType("exp_test_ab", "overrides"), t)
+
+	assertAny(nil, context.GetCustomFieldValue("exp_test_ab", "languages"), t)
+	assertAny(nil, context.GetCustomFieldValue("exp_test_ab", "languages"), t)
+
+	assertAny(nil, context.GetCustomFieldValue("exp_test_abc", "overrides"), t)
+	assertAny(nil, context.GetCustomFieldValue("exp_test_abc", "overrides"), t)
+
+	assertAny("en-US,en-GB,pt-PT,pt-BR,es-ES,es-MX", context.GetCustomFieldValue("exp_test_abc", "languages"), t)
+	assertAny("string", context.GetCustomFieldValueType("exp_test_abc", "languages"), t)
+
+	assertAny(nil, context.GetCustomFieldValue("exp_test_no_custom_fields", "country"), t)
+	assertAny(nil, context.GetCustomFieldValue("exp_test_no_custom_fields", "country"), t)
+
+	assertAny(nil, context.GetCustomFieldValue("exp_test_no_custom_fields", "overrides"), t)
+	assertAny(nil, context.GetCustomFieldValue("exp_test_no_custom_fields", "overrides"), t)
+
+	assertAny(nil, context.GetCustomFieldValue("exp_test_no_custom_fields", "languages"), t)
+	assertAny(nil, context.GetCustomFieldValue("exp_test_no_custom_fields", "languages"), t)
+
 }
 
 func TestPeekTreatmentOverrideVariant(t *testing.T) {
