@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/absmartly/go-sdk/internal/experiment"
-	"github.com/absmartly/go-sdk/pkg/absmartly/field"
+	"github.com/absmartly/go-sdk/pkg/absmartly/types"
 )
 
 type SDK interface {
@@ -14,8 +14,9 @@ type SDK interface {
 	PushExposure(ctx context.Context, a Assignment) error
 	Refresh(ctx context.Context) error
 	UnitContext(u Units) *UnitContext
-	getExperiment(name string) (experiment.Experiment, bool)
-	CustomFieldValue(experiment string, key string) (field.Field, bool)
+	experimentNameByVariable(variable string) (string, bool)
+	experiment(name string) (experiment.Experiment, bool)
+	CustomFieldValue(experiment string, key string) (types.Field, bool)
 }
 
 type NilSDK struct{}
@@ -37,12 +38,16 @@ func (n *NilSDK) UnitContext(u Units) *UnitContext {
 	}
 }
 
-func (n *NilSDK) getExperiment(_ string) (experiment.Experiment, bool) {
+func (n *NilSDK) experimentNameByVariable(_ string) (string, bool) {
+	return "", false
+}
+
+func (n *NilSDK) experiment(_ string) (experiment.Experiment, bool) {
 	return experiment.Experiment{}, false
 }
 
-func (n *NilSDK) CustomFieldValue(_ string, _ string) (field.Field, bool) {
-	return field.Empty(), false
+func (n *NilSDK) CustomFieldValue(_ string, _ string) (types.Field, bool) {
+	return types.EmptyField(), false
 }
 
 func Safe(sdk *ABSDK, err error) SDK {

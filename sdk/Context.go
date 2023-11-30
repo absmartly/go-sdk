@@ -118,12 +118,13 @@ func (c *Context) GetVariableKeys() (map[string]string, error) {
 }
 
 func (c *Context) GetVariableValue(key string, defaultValue interface{}) (interface{}, error) {
-	panic("not yet implemented in v2 SDK")
-
+	v, err := c.uc.GetVariable(key, defaultValue)
+	return v.Interface(), err
 }
 
 func (c *Context) PeekVariableValue(key string, defaultValue interface{}) (interface{}, error) {
-	panic("not yet implemented in v2 SDK")
+	v, _, err := c.uc.PeekVariableValue(key, defaultValue)
+	return v.Interface(), err
 }
 
 func (c *Context) Track(goalName string, properties map[string]interface{}) error {

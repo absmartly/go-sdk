@@ -1,4 +1,4 @@
-package field
+package types
 
 import (
 	"errors"
@@ -26,11 +26,11 @@ type Field struct {
 	t     fType
 }
 
-func Empty() Field {
+func EmptyField() Field {
 	return Field{t: fTypeZero}
 }
 
-func New(value string, t string) (Field, error) {
+func NewField(value string, t string) (Field, error) {
 	f := Field{}
 	switch t {
 	case "text":

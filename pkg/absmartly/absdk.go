@@ -10,7 +10,7 @@ import (
 	"github.com/absmartly/go-sdk/internal/api"
 	"github.com/absmartly/go-sdk/internal/experiment"
 	"github.com/absmartly/go-sdk/internal/model"
-	"github.com/absmartly/go-sdk/pkg/absmartly/field"
+	"github.com/absmartly/go-sdk/pkg/absmartly/types"
 )
 
 type dataLoader interface {
@@ -26,6 +26,8 @@ type ABSDK struct {
 	loader dataLoader
 	// data holds last successful loaded context info with type map[string]experiment.Experiment
 	data atomic.Value
+	// varIndex holds index of variable name to experiment name with type map[string]string
+	varIndex atomic.Value
 
 	pusher eventPusher
 
@@ -121,24 +123,41 @@ func (ab *ABSDK) Refresh(ctx context.Context) error {
 		return err
 	}
 	dataMap := make(map[string]experiment.Experiment, len(data.Experiments))
+	varIndex := make(map[string]string)
 	for _, exp := range data.Experiments {
-		dataMap[exp.Name] = experiment.New(exp)
+		e := experiment.New(exp)
+		dataMap[exp.Name] = e
+		for _, vars := range e.Variables {
+			for key := range vars {
+				if _, ok := varIndex[key]; ok {
+					// todo log overwrite var index
+				}
+				varIndex[key] = exp.Name
+			}
+		}
 	}
+	ab.varIndex.Store(varIndex)
 	ab.data.Store(dataMap)
 
 	return nil
 }
 
-func (ab *ABSDK) getExperiment(name string) (experiment.Experiment, bool) {
+func (ab *ABSDK) experimentNameByVariable(variable string) (string, bool) {
+	varIndex := ab.varIndex.Load().(map[string]string)
+	name, ok := varIndex[variable]
+	return name, ok
+}
+
+func (ab *ABSDK) experiment(name string) (experiment.Experiment, bool) {
 	dataMap := ab.data.Load().(map[string]experiment.Experiment)
 	exp, found := dataMap[name]
 	return exp, found
 }
 
-func (ab *ABSDK) CustomFieldValue(experiment string, key string) (field.Field, bool) {
-	exp, found := ab.getExperiment(experiment)
+func (ab *ABSDK) CustomFieldValue(experiment string, key string) (types.Field, bool) {
+	exp, found := ab.experiment(experiment)
 	if !found {
-		return field.Empty(), false
+		return types.EmptyField(), false
 	}
 	f, found := exp.CustomFields[key]
 

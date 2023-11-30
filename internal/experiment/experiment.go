@@ -1,18 +1,21 @@
 package experiment
 
 import (
+	"encoding/json"
+
 	"github.com/absmartly/go-sdk/internal/assigner"
 	"github.com/absmartly/go-sdk/internal/model"
-	"github.com/absmartly/go-sdk/pkg/absmartly/field"
+	"github.com/absmartly/go-sdk/pkg/absmartly/types"
 )
 
 type Experiment struct {
-	Data model.Experiment // todo transform all required data to own fields
+	Data model.Experiment // todo  temporary field, transform all required data to own fields
 
 	Id       int
 	UnitType string
 
-	CustomFields map[string]field.Field
+	Variables    []map[string]types.Variable
+	CustomFields map[string]types.Field
 	Assigner     *assigner.Assigner
 }
 
@@ -21,10 +24,17 @@ func New(data model.Experiment) Experiment {
 		Data:         data,
 		Id:           data.Id,
 		UnitType:     data.UnitType,
-		CustomFields: make(map[string]field.Field, len(data.CustomFields)),
+		Variables:    make([]map[string]types.Variable, len(data.Variants)),
+		CustomFields: make(map[string]types.Field, len(data.CustomFields)),
+	}
+	for i, variant := range data.Variants {
+		err := json.Unmarshal([]byte(variant.Config), &exp.Variables[i])
+		if err != nil {
+			// todo log
+		}
 	}
 	for _, cf := range data.CustomFields {
-		f, err := field.New(cf.Value, cf.Type)
+		f, err := types.NewField(cf.Value, cf.Type)
 		if err != nil {
 			// todo log
 		}
