@@ -149,22 +149,28 @@ The `SetUnit()` and `SetUnits()` methods can be called before the context is rea
     }
 ```
 
-## Basic Usage
+## Usage
+
+#### Initialize an SDK on application start
+```go
+    sdk, _ := absmartly.New(
+		context.Background(),
+		absmartly.ConfigFromEnvMust())
+```
+
+#### Get an UnitContext on new request processing
+```go
+    uc := sdk.UnitContext(absmartly.Units{"user_id": "123"})
+```
 
 #### Selecting a treatment
 ```go
-    var res, _ = context.GetTreament("exp_test_experiment")
-    if res == 0 {
+    treatment, _ := uc.GetTreatment("experiment_name")
+    if treatment == 0 {
             // user is in control group (variant 0)
     } else {
             // user is in treatment group
     }
-```
-
-### Treatment Variables
-
-```go
-     var res, err = context.GetVariableValue(key, 17)
 ```
 
 #### Peek at treatment variants
@@ -172,12 +178,22 @@ Although generally not recommended, it is sometimes necessary to peek at a treat
 The A/B Smartly SDK provides a `PeekTreatment()` method for that.
 
 ```go
-    var res, _ = context.PeekTreatment("exp_test_experiment")
-    if res == 0 {
+    treatment, exposure, _ := uc.PeekTreatment("experiment_name")
+    if treatment == 0 {
         // user is in control group (variant 0)
     } else {
         // user is in treatment group
     }
+
+    // It is possible to trigger an exposure manually
+    // on a condition like user seen experimental feature.
+    uc.PushExposure(context.Background(), exposure)
+```
+
+### Treatment Variables
+
+```go
+     var res, err = context.GetVariableValue(key, 17)
 ```
 
 ##### Peeking at variables

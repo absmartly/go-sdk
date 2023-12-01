@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"reflect"
 	"testing"
 )
 
@@ -73,4 +74,10 @@ func TestAudienceMatcher_EvaluateNReturnsBoolean(t *testing.T) {
 	res, err = matcher.Evaluate("{\"filter\":[{\"not\":{\"var\":\"returning\"}}]}", map[string]interface{}{"returning": false})
 	assertAny(true, res.Get(), t)
 	assertAny(nil, err, t)
+}
+
+func assertAny(want interface{}, got interface{}, t *testing.T) {
+	if !reflect.DeepEqual(want, got) {
+		t.Errorf("got %q, wanted %q", got, want)
+	}
 }

@@ -1,59 +1,51 @@
 package sdk
 
 import (
-	"github.com/absmartly/go-sdk/sdk/future"
-	"github.com/absmartly/go-sdk/sdk/internal"
+	"context"
+	"time"
+
+	"github.com/absmartly/go-sdk/pkg/absmartly"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
 
 type ABSmartly struct {
-	ContextDataProvider_  ContextDataProvider
-	ContextEventHandler_  ContextEventHandler
-	ContextEventLogger_   ContextEventLogger
-	VariableParser_       VariableParser
-	AudienceDeserializer_ AudienceDeserializer
-	Client_               ClientI
+	sdk absmartly.SDK
 }
 
+// Create the SDK
+// Deprecated: switch to v2 SDK absmartly.Create
 func Create(config ABSmartlyConfig) ABSmartly {
-	var abs = ABSmartly(config)
-	if abs.ContextDataProvider_ == nil {
-		abs.ContextDataProvider_ = DefaultContextDataProvider{client_: abs.Client_}
+	cfgOld := config.Client_.GetConfig()
+	cfg := absmartly.Config{
+		Endpoint:    cfgOld.Endpoint_,
+		ApiKey:      cfgOld.ApiKey_,
+		Application: cfgOld.Application_,
+		Environment: cfgOld.Environment_,
+		// These parameters are controlled individually by Context in Old SDK
+		// Set to some defaults
+		BatchSize:       100,
+		BatchInterval:   1 * time.Second,
+		RefreshInterval: 30 * time.Second,
 	}
-
-	if abs.ContextEventHandler_ == nil {
-		abs.ContextEventHandler_ = DefaultContextEventHandler{client_: abs.Client_}
-	}
-
-	if abs.VariableParser_ == nil {
-		abs.VariableParser_ = DefaultVariableParser{}
-	}
-
-	if abs.AudienceDeserializer_ == nil {
-		abs.AudienceDeserializer_ = DefaultAudienceDeserializer{}
-	}
-
-	if abs.AudienceDeserializer_ == nil {
-		abs.AudienceDeserializer_ = DefaultAudienceDeserializer{}
+	sdk := absmartly.Safe(absmartly.New(context.Background(), cfg))
+	abs := ABSmartly{
+		sdk: sdk,
 	}
 
 	return abs
 }
 
 // CreateContext
+// Deprecated: switch to v2 SDK absmartly.Create
 func (abs ABSmartly) CreateContext(config ContextConfig) *Context {
-	return CreateContext(internal.SystemClockUTC{}, config, abs.ContextDataProvider_.GetContextData(), abs.ContextDataProvider_,
-		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_})
+	uc := abs.sdk.UnitContext(config.Units_)
+	return &Context{
+		uc: uc,
+	}
 }
 
 // CreateContextWith
+// Deprecated: switch to v2 SDK absmartly.Create, file reading is not yet implemented in v2 SDK.
 func (abs ABSmartly) CreateContextWith(config ContextConfig, data jsonmodels.ContextData) *Context {
-	var ft, done = future.New()
-	done(data, nil)
-	return CreateContext(internal.SystemClockUTC{}, config, ft, abs.ContextDataProvider_,
-		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_})
-}
-
-func (abs ABSmartly) GetContextData() *future.Future {
-	return abs.ContextDataProvider_.GetContextData()
+	return abs.CreateContext(config)
 }
