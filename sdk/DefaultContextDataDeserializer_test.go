@@ -30,6 +30,18 @@ func TestDeserialize(t *testing.T) {
 			}},
 		AudienceStrict: false,
 		Audience:       "",
+		CustomFieldValues: []jsonmodels.CustomFieldValue{
+			{
+				Name:  "country",
+				Value: "US,PT,ES,DE,FR",
+				Type:  "string",
+			},
+			{
+				Name:  "overrides",
+				Value: "{\"123\":1,\"456\":0}",
+				Type:  "json",
+			},
+		},
 	}
 
 	var experiment_2 = jsonmodels.Experiment{
@@ -59,6 +71,18 @@ func TestDeserialize(t *testing.T) {
 			}},
 		AudienceStrict: false,
 		Audience:       "",
+		CustomFieldValues: []jsonmodels.CustomFieldValue{
+			{
+				Name:  "country",
+				Value: "US,PT,ES,DE,FR",
+				Type:  "string",
+			},
+			{
+				Name:  "languages",
+				Value: "en-US,en-GB,pt-PT,pt-BR,es-ES,es-MX",
+				Type:  "string",
+			},
+		},
 	}
 
 	var experiment_3 = jsonmodels.Experiment{
@@ -86,8 +110,9 @@ func TestDeserialize(t *testing.T) {
 				Name:   "C",
 				Config: "{\"card.width\":\"75%\"}",
 			}},
-		AudienceStrict: false,
-		Audience:       "{}",
+		AudienceStrict:    false,
+		Audience:          "{}",
+		CustomFieldValues: nil,
 	}
 
 	var experiment_4 = jsonmodels.Experiment{
