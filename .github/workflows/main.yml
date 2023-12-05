@@ -1,0 +1,14 @@
+name: Go SDK
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+
+      - name: Run Tests
+        run:
+          ./test.sh
