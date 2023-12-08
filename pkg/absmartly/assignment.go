@@ -27,6 +27,7 @@ type assignment struct {
 	unitHash string
 	ts       time.Time
 	by       assigned
+	attr     []model.Attribute
 }
 
 func (a *assignment) Variant() int {
@@ -49,7 +50,9 @@ func (a *assignment) encode() (json.RawMessage, error) {
 				ExposedAt: a.ts.UnixMilli(),
 			},
 		},
+		Attributes: a.attr,
 	}
+	// todo it is possible to speed up encode with manual constructing of json []byte
 	var msg json.RawMessage
 	msg, err := json.Marshal(event)
 	if err != nil {

@@ -3,8 +3,10 @@ package absmartly
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
+	"github.com/absmartly/go-sdk/internal/model"
 	"github.com/absmartly/go-sdk/pkg/absmartly/types"
 )
 
@@ -14,6 +16,35 @@ var ErrVarNotFound = errors.New("variable not found")
 type UnitContext struct {
 	u  Units
 	ab SDK
+
+	attributes   []model.Attribute
+	attributesMu sync.RWMutex
+}
+
+func (uc *UnitContext) SetAttribute(key string, value interface{}) {
+	a := model.Attribute{
+		Name:  key,
+		Value: value,
+		SetAt: time.Now().UnixMilli(),
+	}
+	uc.attributesMu.Lock()
+	uc.attributes = append(uc.attributes, a)
+	uc.attributesMu.Unlock()
+}
+
+func (uc *UnitContext) SetAttributes(kv map[string]interface{}) {
+	ts := time.Now().UnixMilli()
+	a := make([]model.Attribute, 0, len(kv))
+	for key, value := range kv {
+		a = append(a, model.Attribute{
+			Name:  key,
+			Value: value,
+			SetAt: ts,
+		})
+	}
+	uc.attributesMu.Lock()
+	uc.attributes = append(uc.attributes, a...)
+	uc.attributesMu.Unlock()
 }
 
 func (uc *UnitContext) GetTreatment(experiment string) (int, error) {
@@ -76,6 +107,9 @@ func (uc *UnitContext) GetAssignment(experiment string) (*assignment, error) {
 		name: experiment,
 		ts:   time.Now(),
 	}
+	uc.attributesMu.RLock()
+	copy(a.attr, uc.attributes)
+	uc.attributesMu.RUnlock()
 
 	unitType := exp.UnitType
 	unitValue, unitFound := uc.u[unitType]

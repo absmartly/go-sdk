@@ -92,11 +92,13 @@ func (c *Context) SetUnits(units map[string]string) error {
 }
 
 func (c *Context) SetAttribute(name string, value interface{}) error {
-	panic("not yet implemented in v2 SDK")
+	c.uc.SetAttribute(name, value)
+	return nil
 }
 
 func (c *Context) SetAttributes(attributes map[string]interface{}) error {
-	panic("not yet implemented in v2 SDK")
+	c.uc.SetAttributes(attributes)
+	return nil
 }
 
 func (c *Context) GetTreatment(experimentName string) (int, error) {
