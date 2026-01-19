@@ -52,6 +52,7 @@ type Context struct {
 	Timeout_             *time.Timer
 	RefreshTimer_        *time.Timer
 	Clock_               internal.Clock
+	AttrsSeq_            int32
 }
 
 type ExperimentVariables struct {
@@ -81,6 +82,7 @@ type Assignment struct {
 	AudienceMismatch bool
 	Variables        map[string]interface{}
 	Exposed          *atomic.Value
+	AttrsSeq         int32
 }
 
 func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *future.Future, dataProvider ContextDataProvider,
@@ -362,6 +364,7 @@ func (c *Context) SetAttribute(name string, value interface{}) error {
 	}
 
 	c.Attributes_ = AddRW(c.ContextLock_, c.Attributes_, jsonmodels.Attribute{Name: name, Value: value, SetAt: c.Clock_.Millis()}).([]interface{})
+	atomic.AddInt32(&c.AttrsSeq_, 1)
 	return nil
 }
 
@@ -514,7 +517,7 @@ func (c *Context) GetVariableValue(key string, defaultValue interface{}) (interf
 	}
 
 	var assignment, errres = c.GetVariableAssignment(key)
-	if errres == nil {
+	if errres == nil && assignment.Variables != nil {
 		if !assignment.Exposed.Load().(bool) {
 			c.QueueExposure(assignment)
 		}
@@ -523,7 +526,6 @@ func (c *Context) GetVariableValue(key string, defaultValue interface{}) (interf
 		if exist {
 			return value, nil
 		}
-
 	}
 	return defaultValue, nil
 }
@@ -704,7 +706,8 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 				return &assignment
 			}
 		} else if !cfound || custom.(int) == assignment.Variant {
-			if c.ExperimentMatches(experiment.Data, assignment) {
+			if c.ExperimentMatches(experiment.Data, assignment) && c.AudienceMatches(experiment.Data, &assignment) {
+				c.AssignmentCache[experimentName] = assignment
 				c.ContextLock_.RUnlock()
 				return &assignment
 			}
@@ -784,10 +787,11 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 			assignment.Iteration = experiment.Data.Iteration
 			assignment.TrafficSplit = experiment.Data.TrafficSplit
 			assignment.FullOnVariant = experiment.Data.FullOnVariant
+			assignment.AttrsSeq = atomic.LoadInt32(&c.AttrsSeq_)
 		}
 	}
 
-	if efound && (assignment.Variant < len(experiment.Data.Variants)) {
+	if efound && assignment.Variant >= 0 && (assignment.Variant < len(experiment.Data.Variants)) {
 		assignment.Variables = experiment.Variables[assignment.Variant]
 	}
 
@@ -814,6 +818,30 @@ func (c *Context) ExperimentMatches(experiment jsonmodels.Experiment, assignment
 		experiment.Iteration == assignment.Iteration &&
 		experiment.FullOnVariant == assignment.FullOnVariant &&
 		reflect.DeepEqual(experiment.TrafficSplit, assignment.TrafficSplit)
+}
+
+func (c *Context) AudienceMatches(experiment jsonmodels.Experiment, assignment *Assignment) bool {
+	if len(experiment.Audience) > 0 {
+		if atomic.LoadInt32(&c.AttrsSeq_) > assignment.AttrsSeq {
+			var attrs = map[string]interface{}{}
+			for _, v := range c.Attributes_ {
+				attrs[v.(jsonmodels.Attribute).Name] = v.(jsonmodels.Attribute).Value
+			}
+
+			var match, err = c.AudienceMatcher_.Evaluate(experiment.Audience, attrs)
+			var newAudienceMismatch = false
+			if err == nil {
+				newAudienceMismatch = !match.Get()
+			}
+
+			if newAudienceMismatch != assignment.AudienceMismatch {
+				return false
+			}
+
+			assignment.AttrsSeq = atomic.LoadInt32(&c.AttrsSeq_)
+		}
+	}
+	return true
 }
 
 func (c *Context) CheckNotClosed() error {
