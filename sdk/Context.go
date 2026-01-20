@@ -837,8 +837,6 @@ func (c *Context) AudienceMatches(experiment jsonmodels.Experiment, assignment *
 			if newAudienceMismatch != assignment.AudienceMismatch {
 				return false
 			}
-
-			assignment.AttrsSeq = atomic.LoadInt32(&c.AttrsSeq_)
 		}
 	}
 	return true
