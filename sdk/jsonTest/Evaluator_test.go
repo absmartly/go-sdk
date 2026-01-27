@@ -489,6 +489,207 @@ func TestEvaluateConsidersListAsAndCombinator(t *testing.T) {
 	assert(false, eval.Evaluate(reflect.ValueOf([]interface{}{map[string]interface{}{"value": true}, map[string]interface{}{"value": false}})), t)
 }
 
+func TestStringConvertSpecialChars(t *testing.T) {
+	var evaluator = eval.Evaluator{}
+
+	result, err := evaluator.StringConvert(reflect.ValueOf("\u4e2d\u6587"))
+	assert(nil, err, t)
+	assert("\u4e2d\u6587", result, t)
+
+	result, err = evaluator.StringConvert(reflect.ValueOf("\u00e9\u00e0\u00fc"))
+	assert(nil, err, t)
+	assert("\u00e9\u00e0\u00fc", result, t)
+
+	result, err = evaluator.StringConvert(reflect.ValueOf("\u0048\u0065\u006c\u006c\u006f"))
+	assert(nil, err, t)
+	assert("Hello", result, t)
+
+	result, err = evaluator.StringConvert(reflect.ValueOf("\u00a9 \u00ae \u2122"))
+	assert(nil, err, t)
+	assert("\u00a9 \u00ae \u2122", result, t)
+
+	result, err = evaluator.StringConvert(reflect.ValueOf("\U0001F600"))
+	assert(nil, err, t)
+	assert("\U0001F600", result, t)
+
+	result, err = evaluator.StringConvert(reflect.ValueOf("line1\nline2\ttab"))
+	assert(nil, err, t)
+	assert("line1\nline2\ttab", result, t)
+
+	result, err = evaluator.StringConvert(reflect.ValueOf("quote\"backslash\\end"))
+	assert(nil, err, t)
+	assert("quote\"backslash\\end", result, t)
+}
+
+func TestNumberConvertFloat64Edge(t *testing.T) {
+	var evaluator = eval.Evaluator{}
+
+	result, err := evaluator.NumberConvert(reflect.ValueOf(math.MaxFloat64))
+	assert(nil, err, t)
+	assert(math.MaxFloat64, result, t)
+
+	result, err = evaluator.NumberConvert(reflect.ValueOf(-math.MaxFloat64))
+	assert(nil, err, t)
+	assert(-math.MaxFloat64, result, t)
+
+	result, err = evaluator.NumberConvert(reflect.ValueOf(math.SmallestNonzeroFloat64))
+	assert(nil, err, t)
+	assert(math.SmallestNonzeroFloat64, result, t)
+
+	result, err = evaluator.NumberConvert(reflect.ValueOf(0.1 + 0.2))
+	assert(nil, err, t)
+	if result < 0.29 || result > 0.31 {
+		t.Errorf("Expected value close to 0.3, got %v", result)
+	}
+
+	result, err = evaluator.NumberConvert(reflect.ValueOf(1e-10))
+	assert(nil, err, t)
+	assert(1e-10, result, t)
+
+	result, err = evaluator.NumberConvert(reflect.ValueOf(1e10))
+	assert(nil, err, t)
+	assert(1e10, result, t)
+
+	result, err = evaluator.NumberConvert(reflect.ValueOf(-0.0))
+	assert(nil, err, t)
+	assert(0.0, result, t)
+
+	result, err = evaluator.NumberConvert(reflect.ValueOf("1e5"))
+	assert(nil, err, t)
+	assert(100000.0, result, t)
+
+	result, err = evaluator.NumberConvert(reflect.ValueOf("1.5e-3"))
+	assert(nil, err, t)
+	assert(0.0015, result, t)
+}
+
+func TestBooleanConvertEdgeCases(t *testing.T) {
+	var evaluator = eval.Evaluator{}
+
+	assert(true, evaluator.BooleanConvert(reflect.ValueOf(map[interface{}]interface{}{})), t)
+	assert(true, evaluator.BooleanConvert(reflect.ValueOf(map[string]int{})), t)
+	assert(true, evaluator.BooleanConvert(reflect.ValueOf(map[string]interface{}{"key": "value"})), t)
+
+	assert(true, evaluator.BooleanConvert(reflect.ValueOf([]interface{}{})), t)
+	assert(true, evaluator.BooleanConvert(reflect.ValueOf([]int{})), t)
+	assert(true, evaluator.BooleanConvert(reflect.ValueOf([]string{"a", "b"})), t)
+
+	assert(true, evaluator.BooleanConvert(reflect.ValueOf(" ")), t)
+	assert(true, evaluator.BooleanConvert(reflect.ValueOf("\t")), t)
+	assert(true, evaluator.BooleanConvert(reflect.ValueOf("\n")), t)
+
+	assert(true, evaluator.BooleanConvert(reflect.ValueOf("FALSE")), t)
+	assert(true, evaluator.BooleanConvert(reflect.ValueOf("False")), t)
+
+	assert(true, evaluator.BooleanConvert(reflect.ValueOf(-1)), t)
+	assert(true, evaluator.BooleanConvert(reflect.ValueOf(0.0001)), t)
+	assert(true, evaluator.BooleanConvert(reflect.ValueOf(-0.0001)), t)
+
+	assert(false, evaluator.BooleanConvert(reflect.ValueOf(0.0)), t)
+	assert(false, evaluator.BooleanConvert(reflect.ValueOf(-0.0)), t)
+}
+
+func TestExtractVarDeepNesting(t *testing.T) {
+	deeplyNested := map[string]interface{}{
+		"level1": map[string]interface{}{
+			"level2": map[string]interface{}{
+				"level3": map[string]interface{}{
+					"level4": map[string]interface{}{
+						"level5": map[string]interface{}{
+							"level6": map[string]interface{}{
+								"value": "deep_value",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	var evaluator = eval.Evaluator{
+		Operators: map[string]eval.Operator{},
+		Vars:      deeplyNested,
+	}
+
+	assert(map[string]interface{}{
+		"level2": map[string]interface{}{
+			"level3": map[string]interface{}{
+				"level4": map[string]interface{}{
+					"level5": map[string]interface{}{
+						"level6": map[string]interface{}{
+							"value": "deep_value",
+						},
+					},
+				},
+			},
+		},
+	}, evaluator.ExtractVar("level1"), t)
+
+	result := evaluator.ExtractVar("level1/level2/level3/level4/level5/level6/value")
+	assert("deep_value", result, t)
+
+	result = evaluator.ExtractVar("level1/level2/level3/level4/level5/level6")
+	if resultMap, ok := result.(map[string]interface{}); ok {
+		if val, exists := resultMap["value"]; exists {
+			assert("deep_value", val, t)
+		} else {
+			t.Errorf("Expected 'value' key in result map")
+		}
+	}
+
+	result = evaluator.ExtractVar("level1/nonexistent/path")
+	assert(nil, result, t)
+
+	result = evaluator.ExtractVar("level1/level2/level3/level4/level5/level6/value/deeper")
+	assert(nil, result, t)
+}
+
+func TestExtractVarMixedArrayMap(t *testing.T) {
+	mixedData := map[string]interface{}{
+		"users": []interface{}{
+			map[string]interface{}{
+				"name": "Alice",
+				"addresses": []interface{}{
+					map[string]interface{}{"city": "NYC", "zip": "10001"},
+					map[string]interface{}{"city": "LA", "zip": "90001"},
+				},
+			},
+			map[string]interface{}{
+				"name": "Bob",
+				"addresses": []interface{}{
+					map[string]interface{}{"city": "Chicago", "zip": "60601"},
+				},
+			},
+		},
+	}
+
+	var evaluator = eval.Evaluator{
+		Operators: map[string]eval.Operator{},
+		Vars:      mixedData,
+	}
+
+	result := evaluator.ExtractVar("users/0/name")
+	assert("Alice", result, t)
+
+	result = evaluator.ExtractVar("users/1/name")
+	assert("Bob", result, t)
+
+	result = evaluator.ExtractVar("users/0/addresses/0/city")
+	assert("NYC", result, t)
+
+	result = evaluator.ExtractVar("users/0/addresses/1/zip")
+	assert("90001", result, t)
+
+	result = evaluator.ExtractVar("users/1/addresses/0/city")
+	assert("Chicago", result, t)
+
+	result = evaluator.ExtractVar("users/2")
+	assert(nil, result, t)
+
+	result = evaluator.ExtractVar("users/0/addresses/5")
+	assert(nil, result, t)
+}
+
 func assert(want interface{}, got interface{}, t *testing.T) {
 	var wanttp = reflect.ValueOf(want)
 	var gottp = reflect.ValueOf(got)
