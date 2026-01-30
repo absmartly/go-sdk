@@ -530,17 +530,19 @@ import (
 var absmartlySDK *sdk.ABsmartly
 
 func main() {
-    var err error
-    absmartlySDK, err = sdk.NewBuilder().
-        Endpoint("https://your-company.absmartly.io/v1").
-        ApiKey("YOUR-API-KEY").
-        Application("website").
-        Environment("production").
-        Build()
-
-    if err != nil {
-        log.Fatalf("Failed to initialize SDK: %v", err)
+    // Initialize SDK once at app startup
+    clientConfig := sdk.ClientConfig{
+        Endpoint_:    "https://your-company.absmartly.io/v1",
+        ApiKey_:      "YOUR-API-KEY",
+        Application_: "website",
+        Environment_: "production",
     }
+
+    sdkConfig := sdk.ABsmartlyConfig{
+        Client_: sdk.CreateDefaultClient(clientConfig),
+    }
+
+    absmartlySDK = sdk.Create(sdkConfig)
 
     r := gin.Default()
 
@@ -558,7 +560,6 @@ func main() {
             c.JSON(500, gin.H{"error": err.Error()})
             return
         }
-        defer ctx.Close()
 
         treatment, _ := ctx.GetTreatment("exp_test_experiment")
 
@@ -567,6 +568,8 @@ func main() {
         } else {
             c.HTML(200, "treatment.html", nil)
         }
+
+        ctx.Close()
     })
 
     r.Run()
@@ -587,25 +590,24 @@ import (
 var absmartlySDK *sdk.ABsmartly
 
 func main() {
-    var err error
-    absmartlySDK, err = sdk.NewBuilder().
-        Endpoint("https://your-company.absmartly.io/v1").
-        ApiKey("YOUR-API-KEY").
-        Application("website").
-        Environment("production").
-        Build()
-
-    if err != nil {
-        log.Fatalf("Failed to initialize SDK: %v", err)
+    // Initialize SDK once at app startup
+    clientConfig := sdk.ClientConfig{
+        Endpoint_:    "https://your-company.absmartly.io/v1",
+        ApiKey_:      "YOUR-API-KEY",
+        Application_: "website",
+        Environment_: "production",
     }
+
+    sdkConfig := sdk.ABsmartlyConfig{
+        Client_: sdk.CreateDefaultClient(clientConfig),
+    }
+
+    absmartlySDK = sdk.Create(sdkConfig)
 
     e := echo.New()
 
     e.GET("/", func(c echo.Context) error {
-        cookie, err := c.Cookie("session_id")
-        if err != nil {
-            return c.JSON(500, map[string]string{"error": "session_id cookie not found"})
-        }
+        cookie, _ := c.Cookie("session_id")
 
         contextConfig := sdk.ContextConfig{
             Units_: map[string]string{
@@ -617,10 +619,10 @@ func main() {
         if err := ctx.WaitUntilReady(); err != nil {
             return c.JSON(500, map[string]string{"error": err.Error()})
         }
-        defer ctx.Close()
 
         treatment, _ := ctx.GetTreatment("exp_test_experiment")
 
+        ctx.Close()
         return c.JSON(200, map[string]int{"treatment": treatment})
     })
 
@@ -644,26 +646,24 @@ import (
 var absmartlySDK *sdk.ABsmartly
 
 func main() {
-    var err error
-    absmartlySDK, err = sdk.NewBuilder().
-        Endpoint("https://your-company.absmartly.io/v1").
-        ApiKey("YOUR-API-KEY").
-        Application("website").
-        Environment("production").
-        Build()
-
-    if err != nil {
-        log.Fatalf("Failed to initialize SDK: %v", err)
+    // Initialize SDK once at app startup
+    clientConfig := sdk.ClientConfig{
+        Endpoint_:    "https://your-company.absmartly.io/v1",
+        ApiKey_:      "YOUR-API-KEY",
+        Application_: "website",
+        Environment_: "production",
     }
+
+    sdkConfig := sdk.ABsmartlyConfig{
+        Client_: sdk.CreateDefaultClient(clientConfig),
+    }
+
+    absmartlySDK = sdk.Create(sdkConfig)
 
     r := chi.NewRouter()
 
     r.Get("/", func(w http.ResponseWriter, r *http.Request) {
-        cookie, err := r.Cookie("session_id")
-        if err != nil {
-            http.Error(w, "session_id cookie not found", http.StatusBadRequest)
-            return
-        }
+        cookie, _ := r.Cookie("session_id")
 
         contextConfig := sdk.ContextConfig{
             Units_: map[string]string{
@@ -676,11 +676,11 @@ func main() {
             http.Error(w, err.Error(), http.StatusInternalServerError)
             return
         }
-        defer ctx.Close()
 
         treatment, _ := ctx.GetTreatment("exp_test_experiment")
 
         w.Write([]byte(fmt.Sprintf("Treatment: %d", treatment)))
+        ctx.Close()
     })
 
     http.ListenAndServe(":8080", r)
