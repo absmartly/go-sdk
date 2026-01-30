@@ -32,6 +32,7 @@ The builder pattern provides the most ergonomic way to initialize the SDK:
 package main
 
 import (
+    "log"
     "os"
     "github.com/absmartly/go-sdk/sdk"
 )
@@ -55,6 +56,13 @@ func main() {
 With optional parameters:
 
 ```go
+import (
+    "log"
+    "os"
+    "time"
+    "github.com/absmartly/go-sdk/sdk"
+)
+
 absmartly, err := sdk.NewBuilder().
     Endpoint("https://your-company.absmartly.io/v1").
     ApiKey(os.Getenv("ABSMARTLY_APIKEY")).
@@ -63,6 +71,10 @@ absmartly, err := sdk.NewBuilder().
     Timeout(5 * time.Second).
     Retries(3).
     Build()
+
+if err != nil {
+    log.Fatalf("Failed to initialize SDK: %v", err)
+}
 ```
 
 ### Advanced: Using Config Structs
@@ -166,6 +178,12 @@ const (
 **Example Implementation:**
 
 ```go
+import (
+    "log"
+    "os"
+    "github.com/absmartly/go-sdk/sdk"
+)
+
 type CustomEventLogger struct{}
 
 func (l *CustomEventLogger) HandleEvent(context sdk.Context, eventType sdk.EventType, data interface{}) {
@@ -198,6 +216,10 @@ absmartly, err := sdk.NewBuilder().
     Environment(os.Getenv("ABSMARTLY_ENVIRONMENT")).
     ContextEventLogger(&CustomEventLogger{}).
     Build()
+
+if err != nil {
+    log.Fatalf("Failed to initialize SDK: %v", err)
+}
 
 // Or with config structs (advanced)
 sdkConfig := sdk.ABsmartlyConfig{
@@ -560,16 +582,19 @@ func main() {
             c.JSON(500, gin.H{"error": err.Error()})
             return
         }
+        defer ctx.Close()
 
-        treatment, _ := ctx.GetTreatment("exp_test_experiment")
+        treatment, err := ctx.GetTreatment("exp_test_experiment")
+        if err != nil {
+            c.JSON(500, gin.H{"error": err.Error()})
+            return
+        }
 
         if treatment == 0 {
             c.HTML(200, "control.html", nil)
         } else {
             c.HTML(200, "treatment.html", nil)
         }
-
-        ctx.Close()
     })
 
     r.Run()
@@ -607,7 +632,10 @@ func main() {
     e := echo.New()
 
     e.GET("/", func(c echo.Context) error {
-        cookie, _ := c.Cookie("session_id")
+        cookie, err := c.Cookie("session_id")
+        if err != nil {
+            return c.JSON(400, map[string]string{"error": "session_id cookie not found"})
+        }
 
         contextConfig := sdk.ContextConfig{
             Units_: map[string]string{
@@ -619,10 +647,13 @@ func main() {
         if err := ctx.WaitUntilReady(); err != nil {
             return c.JSON(500, map[string]string{"error": err.Error()})
         }
+        defer ctx.Close()
 
-        treatment, _ := ctx.GetTreatment("exp_test_experiment")
+        treatment, err := ctx.GetTreatment("exp_test_experiment")
+        if err != nil {
+            return c.JSON(500, map[string]string{"error": err.Error()})
+        }
 
-        ctx.Close()
         return c.JSON(200, map[string]int{"treatment": treatment})
     })
 
@@ -663,7 +694,11 @@ func main() {
     r := chi.NewRouter()
 
     r.Get("/", func(w http.ResponseWriter, r *http.Request) {
-        cookie, _ := r.Cookie("session_id")
+        cookie, err := r.Cookie("session_id")
+        if err != nil {
+            http.Error(w, "session_id cookie not found", http.StatusBadRequest)
+            return
+        }
 
         contextConfig := sdk.ContextConfig{
             Units_: map[string]string{
@@ -676,11 +711,15 @@ func main() {
             http.Error(w, err.Error(), http.StatusInternalServerError)
             return
         }
+        defer ctx.Close()
 
-        treatment, _ := ctx.GetTreatment("exp_test_experiment")
+        treatment, err := ctx.GetTreatment("exp_test_experiment")
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
 
         w.Write([]byte(fmt.Sprintf("Treatment: %d", treatment)))
-        ctx.Close()
     })
 
     http.ListenAndServe(":8080", r)
