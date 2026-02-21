@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"github.com/absmartly/go-sdk/sdk"
-	"io/ioutil"
 	"os"
 )
 
@@ -15,7 +14,7 @@ func main() {
 		Environment_: os.Getenv(`ABSMARTLY_ENVIRONMENT`), // created in the ABSmartly web console
 	}
 
-	var sdkConfig = sdk.ABSmartlyConfig{Client_: sdk.CreateDefaultClient(clientConfig)}
+	var sdkConfig = sdk.ABsmartlyConfig{Client_: sdk.CreateDefaultClient(clientConfig)}
 
 	var sd = sdk.Create(sdkConfig)
 
@@ -30,7 +29,7 @@ func main() {
 
 	//Creating a new Context with pre-fetched data
 	var path, _ = os.Getwd()
-	var content, _ = ioutil.ReadFile(path + "/sdk/testAssets/context.json")
+	var content, _ = os.ReadFile(path + "/sdk/testAssets/context.json")
 	var deser = sdk.DefaultContextDataDeserializer{}
 	var data, _ = deser.Deserialize(content)
 	var anotherContextConfig = sdk.ContextConfig{

@@ -1,6 +1,6 @@
 package sdk
 
-type ABSmartlyConfig struct {
+type ABsmartlyConfig struct {
 	ContextDataProvider_  ContextDataProvider
 	ContextEventHandler_  ContextEventHandler
 	ContextEventLogger_   ContextEventLogger
@@ -8,3 +8,5 @@ type ABSmartlyConfig struct {
 	AudienceDeserializer_ AudienceDeserializer
 	Client_               ClientI
 }
+
+type ABSmartlyConfig = ABsmartlyConfig

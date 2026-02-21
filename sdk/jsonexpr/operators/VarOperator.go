@@ -13,13 +13,16 @@ func (v VarOperator) Evaluate(evaluator eval.Evaluator, path interface{}) interf
 	var tp = reflect.ValueOf(path)
 
 	if tp.Kind() == reflect.Map {
-		path = tp.MapIndex(reflect.ValueOf("path")).Interface()
+		pathValue := tp.MapIndex(reflect.ValueOf("path"))
+		if !pathValue.IsValid() {
+			return nil
+		}
+		path = pathValue.Interface()
 	}
 
 	var pth = reflect.ValueOf(path)
 	if pth.Kind() == reflect.String {
 		return evaluator.ExtractVar(pth.String())
-	} else {
-		return nil
 	}
+	return nil
 }

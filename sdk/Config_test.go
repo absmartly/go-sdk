@@ -332,7 +332,7 @@ func TestClientCreationWithCustomConfig(t *testing.T) {
 }
 
 func TestABSmartlyConfigWithNilClient(t *testing.T) {
-	config := ABSmartlyConfig{
+	config := ABsmartlyConfig{
 		Client_: nil,
 	}
 

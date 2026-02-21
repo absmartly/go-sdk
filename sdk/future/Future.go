@@ -2,6 +2,7 @@ package future
 
 import (
 	"context"
+	"fmt"
 	"sync"
 )
 
@@ -84,20 +85,34 @@ func (f *Future) NotifyCallbacks() {
 }
 
 func (f *Future) Join(ctx context.Context) {
-	f.mu.Lock()
-	var _, _ = f.Get(ctx)
-	for _, callback := range f.callbacks {
-		callback(f.val, f.err)
-	}
-	f.mu.Unlock()
+	f.Get(ctx)
 }
 
 // Call will converts the sync function call as async call.
 func Call(f func() (Value, error)) *Future {
 	fut, setDone := New()
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				var panicErr error
+				if err, ok := r.(error); ok {
+					panicErr = err
+				} else {
+					panicErr = &PanicError{Value: r}
+				}
+				setDone(nil, panicErr)
+			}
+		}()
 		res, err := f()
 		setDone(res, err)
 	}()
 	return fut
+}
+
+type PanicError struct {
+	Value interface{}
+}
+
+func (e *PanicError) Error() string {
+	return fmt.Sprintf("panic: %v", e.Value)
 }

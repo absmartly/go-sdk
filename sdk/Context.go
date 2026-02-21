@@ -3,6 +3,7 @@ package sdk
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/absmartly/go-sdk/sdk/future"
 	"github.com/absmartly/go-sdk/sdk/internal"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
@@ -14,6 +15,16 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// TypeError represents a type assertion failure
+type TypeError struct {
+	Expected string
+	Actual   interface{}
+}
+
+func (e *TypeError) Error() string {
+	return fmt.Sprintf("type assertion failed: expected %s, got %T", e.Expected, e.Actual)
+}
 
 type Context struct {
 	PublishDelay_        int64
@@ -34,7 +45,7 @@ type Context struct {
 	ContextLock_         *sync.RWMutex
 	HashedUnits_         map[interface{}]interface{}
 	Assigners_           map[interface{}]interface{}
-	AssignmentCache      map[string]Assignment
+	AssignmentCache      map[string]*Assignment
 	EventLock_           *sync.Mutex
 	Exposures_           []jsonmodels.Exposure
 	Achievements_        []jsonmodels.GoalAchievement
@@ -115,14 +126,16 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	cntx.EventLock_ = &sync.Mutex{}
 	cntx.TimeoutLock_ = &sync.Mutex{}
 
-	cntx.AssignmentCache = map[string]Assignment{}
+	cntx.AssignmentCache = map[string]*Assignment{}
 	cntx.Achievements_ = make([]jsonmodels.GoalAchievement, 0)
 	cntx.Exposures_ = make([]jsonmodels.Exposure, 0)
 	cntx.Attributes_ = make([]interface{}, 0)
 
 	var units = config.Units_
 	if units != nil {
-		var _ = cntx.SetUnits(units)
+		if err := cntx.SetUnits(units); err != nil && cntx.EventLogger_ != nil {
+			cntx.EventLogger_.HandleEvent(cntx, Error, "CreateContext: Failed to set units: "+err.Error())
+		}
 	}
 
 	cntx.Assigners_ = map[interface{}]interface{}{}
@@ -130,7 +143,9 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 
 	var attributes = config.Attributes_
 	if attributes != nil {
-		var _ = cntx.SetAttributes(attributes)
+		if err := cntx.SetAttributes(attributes); err != nil && cntx.EventLogger_ != nil {
+			cntx.EventLogger_.HandleEvent(cntx, Error, "CreateContext: Failed to set attributes: "+err.Error())
+		}
 	}
 
 	var overrides = config.Overrides_
@@ -176,7 +191,15 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 		cntx.ReadyFuture_ = tempFuture
 		dataFuture.Listen(func(val future.Value, err error) {
 			if err == nil {
-				var result = val.(jsonmodels.ContextData)
+				result, ok := val.(jsonmodels.ContextData)
+				if !ok {
+					err = &TypeError{Expected: "jsonmodels.ContextData", Actual: val}
+					tmp.SetDataFailed(err)
+					readyFutureDone(nil, err)
+					cntx.ReadyFuture_ = nil
+					tmp.LogError(err)
+					return
+				}
 				tmp.SetData(result)
 				readyFutureDone(result, nil)
 				cntx.ReadyFuture_ = nil
@@ -219,12 +242,8 @@ func (c *Context) WaitUntilReadyAsync() *future.Future {
 		return future.Call(func() (future.Value, error) {
 			return c, nil
 		})
-	} else {
-		c.ReadyFuture_.Listen(func(val future.Value, err error) {
-			c.ReadyFuture_.SetResult(val, err)
-		})
-		return c.ReadyFuture_
 	}
+	return c.ReadyFuture_
 }
 
 func (c *Context) WaitUntilReady() Context {
@@ -493,10 +512,10 @@ func (c *Context) GetCustomFieldValue(experimentName string, key string) interfa
 }
 
 func (c *Context) GetCustomFieldValueType(experimentName string, key string) string {
-	var customFieldValues = c.ContextCustomFields_[experimentName]
-
 	c.DataLock.Lock()
+	defer c.DataLock.Unlock()
 
+	var customFieldValues = c.ContextCustomFields_[experimentName]
 	var fieldType string
 	if customFieldValues != nil {
 		field, ok := customFieldValues[key]
@@ -504,8 +523,6 @@ func (c *Context) GetCustomFieldValueType(experimentName string, key string) str
 			fieldType = field.Type
 		}
 	}
-
-	c.DataLock.Unlock()
 
 	return fieldType
 }
@@ -586,12 +603,11 @@ func (c *Context) PublishAsync() (*future.Future, error) {
 
 func (c *Context) Publish() error {
 	var result, err = c.PublishAsync()
-	if err == nil {
-		result.Join(context.Background())
-		return nil
-	} else {
+	if err != nil {
 		return err
 	}
+	_, err = result.Get(context.Background())
+	return err
 }
 
 func (c *Context) GetPendingCount() int32 {
@@ -601,7 +617,9 @@ func (c *Context) GetPendingCount() int32 {
 func (c *Context) RefreshAsync() *future.Future {
 	var err = c.CheckNotClosed()
 	if err != nil {
-		return nil
+		var tempfuture, donefun = future.New()
+		donefun(nil, err)
+		return tempfuture
 	}
 
 	if c.Refreshing_.CompareAndSwap(false, true) {
@@ -610,7 +628,14 @@ func (c *Context) RefreshAsync() *future.Future {
 
 		c.DataProvider_.GetContextData().Listen(func(value future.Value, err error) {
 			if err == nil {
-				var result = value.(jsonmodels.ContextData)
+				result, ok := value.(jsonmodels.ContextData)
+				if !ok {
+					err = &TypeError{Expected: "jsonmodels.ContextData", Actual: value}
+					c.Refreshing_.Store(false)
+					donefun(nil, err)
+					c.LogError(err)
+					return
+				}
 				c.SetData(result)
 				c.Refreshing_.Store(false)
 				donefun(nil, nil)
@@ -681,6 +706,7 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 }
 
 func (c *Context) Close() {
+	c.ClearRefreshTimer()
 	var fut, err = c.CloseAsync()
 	if err == nil {
 		fut.Join(context.Background())
@@ -689,7 +715,7 @@ func (c *Context) Close() {
 
 func (c *Context) GetAssignment(experimentName string) *Assignment {
 
-	c.ContextLock_.RLock()
+	c.ContextLock_.Lock()
 	if assignment, found := c.AssignmentCache[experimentName]; found {
 		var custom, cfound = c.Cassignments_[experimentName]
 		var override, ofound = c.Overrides_[experimentName]
@@ -697,23 +723,22 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 
 		if ofound {
 			if assignment.Overridden && assignment.Variant == override.(int) {
-				c.ContextLock_.RUnlock()
-				return &assignment
+				c.ContextLock_.Unlock()
+				return assignment
 			}
 		} else if !efound {
 			if !assignment.Assigned {
-				c.ContextLock_.RUnlock()
-				return &assignment
+				c.ContextLock_.Unlock()
+				return assignment
 			}
 		} else if !cfound || custom.(int) == assignment.Variant {
-			if c.ExperimentMatches(experiment.Data, assignment) && c.AudienceMatches(experiment.Data, &assignment) {
-				c.AssignmentCache[experimentName] = assignment
-				c.ContextLock_.RUnlock()
-				return &assignment
+			if c.ExperimentMatches(experiment.Data, *assignment) && c.AudienceMatches(experiment.Data, assignment) {
+				c.ContextLock_.Unlock()
+				return assignment
 			}
 		}
 	}
-	c.ContextLock_.RUnlock()
+	c.ContextLock_.Unlock()
 	// cache miss or out-dated
 	c.ContextLock_.Lock()
 
@@ -723,7 +748,7 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 
 	var exposed = &atomic.Value{}
 	exposed.Store(false)
-	var assignment = Assignment{Exposed: exposed}
+	var assignment = &Assignment{Exposed: exposed}
 	assignment.Name = experimentName
 	assignment.Eligible = true
 
@@ -797,7 +822,7 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 
 	c.AssignmentCache[experimentName] = assignment
 	c.ContextLock_.Unlock()
-	return &assignment
+	return assignment
 }
 
 func (c *Context) ClearRefreshTimer() {
@@ -892,9 +917,21 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 				if strings.HasPrefix(customFieldValue.Type, "json") {
 					value.Value = c.VariableParser_.Parse(*c, experiment.Name, customFieldValue.Name, customValue)
 				} else if strings.HasPrefix(customFieldValue.Type, "boolean") {
-					value.Value, _ = strconv.ParseBool(customValue)
+					parsed, err := strconv.ParseBool(customValue)
+					if err != nil && c.EventLogger_ != nil {
+						c.EventLogger_.HandleEvent(*c, Error,
+							"SetData: Failed to parse boolean custom field '"+customFieldValue.Name+
+								"' in experiment '"+experiment.Name+"': "+err.Error())
+					}
+					value.Value = parsed
 				} else if strings.HasPrefix(customFieldValue.Type, "number") {
-					value.Value, _ = strconv.ParseInt(customValue, 10, 64)
+					parsed, err := strconv.ParseInt(customValue, 10, 64)
+					if err != nil && c.EventLogger_ != nil {
+						c.EventLogger_.HandleEvent(*c, Error,
+							"SetData: Failed to parse number custom field '"+customFieldValue.Name+
+								"' in experiment '"+experiment.Name+"': "+err.Error())
+					}
+					value.Value = parsed
 				} else {
 					value.Value = customValue
 				}
@@ -971,6 +1008,8 @@ func (c *Context) Flush() *future.Future {
 				var event = jsonmodels.PublishEvent{}
 				event.Hashed = true
 				event.PublishedAt = c.Clock_.Millis()
+
+				c.ContextLock_.RLock()
 				var entrySet []interface{}
 				for key, value := range c.Units_ {
 					entrySet = append(entrySet, Pair{a: key, b: value})
@@ -990,6 +1029,7 @@ func (c *Context) Flush() *future.Future {
 						event.Attributes[key] = value.(jsonmodels.Attribute)
 					}
 				}
+				c.ContextLock_.RUnlock()
 				event.Goals = achievements
 				event.Exposures = exposures
 
