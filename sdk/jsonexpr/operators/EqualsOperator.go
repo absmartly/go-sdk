@@ -10,6 +10,12 @@ type EqualsOperator struct {
 }
 
 func (v EqualsOperator) Binary(evaluator eval.Evaluator, lhs interface{}, rhs interface{}) interface{} {
+	if lhs == nil && rhs == nil {
+		return true
+	}
+	if lhs == nil || rhs == nil {
+		return nil
+	}
 	var result = evaluator.Compare(reflect.ValueOf(lhs), reflect.ValueOf(rhs))
 	if result != nil {
 		return result == 0

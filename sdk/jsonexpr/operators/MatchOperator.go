@@ -11,6 +11,9 @@ type MatchOperator struct {
 }
 
 func (v MatchOperator) Binary(evaluator eval.Evaluator, lhs interface{}, rhs interface{}) interface{} {
+	if lhs == nil || rhs == nil {
+		return nil
+	}
 	var text, lerror = evaluator.StringConvert(reflect.ValueOf(lhs))
 	if lerror == nil {
 		var pattern, rerror = evaluator.StringConvert(reflect.ValueOf(rhs))

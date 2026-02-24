@@ -14,11 +14,11 @@ func TestEvaluate(t *testing.T) {
 		BinaryOp: operators.EqualsOperator{},
 	}
 
-	assert(nil, binary.Evaluate(eval, []interface{}{0, 0}), t)
-	assert(nil, binary.Evaluate(eval, []interface{}{1, 0}), t)
-	assert(nil, binary.Evaluate(eval, []interface{}{0, 1}), t)
+	assert(true, binary.Evaluate(eval, []interface{}{0, 0}), t)
+	assert(true, binary.Evaluate(eval, []interface{}{1, 0}), t)
+	assert(true, binary.Evaluate(eval, []interface{}{0, 1}), t)
 
-	assert(nil, binary.Evaluate(eval, []interface{}{nil, nil}), t)
+	assert(true, binary.Evaluate(eval, []interface{}{nil, nil}), t)
 	assert(true, binary.Evaluate(eval, []interface{}{[]interface{}{1, 2}, []interface{}{1, 2}}), t)
 	assert(true, binary.Evaluate(eval, []interface{}{[]interface{}{1, 2}, []interface{}{2, 3}}), t)
 

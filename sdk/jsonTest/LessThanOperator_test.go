@@ -18,5 +18,5 @@ func TestLTvaluate(t *testing.T) {
 	assert(true, binary.BinaryOp.Binary(eval, 0, 1), t)
 	assert(false, binary.BinaryOp.Binary(eval, 1, 0), t)
 
-	assert(false, binary.BinaryOp.Binary(eval, nil, nil), t)
+	assert(nil, binary.BinaryOp.Binary(eval, nil, nil), t)
 }

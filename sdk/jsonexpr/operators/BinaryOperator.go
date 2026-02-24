@@ -20,11 +20,15 @@ func (v BinaryOperator) Evaluate(evaluator eval.Evaluator, args interface{}) int
 
 		if argsList.Len() > 0 {
 			var lhs = evaluator.Evaluate(reflect.ValueOf(argsList.Index(0).Interface()))
-			if lhs != nil && argsList.Len() > 1 {
-				var rhs = evaluator.Evaluate(reflect.ValueOf(argsList.Index(1).Interface()))
-				if rhs != nil {
-					return v.BinaryOp.Binary(evaluator, lhs, rhs)
-				}
+			var rhs interface{}
+			if argsList.Len() > 1 {
+				rhs = evaluator.Evaluate(reflect.ValueOf(argsList.Index(1).Interface()))
+			}
+			if lhs != nil && rhs != nil {
+				return v.BinaryOp.Binary(evaluator, lhs, rhs)
+			}
+			if lhs == nil && rhs == nil {
+				return v.BinaryOp.Binary(evaluator, lhs, rhs)
 			}
 		}
 
