@@ -27,6 +27,36 @@ Please follow the [installation](#installation) instructions before trying the f
 
 This example assumes an API Key, an Application, and an Environment have been created in the A/B Smartly web console.
 
+#### Quick Start (Recommended)
+
+The simplest way to get started is using the `New` constructor:
+
+```go
+package main
+
+import (
+    "log"
+    "os"
+    "github.com/absmartly/go-sdk/sdk"
+)
+
+func main() {
+    absmartly, err := sdk.New(
+        "https://your-company.absmartly.io/v1",
+        os.Getenv("ABSMARTLY_APIKEY"),
+        os.Getenv("ABSMARTLY_APPLICATION"),
+        os.Getenv("ABSMARTLY_ENVIRONMENT"),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // ...
+}
+```
+
+#### With Explicit Configuration
+
 ```go
 package main
 
@@ -37,14 +67,14 @@ import (
 
 func main() {
     clientConfig := sdk.ClientConfig{
-        Endpoint_:    "https://your-company.absmartly.io/v1",
-        ApiKey_:      os.Getenv("ABSMARTLY_APIKEY"),
-        Application_: os.Getenv("ABSMARTLY_APPLICATION"),
-        Environment_: os.Getenv("ABSMARTLY_ENVIRONMENT"),
+        Endpoint:    "https://your-company.absmartly.io/v1",
+        APIKey:      os.Getenv("ABSMARTLY_APIKEY"),
+        Application: os.Getenv("ABSMARTLY_APPLICATION"),
+        Environment: os.Getenv("ABSMARTLY_ENVIRONMENT"),
     }
 
     sdkConfig := sdk.ABSmartlyConfig{
-        Client_: sdk.CreateDefaultClient(clientConfig),
+        Client: sdk.CreateDefaultClient(clientConfig),
     }
 
     absmartly := sdk.Create(sdkConfig)
@@ -53,46 +83,25 @@ func main() {
 }
 ```
 
-#### With Optional Parameters
-
-```go
-clientConfig := sdk.ClientConfig{
-    Endpoint_:       "https://your-company.absmartly.io/v1",
-    ApiKey_:         os.Getenv("ABSMARTLY_APIKEY"),
-    Application_:    os.Getenv("ABSMARTLY_APPLICATION"),
-    Environment_:    os.Getenv("ABSMARTLY_ENVIRONMENT"),
-    MaxRetries_:     3,
-    ConnectTimeout_: 5000,
-}
-
-sdkConfig := sdk.ABSmartlyConfig{
-    Client_: sdk.CreateDefaultClient(clientConfig),
-}
-
-absmartly := sdk.Create(sdkConfig)
-```
-
 **SDK Options**
 
 ##### ClientConfig
 
-| Config           | Type     | Required? | Default   | Description                                                                                                                                                                   |
-| :--------------- | :------- | :-------: | :-------: | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Endpoint_        | `string` |  &#9989;  | `""`      | The URL to your API endpoint. Most commonly `"https://your-company.absmartly.io/v1"`                                                                                         |
-| ApiKey_          | `string` |  &#9989;  | `""`      | Your API key which can be found on the Web Console.                                                                                                                           |
-| Environment_     | `string` |  &#9989;  | `""`      | The environment of the platform where the SDK is installed. Environments are created on the Web Console and should match the available environments in your infrastructure.   |
-| Application_     | `string` |  &#9989;  | `""`      | The name of the application where the SDK is installed. Applications are created on the Web Console and should match the applications where your experiments will be running. |
-| MaxRetries_      | `int`    | &#10060;  | `5`       | The number of retries before the SDK stops trying to connect.                                                                                                                 |
-| ConnectTimeout_  | `int`    | &#10060;  | `3000`    | An amount of time, in milliseconds, before the SDK will stop trying to connect.                                                                                               |
+| Config        | Type     | Required? | Default   | Description                                                                                                                                                                   |
+| :------------ | :------- | :-------: | :-------: | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Endpoint      | `string` |  &#9989;  | `""`      | The URL to your API endpoint. Most commonly `"https://your-company.absmartly.io/v1"`                                                                                         |
+| APIKey        | `string` |  &#9989;  | `""`      | Your API key which can be found on the Web Console.                                                                                                                           |
+| Environment   | `string` |  &#9989;  | `""`      | The environment of the platform where the SDK is installed. Environments are created on the Web Console and should match the available environments in your infrastructure.   |
+| Application   | `string` |  &#9989;  | `""`      | The name of the application where the SDK is installed. Applications are created on the Web Console and should match the applications where your experiments will be running. |
 
 ##### ABSmartlyConfig
 
-| Config                  | Type                  | Required? | Default                             | Description                                                  |
-| :---------------------- | :-------------------- | :-------: | :---------------------------------- | :----------------------------------------------------------- |
-| Client_                 | `Client`              |  &#9989;  | `nil`                               | The HTTP client instance (use `CreateDefaultClient`)         |
-| ContextEventLogger_     | `ContextEventLogger`  | &#10060;  | `nil`                               | A callback interface which runs after SDK events.            |
-| ContextDataProvider_    | `ContextDataProvider` | &#10060;  | `DefaultContextDataProvider`        | Custom provider for fetching context data (advanced usage)   |
-| ContextEventHandler_    | `ContextEventHandler` | &#10060;  | `DefaultContextEventHandler`        | Custom handler for publishing events (advanced usage)        |
+| Config               | Type                  | Required? | Default                             | Description                                                  |
+| :------------------- | :-------------------- | :-------: | :---------------------------------- | :----------------------------------------------------------- |
+| Client               | `Client`              |  &#9989;  | `nil`                               | The HTTP client instance (use `CreateDefaultClient`)         |
+| ContextEventLogger   | `ContextEventLogger`  | &#10060;  | `nil`                               | A callback interface which runs after SDK events.            |
+| ContextDataProvider  | `ContextDataProvider` | &#10060;  | `DefaultContextDataProvider`        | Custom provider for fetching context data (advanced usage)   |
+| ContextEventHandler  | `ContextEventHandler` | &#10060;  | `DefaultContextEventHandler`        | Custom handler for publishing events (advanced usage)        |
 
 ## Creating a New Context
 
@@ -100,7 +109,7 @@ absmartly := sdk.Create(sdkConfig)
 
 ```go
 contextConfig := sdk.ContextConfig{
-    Units_: map[string]string{
+    Units: map[string]string{
         "session_id": "5ebf06d8cb5d8137290c4abb64155584fbdb64d8",
     },
 }
@@ -117,7 +126,7 @@ log.Println("Context ready")
 
 ```go
 contextConfig := sdk.ContextConfig{
-    Units_: map[string]string{
+    Units: map[string]string{
         "session_id": "5ebf06d8cb5d8137290c4abb64155584fbdb64d8",
     },
 }
@@ -139,7 +148,7 @@ When doing full-stack experimentation, you can create a context on the server-si
 
 ```go
 serverConfig := sdk.ContextConfig{
-    Units_: map[string]string{
+    Units: map[string]string{
         "session_id": "5ebf06d8cb5d8137290c4abb64155584fbdb64d8",
         "user_id":    "123456",
     },
@@ -156,7 +165,7 @@ if err != nil {
 }
 
 clientConfig := sdk.ContextConfig{
-    Units_: map[string]string{
+    Units: map[string]string{
         "session_id": "5ebf06d8cb5d8137290c4abb64155584fbdb64d8",
         "user_id":    "123456",
     },
@@ -169,14 +178,14 @@ clientCtx := absmartly.CreateContextWith(clientConfig, contextData)
 
 For long-running contexts, the context is usually created once when the application is first started.
 However, any experiments being tracked in your production code, but started after the context was created, will not be triggered.
-To mitigate this, we can use the `RefreshInterval_` option on the context config.
+To mitigate this, we can use the `RefreshInterval` option on the context config.
 
 ```go
 contextConfig := sdk.ContextConfig{
-    Units_: map[string]string{
+    Units: map[string]string{
         "session_id": "5ebf06d8cb5d8137290c4abb64155584fbdb64d8",
     },
-    RefreshInterval_: 4 * time.Hour,
+    RefreshInterval: 4 * time.Hour,
 }
 
 ctx := absmartly.CreateContext(contextConfig)
@@ -412,8 +421,8 @@ func (l *CustomEventLogger) HandleEvent(context sdk.Context, eventType sdk.Event
 }
 
 sdkConfig := sdk.ABSmartlyConfig{
-    Client_:             sdk.CreateDefaultClient(clientConfig),
-    ContextEventLogger_: &CustomEventLogger{},
+    Client:             sdk.CreateDefaultClient(clientConfig),
+    ContextEventLogger: &CustomEventLogger{},
 }
 ```
 
@@ -442,21 +451,19 @@ import (
     "log"
 )
 
-var absmartlySDK sdk.ABSmartly
+var absmartlySDK *sdk.ABSmartly
 
 func main() {
-    clientConfig := sdk.ClientConfig{
-        Endpoint_:    "https://your-company.absmartly.io/v1",
-        ApiKey_:      "YOUR-API-KEY",
-        Application_: "website",
-        Environment_: "production",
+    var err error
+    absmartlySDK, err = sdk.New(
+        "https://your-company.absmartly.io/v1",
+        "YOUR-API-KEY",
+        "website",
+        "production",
+    )
+    if err != nil {
+        log.Fatal(err)
     }
-
-    sdkConfig := sdk.ABSmartlyConfig{
-        Client_: sdk.CreateDefaultClient(clientConfig),
-    }
-
-    absmartlySDK = sdk.Create(sdkConfig)
 
     r := gin.Default()
 
@@ -464,7 +471,7 @@ func main() {
         sessionID, _ := c.Cookie("session_id")
 
         contextConfig := sdk.ContextConfig{
-            Units_: map[string]string{
+            Units: map[string]string{
                 "session_id": sessionID,
             },
         }
@@ -504,21 +511,19 @@ import (
     "log"
 )
 
-var absmartlySDK sdk.ABSmartly
+var absmartlySDK *sdk.ABSmartly
 
 func main() {
-    clientConfig := sdk.ClientConfig{
-        Endpoint_:    "https://your-company.absmartly.io/v1",
-        ApiKey_:      "YOUR-API-KEY",
-        Application_: "website",
-        Environment_: "production",
+    var err error
+    absmartlySDK, err = sdk.New(
+        "https://your-company.absmartly.io/v1",
+        "YOUR-API-KEY",
+        "website",
+        "production",
+    )
+    if err != nil {
+        log.Fatal(err)
     }
-
-    sdkConfig := sdk.ABSmartlyConfig{
-        Client_: sdk.CreateDefaultClient(clientConfig),
-    }
-
-    absmartlySDK = sdk.Create(sdkConfig)
 
     e := echo.New()
 
@@ -529,7 +534,7 @@ func main() {
         }
 
         contextConfig := sdk.ContextConfig{
-            Units_: map[string]string{
+            Units: map[string]string{
                 "session_id": cookie.Value,
             },
         }
@@ -565,21 +570,19 @@ import (
     "log"
 )
 
-var absmartlySDK sdk.ABSmartly
+var absmartlySDK *sdk.ABSmartly
 
 func main() {
-    clientConfig := sdk.ClientConfig{
-        Endpoint_:    "https://your-company.absmartly.io/v1",
-        ApiKey_:      "YOUR-API-KEY",
-        Application_: "website",
-        Environment_: "production",
+    var err error
+    absmartlySDK, err = sdk.New(
+        "https://your-company.absmartly.io/v1",
+        "YOUR-API-KEY",
+        "website",
+        "production",
+    )
+    if err != nil {
+        log.Fatal(err)
     }
-
-    sdkConfig := sdk.ABSmartlyConfig{
-        Client_: sdk.CreateDefaultClient(clientConfig),
-    }
-
-    absmartlySDK = sdk.Create(sdkConfig)
 
     r := chi.NewRouter()
 
@@ -591,7 +594,7 @@ func main() {
         }
 
         contextConfig := sdk.ContextConfig{
-            Units_: map[string]string{
+            Units: map[string]string{
                 "session_id": cookie.Value,
             },
         }

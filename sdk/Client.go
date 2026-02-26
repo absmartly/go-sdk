@@ -30,7 +30,7 @@ func CreateDefaultClient(config ClientConfig) Client {
 }
 
 func CreateClient(config ClientConfig, httpClient HTTPClient) Client {
-	var cl = Client{url_: config.Endpoint_ + "/context", serializer_: config.Serializer_, deserializer_: config.Deserializer_, httpClient_: httpClient}
+	var cl = Client{url_: config.endpoint() + "/context", serializer_: config.serializer(), deserializer_: config.deserializer(), httpClient_: httpClient}
 	if cl.deserializer_ == nil {
 		cl.deserializer_ = DefaultContextDataDeserializer{}
 	}
@@ -40,9 +40,9 @@ func CreateClient(config ClientConfig, httpClient HTTPClient) Client {
 	}
 
 	var headers = map[string]string{
-		"X-API-Key":             config.ApiKey_,
-		"X-Application":         config.Application_,
-		"X-Environment":         config.Environment_,
+		"X-API-Key":             config.apiKey(),
+		"X-Application":         config.application(),
+		"X-Environment":         config.environment(),
 		"X-Application-Version": "0",
 		"X-Agent":               "absmartly-go-sdk",
 		"Content-Type":          "application/json",
@@ -50,8 +50,8 @@ func CreateClient(config ClientConfig, httpClient HTTPClient) Client {
 	cl.headers_ = headers
 
 	var query = map[string]string{
-		"application": config.Application_,
-		"environment": config.Environment_,
+		"application": config.application(),
+		"environment": config.environment(),
 	}
 	cl.query_ = query
 	return cl

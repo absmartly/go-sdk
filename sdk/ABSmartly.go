@@ -16,7 +16,14 @@ type ABSmartly struct {
 }
 
 func Create(config ABSmartlyConfig) ABSmartly {
-	var abs = ABSmartly(config)
+	var abs = ABSmartly{
+		ContextDataProvider_:  config.contextDataProvider(),
+		ContextEventHandler_:  config.contextEventHandler(),
+		ContextEventLogger_:   config.contextEventLogger(),
+		VariableParser_:       config.variableParser(),
+		AudienceDeserializer_: config.audienceDeserializer(),
+		Client_:               config.client(),
+	}
 	if abs.ContextDataProvider_ == nil {
 		abs.ContextDataProvider_ = DefaultContextDataProvider{client_: abs.Client_}
 	}
@@ -33,20 +40,30 @@ func Create(config ABSmartlyConfig) ABSmartly {
 		abs.AudienceDeserializer_ = DefaultAudienceDeserializer{}
 	}
 
-	if abs.AudienceDeserializer_ == nil {
-		abs.AudienceDeserializer_ = DefaultAudienceDeserializer{}
-	}
-
 	return abs
 }
 
-// CreateContext
+func New(endpoint, apiKey, application, environment string) (*ABSmartly, error) {
+	clientConfig := ClientConfig{
+		Endpoint:    endpoint,
+		APIKey:      apiKey,
+		Application: application,
+		Environment: environment,
+	}
+
+	sdkConfig := ABSmartlyConfig{
+		Client: CreateDefaultClient(clientConfig),
+	}
+
+	abs := Create(sdkConfig)
+	return &abs, nil
+}
+
 func (abs ABSmartly) CreateContext(config ContextConfig) *Context {
 	return CreateContext(internal.SystemClockUTC{}, config, abs.ContextDataProvider_.GetContextData(), abs.ContextDataProvider_,
 		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_})
 }
 
-// CreateContextWith
 func (abs ABSmartly) CreateContextWith(config ContextConfig, data jsonmodels.ContextData) *Context {
 	var ft, done = future.New()
 	done(data, nil)

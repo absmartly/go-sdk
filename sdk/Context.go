@@ -88,12 +88,12 @@ type Assignment struct {
 func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *future.Future, dataProvider ContextDataProvider,
 	eventHandler ContextEventHandler, eventLogger ContextEventLogger, variableParser VariableParser,
 	audienceMatcher AudienceMatcher) *Context {
-	var cntx = Context{Clock_: clock, PublishDelay_: config.PublishDelay_, RefreshInterval_: config.RefreshInterval_,
+	var cntx = Context{Clock_: clock, PublishDelay_: config.publishDelay(), RefreshInterval_: config.refreshInterval(),
 		EventHandler_: eventHandler, DataProvider_: dataProvider, VariableParser_: variableParser,
 		AudienceMatcher_: audienceMatcher, Units_: map[string]string{}}
 
-	if config.EventLogger_ != nil {
-		cntx.EventLogger_ = config.EventLogger_
+	if config.eventLogger() != nil {
+		cntx.EventLogger_ = config.eventLogger()
 	} else {
 		cntx.EventLogger_ = eventLogger
 	}
@@ -120,7 +120,7 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	cntx.Exposures_ = make([]jsonmodels.Exposure, 0)
 	cntx.Attributes_ = make([]interface{}, 0)
 
-	var units = config.Units_
+	var units = config.units()
 	if units != nil {
 		var _ = cntx.SetUnits(units)
 	}
@@ -128,12 +128,12 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	cntx.Assigners_ = map[interface{}]interface{}{}
 	cntx.HashedUnits_ = map[interface{}]interface{}{}
 
-	var attributes = config.Attributes_
+	var attributes = config.attributes()
 	if attributes != nil {
 		var _ = cntx.SetAttributes(attributes)
 	}
 
-	var overrides = config.Overrides_
+	var overrides = config.overrides()
 	if overrides != nil {
 		if cntx.Overrides_ == nil {
 			cntx.Overrides_ = map[interface{}]interface{}{}
@@ -145,7 +145,7 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 		cntx.Overrides_ = map[interface{}]interface{}{}
 	}
 
-	var cassignments = config.Cassigmnents_
+	var cassignments = config.customAssignments()
 	if cassignments != nil {
 		if cntx.Cassignments_ == nil {
 			cntx.Cassignments_ = map[interface{}]interface{}{}
