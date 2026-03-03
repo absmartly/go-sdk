@@ -73,18 +73,16 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 
 		if lhs.Kind() == reflect.Slice || lhs.Kind() == reflect.Array {
 			for i := 0; i < lhs.Len(); i++ {
-				if lhs.Index(i).Interface() != rhs.Index(i).Interface() {
+				if !reflect.DeepEqual(lhs.Index(i).Interface(), rhs.Index(i).Interface()) {
 					return nil
 				}
 			}
 			return 0
 		} else if lhs.Kind() == reflect.Map {
 			var entry = lhs.MapRange()
-			var rentry = rhs.MapRange()
 			for entry.Next() {
-				rentry.Next()
-				if entry.Key().Interface() != rentry.Key().Interface() ||
-					entry.Value().Interface() != rentry.Value().Interface() {
+				rvalue := rhs.MapIndex(entry.Key())
+				if !rvalue.IsValid() || !reflect.DeepEqual(entry.Value().Interface(), rvalue.Interface()) {
 					return nil
 				}
 			}
@@ -92,11 +90,14 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 		}
 	}
 
-	if lhs.IsValid() && rhs.IsValid() && lhs.Kind() == rhs.Kind() && lhs == rhs {
-		if lhs.IsNil() && rhs.IsNil() {
-			return nil
+	if lhs.IsValid() && rhs.IsValid() && lhs.Kind() == rhs.Kind() {
+		if lhs.Comparable() && rhs.Comparable() && lhs.Interface() == rhs.Interface() {
+			return 0
 		}
-		return 0
+
+		if reflect.DeepEqual(lhs.Interface(), rhs.Interface()) {
+			return 0
+		}
 	}
 
 	if !lhs.IsValid() && !rhs.IsValid() {
@@ -107,6 +108,10 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 }
 
 func (e Evaluator) BooleanConvert(x reflect.Value) bool {
+	if !x.IsValid() {
+		return false
+	}
+
 	if x.Kind() == reflect.Bool {
 		return x.Bool()
 	} else if x.Kind() == reflect.String {
@@ -116,12 +121,28 @@ func (e Evaluator) BooleanConvert(x reflect.Value) bool {
 		return x.Int() != 0
 	} else if x.Kind() == reflect.Float64 {
 		return x.Float() != 0
-	} else if x.IsValid() && (x.Interface() == false || x.Interface() == "false" || x.Interface() == "[false]") {
-		return false
-	} else if x.IsValid() && (x.Interface() == true || x.Interface() == "true" || x.Interface() == "[true]") {
+	}
+
+	switch value := x.Interface().(type) {
+	case bool:
+		return value
+	case string:
+		return value != "false" && value != "0" && value != "" && value != "[false]"
+	}
+
+	if isNilableKind(x.Kind()) {
+		return !x.IsNil()
+	}
+
+	return true
+}
+
+func isNilableKind(kind reflect.Kind) bool {
+	switch kind {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
 		return true
-	} else {
-		return x.IsValid() && !x.IsNil()
+	default:
+		return false
 	}
 }
 
