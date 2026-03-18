@@ -8,6 +8,8 @@ import (
 
 type ABsmartly struct {
 	ContextDataProvider_  ContextDataProvider
+	ContextPublisher_     ContextEventHandler
+	// Deprecated: Use ContextPublisher_ instead.
 	ContextEventHandler_  ContextEventHandler
 	ContextEventLogger_   ContextEventLogger
 	VariableParser_       VariableParser
@@ -19,6 +21,9 @@ type ABSmartly = ABsmartly
 
 func Create(config ABsmartlyConfig) ABsmartly {
 	var abs = ABsmartly(config)
+	if abs.ContextPublisher_ != nil {
+		abs.ContextEventHandler_ = abs.ContextPublisher_
+	}
 	if abs.ContextDataProvider_ == nil {
 		abs.ContextDataProvider_ = DefaultContextDataProvider{client_: abs.Client_}
 	}

@@ -63,6 +63,12 @@ func (b *ABsmartlyBuilder) ContextDataProvider(provider ContextDataProvider) *AB
 	return b
 }
 
+func (b *ABsmartlyBuilder) ContextPublisher(handler ContextEventHandler) *ABsmartlyBuilder {
+	b.contextEventHandler_ = handler
+	return b
+}
+
+// Deprecated: Use ContextPublisher instead.
 func (b *ABsmartlyBuilder) ContextEventHandler(handler ContextEventHandler) *ABsmartlyBuilder {
 	b.contextEventHandler_ = handler
 	return b
