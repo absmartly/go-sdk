@@ -95,7 +95,7 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 	}
 
 	if lhs.IsValid() && rhs.IsValid() && lhs.Kind() == rhs.Kind() {
-		if lhs.Comparable() && rhs.Comparable() && lhs == rhs {
+		if lhs.Comparable() && rhs.Comparable() && lhs.Interface() == rhs.Interface() {
 			return 0
 		}
 		if reflect.DeepEqual(lhs.Interface(), rhs.Interface()) {

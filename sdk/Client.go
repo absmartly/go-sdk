@@ -3,7 +3,7 @@ package sdk
 import (
 	"context"
 	"errors"
-	"fmt"
+	"log"
 	"net/url"
 
 	"github.com/absmartly/go-sdk/sdk/future"
@@ -37,7 +37,7 @@ func CreateClient(config ClientConfig, httpClient HTTPClient) Client {
 		parsedURL, err := url.Parse(config.Endpoint_)
 		if err == nil && parsedURL.Scheme != "" {
 			if parsedURL.Scheme != "https" {
-				fmt.Printf("WARNING: Endpoint is not using HTTPS. API key will be transmitted insecurely: %s\n", config.Endpoint_)
+				log.Printf("WARNING: Endpoint is not using HTTPS. API key will be transmitted insecurely: %s", config.Endpoint_)
 			}
 		}
 	}
