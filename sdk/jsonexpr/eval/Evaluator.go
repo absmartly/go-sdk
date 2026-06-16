@@ -75,7 +75,7 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 
 		if lhs.Kind() == reflect.Slice || lhs.Kind() == reflect.Array {
 			for i := 0; i < lhs.Len(); i++ {
-				if lhs.Index(i).Interface() != rhs.Index(i).Interface() {
+				if !reflect.DeepEqual(lhs.Index(i).Interface(), rhs.Index(i).Interface()) {
 					return nil
 				}
 			}
@@ -85,8 +85,8 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 			var rentry = rhs.MapRange()
 			for entry.Next() {
 				rentry.Next()
-				if entry.Key().Interface() != rentry.Key().Interface() ||
-					entry.Value().Interface() != rentry.Value().Interface() {
+				if !reflect.DeepEqual(entry.Key().Interface(), rentry.Key().Interface()) ||
+					!reflect.DeepEqual(entry.Value().Interface(), rentry.Value().Interface()) {
 					return nil
 				}
 			}

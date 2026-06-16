@@ -352,7 +352,7 @@ func (c *Context) SetUnit(unitType string, uid string) error {
 	var previous, exist = c.Units_[unitType]
 	if exist && previous != uid {
 		c.ContextLock_.Unlock()
-		return errors.New("unit already set")
+		return fmt.Errorf("Unit '%s' UID already set.", unitType)
 	}
 
 	var trimmed = strings.TrimSpace(uid)

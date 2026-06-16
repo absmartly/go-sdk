@@ -27,9 +27,7 @@ var Operators = map[string]eval.Operator{
 	"match": operators.BinaryOperator{
 		BinaryOp: operators.MatchOperator{},
 	},
-	"eq": operators.BinaryOperator{
-		BinaryOp: operators.EqualsOperator{},
-	},
+	"eq": operators.EqualsOperator{},
 	"gt": operators.BinaryOperator{
 		BinaryOp: operators.GreaterThanOperator{},
 	},

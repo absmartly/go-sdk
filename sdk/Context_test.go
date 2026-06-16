@@ -432,7 +432,7 @@ func TestUnitEmpty(t *testing.T) {
 
 	err = context.SetUnit("session_id", "1")
 
-	assertAny("unit already set", err.Error(), t)
+	assertAny("Unit 'session_id' UID already set.", err.Error(), t)
 }
 
 func TestSetAttributes(t *testing.T) {
