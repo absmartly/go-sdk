@@ -75,6 +75,17 @@ var variableExperiments = map[string]string{
 	"show-modal":    "exp_test_new",
 }
 
+// GetVariableKeys returns a list of experiment names per variable key.
+var variableExperimentKeys = map[string][]string{
+	"banner.border": {"exp_test_ab"},
+	"banner.size":   {"exp_test_ab"},
+	"button.color":  {"exp_test_abc"},
+	"card.width":    {"exp_test_not_eligible"},
+	"submit.color":  {"exp_test_fullon"},
+	"submit.shape":  {"exp_test_fullon"},
+	"show-modal":    {"exp_test_new"},
+}
+
 var units = map[string]string{
 	"session_id": "e791e240fcd3df7d238cfc285f475e8152fcc0ec",
 	"user_id":    "123456789",
@@ -768,7 +779,7 @@ func TestGetVariableKeys(t *testing.T) {
 	assertAny(false, context.IsFailed(), t)
 
 	var res, _ = context.GetVariableKeys()
-	assertAny(variableExperiments, res, t)
+	assertAny(variableExperimentKeys, res, t)
 
 	assertAny(int32(0), context.GetPendingCount(), t)
 }

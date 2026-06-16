@@ -1095,7 +1095,7 @@ func TestVariableKeysReturnsAllActiveKeys(t *testing.T) {
 
 	var res, err = context.GetVariableKeys()
 	assertAny(nil, err, t)
-	assertAny(variableExperiments, res, t)
+	assertAny(variableExperimentKeys, res, t)
 }
 
 func TestRefreshClearsAssignmentCacheForStoppedExperiment(t *testing.T) {

@@ -41,7 +41,7 @@ type Context struct {
 	Data_                jsonmodels.ContextData
 	Index_               map[string]ExperimentVariables
 	ContextCustomFields_ map[string]map[string]ContextCustomFieldValue
-	IndexVariables_      map[interface{}]interface{}
+	IndexVariables_      map[string][]ExperimentVariables
 	ContextLock_         *sync.RWMutex
 	HashedUnits_         map[interface{}]interface{}
 	Assigners_           map[interface{}]interface{}
@@ -437,17 +437,21 @@ func (c *Context) PeekTreatment(experimentName string) (int, error) {
 	return c.GetAssignment(experimentName).Variant, nil
 }
 
-func (c *Context) GetVariableKeys() (map[string]string, error) {
+func (c *Context) GetVariableKeys() (map[string][]string, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
 	}
 
-	var variableKeys = map[string]string{}
+	var variableKeys = map[string][]string{}
 
 	c.DataLock.Lock()
-	for key, value := range c.IndexVariables_ {
-		variableKeys[key.(string)] = value.(ExperimentVariables).Data.Name
+	for key, experiments := range c.IndexVariables_ {
+		var names = make([]string, 0, len(experiments))
+		for _, value := range experiments {
+			names = append(names, value.Data.Name)
+		}
+		variableKeys[key] = names
 	}
 	c.DataLock.Unlock()
 	return variableKeys, nil
@@ -887,7 +891,7 @@ func (c *Context) CheckReady(expectNotClosed bool) error {
 
 func (c *Context) SetData(data jsonmodels.ContextData) {
 	var index = map[string]ExperimentVariables{}
-	var indexVariables = map[interface{}]interface{}{}
+	var indexVariables = map[string][]ExperimentVariables{}
 	var contextCustomFields = map[string]map[string]ContextCustomFieldValue{}
 
 	for _, experiment := range data.Experiments {
@@ -900,7 +904,20 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 			if len(variant.Config) > 0 {
 				var variables = c.VariableParser_.Parse(*c, experiment.Name, variant.Name, variant.Config)
 				for key := range variables {
-					indexVariables[key] = experiemntVariables
+					// Keep a list of experiments per variable key (matching the
+					// canonical SDKs). Guard against adding the same experiment
+					// twice when multiple variants define the same key.
+					var existing = indexVariables[key]
+					var already = false
+					for _, e := range existing {
+						if e.Data.Name == experiment.Name {
+							already = true
+							break
+						}
+					}
+					if !already {
+						indexVariables[key] = append(existing, experiemntVariables)
+					}
 				}
 				experiemntVariables.Variables = append(experiemntVariables.Variables, variables)
 			} else {
@@ -970,7 +987,7 @@ func (c *Context) LogError(err error) {
 func (c *Context) SetDataFailed(err error) {
 	c.DataLock.Lock()
 	c.Index_ = map[string]ExperimentVariables{}
-	c.IndexVariables_ = map[interface{}]interface{}{}
+	c.IndexVariables_ = map[string][]ExperimentVariables{}
 	c.Data_ = jsonmodels.ContextData{}
 	c.Ready_.Store(true)
 	c.Failed_.Store(true)
@@ -1154,12 +1171,13 @@ func (c *Context) GetVariableAssignment(key string) (*Assignment, error) {
 }
 
 func (c *Context) GetVariableExperiment(key string) (ExperimentVariables, error) {
-	var result = GetRW(c.DataLock, c.IndexVariables_, key)
-	if result == nil {
+	c.DataLock.Lock()
+	var experiments = c.IndexVariables_[key]
+	c.DataLock.Unlock()
+	if len(experiments) == 0 {
 		return ExperimentVariables{}, errors.New("result is nil")
-	} else {
-		return result.(ExperimentVariables), nil
 	}
+	return experiments[0], nil
 }
 
 type ComputerVariantAssigner struct {
