@@ -3,6 +3,9 @@ package sdk
 import (
 	"context"
 	"errors"
+	"log"
+	"net/url"
+
 	"github.com/absmartly/go-sdk/sdk/future"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 	"github.com/go-resty/resty/v2"
@@ -30,6 +33,15 @@ func CreateDefaultClient(config ClientConfig) Client {
 }
 
 func CreateClient(config ClientConfig, httpClient HTTPClient) Client {
+	if config.Endpoint_ != "" {
+		parsedURL, err := url.Parse(config.Endpoint_)
+		if err == nil && parsedURL.Scheme != "" {
+			if parsedURL.Scheme != "https" {
+				log.Printf("WARNING: Endpoint is not using HTTPS. API key will be transmitted insecurely: %s", config.Endpoint_)
+			}
+		}
+	}
+
 	var cl = Client{url_: config.Endpoint_ + "/context", serializer_: config.Serializer_, deserializer_: config.Deserializer_, httpClient_: httpClient}
 	if cl.deserializer_ == nil {
 		cl.deserializer_ = DefaultContextDataDeserializer{}
@@ -61,13 +73,20 @@ func (c Client) GetContextData() *future.Future {
 	var dataFuture = future.Call(func() (future.Value, error) {
 		var fut = c.httpClient_.Get(c.url_, c.query_, nil)
 		var value, err = fut.Get(context.Background())
-		if err != nil || value.(*resty.Response).StatusCode()/100 != 2 {
-			err = errors.New(value.(*resty.Response).Status())
-			value = nil
+		if err != nil {
+			return nil, err
 		}
-		if err == nil {
-			value, err = c.deserializer_.Deserialize(value.(*resty.Response).Body())
+
+		resp, ok := value.(*resty.Response)
+		if !ok {
+			return nil, errors.New("unexpected response type")
 		}
+
+		if resp.StatusCode()/100 != 2 {
+			return nil, errors.New(resp.Status())
+		}
+
+		value, err = c.deserializer_.Deserialize(resp.Body())
 		return value, err
 	})
 	return dataFuture
@@ -86,8 +105,13 @@ func (c Client) Publish(event jsonmodels.PublishEvent) *future.Future {
 			return nil, err
 		}
 
-		if value.(*resty.Response).StatusCode()/100 != 2 {
-			return nil, errors.New(value.(*resty.Response).Status())
+		resp, ok := value.(*resty.Response)
+		if !ok {
+			return nil, errors.New("unexpected response type")
+		}
+
+		if resp.StatusCode()/100 != 2 {
+			return nil, errors.New(resp.Status())
 		}
 		return value, nil
 	})

@@ -8,8 +8,12 @@ func Digest(key []int8, seed int) int {
 	return DigestOffset(key, 0, len(key), seed)
 }
 
-func DigestOffset(key []int8, offset int, len int, seed int) int {
-	var n = offset + (len & ^3)
+func DigestOffset(key []int8, offset int, length int, seed int) int {
+	if offset < 0 || length < 0 || offset+length > len(key) {
+		panic("DigestOffset: invalid offset or length")
+	}
+
+	var n = offset + (length & ^3)
 	var hash = seed
 	var i = offset
 	for ; i < n; i += 4 {
@@ -18,7 +22,7 @@ func DigestOffset(key []int8, offset int, len int, seed int) int {
 		hash = int(int32(bits.RotateLeft32(uint32(hash), 13)))
 		hash = int(int32((hash * 5) + 0xe6546b64))
 	}
-	switch len & 3 {
+	switch length & 3 {
 	case 3:
 		hash ^= scramble32(GetUInt24(key, i))
 	case 2:
@@ -28,7 +32,7 @@ func DigestOffset(key []int8, offset int, len int, seed int) int {
 	case 0:
 	default:
 	}
-	hash ^= len
+	hash ^= length
 	hash = fmix32(hash)
 	return hash
 }

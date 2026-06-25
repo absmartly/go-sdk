@@ -6,8 +6,10 @@ import (
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
 
-type ABSmartly struct {
+type ABsmartly struct {
 	ContextDataProvider_  ContextDataProvider
+	ContextPublisher_     ContextEventHandler
+	// Deprecated: Use ContextPublisher_ instead.
 	ContextEventHandler_  ContextEventHandler
 	ContextEventLogger_   ContextEventLogger
 	VariableParser_       VariableParser
@@ -15,8 +17,13 @@ type ABSmartly struct {
 	Client_               ClientI
 }
 
-func Create(config ABSmartlyConfig) ABSmartly {
-	var abs = ABSmartly(config)
+type ABSmartly = ABsmartly
+
+func Create(config ABsmartlyConfig) ABsmartly {
+	var abs = ABsmartly(config)
+	if abs.ContextPublisher_ != nil {
+		abs.ContextEventHandler_ = abs.ContextPublisher_
+	}
 	if abs.ContextDataProvider_ == nil {
 		abs.ContextDataProvider_ = DefaultContextDataProvider{client_: abs.Client_}
 	}
@@ -41,19 +48,19 @@ func Create(config ABSmartlyConfig) ABSmartly {
 }
 
 // CreateContext
-func (abs ABSmartly) CreateContext(config ContextConfig) *Context {
+func (abs ABsmartly) CreateContext(config ContextConfig) *Context {
 	return CreateContext(internal.SystemClockUTC{}, config, abs.ContextDataProvider_.GetContextData(), abs.ContextDataProvider_,
 		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_})
 }
 
 // CreateContextWith
-func (abs ABSmartly) CreateContextWith(config ContextConfig, data jsonmodels.ContextData) *Context {
+func (abs ABsmartly) CreateContextWith(config ContextConfig, data jsonmodels.ContextData) *Context {
 	var ft, done = future.New()
 	done(data, nil)
 	return CreateContext(internal.SystemClockUTC{}, config, ft, abs.ContextDataProvider_,
 		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_})
 }
 
-func (abs ABSmartly) GetContextData() *future.Future {
+func (abs ABsmartly) GetContextData() *future.Future {
 	return abs.ContextDataProvider_.GetContextData()
 }

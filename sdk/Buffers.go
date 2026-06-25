@@ -30,18 +30,32 @@ func GetUInt8(buf []int8, offset int) uint32 {
 }
 
 func EncodeUTF8(buf []int8, offset int, value string) int {
-	var n = len(value)
-
 	var out = offset
-	for i := 0; i < n; i++ {
-		var c = value[i]
+	for _, r := range value {
+		var c = uint32(r)
 		if c < 0x80 {
 			buf[out] = int8(c)
 			out++
-		} else if c == 0x80 {
-			buf[out] = int8((c >> 6) | 192)
+		} else if c < 0x800 {
+			buf[out] = int8((c >> 6) | 0xC0)
 			out++
-			buf[out] = int8((c & 63) | 128)
+			buf[out] = int8((c & 0x3F) | 0x80)
+			out++
+		} else if c < 0x10000 {
+			buf[out] = int8((c >> 12) | 0xE0)
+			out++
+			buf[out] = int8(((c >> 6) & 0x3F) | 0x80)
+			out++
+			buf[out] = int8((c & 0x3F) | 0x80)
+			out++
+		} else {
+			buf[out] = int8((c >> 18) | 0xF0)
+			out++
+			buf[out] = int8(((c >> 12) & 0x3F) | 0x80)
+			out++
+			buf[out] = int8(((c >> 6) & 0x3F) | 0x80)
+			out++
+			buf[out] = int8((c & 0x3F) | 0x80)
 			out++
 		}
 	}

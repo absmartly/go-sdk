@@ -17,7 +17,9 @@ func (e Evaluator) Evaluate(expr reflect.Value) interface{} {
 		return e.Operators["and"].Evaluate(e, expr.Interface())
 	} else if expr.Kind() == reflect.Map {
 		var entry = expr.MapRange()
-		entry.Next()
+		if !entry.Next() {
+			return nil
+		}
 		var op = e.Operators[entry.Key().String()]
 		if op != nil {
 			return op.Evaluate(e, entry.Value().Interface())
@@ -73,7 +75,7 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 
 		if lhs.Kind() == reflect.Slice || lhs.Kind() == reflect.Array {
 			for i := 0; i < lhs.Len(); i++ {
-				if lhs.Index(i).Interface() != rhs.Index(i).Interface() {
+				if !reflect.DeepEqual(lhs.Index(i).Interface(), rhs.Index(i).Interface()) {
 					return nil
 				}
 			}
@@ -83,8 +85,8 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 			var rentry = rhs.MapRange()
 			for entry.Next() {
 				rentry.Next()
-				if entry.Key().Interface() != rentry.Key().Interface() ||
-					entry.Value().Interface() != rentry.Value().Interface() {
+				if !reflect.DeepEqual(entry.Key().Interface(), rentry.Key().Interface()) ||
+					!reflect.DeepEqual(entry.Value().Interface(), rentry.Value().Interface()) {
 					return nil
 				}
 			}
@@ -92,11 +94,13 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 		}
 	}
 
-	if lhs.IsValid() && rhs.IsValid() && lhs.Kind() == rhs.Kind() && lhs == rhs {
-		if lhs.IsNil() && rhs.IsNil() {
-			return nil
+	if lhs.IsValid() && rhs.IsValid() && lhs.Kind() == rhs.Kind() {
+		if lhs.Comparable() && rhs.Comparable() && lhs.Interface() == rhs.Interface() {
+			return 0
 		}
-		return 0
+		if reflect.DeepEqual(lhs.Interface(), rhs.Interface()) {
+			return 0
+		}
 	}
 
 	if !lhs.IsValid() && !rhs.IsValid() {
@@ -120,9 +124,17 @@ func (e Evaluator) BooleanConvert(x reflect.Value) bool {
 		return false
 	} else if x.IsValid() && (x.Interface() == true || x.Interface() == "true" || x.Interface() == "[true]") {
 		return true
-	} else {
-		return x.IsValid() && !x.IsNil()
+	} else if !x.IsValid() {
+		return false
 	}
+
+	kind := x.Kind()
+	if kind == reflect.Chan || kind == reflect.Func || kind == reflect.Interface ||
+		kind == reflect.Map || kind == reflect.Pointer || kind == reflect.Slice {
+		return !x.IsNil()
+	}
+
+	return true
 }
 
 func (e Evaluator) NumberConvert(x reflect.Value) (float64, error) {
