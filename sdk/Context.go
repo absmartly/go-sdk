@@ -64,6 +64,11 @@ type Context struct {
 	RefreshTimer_        *time.Timer
 	Clock_               internal.Clock
 	AttrsSeq_            int32
+
+	// customFieldErrors_ holds, per experiment and field name, the error from
+	// parsing a "json" custom field. GetCustomFieldValue reports it through the
+	// event logger when the field is read. Guarded by DataLock.
+	customFieldErrors_ map[string]map[string]error
 }
 
 type ExperimentVariables struct {
@@ -510,7 +515,13 @@ func (c *Context) GetCustomFieldValue(experimentName string, key string) interfa
 			value = field.Value
 		}
 	}
+	var parseErr = c.customFieldErrors_[experimentName][key]
 	c.DataLock.Unlock()
+
+	if parseErr != nil {
+		c.LogError(errors.New("Failed to parse JSON custom field value '" + key + "' for experiment '" +
+			experimentName + "': " + parseErr.Error()))
+	}
 
 	return value
 }
@@ -893,6 +904,7 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 	var index = map[string]ExperimentVariables{}
 	var indexVariables = map[string][]ExperimentVariables{}
 	var contextCustomFields = map[string]map[string]ContextCustomFieldValue{}
+	var customFieldErrors = map[string]map[string]error{}
 
 	for _, experiment := range data.Experiments {
 		var experiemntVariables = ExperimentVariables{}
@@ -932,7 +944,18 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 			if len(customFieldValue.Value) > 0 {
 				var customValue = customFieldValue.Value
 				if strings.HasPrefix(customFieldValue.Type, "json") {
-					value.Value = c.VariableParser_.Parse(*c, experiment.Name, customFieldValue.Name, customValue)
+					if parser, ok := c.VariableParser_.(CustomFieldValueParser); ok {
+						parsed, err := parser.ParseCustomFieldValue(*c, experiment.Name, customFieldValue.Name, customValue)
+						value.Value = parsed
+						if err != nil {
+							if customFieldErrors[experiment.Name] == nil {
+								customFieldErrors[experiment.Name] = map[string]error{}
+							}
+							customFieldErrors[experiment.Name][customFieldValue.Name] = err
+						}
+					} else {
+						value.Value = c.VariableParser_.Parse(*c, experiment.Name, customFieldValue.Name, customValue)
+					}
 				} else if strings.HasPrefix(customFieldValue.Type, "boolean") {
 					parsed, err := strconv.ParseBool(customValue)
 					if err != nil && c.EventLogger_ != nil {
@@ -964,6 +987,7 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 
 	c.Index_ = index
 	c.ContextCustomFields_ = contextCustomFields
+	c.customFieldErrors_ = customFieldErrors
 	c.IndexVariables_ = indexVariables
 	c.Data_ = data
 	c.Ready_.Store(true)
@@ -988,6 +1012,7 @@ func (c *Context) SetDataFailed(err error) {
 	c.DataLock.Lock()
 	c.Index_ = map[string]ExperimentVariables{}
 	c.IndexVariables_ = map[string][]ExperimentVariables{}
+	c.customFieldErrors_ = nil
 	c.Data_ = jsonmodels.ContextData{}
 	c.Ready_.Store(true)
 	c.Failed_.Store(true)
