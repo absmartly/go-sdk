@@ -1083,6 +1083,7 @@ func (c *Context) Flush() *future.Future {
 							c.LogEvent(Publish, event)
 							done(nil, nil)
 						} else {
+							c.requeueEvents(exposures, achievements, eventCount)
 							c.LogError(err)
 							done(nil, err)
 						}
@@ -1102,6 +1103,28 @@ func (c *Context) Flush() *future.Future {
 	result, done := future.New()
 	done(nil, nil)
 	return result
+}
+
+// requeueEvents puts the events of a failed publish back in the queue so a
+// later Publish or Close can send them again. Flush empties the queue before
+// it calls the publisher, so events recorded while the publish was in flight
+// are already queued. The failed batch goes in front of them to keep the
+// queue in the order the events happened.
+func (c *Context) requeueEvents(exposures []jsonmodels.Exposure, achievements []jsonmodels.GoalAchievement, count int32) {
+	c.EventLock_.Lock()
+	defer c.EventLock_.Unlock()
+
+	// Build new slices. The publisher can still hold the event that references
+	// the failed batch, so the batch slices must not be changed.
+	var restoredExposures = make([]jsonmodels.Exposure, 0, len(exposures)+len(c.Exposures_))
+	restoredExposures = append(restoredExposures, exposures...)
+	c.Exposures_ = append(restoredExposures, c.Exposures_...)
+
+	var restoredAchievements = make([]jsonmodels.GoalAchievement, 0, len(achievements)+len(c.Achievements_))
+	restoredAchievements = append(restoredAchievements, achievements...)
+	c.Achievements_ = append(restoredAchievements, c.Achievements_...)
+
+	c.PendingCount_.Store(c.PendingCount_.Load().(int32) + count)
 }
 
 type FlushMapper struct {

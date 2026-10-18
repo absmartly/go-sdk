@@ -1626,20 +1626,21 @@ func TestTreatmentThrowsAfterClose(t *testing.T) {
 	}
 }
 
-func TestPublishNotRetainQueueOnFailure(t *testing.T) {
+func TestPublishRetainsQueueOnFailure(t *testing.T) {
 	setUp()
+	publishErr := errors.New("publish failed")
 	client := &CapturingPublishClient{
 		contextData: data,
-		publishErr:  errors.New("publish failed"),
+		publishErr:  publishErr,
 	}
 	df, done := future.New()
 	done(data, nil)
 	ctx := createCanonicalContext(t, client, df, nil)
 
 	ctx.Track("goal1", nil)
-	ctx.Publish()
-
-	time.Sleep(50 * time.Millisecond)
+	assertAny(publishErr, ctx.Publish(), t)
+	assertAny(int32(1), ctx.GetPendingCount(), t)
+	assertAny(1, len(ctx.Achievements_), t)
 }
 
 func TestEventLoggerCalledOnVariableValueExposure(t *testing.T) {
