@@ -17,11 +17,16 @@ type ClientContextMock struct {
 
 var experiment = jsonmodels.Experiment{Name: "test"}
 
-var fut = future.Call(func() (future.Value, error) {
-	return jsonmodels.ContextData{
-		Experiments: []jsonmodels.Experiment{experiment},
-	}, nil
-})
+func newDefaultFut() *future.Future {
+	var exp = experiment
+	return future.Call(func() (future.Value, error) {
+		return jsonmodels.ContextData{
+			Experiments: []jsonmodels.Experiment{exp},
+		}, nil
+	})
+}
+
+var fut = newDefaultFut()
 
 var futLock sync.Mutex
 
@@ -127,7 +132,34 @@ var eventLogger ContextEventLogger
 var variableParser DefaultVariableParser
 var audienceMatcher AudienceMatcher
 
+var createdContexts []*Context
+var createdContextsLock sync.Mutex
+
+func trackContext(c *Context) *Context {
+	createdContextsLock.Lock()
+	createdContexts = append(createdContexts, c)
+	createdContextsLock.Unlock()
+	return c
+}
+
+// stopLeakedTimers stops the refresh timers of contexts earlier tests created,
+// so they cannot fire while a later test replaces the shared fixtures.
+func stopLeakedTimers() {
+	createdContextsLock.Lock()
+	var old = createdContexts
+	createdContexts = nil
+	createdContextsLock.Unlock()
+	for _, c := range old {
+		c.ClearRefreshTimer()
+	}
+}
+
 func setUp() {
+	stopLeakedTimers()
+	// Tests replace fut; start every test from the default so results do not
+	// depend on test order or -count.
+	experiment = jsonmodels.Experiment{Name: "test"}
+	setFut(newDefaultFut())
 	content, _ := ioutil.ReadFile("testAssets/context.json")
 	contentstrict, _ := ioutil.ReadFile("testAssets/context-strict.json")
 	refreshed, _ := ioutil.ReadFile("testAssets/refreshed.json")
@@ -158,11 +190,11 @@ func setUp() {
 }
 
 func CreateTestContext(config ContextConfig, dataFuture *future.Future) *Context {
-	return CreateContext(clock, config, dataFuture, dataProvider, eventHandler, eventLogger, variableParser, audienceMatcher)
+	return trackContext(CreateContext(clock, config, dataFuture, dataProvider, eventHandler, eventLogger, variableParser, audienceMatcher))
 }
 
 func CreateTestPublishContext(config ContextConfig, dataFuture *future.Future) *Context {
-	return CreateContext(clock, config, dataFuture, DefaultContextDataProvider{client_: ClientContextPublishMock{}}, DefaultContextEventHandler{client_: ClientContextPublishMock{}}, eventLogger, variableParser, audienceMatcher)
+	return trackContext(CreateContext(clock, config, dataFuture, DefaultContextDataProvider{client_: ClientContextPublishMock{}}, DefaultContextEventHandler{client_: ClientContextPublishMock{}}, eventLogger, variableParser, audienceMatcher))
 }
 
 func TestConstructorSetsOverrides(t *testing.T) {
@@ -1093,6 +1125,7 @@ func TestPublishSuccess(t *testing.T) {
 		}},
 		Attributes: []jsonmodels.Attribute{{Name: "test", Value: "value1", SetAt: 1620000000000}},
 	}
+	publishResult = nil
 	assertAny(nil, publishResult, t)
 	var attrErr = context.SetAttribute("test", "value1")
 	assertAny(nil, attrErr, t)
@@ -1347,4 +1380,9 @@ func TestClearAssignmentCacheForExperimentIdChange(t *testing.T) {
 	res, err = context.GetTreatment("not_found")
 	assertAny(0, res, t)
 	assertAny(nil, err, t)
+}
+
+func createTrackedContext(clk internal.Clock, config ContextConfig, dataFuture *future.Future, dp ContextDataProvider,
+	eh ContextEventHandler, el ContextEventLogger, vp VariableParser, am AudienceMatcher) *Context {
+	return trackContext(CreateContext(clk, config, dataFuture, dp, eh, el, vp, am))
 }

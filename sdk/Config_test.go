@@ -102,7 +102,7 @@ func TestInvalidUnitTypes(t *testing.T) {
 		var audienceMatcher = AudienceMatcher{audeser}
 		var clk = FixedClockForTest{millis: 1620000000000}
 
-		ctx := CreateContext(clk, config, dataFutureReady, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
+		ctx := createTrackedContext(clk, config, dataFutureReady, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
 
 		err := ctx.SetUnit("new_unit", "")
 		if err == nil {
@@ -123,7 +123,7 @@ func TestInvalidUnitTypes(t *testing.T) {
 		var audienceMatcher = AudienceMatcher{audeser}
 		var clk = FixedClockForTest{millis: 1620000000000}
 
-		ctx := CreateContext(clk, config, dataFutureReady, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
+		ctx := createTrackedContext(clk, config, dataFutureReady, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
 
 		err := ctx.SetUnit("new_unit", "   ")
 		if err == nil {
@@ -142,7 +142,7 @@ func TestInvalidUnitTypes(t *testing.T) {
 		var audienceMatcher = AudienceMatcher{audeser}
 		var clk = FixedClockForTest{millis: 1620000000000}
 
-		ctx := CreateContext(clk, config, dataFutureReady, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
+		ctx := createTrackedContext(clk, config, dataFutureReady, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
 
 		err := ctx.SetUnit("user_id", "different_value")
 		if err == nil {
@@ -163,7 +163,7 @@ func TestInvalidUnitTypes(t *testing.T) {
 		var audienceMatcher = AudienceMatcher{audeser}
 		var clk = FixedClockForTest{millis: 1620000000000}
 
-		ctx := CreateContext(clk, config, dataFutureReady, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
+		ctx := createTrackedContext(clk, config, dataFutureReady, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
 
 		err := ctx.SetUnit("user_id", "same_value")
 		if err != nil {
@@ -193,7 +193,7 @@ func TestNegativeIntervals(t *testing.T) {
 		var audienceMatcher = AudienceMatcher{DefaultAudienceDeserializer{}}
 		var clk = FixedClockForTest{millis: 1620000000000}
 
-		ctx := CreateContext(clk, config, dataFuture, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
+		ctx := createTrackedContext(clk, config, dataFuture, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
 
 		err := ctx.Track("test_goal", nil)
 		if err != nil {
@@ -221,7 +221,7 @@ func TestNegativeIntervals(t *testing.T) {
 		var audienceMatcher = AudienceMatcher{DefaultAudienceDeserializer{}}
 		var clk = FixedClockForTest{millis: 1620000000000}
 
-		ctx := CreateContext(clk, config, dataFuture, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
+		ctx := createTrackedContext(clk, config, dataFuture, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
 
 		if ctx.RefreshTimer_ != nil {
 			t.Errorf("Expected no refresh timer with zero interval, but timer was set")
@@ -248,7 +248,7 @@ func TestNegativeIntervals(t *testing.T) {
 		var audienceMatcher = AudienceMatcher{DefaultAudienceDeserializer{}}
 		var clk = FixedClockForTest{millis: 1620000000000}
 
-		ctx := CreateContext(clk, config, dataFuture, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
+		ctx := createTrackedContext(clk, config, dataFuture, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
 
 		if ctx.RefreshTimer_ != nil {
 			t.Errorf("Expected no refresh timer with negative interval, but timer was set")
@@ -361,7 +361,7 @@ func TestContextWithEmptyUnits(t *testing.T) {
 	var audienceMatcher = AudienceMatcher{DefaultAudienceDeserializer{}}
 	var clk = FixedClockForTest{millis: 1620000000000}
 
-	ctx := CreateContext(clk, config, dataFuture, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
+	ctx := createTrackedContext(clk, config, dataFuture, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
 
 	treatment, _ := ctx.GetTreatment("exp_test")
 	if treatment != 0 {

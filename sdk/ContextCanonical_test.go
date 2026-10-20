@@ -50,7 +50,7 @@ func createCanonicalContext(t *testing.T, client *CapturingPublishClient, dataFu
 		el = logger
 	}
 
-	return CreateContext(clk, config, dataFuture, dp, eh, el, vp, am)
+	return createTrackedContext(clk, config, dataFuture, dp, eh, el, vp, am)
 }
 
 func TestTreatmentQueuesExposures(t *testing.T) {
@@ -625,7 +625,7 @@ func TestRefreshNotReQueueExposuresWhenNotChanged(t *testing.T) {
 	var am = AudienceMatcher{DefaultAudienceDeserializer{}}
 	var clk = FixedClockForTest{millis: 1620000000000}
 
-	ctx := CreateContext(clk, config, df, dp, eh, nil, vp, am)
+	ctx := createTrackedContext(clk, config, df, dp, eh, nil, vp, am)
 
 	ctx.GetTreatment("exp_test_ab")
 	var count = ctx.GetPendingCount()
@@ -659,7 +659,7 @@ func TestRefreshNotReQueueWhenNotChangedWithOverride(t *testing.T) {
 	var am = AudienceMatcher{DefaultAudienceDeserializer{}}
 	var clk = FixedClockForTest{millis: 1620000000000}
 
-	ctx := CreateContext(clk, config, df, dp, eh, nil, vp, am)
+	ctx := createTrackedContext(clk, config, df, dp, eh, nil, vp, am)
 
 	ctx.SetOverride("exp_test_ab", 5)
 	ctx.GetTreatment("exp_test_ab")
@@ -754,7 +754,7 @@ func TestEventLoggerCalledOnTreatmentExposure(t *testing.T) {
 	var am = AudienceMatcher{audeser}
 	var clk = FixedClockForTest{millis: 1620000000000}
 
-	ctx := CreateContext(clk, config, dataFutureReady, dp, eh, logger, vp, am)
+	ctx := createTrackedContext(clk, config, dataFutureReady, dp, eh, logger, vp, am)
 	logger.Reset()
 
 	ctx.GetTreatment("exp_test_ab")
@@ -792,7 +792,7 @@ func TestEventLoggerCalledOnTrackGoal(t *testing.T) {
 	var am = AudienceMatcher{audeser}
 	var clk = FixedClockForTest{millis: 1620000000000}
 
-	ctx := CreateContext(clk, config, dataFutureReady, dp, eh, logger, vp, am)
+	ctx := createTrackedContext(clk, config, dataFutureReady, dp, eh, logger, vp, am)
 	logger.Reset()
 
 	ctx.Track("purchase", map[string]interface{}{"amount": 99.0})
@@ -832,7 +832,7 @@ func TestEventLoggerCalledOnReadyWithPreFetchedData(t *testing.T) {
 	var am = AudienceMatcher{audeser}
 	var clk = FixedClockForTest{millis: 1620000000000}
 
-	ctx := CreateContext(clk, config, df, dp, eh, logger, vp, am)
+	ctx := createTrackedContext(clk, config, df, dp, eh, logger, vp, am)
 	_ = ctx
 
 	time.Sleep(10 * time.Millisecond)
@@ -867,7 +867,7 @@ func TestEventLoggerCalledOnInitializationError(t *testing.T) {
 	var am = AudienceMatcher{DefaultAudienceDeserializer{}}
 	var clk = FixedClockForTest{millis: 1620000000000}
 
-	_ = CreateContext(clk, config, df, dp, eh, logger, vp, am)
+	_ = createTrackedContext(clk, config, df, dp, eh, logger, vp, am)
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -1402,7 +1402,7 @@ func TestEventLoggerCalledOnRefreshSuccess(t *testing.T) {
 	var am = AudienceMatcher{audeser}
 	var clk = FixedClockForTest{millis: 1620000000000}
 
-	ctx := CreateContext(clk, config, dataFutureReady, dp, eh, logger, vp, am)
+	ctx := createTrackedContext(clk, config, dataFutureReady, dp, eh, logger, vp, am)
 	logger.Reset()
 
 	ctx.Refresh()
@@ -1436,7 +1436,7 @@ func TestEventLoggerCalledOnCloseSuccess(t *testing.T) {
 	var am = AudienceMatcher{audeser}
 	var clk = FixedClockForTest{millis: 1620000000000}
 
-	ctx := CreateContext(clk, config, dataFutureReady, dp, eh, logger, vp, am)
+	ctx := createTrackedContext(clk, config, dataFutureReady, dp, eh, logger, vp, am)
 	logger.Reset()
 
 	ctx.Close()
@@ -1658,7 +1658,7 @@ func TestEventLoggerCalledOnVariableValueExposure(t *testing.T) {
 	var am = AudienceMatcher{audeser}
 	var clk = FixedClockForTest{millis: 1620000000000}
 
-	ctx := CreateContext(clk, config, dataFutureReady, dp, eh, logger, vp, am)
+	ctx := createTrackedContext(clk, config, dataFutureReady, dp, eh, logger, vp, am)
 	logger.Reset()
 
 	ctx.GetVariableValue("banner.border", 0)
@@ -1719,7 +1719,7 @@ func TestContextWithCustomPublisherDataProviderAndEventLogger(t *testing.T) {
 	var am = AudienceMatcher{audeser}
 	var clk = FixedClockForTest{millis: 1620000000000}
 
-	ctx := CreateContext(clk, config, dataFutureReady, dp, eh, logger, vp, am)
+	ctx := createTrackedContext(clk, config, dataFutureReady, dp, eh, logger, vp, am)
 	assertAny(true, ctx.IsReady(), t)
 }
 

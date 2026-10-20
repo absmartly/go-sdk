@@ -68,7 +68,7 @@ func createHeldPublisherContext(t *testing.T, publisher *heldPublisher, logger *
 		config.EventLogger_ = logger
 		el = logger
 	}
-	var ctx = CreateContext(clock, config, dataFutureReady, dataProvider, publisher, el, variableParser, audienceMatcher)
+	var ctx = createTrackedContext(clock, config, dataFutureReady, dataProvider, publisher, el, variableParser, audienceMatcher)
 	if !ctx.IsReady() || ctx.IsFailed() {
 		t.Fatalf("context not ready: ready=%v failed=%v", ctx.IsReady(), ctx.IsFailed())
 	}
@@ -208,7 +208,7 @@ func TestPublishOnFailedContextStillDiscardsEvents(t *testing.T) {
 	config.Units_ = units
 	config.PublishDelay_ = -1
 	config.RefreshInterval_ = 0
-	var ctx = CreateContext(clock, config, dataFutureFailed, dataProvider, publisher, nil, variableParser, audienceMatcher)
+	var ctx = createTrackedContext(clock, config, dataFutureFailed, dataProvider, publisher, nil, variableParser, audienceMatcher)
 	assertAny(true, ctx.IsFailed(), t)
 
 	assertAny(nil, ctx.Track("goal1", nil), t)
@@ -277,7 +277,7 @@ func TestFailedCloseRestoresRefreshTimer(t *testing.T) {
 	config.Units_ = units
 	config.PublishDelay_ = -1
 	config.RefreshInterval_ = 5000
-	var ctx = CreateContext(clock, config, dataFutureReady, dataProvider, publisher, nil, variableParser, audienceMatcher)
+	var ctx = createTrackedContext(clock, config, dataFutureReady, dataProvider, publisher, nil, variableParser, audienceMatcher)
 	defer ctx.ClearRefreshTimer()
 
 	assertAny(nil, ctx.Track("goal1", nil), t)

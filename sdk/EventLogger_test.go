@@ -88,7 +88,7 @@ func createEventLoggerTestContext(logger *MockEventLogger, dataFuture *future.Fu
 	var audienceMatcher = AudienceMatcher{DefaultAudienceDeserializer{}}
 	var clock = FixedClockForTest{millis: 1620000000000}
 
-	return CreateContext(clock, config, dataFuture, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
+	return createTrackedContext(clock, config, dataFuture, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
 }
 
 type FixedClockForTest struct {
@@ -171,7 +171,7 @@ func TestEventLoggerCalledOnExposure(t *testing.T) {
 	var audienceMatcher = AudienceMatcher{audeser}
 	var clk = FixedClockForTest{millis: 1620000000000}
 
-	ctx := CreateContext(clk, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
+	ctx := createTrackedContext(clk, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
 
 	logger.Reset()
 
@@ -214,7 +214,7 @@ func TestEventLoggerCalledOnGoal(t *testing.T) {
 	var audienceMatcher = AudienceMatcher{audeser}
 	var clk = FixedClockForTest{millis: 1620000000000}
 
-	ctx := CreateContext(clk, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
+	ctx := createTrackedContext(clk, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
 
 	logger.Reset()
 
@@ -261,7 +261,7 @@ func TestEventLoggerCalledOnPublish(t *testing.T) {
 	var audienceMatcher = AudienceMatcher{audeser}
 	var clk = FixedClockForTest{millis: 1620000000000}
 
-	ctx := CreateContext(clk, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
+	ctx := createTrackedContext(clk, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
 
 	logger.Reset()
 
@@ -305,7 +305,7 @@ func TestEventLoggerCalledOnRefresh(t *testing.T) {
 	var audienceMatcher = AudienceMatcher{audeser}
 	var clk = FixedClockForTest{millis: 1620000000000}
 
-	ctx := CreateContext(clk, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
+	ctx := createTrackedContext(clk, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
 
 	logger.Reset()
 
@@ -342,7 +342,7 @@ func TestEventLoggerCalledOnClose(t *testing.T) {
 	var audienceMatcher = AudienceMatcher{audeser}
 	var clk = FixedClockForTest{millis: 1620000000000}
 
-	ctx := CreateContext(clk, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
+	ctx := createTrackedContext(clk, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
 
 	logger.Reset()
 
@@ -385,7 +385,7 @@ func TestEventLoggerErrorInCallback(t *testing.T) {
 		}
 	}()
 
-	_ = CreateContext(clk, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
+	_ = createTrackedContext(clk, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
 
 	if logger.GetCallCount() == 0 {
 		t.Logf("Logger was called despite potential panic (expected behavior)")

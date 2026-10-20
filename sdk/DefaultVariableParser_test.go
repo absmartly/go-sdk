@@ -101,7 +101,7 @@ func createJSONCustomFieldContext(t *testing.T, parser VariableParser, logger *M
 	var dataFut, done = future.New()
 	done(jsonCustomFieldContextData(), nil)
 
-	var ctx = CreateContext(clock, config, dataFut, dataProvider, eventHandler, logger, parser, audienceMatcher)
+	var ctx = createTrackedContext(clock, config, dataFut, dataProvider, eventHandler, logger, parser, audienceMatcher)
 	if !ctx.IsReady() || ctx.IsFailed() {
 		t.Fatalf("context not ready: ready=%v failed=%v", ctx.IsReady(), ctx.IsFailed())
 	}
