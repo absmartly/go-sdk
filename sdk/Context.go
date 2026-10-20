@@ -60,10 +60,12 @@ type Context struct {
 	ClosingFuture_       *future.Future
 	RefreshFuture_       *future.Future
 	TimeoutLock_         *sync.Mutex
-	Timeout_             *time.Timer
-	RefreshTimer_        *time.Timer
-	Clock_               internal.Clock
-	AttrsSeq_            int32
+	// StateLock_ guards ReadyFuture_, RefreshFuture_, ClosingFuture_ and RefreshTimer_.
+	StateLock_    *sync.Mutex
+	Timeout_      *time.Timer
+	RefreshTimer_ *time.Timer
+	Clock_        internal.Clock
+	AttrsSeq_     int32
 
 	// customFieldErrors_ holds, per experiment and field name, the error from
 	// parsing a "json" custom field. GetCustomFieldValue reports it through the
@@ -130,6 +132,7 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	cntx.ContextLock_ = &sync.RWMutex{}
 	cntx.EventLock_ = &sync.Mutex{}
 	cntx.TimeoutLock_ = &sync.Mutex{}
+	cntx.StateLock_ = &sync.Mutex{}
 
 	cntx.AssignmentCache = map[string]*Assignment{}
 	cntx.Achievements_ = make([]jsonmodels.GoalAchievement, 0)
@@ -193,7 +196,7 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	} else {
 		var tmp = &cntx
 		var tempFuture, readyFutureDone = future.New()
-		cntx.ReadyFuture_ = tempFuture
+		cntx.setReadyFuture(tempFuture)
 		dataFuture.Listen(func(val future.Value, err error) {
 			if err == nil {
 				result, ok := val.(jsonmodels.ContextData)
@@ -201,13 +204,13 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 					err = &TypeError{Expected: "jsonmodels.ContextData", Actual: val}
 					tmp.SetDataFailed(err)
 					readyFutureDone(nil, err)
-					cntx.ReadyFuture_ = nil
+					cntx.setReadyFuture(nil)
 					tmp.LogError(err)
 					return
 				}
 				tmp.SetData(result)
 				readyFutureDone(result, nil)
-				cntx.ReadyFuture_ = nil
+				cntx.setReadyFuture(nil)
 				tmp.LogEvent(Ready, result)
 
 				if tmp.GetPendingCount() > 0 {
@@ -216,7 +219,7 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 			} else {
 				tmp.SetDataFailed(err)
 				readyFutureDone(nil, err)
-				cntx.ReadyFuture_ = nil
+				cntx.setReadyFuture(nil)
 				tmp.LogError(err)
 			}
 
@@ -248,16 +251,46 @@ func (c *Context) WaitUntilReadyAsync() *future.Future {
 			return c, nil
 		})
 	}
-	return c.ReadyFuture_
+	return c.getReadyFuture()
 }
 
 func (c *Context) WaitUntilReady() Context {
 	if !c.Ready_.Load().(bool) {
-		var ft = c.ReadyFuture_
+		var ft = c.getReadyFuture()
 		if ft != nil && !ft.Ready() {
 			ft.Join(context.Background())
 		}
 	}
+	return c.snapshot()
+}
+
+func (c *Context) getReadyFuture() *future.Future {
+	c.StateLock_.Lock()
+	defer c.StateLock_.Unlock()
+	return c.ReadyFuture_
+}
+
+func (c *Context) setReadyFuture(f *future.Future) {
+	c.StateLock_.Lock()
+	c.ReadyFuture_ = f
+	c.StateLock_.Unlock()
+}
+
+// snapshot returns a copy of the context taken while holding every lock that
+// guards a mutable field, so the copy handed to a callback does not race with
+// writers. Lock order is ContextLock_, DataLock, EventLock_, TimeoutLock_,
+// StateLock_. It must not be called while holding any of them.
+func (c *Context) snapshot() Context {
+	c.ContextLock_.RLock()
+	defer c.ContextLock_.RUnlock()
+	c.DataLock.RLock()
+	defer c.DataLock.RUnlock()
+	c.EventLock_.Lock()
+	defer c.EventLock_.Unlock()
+	c.TimeoutLock_.Lock()
+	defer c.TimeoutLock_.Unlock()
+	c.StateLock_.Lock()
+	defer c.StateLock_.Unlock()
 	return *c
 }
 
@@ -284,6 +317,8 @@ func (c *Context) GetData() (jsonmodels.ContextData, error) {
 		return jsonmodels.ContextData{}, err
 	}
 
+	c.DataLock.RLock()
+	defer c.DataLock.RUnlock()
 	return c.Data_, nil
 
 }
@@ -387,8 +422,11 @@ func (c *Context) SetAttribute(name string, value interface{}) error {
 		return err
 	}
 
-	c.Attributes_ = AddRW(c.ContextLock_, c.Attributes_, jsonmodels.Attribute{Name: name, Value: value, SetAt: c.Clock_.Millis()}).([]interface{})
+	var attribute = jsonmodels.Attribute{Name: name, Value: value, SetAt: c.Clock_.Millis()}
+	c.ContextLock_.Lock()
+	c.Attributes_ = append(c.Attributes_, attribute)
 	atomic.AddInt32(&c.AttrsSeq_, 1)
+	c.ContextLock_.Unlock()
 	return nil
 }
 
@@ -450,7 +488,7 @@ func (c *Context) GetVariableKeys() (map[string][]string, error) {
 
 	var variableKeys = map[string][]string{}
 
-	c.DataLock.Lock()
+	c.DataLock.RLock()
 	for key, experiments := range c.IndexVariables_ {
 		var names = make([]string, 0, len(experiments))
 		for _, value := range experiments {
@@ -458,7 +496,7 @@ func (c *Context) GetVariableKeys() (map[string][]string, error) {
 		}
 		variableKeys[key] = names
 	}
-	c.DataLock.Unlock()
+	c.DataLock.RUnlock()
 	return variableKeys, nil
 }
 
@@ -639,7 +677,9 @@ func (c *Context) RefreshAsync() *future.Future {
 
 	if c.Refreshing_.CompareAndSwap(false, true) {
 		var tempfuture, donefun = future.New()
+		c.StateLock_.Lock()
 		c.RefreshFuture_ = tempfuture
+		c.StateLock_.Unlock()
 
 		c.DataProvider_.GetContextData().Listen(func(value future.Value, err error) {
 			if err == nil {
@@ -665,7 +705,9 @@ func (c *Context) RefreshAsync() *future.Future {
 		})
 	}
 
+	c.StateLock_.Lock()
 	var ft = c.RefreshFuture_
+	c.StateLock_.Unlock()
 	if ft != nil {
 		return ft
 	}
@@ -685,7 +727,9 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 
 			if c.PendingCount_.Load().(int32) > 0 {
 				var tempFuture, done = future.New()
+				c.StateLock_.Lock()
 				c.ClosingFuture_ = tempFuture
+				c.StateLock_.Unlock()
 				c.Flush().Listen(func(value future.Value, err error) {
 					if err == nil {
 						c.Closed_.Store(true)
@@ -694,13 +738,17 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 
 						c.LogEvent(Close, nil)
 					} else {
-						c.Closed_.Store(true)
+						// The failed batch is back in the queue. Leave the context
+						// open so Publish or Close can retry it.
+						c.StateLock_.Lock()
+						c.ClosingFuture_ = nil
+						c.StateLock_.Unlock()
 						c.Closing_.Store(false)
 						done(nil, err)
 						// event logger gets this error during publish
 					}
 				})
-				return c.ClosingFuture_, nil
+				return tempFuture, nil
 			} else {
 				c.Closed_.Store(true)
 				c.Closing_.Store(false)
@@ -709,7 +757,9 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 			}
 		}
 
+		c.StateLock_.Lock()
 		var future = c.ClosingFuture_
+		c.StateLock_.Unlock()
 		if future != nil {
 			return future, nil
 		}
@@ -841,6 +891,8 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 }
 
 func (c *Context) ClearRefreshTimer() {
+	c.StateLock_.Lock()
+	defer c.StateLock_.Unlock()
 	if c.RefreshTimer_ != nil {
 		c.RefreshTimer_.Stop()
 		c.RefreshTimer_ = nil
@@ -901,6 +953,7 @@ func (c *Context) CheckReady(expectNotClosed bool) error {
 }
 
 func (c *Context) SetData(data jsonmodels.ContextData) {
+	var self = c.snapshot()
 	var index = map[string]ExperimentVariables{}
 	var indexVariables = map[string][]ExperimentVariables{}
 	var contextCustomFields = map[string]map[string]ContextCustomFieldValue{}
@@ -914,7 +967,7 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 
 		for _, variant := range experiment.Variants {
 			if len(variant.Config) > 0 {
-				var variables = c.VariableParser_.Parse(*c, experiment.Name, variant.Name, variant.Config)
+				var variables = c.VariableParser_.Parse(self, experiment.Name, variant.Name, variant.Config)
 				for key := range variables {
 					// Keep a list of experiments per variable key (matching the
 					// canonical SDKs). Guard against adding the same experiment
@@ -945,7 +998,7 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 				var customValue = customFieldValue.Value
 				if strings.HasPrefix(customFieldValue.Type, "json") {
 					if parser, ok := c.VariableParser_.(CustomFieldValueParser); ok {
-						parsed, err := parser.ParseCustomFieldValue(*c, experiment.Name, customFieldValue.Name, customValue)
+						parsed, err := parser.ParseCustomFieldValue(self, experiment.Name, customFieldValue.Name, customValue)
 						value.Value = parsed
 						if err != nil {
 							if customFieldErrors[experiment.Name] == nil {
@@ -954,12 +1007,12 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 							customFieldErrors[experiment.Name][customFieldValue.Name] = err
 						}
 					} else {
-						value.Value = c.VariableParser_.Parse(*c, experiment.Name, customFieldValue.Name, customValue)
+						value.Value = c.VariableParser_.Parse(self, experiment.Name, customFieldValue.Name, customValue)
 					}
 				} else if strings.HasPrefix(customFieldValue.Type, "boolean") {
 					parsed, err := strconv.ParseBool(customValue)
 					if err != nil && c.EventLogger_ != nil {
-						c.EventLogger_.HandleEvent(*c, Error,
+						c.EventLogger_.HandleEvent(self, Error,
 							"SetData: Failed to parse boolean custom field '"+customFieldValue.Name+
 								"' in experiment '"+experiment.Name+"': "+err.Error())
 					}
@@ -967,7 +1020,7 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 				} else if strings.HasPrefix(customFieldValue.Type, "number") {
 					parsed, err := strconv.ParseInt(customValue, 10, 64)
 					if err != nil && c.EventLogger_ != nil {
-						c.EventLogger_.HandleEvent(*c, Error,
+						c.EventLogger_.HandleEvent(self, Error,
 							"SetData: Failed to parse number custom field '"+customFieldValue.Name+
 								"' in experiment '"+experiment.Name+"': "+err.Error())
 					}
@@ -998,13 +1051,13 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 
 func (c *Context) LogEvent(event EventType, data interface{}) {
 	if c.EventLogger_ != nil {
-		c.EventLogger_.HandleEvent(*c, event, data)
+		c.EventLogger_.HandleEvent(c.snapshot(), event, data)
 	}
 }
 
 func (c *Context) LogError(err error) {
 	if c.EventLogger_ != nil {
-		c.EventLogger_.HandleEvent(*c, Error, err)
+		c.EventLogger_.HandleEvent(c.snapshot(), Error, err)
 	}
 }
 
@@ -1051,13 +1104,13 @@ func (c *Context) Flush() *future.Future {
 				event.Hashed = true
 				event.PublishedAt = c.Clock_.Millis()
 
-				c.ContextLock_.RLock()
+				c.ContextLock_.Lock()
 				var entrySet []interface{}
 				for key, value := range c.Units_ {
 					entrySet = append(entrySet, Pair{a: key, b: value})
 				}
 
-				var mapper = FlushMapper{Context: *c}
+				var mapper = FlushMapper{Context: c}
 				var temp = MapSetToArray(entrySet, make([]interface{}, 0), mapper)
 				event.Units = make([]jsonmodels.Unit, 0)
 				for _, value := range temp {
@@ -1071,13 +1124,13 @@ func (c *Context) Flush() *future.Future {
 						event.Attributes[key] = value.(jsonmodels.Attribute)
 					}
 				}
-				c.ContextLock_.RUnlock()
+				c.ContextLock_.Unlock()
 				event.Goals = achievements
 				event.Exposures = exposures
 
 				result, done := future.New()
 
-				c.EventHandler_.Publish(*c, event).Listen(
+				c.EventHandler_.Publish(c.snapshot(), event).Listen(
 					func(value future.Value, err error) {
 						if err == nil {
 							c.LogEvent(Publish, event)
@@ -1129,13 +1182,13 @@ func (c *Context) requeueEvents(exposures []jsonmodels.Exposure, achievements []
 
 type FlushMapper struct {
 	MapperInt
-	Context Context
+	Context *Context
 }
 
 func (f FlushMapper) Apply(value interface{}) interface{} {
 	var key = value.(Pair).a
 	var val = value.(Pair).b
-	var cntx = &f.Context
+	var cntx = f.Context
 	var data [22]byte
 	var uid = cntx.GetUnitHash(key, val, data[:], false)
 	var res = f.forceASCII(string(uid))
@@ -1153,19 +1206,17 @@ func (f FlushMapper) forceASCII(s string) string {
 }
 
 func (c *Context) ClearTimeout() {
+	c.TimeoutLock_.Lock()
 	if c.Timeout_ != nil {
-		c.TimeoutLock_.Lock()
-		if c.Timeout_ != nil {
-			c.Timeout_.Stop()
-			c.Timeout_ = nil
-		}
-		c.TimeoutLock_.Unlock()
+		c.Timeout_.Stop()
+		c.Timeout_ = nil
 	}
+	c.TimeoutLock_.Unlock()
 }
 
 func (c *Context) SetTimeout() {
 	if c.IsReady() {
-		if c.Timeout_ == nil {
+		{
 			c.TimeoutLock_.Lock()
 			if c.Timeout_ == nil && c.PublishDelay_ >= 0 {
 				var delay = uint64(c.PublishDelay_ * int64(time.Millisecond))
@@ -1183,12 +1234,21 @@ func (c *Context) SetTimeout() {
 }
 
 func (c *Context) SetRefreshTimer() {
+	c.StateLock_.Lock()
+	defer c.StateLock_.Unlock()
 	if c.RefreshInterval_ > 0 && c.RefreshTimer_ == nil {
 		var rate = time.Duration(uint64(c.RefreshInterval_ * int64(time.Millisecond)))
 
 		c.RefreshTimer_ = time.AfterFunc(rate, func() {
-			c.RefreshTimer_.Reset(rate)
-			c.RefreshAsync()
+			c.StateLock_.Lock()
+			var timer = c.RefreshTimer_
+			if timer != nil {
+				timer.Reset(rate)
+			}
+			c.StateLock_.Unlock()
+			if timer != nil {
+				c.RefreshAsync()
+			}
 		})
 	}
 }
@@ -1219,9 +1279,9 @@ func (c *Context) GetVariableAssignment(key string) (*Assignment, error) {
 }
 
 func (c *Context) GetVariableExperiment(key string) (ExperimentVariables, error) {
-	c.DataLock.Lock()
+	c.DataLock.RLock()
 	var experiments = c.IndexVariables_[key]
-	c.DataLock.Unlock()
+	c.DataLock.RUnlock()
 	if len(experiments) == 0 {
 		return ExperimentVariables{}, errors.New("result is nil")
 	}

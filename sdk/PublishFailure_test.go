@@ -217,3 +217,30 @@ func TestPublishOnFailedContextStillDiscardsEvents(t *testing.T) {
 	assertAny(int32(0), ctx.GetPendingCount(), t)
 	assertAny(0, publisher.calls(), t)
 }
+
+// A close that fails to publish must leave the context open and its events
+// pending, so a later Close or Publish can send them.
+func TestFailedCloseKeepsContextOpenForRetry(t *testing.T) {
+	var publisher = &heldPublisher{}
+	var ctx = createHeldPublisherContext(t, publisher, nil)
+
+	assertAny(nil, ctx.Track("goal1", nil), t)
+
+	fut, err := ctx.CloseAsync()
+	assertAny(nil, err, t)
+	var publishFailed = errors.New("Publish failed")
+	publisher.settle(t, 0, publishFailed)
+	assertAny(publishFailed, getWithTimeout(t, fut), t)
+
+	assertAny(false, ctx.IsClosed(), t)
+	assertAny(false, ctx.IsClosing(), t)
+	assertAny(int32(1), ctx.GetPendingCount(), t)
+
+	fut, err = ctx.CloseAsync()
+	assertAny(nil, err, t)
+	assertAny(2, publisher.calls(), t)
+	publisher.settle(t, 1, nil)
+	assertAny(nil, getWithTimeout(t, fut), t)
+	assertAny(true, ctx.IsClosed(), t)
+	assertAny(int32(0), ctx.GetPendingCount(), t)
+}

@@ -48,3 +48,14 @@ func TestMD5ShouldMatchKnownHashes(t *testing.T) {
 	}
 }
 
+func TestHashUnitInvalidUTF8DoesNotPanic(t *testing.T) {
+	for _, n := range []int{1, 100, 170, 171, 256, 257, 1000, 5000} {
+		var unit = make([]byte, n)
+		for i := range unit {
+			unit[i] = 0xff
+		}
+		if got := len(HashUnit(string(unit))); got != 22 {
+			t.Fatalf("len %d: hash length %d, want 22", n, got)
+		}
+	}
+}

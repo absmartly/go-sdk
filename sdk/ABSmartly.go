@@ -40,10 +40,6 @@ func Create(config ABsmartlyConfig) ABsmartly {
 		abs.AudienceDeserializer_ = DefaultAudienceDeserializer{}
 	}
 
-	if abs.AudienceDeserializer_ == nil {
-		abs.AudienceDeserializer_ = DefaultAudienceDeserializer{}
-	}
-
 	return abs
 }
 

@@ -4,8 +4,10 @@ Go SDK for [ABsmartly](https://www.absmartly.com/) A/B testing platform.
 
 ## Compatibility
 
-The A/B Smartly Go SDK is compatible with Go versions 1.15 and later.
+The A/B Smartly Go SDK is compatible with Go versions 1.25 and later.
 It provides both a blocking and an asynchronous interfaces.
+
+**Breaking change:** `Context.GetVariableKeys()` now returns `map[string][]string` (variable key to the names of all experiments that define it), matching the other ABsmartly SDKs. It previously returned `map[string]string`. Callers must update their types.
 
 ## Getting Started
 
