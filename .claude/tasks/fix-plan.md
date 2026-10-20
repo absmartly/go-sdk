@@ -1,6 +1,6 @@
 # Go SDK Fix Plan
 
-Based on full review of PR #11. This PR was rated CLEAN.
+Based on a review of an earlier PR (#11) of this SDK. That review had no blocking findings; the items below are informational only and do not reflect the status of PR #10.
 
 ## Minor (informational only)
 

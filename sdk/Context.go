@@ -357,7 +357,7 @@ func (c *Context) SetUnit(unitType string, uid string) error {
 	var previous, exist = c.Units_[unitType]
 	if exist && previous != uid {
 		c.ContextLock_.Unlock()
-		return fmt.Errorf("Unit '%s' UID already set.", unitType)
+		return fmt.Errorf("Unit '%s' UID already set.", unitType) //nolint:staticcheck // canonical SDK error text
 	}
 
 	var trimmed = strings.TrimSpace(uid)
