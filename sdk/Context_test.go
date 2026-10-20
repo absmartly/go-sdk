@@ -8,6 +8,7 @@ import (
 	"github.com/absmartly/go-sdk/sdk/internal"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 	"io/ioutil"
+	"sync"
 	"testing"
 )
 
@@ -22,8 +23,24 @@ var fut = future.Call(func() (future.Value, error) {
 	}, nil
 })
 
-func (c ClientContextMock) GetContextData() *future.Future {
+var futLock sync.Mutex
+
+// setFut and getFut guard fut: refresh timers of earlier tests can still call
+// the mock while a later test replaces the future.
+func setFut(f *future.Future) {
+	futLock.Lock()
+	fut = f
+	futLock.Unlock()
+}
+
+func getFut() *future.Future {
+	futLock.Lock()
+	defer futLock.Unlock()
 	return fut
+}
+
+func (c ClientContextMock) GetContextData() *future.Future {
+	return getFut()
 }
 
 func (c ClientContextMock) Publish(event jsonmodels.PublishEvent) *future.Future {
@@ -1257,7 +1274,7 @@ func TestRefreshClearAssignmentCacheForStartedExperiment(t *testing.T) {
 	assertAny(0, res, t)
 	assertAny(nil, err, t)
 
-	fut = dataFutureRefresh
+	setFut(dataFutureRefresh)
 	experiment.Name = "exp_test_new"
 	experiment.Id = 2
 	assertAny(false, context.RefreshTimer_ == nil, t)
@@ -1306,11 +1323,11 @@ func TestClearAssignmentCacheForExperimentIdChange(t *testing.T) {
 	context.Data_.Experiments[4].SeedHi = 77498863
 	context.Data_.Experiments[4].SeedLo = 34737352
 	experiment = context.Data_.Experiments[4]
-	fut = future.Call(func() (future.Value, error) {
+	setFut(future.Call(func() (future.Value, error) {
 		return jsonmodels.ContextData{
 			Experiments: []jsonmodels.Experiment{experiment},
 		}, nil
-	})
+	}))
 	assertAny(true, context.RefreshTimer_ == nil, t)
 	var ft = context.RefreshAsync()
 	assertAny(true, context.RefreshTimer_ == nil, t)

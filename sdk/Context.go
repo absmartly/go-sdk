@@ -61,7 +61,9 @@ type Context struct {
 	RefreshFuture_       *future.Future
 	TimeoutLock_         *sync.Mutex
 	// StateLock_ guards ReadyFuture_, RefreshFuture_, ClosingFuture_ and RefreshTimer_.
-	StateLock_    *sync.Mutex
+	StateLock_ *sync.Mutex
+	// inflight_ holds the publishes that have been sent and not yet settled. Guarded by StateLock_.
+	inflight_     []*future.Future
 	Timeout_      *time.Timer
 	RefreshTimer_ *time.Timer
 	Clock_        internal.Clock
@@ -725,29 +727,49 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 		if c.Closing_.CompareAndSwap(false, true) {
 			c.ClearRefreshTimer()
 
-			if c.PendingCount_.Load().(int32) > 0 {
+			if c.PendingCount_.Load().(int32) > 0 || c.inflightCount() > 0 {
 				var tempFuture, done = future.New()
 				c.StateLock_.Lock()
 				c.ClosingFuture_ = tempFuture
 				c.StateLock_.Unlock()
-				c.Flush().Listen(func(value future.Value, err error) {
-					if err == nil {
-						c.Closed_.Store(true)
-						c.Closing_.Store(false)
-						done(nil, nil)
 
-						c.LogEvent(Close, nil)
-					} else {
+				// Wait for the publish started here and for any publish that was
+				// already in flight. A failed batch is requeued, so the context
+				// can only close once every publish has succeeded.
+				var flushed = c.Flush()
+				var waitFor = append(c.inflightSnapshot(), flushed)
+				var remaining = int32(len(waitFor))
+				var failure atomic.Value
+				var finish = func() {
+					if err, failed := failure.Load().(error); failed {
 						// The failed batch is back in the queue. Leave the context
-						// open so Publish or Close can retry it.
+						// open so Publish or Close can retry it, and bring back
+						// the refresh timer that Close stopped.
 						c.StateLock_.Lock()
 						c.ClosingFuture_ = nil
 						c.StateLock_.Unlock()
 						c.Closing_.Store(false)
+						c.SetRefreshTimer()
 						done(nil, err)
 						// event logger gets this error during publish
+						return
 					}
-				})
+					c.Closed_.Store(true)
+					c.Closing_.Store(false)
+					done(nil, nil)
+
+					c.LogEvent(Close, nil)
+				}
+				for _, f := range waitFor {
+					f.Listen(func(value future.Value, err error) {
+						if err != nil {
+							failure.CompareAndSwap(nil, err)
+						}
+						if atomic.AddInt32(&remaining, -1) == 0 {
+							finish()
+						}
+					})
+				}
 				return tempFuture, nil
 			} else {
 				c.Closed_.Store(true)
@@ -1129,9 +1151,11 @@ func (c *Context) Flush() *future.Future {
 				event.Exposures = exposures
 
 				result, done := future.New()
+				c.addInflight(result)
 
 				c.EventHandler_.Publish(c.snapshot(), event).Listen(
 					func(value future.Value, err error) {
+						defer c.removeInflight(result)
 						if err == nil {
 							c.LogEvent(Publish, event)
 							done(nil, nil)
@@ -1156,6 +1180,35 @@ func (c *Context) Flush() *future.Future {
 	result, done := future.New()
 	done(nil, nil)
 	return result
+}
+
+func (c *Context) addInflight(f *future.Future) {
+	c.StateLock_.Lock()
+	c.inflight_ = append(c.inflight_, f)
+	c.StateLock_.Unlock()
+}
+
+func (c *Context) removeInflight(f *future.Future) {
+	c.StateLock_.Lock()
+	for i, g := range c.inflight_ {
+		if g == f {
+			c.inflight_ = append(c.inflight_[:i:i], c.inflight_[i+1:]...)
+			break
+		}
+	}
+	c.StateLock_.Unlock()
+}
+
+func (c *Context) inflightCount() int {
+	c.StateLock_.Lock()
+	defer c.StateLock_.Unlock()
+	return len(c.inflight_)
+}
+
+func (c *Context) inflightSnapshot() []*future.Future {
+	c.StateLock_.Lock()
+	defer c.StateLock_.Unlock()
+	return append([]*future.Future(nil), c.inflight_...)
 }
 
 // requeueEvents puts the events of a failed publish back in the queue so a

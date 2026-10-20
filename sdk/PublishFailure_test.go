@@ -244,3 +244,60 @@ func TestFailedCloseKeepsContextOpenForRetry(t *testing.T) {
 	assertAny(true, ctx.IsClosed(), t)
 	assertAny(int32(0), ctx.GetPendingCount(), t)
 }
+
+// A publish that is already in flight when Close is called must hold the close
+// open: if it fails, its events are requeued and the context must still accept a retry.
+func TestCloseWaitsForInFlightPublishThatFails(t *testing.T) {
+	var publisher = &heldPublisher{}
+	var ctx = createHeldPublisherContext(t, publisher, nil)
+
+	assertAny(nil, ctx.Track("goal1", nil), t)
+	inflight, err := ctx.PublishAsync()
+	assertAny(nil, err, t)
+
+	closing, err := ctx.CloseAsync()
+	assertAny(nil, err, t)
+	assertAny(false, ctx.IsClosed(), t)
+
+	var publishFailed = errors.New("Publish failed")
+	publisher.settle(t, 0, publishFailed)
+	assertAny(publishFailed, getWithTimeout(t, inflight), t)
+	assertAny(publishFailed, getWithTimeout(t, closing), t)
+
+	assertAny(false, ctx.IsClosed(), t)
+	assertAny(int32(1), ctx.GetPendingCount(), t)
+	assertAny(nil, ctx.Publish2ForTest(t, publisher, 1), t)
+}
+
+// A failed close must bring back the automatic refresh that Close stopped.
+func TestFailedCloseRestoresRefreshTimer(t *testing.T) {
+	var publisher = &heldPublisher{}
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = 5000
+	var ctx = CreateContext(clock, config, dataFutureReady, dataProvider, publisher, nil, variableParser, audienceMatcher)
+	defer ctx.ClearRefreshTimer()
+
+	assertAny(nil, ctx.Track("goal1", nil), t)
+	closing, err := ctx.CloseAsync()
+	assertAny(nil, err, t)
+	publisher.settle(t, 0, errors.New("Publish failed"))
+	_ = getWithTimeout(t, closing)
+
+	ctx.StateLock_.Lock()
+	var restored = ctx.RefreshTimer_ != nil
+	ctx.StateLock_.Unlock()
+	assertAny(true, restored, t)
+}
+
+func (c *Context) Publish2ForTest(t *testing.T, publisher *heldPublisher, i int) error {
+	t.Helper()
+	fut, err := c.PublishAsync()
+	if err != nil {
+		return err
+	}
+	publisher.settle(t, i, nil)
+	return getWithTimeout(t, fut)
+}

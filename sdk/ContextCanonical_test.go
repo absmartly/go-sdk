@@ -1101,10 +1101,10 @@ func TestVariableKeysReturnsAllActiveKeys(t *testing.T) {
 func TestRefreshClearsAssignmentCacheForStoppedExperiment(t *testing.T) {
 	setUp()
 	savedExperiment := experiment
-	savedFut := fut
+	savedFut := getFut()
 	defer func() {
 		experiment = savedExperiment
-		fut = savedFut
+		setFut(savedFut)
 	}()
 
 	var config = CreateDefaultContextConfig()
@@ -1121,11 +1121,11 @@ func TestRefreshClearsAssignmentCacheForStoppedExperiment(t *testing.T) {
 	var tempExp = context.Data_.Experiments[4]
 	experiment.Name = tempExp.Name
 	experiment.Id = tempExp.Id
-	fut = future.Call(func() (future.Value, error) {
+	setFut(future.Call(func() (future.Value, error) {
 		return jsonmodels.ContextData{
 			Experiments: []jsonmodels.Experiment{experiment},
 		}, nil
-	})
+	}))
 
 	context.Refresh()
 
@@ -1893,10 +1893,10 @@ func TestCustomFieldValueForMultipleExperiments(t *testing.T) {
 }
 
 type CapturingClientWithRefresh struct {
-	contextData        jsonmodels.ContextData
-	refreshedData      jsonmodels.ContextData
-	refreshCount       int32
-	useRefreshedData   atomic.Value
+	contextData      jsonmodels.ContextData
+	refreshedData    jsonmodels.ContextData
+	refreshCount     int32
+	useRefreshedData atomic.Value
 }
 
 func (c *CapturingClientWithRefresh) GetContextData() *future.Future {
