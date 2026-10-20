@@ -372,6 +372,10 @@ func TestEventLoggerErrorInCallback(t *testing.T) {
 	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	config.EventLogger_ = logger
+	// The logger panics while the context is constructed, so the context is never
+	// returned or tracked. A refresh timer would later call the logger and crash
+	// the test binary.
+	config.RefreshInterval_ = 0
 
 	var client = EventLoggerClientMock{}
 	var dataProvider = DefaultContextDataProvider{client_: client}

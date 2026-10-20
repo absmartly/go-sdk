@@ -373,10 +373,10 @@ func TestWaitUntilReadyAsynCompleted(t *testing.T) {
 }
 
 func TestErrorWhenClosing(t *testing.T) {
-	setUp()
-	var config = CreateDefaultContextConfig()
-	config.Units_ = units
-	var context = CreateTestContext(config, dataFutureReady)
+	// Hold the publish so the context stays in the closing state while the
+	// test checks it, instead of racing the publish that finishes the close.
+	var publisher = &heldPublisher{}
+	var context = createHeldPublisherContext(t, publisher, nil)
 
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
@@ -405,6 +405,12 @@ func TestErrorWhenClosing(t *testing.T) {
 	assertAny("ABSmartly Context is closing", resErr.Error(), t)
 	assertAny(true, context.IsClosing(), t)
 	assertAny(false, context.IsClosed(), t)
+
+	publisher.settle(t, 0, nil)
+	var closing, _ = context.CloseAsync()
+	assertAny(nil, getWithTimeout(t, closing), t)
+	assertAny(true, context.IsClosed(), t)
+	assertAny(false, context.IsClosing(), t)
 }
 
 func TestErrorWhenClosed(t *testing.T) {
