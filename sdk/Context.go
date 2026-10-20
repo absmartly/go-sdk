@@ -677,44 +677,46 @@ func (c *Context) RefreshAsync() *future.Future {
 		return tempfuture
 	}
 
-	if c.Refreshing_.CompareAndSwap(false, true) {
-		var tempfuture, donefun = future.New()
-		c.StateLock_.Lock()
-		c.RefreshFuture_ = tempfuture
+	// Decide and publish under one lock so a concurrent caller that sees the
+	// refresh as running also sees its future.
+	c.StateLock_.Lock()
+	if c.Refreshing_.Load().(bool) {
+		var active = c.RefreshFuture_
 		c.StateLock_.Unlock()
+		if active != nil {
+			return active
+		}
+		var tempfuture, donefun = future.New()
+		donefun(nil, nil)
+		return tempfuture
+	}
+	c.Refreshing_.Store(true)
+	var tempfuture, donefun = future.New()
+	c.RefreshFuture_ = tempfuture
+	c.StateLock_.Unlock()
 
-		c.DataProvider_.GetContextData().Listen(func(value future.Value, err error) {
-			if err == nil {
-				result, ok := value.(jsonmodels.ContextData)
-				if !ok {
-					err = &TypeError{Expected: "jsonmodels.ContextData", Actual: value}
-					c.Refreshing_.Store(false)
-					donefun(nil, err)
-					c.LogError(err)
-					return
-				}
-				c.SetData(result)
-				c.Refreshing_.Store(false)
-				donefun(nil, nil)
-
-				c.LogEvent(Refresh, result)
-			} else {
+	c.DataProvider_.GetContextData().Listen(func(value future.Value, err error) {
+		if err == nil {
+			result, ok := value.(jsonmodels.ContextData)
+			if !ok {
+				err = &TypeError{Expected: "jsonmodels.ContextData", Actual: value}
 				c.Refreshing_.Store(false)
 				donefun(nil, err)
-
 				c.LogError(err)
+				return
 			}
-		})
-	}
+			c.SetData(result)
+			c.Refreshing_.Store(false)
+			donefun(nil, nil)
 
-	c.StateLock_.Lock()
-	var ft = c.RefreshFuture_
-	c.StateLock_.Unlock()
-	if ft != nil {
-		return ft
-	}
-	var tempfuture, donefun = future.New()
-	donefun(nil, nil)
+			c.LogEvent(Refresh, result)
+		} else {
+			c.Refreshing_.Store(false)
+			donefun(nil, err)
+
+			c.LogError(err)
+		}
+	})
 	return tempfuture
 }
 

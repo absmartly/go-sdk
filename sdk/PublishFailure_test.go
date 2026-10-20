@@ -301,3 +301,42 @@ func (c *Context) Publish2ForTest(t *testing.T, publisher *heldPublisher, i int)
 	publisher.settle(t, i, nil)
 	return getWithTimeout(t, fut)
 }
+
+// Concurrent RefreshAsync callers must all get the future of the active
+// refresh and must not return before it settles.
+func TestConcurrentRefreshAsyncShareActiveFuture(t *testing.T) {
+	setUp()
+	var slow, settle = future.New()
+	var provider = DefaultContextDataProvider{client_: slowRefreshClient{fut: slow}}
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	var ctx = createTrackedContext(clock, config, dataFutureReady, provider, eventHandler, nil, variableParser, audienceMatcher)
+
+	var results = make([]*future.Future, 16)
+	var wg sync.WaitGroup
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = ctx.RefreshAsync()
+		}(i)
+	}
+	wg.Wait()
+	for _, f := range results {
+		if f.Ready() {
+			t.Fatal("RefreshAsync returned a settled future before the refresh finished")
+		}
+		if f != results[0] {
+			t.Fatal("callers got different futures for the same active refresh")
+		}
+	}
+	settle(data, nil)
+	assertAny(nil, getWithTimeout(t, results[0]), t)
+}
+
+type slowRefreshClient struct {
+	ClientContextMock
+	fut *future.Future
+}
+
+func (c slowRefreshClient) GetContextData() *future.Future { return c.fut }
