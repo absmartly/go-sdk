@@ -340,3 +340,28 @@ type slowRefreshClient struct {
 }
 
 func (c slowRefreshClient) GetContextData() *future.Future { return c.fut }
+
+// Close racing with a publish that has just drained the queue must not
+// close the context before that publish settles.
+func TestCloseRacingPublishNeverStrandsFailedBatch(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		var publisher = &heldPublisher{}
+		var ctx = createHeldPublisherContext(t, publisher, nil)
+		assertAny(nil, ctx.Track("goal1", nil), t)
+
+		var wg sync.WaitGroup
+		var closing *future.Future
+		wg.Add(2)
+		go func() { defer wg.Done(); _, _ = ctx.PublishAsync() }()
+		go func() { defer wg.Done(); closing, _ = ctx.CloseAsync() }()
+		wg.Wait()
+
+		if publisher.calls() > 0 {
+			publisher.settle(t, 0, errors.New("Publish failed"))
+		}
+		_, _ = closing.Get(context.Background())
+		if ctx.IsClosed() && ctx.GetPendingCount() > 0 {
+			t.Fatalf("iteration %d: context closed with %d events stranded; calls=%d closing=%v", i, ctx.GetPendingCount(), publisher.calls(), ctx.IsClosing())
+		}
+	}
+}

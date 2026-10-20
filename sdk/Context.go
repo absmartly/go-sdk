@@ -729,7 +729,14 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 		if c.Closing_.CompareAndSwap(false, true) {
 			c.ClearRefreshTimer()
 
-			if c.PendingCount_.Load().(int32) > 0 || c.inflightCount() > 0 {
+			// Flush drains the queue and registers the publish under EventLock_,
+			// so reading both under it never sees a drained batch that is not
+			// yet registered.
+			c.EventLock_.Lock()
+			var mustWait = c.PendingCount_.Load().(int32) > 0 || c.inflightCount() > 0
+			c.EventLock_.Unlock()
+
+			if mustWait {
 				var tempFuture, done = future.New()
 				c.StateLock_.Lock()
 				c.ClosingFuture_ = tempFuture
@@ -739,7 +746,11 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 				// already in flight. A failed batch is requeued, so the context
 				// can only close once every publish has succeeded.
 				var flushed = c.Flush()
+				// Take the snapshot under EventLock_: a publish registers itself in
+				// the same critical section that drains the queue.
+				c.EventLock_.Lock()
 				var waitFor = append(c.inflightSnapshot(), flushed)
+				c.EventLock_.Unlock()
 				var remaining = int32(len(waitFor))
 				var failure atomic.Value
 				var finish = func() {
@@ -1107,6 +1118,7 @@ func (c *Context) Flush() *future.Future {
 			eventCount = c.PendingCount_.Load().(int32)
 			var exposures = make([]jsonmodels.Exposure, len(c.Exposures_))
 			var achievements = make([]jsonmodels.GoalAchievement, len(c.Achievements_))
+			var result, done = future.New()
 
 			if eventCount > 0 {
 				if len(c.Exposures_) > 0 {
@@ -1120,6 +1132,9 @@ func (c *Context) Flush() *future.Future {
 				}
 
 				c.PendingCount_.Store(int32(0))
+				// Register the publish in the same critical section that drains
+				// the queue, so CloseAsync cannot miss it.
+				c.addInflight(result)
 			}
 			c.EventLock_.Unlock()
 
@@ -1151,9 +1166,6 @@ func (c *Context) Flush() *future.Future {
 				c.ContextLock_.Unlock()
 				event.Goals = achievements
 				event.Exposures = exposures
-
-				result, done := future.New()
-				c.addInflight(result)
 
 				c.EventHandler_.Publish(c.snapshot(), event).Listen(
 					func(value future.Value, err error) {
