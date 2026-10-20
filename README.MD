@@ -4,7 +4,7 @@ Go SDK for [ABsmartly](https://www.absmartly.com/) A/B testing platform.
 
 ## Compatibility
 
-The A/B Smartly Go SDK is compatible with Go versions 1.25 and later.
+The A/B Smartly Go SDK is compatible with Go versions 1.23 and later (the minimum required by the `resty` HTTP client dependency). Earlier releases of this SDK declared Go 1.15; dropping Go 1.15-1.22 is a deliberate breaking change of this release, and CI builds and tests on Go 1.23 and the latest stable Go.
 It provides both a blocking and an asynchronous interfaces.
 
 **Breaking change:** `Context.GetVariableKeys()` now returns `map[string][]string` (variable key to the names of all experiments that define it), matching the other ABsmartly SDKs. It previously returned `map[string]string`. Callers must update their types.
@@ -256,8 +256,9 @@ contextConfig := sdk.ContextConfig{
 }
 
 ctx := absmartly.CreateContext(contextConfig)
-if err := ctx.WaitUntilReady(); err != nil {
-    log.Fatalf("Failed to initialize context: %v", err)
+_ = ctx.WaitUntilReady()
+if ctx.IsFailed() {
+    log.Fatal("Failed to initialize context: could not load experiment data")
 }
 
 log.Println("Context ready")
@@ -276,8 +277,9 @@ ctx := absmartly.CreateContext(contextConfig)
 
 // Use goroutine for async initialization
 go func() {
-    if err := ctx.WaitUntilReady(); err != nil {
-        log.Printf("Failed to initialize context: %v", err)
+    _ = ctx.WaitUntilReady()
+    if ctx.IsFailed() {
+        log.Print("Failed to initialize context: could not load experiment data")
         return
     }
     log.Println("Context ready")
@@ -300,12 +302,16 @@ serverConfig := sdk.ContextConfig{
 }
 
 serverCtx := absmartly.CreateContext(serverConfig)
-if err := serverCtx.WaitUntilReady(); err != nil {
-    log.Fatalf("Failed to initialize context: %v", err)
+_ = serverCtx.WaitUntilReady()
+if serverCtx.IsFailed() {
+    log.Fatal("Failed to initialize context: could not load experiment data")
 }
 
 // Get the context data to send to client
-contextData := serverCtx.GetContextData()
+contextData, err := serverCtx.GetData()
+if err != nil {
+    log.Fatalf("Failed to read context data: %v", err)
+}
 
 // Client-side: create context with prefetched data
 clientConfig := sdk.ContextConfig{
@@ -335,8 +341,9 @@ contextConfig := sdk.ContextConfig{
 }
 
 ctx := absmartly.CreateContext(contextConfig)
-if err := ctx.WaitUntilReady(); err != nil {
-    log.Fatalf("Failed to initialize context: %v", err)
+_ = ctx.WaitUntilReady()
+if ctx.IsFailed() {
+    log.Fatal("Failed to initialize context: could not load experiment data")
 }
 ```
 
@@ -344,7 +351,10 @@ Alternatively, the `Refresh()` method can be called manually.
 The `Refresh()` method pulls updated experiment data from the A/B Smartly collector and will trigger recently started experiments when `GetTreatment()` is called again.
 
 ```go
-if err := ctx.Refresh(); err != nil {
+ctx.Refresh() // blocks until the refresh finishes
+
+// or without blocking:
+if err := func() error { _, err := ctx.RefreshAsync().Get(context.Background()); return err }(); err != nil {
     log.Printf("Failed to refresh context: %v", err)
 }
 ```
@@ -417,7 +427,7 @@ if treatment == 0 {
 ### Peeking at Variables
 
 ```go
-variable, err := ctx.PeekVariable("my_variable")
+variable, err := ctx.PeekVariableValue("my_variable", "default")
 if err != nil {
     log.Printf("Failed to peek variable: %v", err)
 }
@@ -518,24 +528,23 @@ go func() {
 
 ### Finalize
 
-The `Close()` method will ensure all events have been published to the A/B Smartly collector, like `Publish()`, and will also "seal" the context, returning an error if any method that could generate an event is called afterwards.
+The `Close()` method will ensure all events have been published to the A/B Smartly collector, like `Publish()`, and will also "seal" the context: methods that could generate an event return an error once the context is closed. `Close()` blocks until the events are published; use `CloseAsync()` to get the result as a future.
 
 **Synchronously:**
 
 ```go
-if err := ctx.Close(); err != nil {
-    log.Printf("Failed to close context: %v", err)
-}
+ctx.Close() // blocks until all pending events are published
 ```
 
 **Asynchronously:**
 
 ```go
-go func() {
-    if err := ctx.Close(); err != nil {
-        log.Printf("Failed to close context: %v", err)
-    }
-}()
+closing, err := ctx.CloseAsync()
+if err != nil {
+    log.Printf("Failed to close context: %v", err)
+} else if _, err := closing.Get(context.Background()); err != nil {
+    log.Printf("Failed to publish pending events: %v", err)
+}
 ```
 
 ## Platform-Specific Examples
@@ -580,8 +589,9 @@ func main() {
         }
 
         ctx := absmartlySDK.CreateContext(contextConfig)
-        if err := ctx.WaitUntilReady(); err != nil {
-            c.JSON(500, gin.H{"error": err.Error()})
+        _ = ctx.WaitUntilReady()
+        if ctx.IsFailed() {
+            c.JSON(500, gin.H{"error": "failed to load experiment data"})
             return
         }
         defer ctx.Close()
@@ -646,8 +656,9 @@ func main() {
         }
 
         ctx := absmartlySDK.CreateContext(contextConfig)
-        if err := ctx.WaitUntilReady(); err != nil {
-            return c.JSON(500, map[string]string{"error": err.Error()})
+        _ = ctx.WaitUntilReady()
+        if ctx.IsFailed() {
+            return c.JSON(500, map[string]string{"error": "failed to load experiment data"})
         }
         defer ctx.Close()
 
@@ -709,8 +720,9 @@ func main() {
         }
 
         ctx := absmartlySDK.CreateContext(contextConfig)
-        if err := ctx.WaitUntilReady(); err != nil {
-            http.Error(w, err.Error(), http.StatusInternalServerError)
+        _ = ctx.WaitUntilReady()
+        if ctx.IsFailed() {
+            http.Error(w, "failed to load experiment data", http.StatusInternalServerError)
             return
         }
         defer ctx.Close()
@@ -737,6 +749,7 @@ Go supports context-based cancellation. You can use Go's context package for tim
 ```go
 import (
     "context"
+    "errors"
     "time"
     "github.com/absmartly/go-sdk/sdk"
 )
@@ -753,15 +766,16 @@ func createContextWithTimeout() (*sdk.Context, error) {
 
     absmartlyCtx := absmartlySDK.CreateContext(contextConfig)
 
-    done := make(chan error, 1)
+    done := make(chan struct{})
     go func() {
-        done <- absmartlyCtx.WaitUntilReady()
+        absmartlyCtx.WaitUntilReady()
+        close(done)
     }()
 
     select {
-    case err := <-done:
-        if err != nil {
-            return nil, err
+    case <-done:
+        if absmartlyCtx.IsFailed() {
+            return nil, errors.New("failed to load experiment data")
         }
         return absmartlyCtx, nil
     case <-ctx.Done():
@@ -775,6 +789,7 @@ func createContextWithTimeout() (*sdk.Context, error) {
 ```go
 import (
     "context"
+    "errors"
     "github.com/absmartly/go-sdk/sdk"
 )
 
@@ -789,15 +804,16 @@ func createContextWithCancellation() (*sdk.Context, context.CancelFunc, error) {
 
     absmartlyCtx := absmartlySDK.CreateContext(contextConfig)
 
-    done := make(chan error, 1)
+    done := make(chan struct{})
     go func() {
-        done <- absmartlyCtx.WaitUntilReady()
+        absmartlyCtx.WaitUntilReady()
+        close(done)
     }()
 
     select {
-    case err := <-done:
-        if err != nil {
-            return nil, cancel, err
+    case <-done:
+        if absmartlyCtx.IsFailed() {
+            return nil, cancel, errors.New("failed to load experiment data")
         }
         return absmartlyCtx, cancel, nil
     case <-ctx.Done():

@@ -365,3 +365,34 @@ func TestCloseRacingPublishNeverStrandsFailedBatch(t *testing.T) {
 		}
 	}
 }
+
+// Every CloseAsync call that overlaps a running close must get the future of
+// that close and must not see it settled before the close finishes.
+func TestConcurrentCloseAsyncShareClosingFuture(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		var publisher = &heldPublisher{}
+		var ctx = createHeldPublisherContext(t, publisher, nil)
+		assertAny(nil, ctx.Track("goal1", nil), t)
+
+		var results = make([]*future.Future, 8)
+		var wg sync.WaitGroup
+		for j := range results {
+			wg.Add(1)
+			go func(j int) {
+				defer wg.Done()
+				results[j], _ = ctx.CloseAsync()
+			}(j)
+		}
+		wg.Wait()
+		for _, f := range results {
+			if f.Ready() {
+				t.Fatalf("iteration %d: CloseAsync returned a settled future before the close finished", i)
+			}
+		}
+		publisher.settle(t, 0, nil)
+		for _, f := range results {
+			assertAny(nil, getWithTimeout(t, f), t)
+		}
+		assertAny(true, ctx.IsClosed(), t)
+	}
+}

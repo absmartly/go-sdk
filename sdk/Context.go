@@ -725,83 +725,84 @@ func (c *Context) Refresh() {
 }
 
 func (c *Context) CloseAsync() (*future.Future, error) {
-	if !c.Closed_.Load().(bool) {
-		if c.Closing_.CompareAndSwap(false, true) {
-			c.ClearRefreshTimer()
-
-			// Flush drains the queue and registers the publish under EventLock_,
-			// so reading both under it never sees a drained batch that is not
-			// yet registered.
-			c.EventLock_.Lock()
-			var mustWait = c.PendingCount_.Load().(int32) > 0 || c.inflightCount() > 0
-			c.EventLock_.Unlock()
-
-			if mustWait {
-				var tempFuture, done = future.New()
-				c.StateLock_.Lock()
-				c.ClosingFuture_ = tempFuture
-				c.StateLock_.Unlock()
-
-				// Wait for the publish started here and for any publish that was
-				// already in flight. A failed batch is requeued, so the context
-				// can only close once every publish has succeeded.
-				var flushed = c.Flush()
-				// Take the snapshot under EventLock_: a publish registers itself in
-				// the same critical section that drains the queue.
-				c.EventLock_.Lock()
-				var waitFor = append(c.inflightSnapshot(), flushed)
-				c.EventLock_.Unlock()
-				var remaining = int32(len(waitFor))
-				var failure atomic.Value
-				var finish = func() {
-					if err, failed := failure.Load().(error); failed {
-						// The failed batch is back in the queue. Leave the context
-						// open so Publish or Close can retry it, and bring back
-						// the refresh timer that Close stopped.
-						c.StateLock_.Lock()
-						c.ClosingFuture_ = nil
-						c.StateLock_.Unlock()
-						c.Closing_.Store(false)
-						c.SetRefreshTimer()
-						done(nil, err)
-						// event logger gets this error during publish
-						return
-					}
-					c.Closed_.Store(true)
-					c.Closing_.Store(false)
-					done(nil, nil)
-
-					c.LogEvent(Close, nil)
-				}
-				for _, f := range waitFor {
-					f.Listen(func(value future.Value, err error) {
-						if err != nil {
-							failure.CompareAndSwap(nil, err)
-						}
-						if atomic.AddInt32(&remaining, -1) == 0 {
-							finish()
-						}
-					})
-				}
-				return tempFuture, nil
-			} else {
-				c.Closed_.Store(true)
-				c.Closing_.Store(false)
-
-				c.LogEvent(Close, nil)
-			}
-		}
-
-		c.StateLock_.Lock()
-		var future = c.ClosingFuture_
+	// Claim the close and publish its future in one critical section, so a
+	// concurrent caller that sees the context closing also gets the future of
+	// the close that is running.
+	c.StateLock_.Lock()
+	if c.Closed_.Load().(bool) || c.Closing_.Load().(bool) {
+		var existing = c.ClosingFuture_
 		c.StateLock_.Unlock()
-		if future != nil {
-			return future, nil
+		if existing != nil {
+			return existing, nil
 		}
+		var resolved, resolve = future.New()
+		resolve(nil, nil)
+		return resolved, nil
+	}
+	c.Closing_.Store(true)
+	var tempFuture, done = future.New()
+	c.ClosingFuture_ = tempFuture
+	c.StateLock_.Unlock()
+
+	c.ClearRefreshTimer()
+
+	// Flush drains the queue and registers the publish under EventLock_, so
+	// reading both under it never sees a drained batch that is not yet
+	// registered.
+	c.EventLock_.Lock()
+	var mustWait = c.PendingCount_.Load().(int32) > 0 || c.inflightCount() > 0
+	c.EventLock_.Unlock()
+
+	if !mustWait {
+		c.Closed_.Store(true)
+		c.Closing_.Store(false)
+		done(nil, nil)
+
+		c.LogEvent(Close, nil)
+		return tempFuture, nil
 	}
 
-	var tempFuture, done = future.New()
-	done(nil, nil)
+	// Wait for the publish started here and for any publish that was already
+	// in flight. A failed batch is requeued, so the context can only close
+	// once every publish has succeeded.
+	var flushed = c.Flush()
+	// Take the snapshot under EventLock_: a publish registers itself in the
+	// same critical section that drains the queue.
+	c.EventLock_.Lock()
+	var waitFor = append(c.inflightSnapshot(), flushed)
+	c.EventLock_.Unlock()
+	var remaining = int32(len(waitFor))
+	var failure atomic.Value
+	var finish = func() {
+		if err, failed := failure.Load().(error); failed {
+			// The failed batch is back in the queue. Leave the context open so
+			// Publish or Close can retry it, and bring back the refresh timer
+			// that Close stopped.
+			c.StateLock_.Lock()
+			c.ClosingFuture_ = nil
+			c.Closing_.Store(false)
+			c.StateLock_.Unlock()
+			c.SetRefreshTimer()
+			done(nil, err)
+			// event logger gets this error during publish
+			return
+		}
+		c.Closed_.Store(true)
+		c.Closing_.Store(false)
+		done(nil, nil)
+
+		c.LogEvent(Close, nil)
+	}
+	for _, f := range waitFor {
+		f.Listen(func(value future.Value, err error) {
+			if err != nil {
+				failure.CompareAndSwap(nil, err)
+			}
+			if atomic.AddInt32(&remaining, -1) == 0 {
+				finish()
+			}
+		})
+	}
 	return tempFuture, nil
 }
 
