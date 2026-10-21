@@ -567,3 +567,41 @@ func TestCloseWithOverlappingFailingPublishes(t *testing.T) {
 		}
 	}
 }
+
+// completedPublisher returns publish futures that are already complete, so the
+// publish callback runs on the caller's stack.
+type completedPublisher struct{}
+
+func (completedPublisher) Publish(context Context, event jsonmodels.PublishEvent) *future.Future {
+	var result, done = future.New()
+	done(nil, nil)
+	return result
+}
+
+// Close with queued events, a publisher that completes synchronously and a
+// logger that calls Close from its Publish callback must not hang.
+func TestCloseWithSynchronousPublisherAndLoggerCallingClose(t *testing.T) {
+	setUp()
+	var logger = &closingLogger{}
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = 0
+	config.EventLogger_ = logger
+	var ctx = createTrackedContext(clock, config, dataFutureReady, dataProvider, completedPublisher{}, logger, variableParser, audienceMatcher)
+	logger.ctx = ctx
+
+	assertAny(nil, ctx.Track("goal1", nil), t)
+	closing, err := ctx.CloseAsync()
+	assertAny(nil, err, t)
+	assertAny(nil, getWithTimeout(t, closing), t)
+	assertAny(true, ctx.IsClosed(), t)
+	// The logger runs on its own goroutine; wait for it to call Close.
+	var deadline = time.Now().Add(5 * time.Second)
+	for !logger.closed.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !logger.closed.Load() {
+		t.Fatal("logger did not call Close")
+	}
+}

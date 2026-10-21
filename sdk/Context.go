@@ -1190,17 +1190,26 @@ func (c *Context) Flush() *future.Future {
 
 				c.EventHandler_.Publish(c.snapshot(), event).Listen(
 					func(value future.Value, err error) {
+						// The publisher may return a future that is already complete,
+						// which runs this callback on the caller's stack, for example
+						// inside CloseAsync. Run the logger and settle the caller's
+						// future on their own goroutine, so a logger that calls Close
+						// cannot block the call that started the publish.
 						if err == nil {
 							c.removeInflight(settled)
 							settledDone(nil, nil)
-							c.LogEvent(Publish, event)
-							done(nil, nil)
+							go func() {
+								c.LogEvent(Publish, event)
+								done(nil, nil)
+							}()
 						} else {
 							c.requeueEvents(exposures, achievements, eventCount)
 							c.removeInflight(settled)
 							settledDone(nil, err)
-							c.LogError(err)
-							done(nil, err)
+							go func() {
+								c.LogError(err)
+								done(nil, err)
+							}()
 						}
 					})
 
