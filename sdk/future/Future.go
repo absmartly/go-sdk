@@ -66,11 +66,15 @@ func (f *Future) SetResult(v Value, err error) {
 
 // Listen for the result.
 func (f *Future) Listen(callback SetResultFunc) {
+	// Check readiness while holding the lock that NotifyCallbacks takes. Checking
+	// first and locking after would lose the callback when the future completes
+	// in between: NotifyCallbacks would already have run without it.
+	f.mu.Lock()
 	select {
 	case <-f.ready:
+		f.mu.Unlock()
 		callback(f.val, f.err)
 	default:
-		f.mu.Lock()
 		f.callbacks = append(f.callbacks, callback)
 		f.mu.Unlock()
 	}
@@ -78,10 +82,14 @@ func (f *Future) Listen(callback SetResultFunc) {
 
 func (f *Future) NotifyCallbacks() {
 	f.mu.Lock()
-	for _, callback := range f.callbacks {
+	var callbacks = f.callbacks
+	f.callbacks = nil
+	f.mu.Unlock()
+	// Run the callbacks without the lock so one of them can call Listen on
+	// this future.
+	for _, callback := range callbacks {
 		callback(f.val, f.err)
 	}
-	f.mu.Unlock()
 }
 
 func (f *Future) Join(ctx context.Context) {

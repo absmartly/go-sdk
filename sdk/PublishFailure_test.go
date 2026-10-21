@@ -3,6 +3,7 @@ package sdk
 import (
 	"context"
 	"errors"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -394,5 +395,76 @@ func TestConcurrentCloseAsyncShareClosingFuture(t *testing.T) {
 			assertAny(nil, getWithTimeout(t, f), t)
 		}
 		assertAny(true, ctx.IsClosed(), t)
+	}
+}
+
+// Two in-flight publishes that fail with different concrete error types must
+// not panic the close aggregation.
+func TestCloseAggregatesDifferentPublishErrorTypes(t *testing.T) {
+	var publisher = &heldPublisher{}
+	var ctx = createHeldPublisherContext(t, publisher, nil)
+
+	assertAny(nil, ctx.Track("goal1", nil), t)
+	first, err := ctx.PublishAsync()
+	assertAny(nil, err, t)
+	assertAny(nil, ctx.Track("goal2", nil), t)
+	second, err := ctx.PublishAsync()
+	assertAny(nil, err, t)
+
+	closing, err := ctx.CloseAsync()
+	assertAny(nil, err, t)
+
+	publisher.settle(t, 0, errors.New("500 Internal Server Error"))
+	publisher.settle(t, 1, &url.Error{Op: "Put", URL: "http://x", Err: errors.New("connection refused")})
+	if getWithTimeout(t, first) == nil {
+		t.Fatal("expected an error")
+	}
+	if getWithTimeout(t, second) == nil {
+		t.Fatal("expected an error")
+	}
+	if getWithTimeout(t, closing) == nil {
+		t.Fatal("expected an error")
+	}
+
+	assertAny(false, ctx.IsClosed(), t)
+	assertAny(int32(2), ctx.GetPendingCount(), t)
+}
+
+// An in-flight publish that fails while Close is running must either fail the
+// close or leave nothing pending; the context may never be closed with
+// requeued events.
+func TestCloseNeverSealsContextWithRequeuedEvents(t *testing.T) {
+	for i := 0; i < 300; i++ {
+		var publisher = &heldPublisher{}
+		var ctx = createHeldPublisherContext(t, publisher, nil)
+		assertAny(nil, ctx.Track("goal1", nil), t)
+		_, err := ctx.PublishAsync()
+		assertAny(nil, err, t)
+
+		var wg sync.WaitGroup
+		var closing *future.Future
+		wg.Add(2)
+		go func() { defer wg.Done(); closing, _ = ctx.CloseAsync() }()
+		go func() { defer wg.Done(); publisher.settle(t, 0, errors.New("Publish failed")) }()
+		wg.Wait()
+
+		// If the first publish failed before Close ran, Close sends the requeued
+		// events itself; settle that publish too.
+		if publisher.calls() > 1 {
+			publisher.settle(t, 1, errors.New("Publish failed"))
+		}
+		if !closing.Ready() {
+			time.Sleep(200 * time.Millisecond)
+			if !closing.Ready() {
+				t.Fatalf("iteration %d: close hung: calls=%d pending=%d inflight=%d closing=%v", i, publisher.calls(), ctx.GetPendingCount(), ctx.inflightCount(), ctx.IsClosing())
+			}
+		}
+		var closeErr = getWithTimeout(t, closing)
+		if ctx.IsClosed() && ctx.GetPendingCount() > 0 {
+			t.Fatalf("iteration %d: closed with %d requeued events", i, ctx.GetPendingCount())
+		}
+		if closeErr == nil && ctx.GetPendingCount() > 0 {
+			t.Fatalf("iteration %d: close reported success with %d requeued events", i, ctx.GetPendingCount())
+		}
 	}
 }

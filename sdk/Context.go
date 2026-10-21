@@ -772,9 +772,26 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 	var waitFor = append(c.inflightSnapshot(), flushed)
 	c.EventLock_.Unlock()
 	var remaining = int32(len(waitFor))
-	var failure atomic.Value
+	var failureLock sync.Mutex
+	var failure error
 	var finish = func() {
-		if err, failed := failure.Load().(error); failed {
+		failureLock.Lock()
+		var err = failure
+		failureLock.Unlock()
+
+		// A publish that failed before it was in the snapshot has already put
+		// its events back in the queue. Check the queue and seal the context
+		// under EventLock_, so a successful close never strands them.
+		c.EventLock_.Lock()
+		if err == nil && c.PendingCount_.Load().(int32) > 0 {
+			err = errors.New("close left unsent events: an earlier publish failed")
+		}
+		if err == nil {
+			c.Closed_.Store(true)
+		}
+		c.EventLock_.Unlock()
+
+		if err != nil {
 			// The failed batch is back in the queue. Leave the context open so
 			// Publish or Close can retry it, and bring back the refresh timer
 			// that Close stopped.
@@ -787,7 +804,6 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 			// event logger gets this error during publish
 			return
 		}
-		c.Closed_.Store(true)
 		c.Closing_.Store(false)
 		done(nil, nil)
 
@@ -796,7 +812,11 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 	for _, f := range waitFor {
 		f.Listen(func(value future.Value, err error) {
 			if err != nil {
-				failure.CompareAndSwap(nil, err)
+				failureLock.Lock()
+				if failure == nil {
+					failure = err
+				}
+				failureLock.Unlock()
 			}
 			if atomic.AddInt32(&remaining, -1) == 0 {
 				finish()
