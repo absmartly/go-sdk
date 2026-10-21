@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"encoding/json"
+	"errors"
 )
 
 type DefaultVariableParser struct {
@@ -13,8 +14,8 @@ func (vr DefaultVariableParser) Parse(context Context, experimentName string, va
 	if err := json.Unmarshal([]byte(config), &data); err != nil {
 		if context.EventLogger_ != nil {
 			context.EventLogger_.HandleEvent(context, Error,
-				"DefaultVariableParser.Parse: Failed to parse variant config for experiment '"+experimentName+
-					"', variant '"+variantName+"': "+err.Error())
+				errors.New("DefaultVariableParser.Parse: Failed to parse variant config for experiment '"+experimentName+
+					"', variant '"+variantName+"': "+err.Error()))
 		}
 		return nil
 	}

@@ -87,10 +87,13 @@ func TestHermeticWireContract(t *testing.T) {
 		t.Fatalf("Failed to build SDK: %v", err)
 	}
 
+	// PublishDelay_ -1 turns off automatic publishing, so the explicit Publish
+	// below is the only publish and the test waits for its request.
 	ctx := sdk.CreateContext(ContextConfig{
 		Units_: map[string]string{
 			"session_id": "test-session-123",
 		},
+		PublishDelay_: -1,
 	})
 	if ctx == nil {
 		t.Fatal("Expected context to be created")

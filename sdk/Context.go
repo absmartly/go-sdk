@@ -144,7 +144,7 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	var units = config.Units_
 	if units != nil {
 		if err := cntx.SetUnits(units); err != nil && cntx.EventLogger_ != nil {
-			cntx.EventLogger_.HandleEvent(cntx, Error, "CreateContext: Failed to set units: "+err.Error())
+			cntx.EventLogger_.HandleEvent(cntx, Error, errors.New("CreateContext: Failed to set units: "+err.Error()))
 		}
 	}
 
@@ -154,7 +154,7 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	var attributes = config.Attributes_
 	if attributes != nil {
 		if err := cntx.SetAttributes(attributes); err != nil && cntx.EventLogger_ != nil {
-			cntx.EventLogger_.HandleEvent(cntx, Error, "CreateContext: Failed to set attributes: "+err.Error())
+			cntx.EventLogger_.HandleEvent(cntx, Error, errors.New("CreateContext: Failed to set attributes: "+err.Error()))
 		}
 	}
 
@@ -746,43 +746,51 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 
 	c.ClearRefreshTimer()
 
-	// Flush drains the queue and registers the publish under EventLock_, so
-	// reading both under it never sees a drained batch that is not yet
-	// registered.
-	c.EventLock_.Lock()
-	var mustWait = c.PendingCount_.Load().(int32) > 0 || c.inflightCount() > 0
-	c.EventLock_.Unlock()
+	// Send what is queued. The publish is registered in inflight_ in the same
+	// critical section that drains the queue.
+	c.Flush()
 
-	if !mustWait {
-		c.Closed_.Store(true)
-		c.Closing_.Store(false)
-		done(nil, nil)
-
-		c.LogEvent(Close, nil)
-		return tempFuture, nil
-	}
-
-	// Wait for the publish started here and for any publish that was already
-	// in flight. A failed batch is requeued, so the context can only close
-	// once every publish has succeeded.
-	var flushed = c.Flush()
-	// Take the snapshot under EventLock_: a publish registers itself in the
-	// same critical section that drains the queue.
-	c.EventLock_.Lock()
-	var waitFor = append(c.inflightSnapshot(), flushed)
-	c.EventLock_.Unlock()
-	var remaining = int32(len(waitFor))
 	var failureLock sync.Mutex
 	var failure error
-	var finish = func() {
+	var recordFailure = func(err error) {
+		if err == nil {
+			return
+		}
+		failureLock.Lock()
+		if failure == nil {
+			failure = err
+		}
+		failureLock.Unlock()
+	}
+
+	// settle waits for every publish in flight and then decides, under
+	// EventLock_, whether the context can be sealed. A publish that fails puts
+	// its events back in the queue, and another publish may drain them again
+	// after a snapshot was taken, so the loop repeats until nothing is in
+	// flight. Only then is the queue checked and the context sealed, in one
+	// critical section. A close that finds events still queued fails and leaves
+	// the context open for a retry.
+	var settle func()
+	settle = func() {
+		c.EventLock_.Lock()
+		var waitFor = c.inflightSnapshot()
+		if len(waitFor) > 0 {
+			c.EventLock_.Unlock()
+			var remaining = int32(len(waitFor))
+			for _, f := range waitFor {
+				f.Listen(func(value future.Value, err error) {
+					recordFailure(err)
+					if atomic.AddInt32(&remaining, -1) == 0 {
+						settle()
+					}
+				})
+			}
+			return
+		}
+
 		failureLock.Lock()
 		var err = failure
 		failureLock.Unlock()
-
-		// A publish that failed before it was in the snapshot has already put
-		// its events back in the queue. Check the queue and seal the context
-		// under EventLock_, so a successful close never strands them.
-		c.EventLock_.Lock()
 		if err == nil && c.PendingCount_.Load().(int32) > 0 {
 			err = errors.New("close left unsent events: an earlier publish failed")
 		}
@@ -809,20 +817,7 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 
 		c.LogEvent(Close, nil)
 	}
-	for _, f := range waitFor {
-		f.Listen(func(value future.Value, err error) {
-			if err != nil {
-				failureLock.Lock()
-				if failure == nil {
-					failure = err
-				}
-				failureLock.Unlock()
-			}
-			if atomic.AddInt32(&remaining, -1) == 0 {
-				finish()
-			}
-		})
-	}
+	settle()
 	return tempFuture, nil
 }
 
@@ -1069,16 +1064,16 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 					parsed, err := strconv.ParseBool(customValue)
 					if err != nil && c.EventLogger_ != nil {
 						c.EventLogger_.HandleEvent(self, Error,
-							"SetData: Failed to parse boolean custom field '"+customFieldValue.Name+
-								"' in experiment '"+experiment.Name+"': "+err.Error())
+							errors.New("SetData: Failed to parse boolean custom field '"+customFieldValue.Name+
+								"' in experiment '"+experiment.Name+"': "+err.Error()))
 					}
 					value.Value = parsed
 				} else if strings.HasPrefix(customFieldValue.Type, "number") {
 					parsed, err := strconv.ParseInt(customValue, 10, 64)
 					if err != nil && c.EventLogger_ != nil {
 						c.EventLogger_.HandleEvent(self, Error,
-							"SetData: Failed to parse number custom field '"+customFieldValue.Name+
-								"' in experiment '"+experiment.Name+"': "+err.Error())
+							errors.New("SetData: Failed to parse number custom field '"+customFieldValue.Name+
+								"' in experiment '"+experiment.Name+"': "+err.Error()))
 					}
 					value.Value = parsed
 				} else {
@@ -1139,6 +1134,11 @@ func (c *Context) Flush() *future.Future {
 			eventCount = c.PendingCount_.Load().(int32)
 			var exposures = make([]jsonmodels.Exposure, len(c.Exposures_))
 			var achievements = make([]jsonmodels.GoalAchievement, len(c.Achievements_))
+			// settled is the future Close waits on. It settles before the event
+			// logger runs, so a logger that calls Close cannot wait on its own
+			// publish. result is the future callers get; it settles after the
+			// logger has run.
+			var settled, settledDone = future.New()
 			var result, done = future.New()
 
 			if eventCount > 0 {
@@ -1155,7 +1155,7 @@ func (c *Context) Flush() *future.Future {
 				c.PendingCount_.Store(int32(0))
 				// Register the publish in the same critical section that drains
 				// the queue, so CloseAsync cannot miss it.
-				c.addInflight(result)
+				c.addInflight(settled)
 			}
 			c.EventLock_.Unlock()
 
@@ -1190,12 +1190,15 @@ func (c *Context) Flush() *future.Future {
 
 				c.EventHandler_.Publish(c.snapshot(), event).Listen(
 					func(value future.Value, err error) {
-						defer c.removeInflight(result)
 						if err == nil {
+							c.removeInflight(settled)
+							settledDone(nil, nil)
 							c.LogEvent(Publish, event)
 							done(nil, nil)
 						} else {
 							c.requeueEvents(exposures, achievements, eventCount)
+							c.removeInflight(settled)
+							settledDone(nil, err)
 							c.LogError(err)
 							done(nil, err)
 						}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -465,6 +466,104 @@ func TestCloseNeverSealsContextWithRequeuedEvents(t *testing.T) {
 		}
 		if closeErr == nil && ctx.GetPendingCount() > 0 {
 			t.Fatalf("iteration %d: close reported success with %d requeued events", i, ctx.GetPendingCount())
+		}
+	}
+}
+
+// An event logger that calls Close from its Publish callback must not wait on
+// the publish it is being called for.
+func TestEventLoggerCallingCloseFromPublishDoesNotDeadlock(t *testing.T) {
+	var publisher = &heldPublisher{}
+	var logger = &closingLogger{}
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = 0
+	config.EventLogger_ = logger
+	var ctx = createTrackedContext(clock, config, dataFutureReady, dataProvider, publisher, logger, variableParser, audienceMatcher)
+	logger.ctx = ctx
+
+	assertAny(nil, ctx.Track("goal1", nil), t)
+	fut, err := ctx.PublishAsync()
+	assertAny(nil, err, t)
+	publisher.settle(t, 0, nil)
+	assertAny(nil, getWithTimeout(t, fut), t)
+	if !logger.closed.Load() {
+		t.Fatal("logger did not call Close")
+	}
+	assertAny(true, ctx.IsClosed(), t)
+}
+
+type closingLogger struct {
+	ctx    *Context
+	closed atomic.Bool
+}
+
+func (l *closingLogger) HandleEvent(_ Context, event EventType, _ interface{}) {
+	if event == Publish && l.ctx != nil && l.closed.CompareAndSwap(false, true) {
+		l.ctx.Close()
+	}
+}
+
+// Error events carry error values, as the README's logger contract says.
+func TestErrorEventsCarryErrorValues(t *testing.T) {
+	setUp()
+	var logger = &MockEventLogger{}
+	var config = CreateDefaultContextConfig()
+	config.Units_ = map[string]string{"session_id": ""}
+	config.RefreshInterval_ = 0
+	config.EventLogger_ = logger
+	_ = createTrackedContext(clock, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
+	DefaultVariableParser{}.Parse(Context{EventLogger_: logger}, "exp", "variant", "{not json")
+
+	var seen = 0
+	for _, e := range logger.GetEvents() {
+		if e.EventType == Error {
+			seen++
+			if _, ok := e.Data.(error); !ok {
+				t.Errorf("Error event data is %T, want error: %v", e.Data, e.Data)
+			}
+		}
+	}
+	if seen == 0 {
+		t.Fatal("expected at least one Error event")
+	}
+}
+
+// An in-flight publish that fails while a second publish and Close overlap
+// must never leave a closed context holding requeued events.
+func TestCloseWithOverlappingFailingPublishes(t *testing.T) {
+	for i := 0; i < 300; i++ {
+		var publisher = &heldPublisher{}
+		var ctx = createHeldPublisherContext(t, publisher, nil)
+		assertAny(nil, ctx.Track("goal1", nil), t)
+		_, err := ctx.PublishAsync()
+		assertAny(nil, err, t)
+
+		var wg sync.WaitGroup
+		var closing *future.Future
+		wg.Add(3)
+		go func() { defer wg.Done(); closing, _ = ctx.CloseAsync() }()
+		go func() { defer wg.Done(); _, _ = ctx.PublishAsync() }()
+		go func() { defer wg.Done(); publisher.settle(t, 0, errors.New("Publish failed")) }()
+		wg.Wait()
+
+		// Fail every further publish until the close settles.
+		var deadline = time.Now().Add(5 * time.Second)
+		var settled = 1
+		for !closing.Ready() && time.Now().Before(deadline) {
+			if publisher.calls() > settled {
+				publisher.settle(t, settled, errors.New("Publish failed"))
+				settled++
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if !closing.Ready() {
+			t.Fatalf("iteration %d: close hung", i)
+		}
+		if ctx.IsClosed() && ctx.GetPendingCount() > 0 {
+			t.Fatalf("iteration %d: closed with %d requeued events", i, ctx.GetPendingCount())
 		}
 	}
 }
