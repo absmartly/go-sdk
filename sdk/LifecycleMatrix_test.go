@@ -189,6 +189,9 @@ func (l *matrixLogger) HandleEvent(supplied Context, event EventType, _ interfac
 	case l.behavior == "publishViaCopy" && event == Publish && first():
 		l.fired.Add(1)
 		_, _ = copied.PublishAsync()
+	case l.behavior == "refreshOnError" && event == Error && c != nil && first():
+		l.fired.Add(1)
+		c.Refresh()
 	case l.behavior == "refreshViaCopy" && event == Publish && first():
 		l.fired.Add(1)
 		copied.Refresh()
@@ -404,6 +407,26 @@ func runLifecycleCase(t *testing.T, mode, fault string, failing bool, loggerBeha
 		mustFire = failing
 	case "panicClose":
 		mustFire = !failing && act.closes
+	}
+	// A refresh that succeeded must have reported a Refresh event. The event is
+	// logged right after the future settles, so give it a moment.
+	for _, o := range futs {
+		if o.kind != "refresh" {
+			continue
+		}
+		if _, err := o.f.Get(context.Background()); err != nil {
+			continue
+		}
+		var waitUntil = time.Now().Add(5 * time.Second)
+		for logger.seenCount(Refresh) == 0 && time.Now().Before(waitUntil) {
+			time.Sleep(time.Millisecond)
+		}
+		if logger.seenCount(Refresh) == 0 {
+			t.Fatalf("a refresh succeeded but the logger never received the Refresh event: %s", state())
+		}
+		if loggerBehavior == "panicRefresh" && logger.fired.Load() == 0 {
+			t.Fatalf("logger behavior panicRefresh never ran: %s", state())
+		}
 	}
 	if mustFire && logger.fired.Load() == 0 {
 		t.Fatalf("logger behavior %q never ran: %s", loggerBehavior, state())
@@ -639,4 +662,62 @@ type panickingParser struct{}
 
 func (panickingParser) Parse(Context, string, string, string) map[string]interface{} {
 	panic("parser panic")
+}
+
+// Rejecting an exposure because the context is closing must not consume the
+// assignment's exposure marker: a failed close reopens the context, and the
+// next GetTreatment has to queue the exposure.
+func TestRejectedExposureIsQueuedAfterFailedClose(t *testing.T) {
+	setUp()
+	var publisher = &heldPublisher{}
+	var ctx = createHeldPublisherContext(t, publisher, nil)
+
+	var assignment = ctx.GetAssignment("exp_test_ab")
+	// Close has begun by the time the exposure is queued.
+	ctx.Closing_.Store(true)
+	ctx.QueueExposure(assignment)
+	assertAny(false, assignment.Exposed.Load().(bool), t)
+	assertAny(int32(0), ctx.GetPendingCount(), t)
+
+	// The close failed and left the context open.
+	ctx.Closing_.Store(false)
+	_, err := ctx.GetTreatment("exp_test_ab")
+	assertAny(nil, err, t)
+	assertAny(int32(1), ctx.GetPendingCount(), t)
+	assertAny(1, len(ctx.Exposures_), t)
+}
+
+// A parse diagnostic must not wait on the load that reports it. A logger that
+// calls Refresh from its Error callback while a refresh is parsing malformed
+// data used to wait on that very refresh.
+func TestParseDiagnosticLoggerCallingRefreshDoesNotSelfWait(t *testing.T) {
+	var malformed = jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{{
+		Id: 1, Name: "bad_config", UnitType: "session_id", Split: []float64{0.5, 0.5}, TrafficSplit: []float64{0, 1},
+		Variants:          []jsonmodels.ExperimentVariant{{Name: "A", Config: "{"}, {Name: "B", Config: `{"a":1}`}},
+		CustomFieldValues: []jsonmodels.CustomFieldValue{{Name: "flag", Type: "boolean", Value: "notabool"}},
+	}}}
+	setUp()
+	var p = &matrixPublisher{mode: "async", delivered: map[string]int{}}
+	var logger = &matrixLogger{behavior: "refreshOnError"}
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = 0
+	config.EventLogger_ = logger
+	var ctx = createTrackedContext(clock, config, dataFutureReady, matrixProvider{p: p, data: malformed}, p, logger, DefaultVariableParser{}, audienceMatcher)
+	logger.ctx.Store(ctx)
+
+	var refreshed = ctx.RefreshAsync()
+	assertAny(nil, getWithTimeout(t, refreshed), t)
+	var deadline = time.Now().Add(5 * time.Second)
+	for logger.inflight.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if logger.fired.Load() == 0 {
+		t.Fatal("the logger never saw a parse diagnostic")
+	}
+	if logger.seenCount(Error) < 2 {
+		t.Fatalf("expected both the config and the custom field diagnostics, saw %d Error events", logger.seenCount(Error))
+	}
+	assertAny(nil, getWithTimeout(t, ctx.RefreshAsync()), t)
 }

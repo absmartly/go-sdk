@@ -195,11 +195,14 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 		dataFuture.Listen(func(val future.Value, err error) {
 			if err == nil {
 				var result = val.(jsonmodels.ContextData)
-				if panicErr := tmp.applyRefreshedData(result); panicErr != nil {
+				var diagnostics, panicErr = tmp.applyRefreshedData(result)
+				if panicErr != nil {
 					tmp.SetDataFailed(panicErr)
+					tmp.dispatchDiagnostics(diagnostics)
 					tmp.LogError(panicErr)
 					return
 				}
+				tmp.dispatchDiagnostics(diagnostics)
 				tmp.LogEvent(Ready, result)
 			} else {
 				tmp.SetDataFailed(err)
@@ -222,15 +225,18 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 					tmp.LogError(err)
 					return
 				}
-				if panicErr := tmp.applyRefreshedData(result); panicErr != nil {
+				var diagnostics, panicErr = tmp.applyRefreshedData(result)
+				if panicErr != nil {
 					tmp.SetDataFailed(panicErr)
 					readyFutureDone(nil, panicErr)
 					cntx.setReadyFuture(nil)
+					tmp.dispatchDiagnostics(diagnostics)
 					tmp.LogError(panicErr)
 					return
 				}
 				readyFutureDone(result, nil)
 				cntx.setReadyFuture(nil)
+				tmp.dispatchDiagnostics(diagnostics)
 				tmp.LogEvent(Ready, result)
 
 				if tmp.GetPendingCount() > 0 {
@@ -499,6 +505,10 @@ func (c *Context) QueueExposure(assignment *Assignment) {
 		// or rejected after it, never stranded behind it.
 		if c.CheckNotClosed() != nil {
 			c.EventLock_.Unlock()
+			// The exposure was not queued, so it must not stay marked as
+			// exposed: a failed close reopens the context, and the next
+			// GetTreatment has to queue it.
+			assignment.Exposed.Store(false)
 			return
 		}
 		c.PendingCount_.Store(c.PendingCount_.Load().(int32) + 1)
@@ -746,18 +756,25 @@ func (c *Context) RefreshAsync() *future.Future {
 		// the future settles, so later refreshes are not blocked for ever.
 		var outcome = err
 		var result jsonmodels.ContextData
+		var diagnostics []bufferedEvent
 		if outcome == nil {
 			var ok bool
 			result, ok = value.(jsonmodels.ContextData)
 			if !ok {
 				outcome = &TypeError{Expected: "jsonmodels.ContextData", Actual: value}
-			} else if panicErr := c.applyRefreshedData(result); panicErr != nil {
-				outcome = panicErr
+			} else {
+				var panicErr error
+				diagnostics, panicErr = c.applyRefreshedData(result)
+				if panicErr != nil {
+					outcome = panicErr
+				}
 			}
 		}
 		c.Refreshing_.Store(false)
 		donefun(nil, outcome)
 
+		// The load is over; only now tell the logger what the parser found.
+		c.dispatchDiagnostics(diagnostics)
 		if outcome == nil {
 			c.LogEvent(Refresh, result)
 		} else {
@@ -769,14 +786,16 @@ func (c *Context) RefreshAsync() *future.Future {
 
 // applyRefreshedData sets refreshed data and returns a panic from the variable
 // parser, or any other code SetData calls, as an error.
-func (c *Context) applyRefreshedData(data jsonmodels.ContextData) (panicErr error) {
+func (c *Context) applyRefreshedData(data jsonmodels.ContextData) (diagnostics []bufferedEvent, panicErr error) {
+	var buffer = &diagnosticBuffer{}
 	defer func() {
 		if r := recover(); r != nil {
 			panicErr = panicToError(r)
 		}
+		diagnostics = buffer.take()
 	}()
-	c.SetData(data)
-	return nil
+	c.setData(data, buffer)
+	return nil, nil
 }
 
 func (c *Context) Refresh() {
@@ -1065,8 +1084,53 @@ func (c *Context) CheckReady(expectNotClosed bool) error {
 	return nil
 }
 
+// SetData sets the experiment data and then reports what it found while
+// parsing (malformed configs and custom fields) to the event logger.
 func (c *Context) SetData(data jsonmodels.ContextData) {
+	var buffer = &diagnosticBuffer{}
+	c.setData(data, buffer)
+	c.dispatchDiagnostics(buffer.take())
+}
+
+// diagnosticBuffer collects the events the parser and SetData emit while a
+// load is running. They are delivered only after the load has finished, so a
+// logger that reacts to a diagnostic by calling Refresh, Close or Publish
+// never waits on the load that is reporting to it.
+type diagnosticBuffer struct {
+	mu     sync.Mutex
+	events []bufferedEvent
+}
+
+type bufferedEvent struct {
+	event EventType
+	data  interface{}
+}
+
+func (b *diagnosticBuffer) HandleEvent(_ Context, event EventType, data interface{}) {
+	b.mu.Lock()
+	b.events = append(b.events, bufferedEvent{event, data})
+	b.mu.Unlock()
+}
+
+func (b *diagnosticBuffer) take() []bufferedEvent {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var events = b.events
+	b.events = nil
+	return events
+}
+
+func (c *Context) dispatchDiagnostics(events []bufferedEvent) {
+	for _, e := range events {
+		_ = c.logEvent(e.event, e.data)
+	}
+}
+
+// setData does the work of SetData. Parse diagnostics go to buffer instead of
+// the event logger.
+func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer) {
 	var self = c.snapshot()
+	self.EventLogger_ = buffer
 	var index = map[string]ExperimentVariables{}
 	var indexVariables = map[string][]ExperimentVariables{}
 	var contextCustomFields = map[string]map[string]ContextCustomFieldValue{}
@@ -1125,7 +1189,7 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 				} else if strings.HasPrefix(customFieldValue.Type, "boolean") {
 					parsed, err := strconv.ParseBool(customValue)
 					if err != nil && c.EventLogger_ != nil {
-						notifyLogger(c.EventLogger_, self, Error,
+						buffer.HandleEvent(self, Error,
 							errors.New("SetData: Failed to parse boolean custom field '"+customFieldValue.Name+
 								"' in experiment '"+experiment.Name+"': "+err.Error()))
 					}
@@ -1133,7 +1197,7 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 				} else if strings.HasPrefix(customFieldValue.Type, "number") {
 					parsed, err := strconv.ParseInt(customValue, 10, 64)
 					if err != nil && c.EventLogger_ != nil {
-						notifyLogger(c.EventLogger_, self, Error,
+						buffer.HandleEvent(self, Error,
 							errors.New("SetData: Failed to parse number custom field '"+customFieldValue.Name+
 								"' in experiment '"+experiment.Name+"': "+err.Error()))
 					}
