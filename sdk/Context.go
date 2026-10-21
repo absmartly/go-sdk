@@ -1196,14 +1196,17 @@ func (c *Context) Flush() *future.Future {
 						// future on their own goroutine, so a logger that calls Close
 						// cannot block the call that started the publish.
 						if err == nil {
+							// Start the logger first: settledDone runs Close's listeners
+							// synchronously, and a panic there must not leave the
+							// caller's future unsettled.
+							runLogger(done, nil, func() { c.LogEvent(Publish, event) })
 							c.removeInflight(settled)
 							settledDone(nil, nil)
-							runLogger(done, nil, func() { c.LogEvent(Publish, event) })
 						} else {
 							c.requeueEvents(exposures, achievements, eventCount)
+							runLogger(done, err, func() { c.LogError(err) })
 							c.removeInflight(settled)
 							settledDone(nil, err)
-							runLogger(done, err, func() { c.LogError(err) })
 						}
 					})
 

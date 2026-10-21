@@ -656,3 +656,30 @@ func TestPanickingLoggersAreContained(t *testing.T) {
 		assertAny(int32(1), ctx.GetPendingCount(), t)
 	})
 }
+
+// A panic in the Close logger, reached while a held publish settles, must not
+// leave the public publish future unsettled.
+func TestClosePanicDoesNotStrandPublishFuture(t *testing.T) {
+	var publisher = &heldPublisher{}
+	var logger = panickingLogger{on: Close}
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = 0
+	config.EventLogger_ = logger
+	var ctx = createTrackedContext(clock, config, dataFutureReady, dataProvider, publisher, logger, variableParser, audienceMatcher)
+
+	assertAny(nil, ctx.Track("goal1", nil), t)
+	published, err := ctx.PublishAsync()
+	assertAny(nil, err, t)
+	_, err = ctx.CloseAsync()
+	assertAny(nil, err, t)
+
+	func() {
+		defer func() { _ = recover() }()
+		publisher.settle(t, 0, nil)
+	}()
+
+	assertAny(nil, getWithTimeout(t, published), t)
+}
