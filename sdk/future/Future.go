@@ -54,14 +54,20 @@ func (f *Future) Ready() bool {
 	}
 }
 
+// SetResult settles the future. Only the first call has an effect, even when
+// several goroutines settle the future at the same time.
 func (f *Future) SetResult(v Value, err error) {
+	f.mu.Lock()
 	select {
 	case <-f.ready:
+		f.mu.Unlock()
+		return
 	default:
-		f.val, f.err = v, err
-		close(f.ready)
-		f.NotifyCallbacks()
 	}
+	f.val, f.err = v, err
+	close(f.ready)
+	f.mu.Unlock()
+	f.NotifyCallbacks()
 }
 
 // Listen for the result.
@@ -86,10 +92,16 @@ func (f *Future) NotifyCallbacks() {
 	f.callbacks = nil
 	f.mu.Unlock()
 	// Run the callbacks without the lock so one of them can call Listen on
-	// this future.
+	// this future. A callback that panics must not stop the callbacks after it
+	// (they would never run) or unwind into whoever settled the future.
 	for _, callback := range callbacks {
-		callback(f.val, f.err)
+		f.runCallback(callback)
 	}
+}
+
+func (f *Future) runCallback(callback SetResultFunc) {
+	defer func() { _ = recover() }()
+	callback(f.val, f.err)
 }
 
 func (f *Future) Join(ctx context.Context) {

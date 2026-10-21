@@ -63,7 +63,15 @@ type Context struct {
 	// StateLock_ guards ReadyFuture_, RefreshFuture_, ClosingFuture_ and RefreshTimer_.
 	StateLock_ *sync.Mutex
 	// inflight_ holds the publishes that have been sent and not yet settled. Guarded by StateLock_.
-	inflight_     []*future.Future
+	inflight_ []*future.Future
+
+	// root_ is set on the copies of the Context that callbacks receive. It
+	// points at the live context, which owns the lifecycle state (the
+	// closing/refresh futures, timers, in-flight publishes and event queue).
+	// The lifecycle methods run on the live context, so calling Close, Publish
+	// or Refresh on the copy a logger was given acts on the real context, not
+	// on stale copied fields.
+	root_         *Context
 	Timeout_      *time.Timer
 	RefreshTimer_ *time.Timer
 	Clock_        internal.Clock
@@ -283,6 +291,7 @@ func (c *Context) setReadyFuture(f *future.Future) {
 // writers. Lock order is ContextLock_, DataLock, EventLock_, TimeoutLock_,
 // StateLock_. It must not be called while holding any of them.
 func (c *Context) snapshot() Context {
+	c = c.live()
 	c.ContextLock_.RLock()
 	defer c.ContextLock_.RUnlock()
 	c.DataLock.RLock()
@@ -293,7 +302,18 @@ func (c *Context) snapshot() Context {
 	defer c.TimeoutLock_.Unlock()
 	c.StateLock_.Lock()
 	defer c.StateLock_.Unlock()
-	return *c
+	var cp = *c
+	cp.root_ = c
+	return cp
+}
+
+// live returns the context that owns the lifecycle state: the context itself,
+// or, for a copy handed to a callback, the context it was copied from.
+func (c *Context) live() *Context {
+	if c.root_ != nil {
+		return c.root_
+	}
+	return c
 }
 
 func (c *Context) GetExperiments() ([]string, error) {
@@ -456,6 +476,7 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 }
 
 func (c *Context) QueueExposure(assignment *Assignment) {
+	c = c.live()
 	if assignment.Exposed.CompareAndSwap(false, true) {
 		var exposure = jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
 			Variant: assignment.Variant, ExposedAt: c.Clock_.Millis(), Assigned: assignment.Assigned,
@@ -463,6 +484,13 @@ func (c *Context) QueueExposure(assignment *Assignment) {
 			Custom: assignment.Custom, AudienceMismatch: assignment.AudienceMismatch}
 
 		c.EventLock_.Lock()
+		// Close seals the context under EventLock_, so this check and the
+		// append cannot interleave with the seal: an event is queued before it
+		// or rejected after it, never stranded behind it.
+		if c.CheckNotClosed() != nil {
+			c.EventLock_.Unlock()
+			return
+		}
 		c.PendingCount_.Store(c.PendingCount_.Load().(int32) + 1)
 		c.Exposures_ = append(c.Exposures_, exposure)
 		c.EventLock_.Unlock()
@@ -619,6 +647,7 @@ func (c *Context) PeekVariableValue(key string, defaultValue interface{}) (inter
 }
 
 func (c *Context) Track(goalName string, properties map[string]interface{}) error {
+	c = c.live()
 	var err = c.CheckNotClosed()
 	if err != nil {
 		return err
@@ -637,6 +666,11 @@ func (c *Context) Track(goalName string, properties map[string]interface{}) erro
 	}
 
 	c.EventLock_.Lock()
+	// See QueueExposure: check and append under the lock Close seals with.
+	if err := c.CheckNotClosed(); err != nil {
+		c.EventLock_.Unlock()
+		return err
+	}
 	c.PendingCount_.Store(c.PendingCount_.Load().(int32) + 1)
 	c.Achievements_ = append(c.Achievements_, achievement)
 	c.EventLock_.Unlock()
@@ -648,6 +682,7 @@ func (c *Context) Track(goalName string, properties map[string]interface{}) erro
 }
 
 func (c *Context) PublishAsync() (*future.Future, error) {
+	c = c.live()
 	var err = c.CheckNotClosed()
 	if err != nil {
 		return nil, err
@@ -670,6 +705,7 @@ func (c *Context) GetPendingCount() int32 {
 }
 
 func (c *Context) RefreshAsync() *future.Future {
+	c = c.live()
 	var err = c.CheckNotClosed()
 	if err != nil {
 		var tempfuture, donefun = future.New()
@@ -695,29 +731,42 @@ func (c *Context) RefreshAsync() *future.Future {
 	c.RefreshFuture_ = tempfuture
 	c.StateLock_.Unlock()
 
-	c.DataProvider_.GetContextData().Listen(func(value future.Value, err error) {
-		if err == nil {
-			result, ok := value.(jsonmodels.ContextData)
+	c.callDataProvider().Listen(func(value future.Value, err error) {
+		// Whatever happens below, the refresh ends: Refreshing_ is cleared and
+		// the future settles, so later refreshes are not blocked for ever.
+		var outcome = err
+		var result jsonmodels.ContextData
+		if outcome == nil {
+			var ok bool
+			result, ok = value.(jsonmodels.ContextData)
 			if !ok {
-				err = &TypeError{Expected: "jsonmodels.ContextData", Actual: value}
-				c.Refreshing_.Store(false)
-				donefun(nil, err)
-				c.LogError(err)
-				return
+				outcome = &TypeError{Expected: "jsonmodels.ContextData", Actual: value}
+			} else if panicErr := c.applyRefreshedData(result); panicErr != nil {
+				outcome = panicErr
 			}
-			c.SetData(result)
-			c.Refreshing_.Store(false)
-			donefun(nil, nil)
+		}
+		c.Refreshing_.Store(false)
+		donefun(nil, outcome)
 
+		if outcome == nil {
 			c.LogEvent(Refresh, result)
 		} else {
-			c.Refreshing_.Store(false)
-			donefun(nil, err)
-
-			c.LogError(err)
+			c.LogError(outcome)
 		}
 	})
 	return tempfuture
+}
+
+// applyRefreshedData sets refreshed data and returns a panic from the variable
+// parser, or any other code SetData calls, as an error.
+func (c *Context) applyRefreshedData(data jsonmodels.ContextData) (panicErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			panicErr = panicToError(r)
+		}
+	}()
+	c.SetData(data)
+	return nil
 }
 
 func (c *Context) Refresh() {
@@ -725,6 +774,7 @@ func (c *Context) Refresh() {
 }
 
 func (c *Context) CloseAsync() (*future.Future, error) {
+	c = c.live()
 	// Claim the close and publish its future in one critical section, so a
 	// concurrent caller that sees the context closing also gets the future of
 	// the close that is running.
@@ -822,6 +872,7 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 }
 
 func (c *Context) Close() {
+	c = c.live()
 	c.ClearRefreshTimer()
 	var fut, err = c.CloseAsync()
 	if err == nil {
@@ -942,6 +993,7 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 }
 
 func (c *Context) ClearRefreshTimer() {
+	c = c.live()
 	c.StateLock_.Lock()
 	defer c.StateLock_.Unlock()
 	if c.RefreshTimer_ != nil {
@@ -1100,16 +1152,37 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 	c.DataLock.Unlock()
 }
 
+// LogEvent and LogError pass an event to the event logger. A logger is an
+// observer: a panic in it is contained here, so it can neither end the host
+// process from an SDK goroutine nor leave the SDK's own state half updated.
 func (c *Context) LogEvent(event EventType, data interface{}) {
-	if c.EventLogger_ != nil {
-		c.EventLogger_.HandleEvent(c.snapshot(), event, data)
-	}
+	_ = c.logEvent(event, data)
 }
 
 func (c *Context) LogError(err error) {
-	if c.EventLogger_ != nil {
-		c.EventLogger_.HandleEvent(c.snapshot(), Error, err)
+	_ = c.logEvent(Error, err)
+}
+
+// logEvent returns the logger's panic as an error, for the callers that can
+// report it through a future.
+func (c *Context) logEvent(event EventType, data interface{}) (panicErr error) {
+	if c.EventLogger_ == nil {
+		return nil
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			panicErr = panicToError(r)
+		}
+	}()
+	c.EventLogger_.HandleEvent(c.snapshot(), event, data)
+	return nil
+}
+
+func panicToError(r interface{}) error {
+	if err, ok := r.(error); ok {
+		return err
+	}
+	return &future.PanicError{Value: r}
 }
 
 func (c *Context) SetDataFailed(err error) {
@@ -1124,6 +1197,7 @@ func (c *Context) SetDataFailed(err error) {
 }
 
 func (c *Context) Flush() *future.Future {
+	c = c.live()
 	c.ClearTimeout()
 
 	if !c.Failed_.Load().(bool) {
@@ -1188,7 +1262,7 @@ func (c *Context) Flush() *future.Future {
 				event.Goals = achievements
 				event.Exposures = exposures
 
-				c.EventHandler_.Publish(c.snapshot(), event).Listen(
+				c.callPublisher(event).Listen(
 					func(value future.Value, err error) {
 						// The publisher may return a future that is already complete,
 						// which runs this callback on the caller's stack, for example
@@ -1199,12 +1273,12 @@ func (c *Context) Flush() *future.Future {
 							// Start the logger first: settledDone runs Close's listeners
 							// synchronously, and a panic there must not leave the
 							// caller's future unsettled.
-							runLogger(done, nil, func() { c.LogEvent(Publish, event) })
+							runLogger(done, nil, func() error { return c.logEvent(Publish, event) })
 							c.removeInflight(settled)
 							settledDone(nil, nil)
 						} else {
 							c.requeueEvents(exposures, achievements, eventCount)
-							runLogger(done, err, func() { c.LogError(err) })
+							runLogger(done, err, func() error { return c.logEvent(Error, err) })
 							c.removeInflight(settled)
 							settledDone(nil, err)
 						}
@@ -1259,22 +1333,52 @@ func (c *Context) inflightSnapshot() []*future.Future {
 // caller's future with result. A panic in the logger is contained and reported
 // through the future instead of ending the process, as it was when the logger
 // ran under future.Call.
-func runLogger(done future.SetResultFunc, result error, log func()) {
+func runLogger(done future.SetResultFunc, result error, log func() error) {
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				var panicErr error
-				if err, ok := r.(error); ok {
-					panicErr = err
-				} else {
-					panicErr = &future.PanicError{Value: r}
-				}
-				done(nil, panicErr)
-			}
-		}()
-		log()
+		if panicErr := log(); panicErr != nil {
+			done(nil, panicErr)
+			return
+		}
 		done(nil, result)
 	}()
+}
+
+// callPublisher calls the event handler and always returns a future. A
+// handler that panics or returns nil would otherwise leave the drained batch
+// in flight forever, and Close would wait for it for ever.
+func (c *Context) callPublisher(event jsonmodels.PublishEvent) (published *future.Future) {
+	defer func() {
+		if r := recover(); r != nil {
+			var failed, fail = future.New()
+			fail(nil, panicToError(r))
+			published = failed
+		}
+	}()
+	published = c.EventHandler_.Publish(c.snapshot(), event)
+	if published == nil {
+		var failed, fail = future.New()
+		fail(nil, errors.New("event handler returned no future"))
+		published = failed
+	}
+	return published
+}
+
+// callDataProvider is callPublisher for the data provider.
+func (c *Context) callDataProvider() (loaded *future.Future) {
+	defer func() {
+		if r := recover(); r != nil {
+			var failed, fail = future.New()
+			fail(nil, panicToError(r))
+			loaded = failed
+		}
+	}()
+	loaded = c.DataProvider_.GetContextData()
+	if loaded == nil {
+		var failed, fail = future.New()
+		fail(nil, errors.New("data provider returned no future"))
+		loaded = failed
+	}
+	return loaded
 }
 
 // requeueEvents puts the events of a failed publish back in the queue so a
@@ -1325,6 +1429,7 @@ func (f FlushMapper) forceASCII(s string) string {
 }
 
 func (c *Context) ClearTimeout() {
+	c = c.live()
 	c.TimeoutLock_.Lock()
 	if c.Timeout_ != nil {
 		c.Timeout_.Stop()
@@ -1334,6 +1439,7 @@ func (c *Context) ClearTimeout() {
 }
 
 func (c *Context) SetTimeout() {
+	c = c.live()
 	if c.IsReady() {
 		{
 			c.TimeoutLock_.Lock()
@@ -1353,8 +1459,14 @@ func (c *Context) SetTimeout() {
 }
 
 func (c *Context) SetRefreshTimer() {
+	c = c.live()
 	c.StateLock_.Lock()
 	defer c.StateLock_.Unlock()
+	// A refresh that finishes after Close began calls SetData, which gets here.
+	// Installing the timer then would leave a timer on a closed context.
+	if c.Closed_.Load().(bool) || c.Closing_.Load().(bool) {
+		return
+	}
 	if c.RefreshInterval_ > 0 && c.RefreshTimer_ == nil {
 		var rate = time.Duration(uint64(c.RefreshInterval_ * int64(time.Millisecond)))
 
