@@ -127,6 +127,7 @@ func (b *ABsmartlyBuilder) Build() (ABsmartly, error) {
 		httpClientConfig := CreateDefaultHttpClientConfig()
 		if b.timeout_ != nil {
 			httpClientConfig.ConnectTimeout_ = *b.timeout_
+			httpClientConfig.ConnectionRequestTimeout_ = *b.timeout_
 		}
 		if b.retries_ != nil {
 			httpClientConfig.MaxRetries_ = *b.retries_

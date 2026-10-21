@@ -742,9 +742,31 @@ func main() {
 
 ## Advanced Request Configuration
 
-### Request Timeout with Context
+### HTTP Timeout and Retries
 
-Go supports context-based cancellation. You can use Go's context package for timeouts:
+The SDK's HTTP client is configured on the builder. `Timeout` bounds how long a request may take and `Retries` sets how often a failed request (network error, 502, 503 or 504) is retried:
+
+```go
+import (
+    "time"
+    "github.com/absmartly/go-sdk/sdk"
+)
+
+func newSDK() (sdk.ABsmartly, error) {
+    return sdk.NewBuilder().
+        Endpoint("https://your-company.absmartly.io/v1").
+        ApiKey("YOUR-API-KEY").
+        Application("website").
+        Environment("development").
+        Timeout(2 * time.Second).
+        Retries(2).
+        Build()
+}
+```
+
+### Bounding How Long You Wait for a Context
+
+The SDK does not accept a `context.Context`, so a Go context cannot cancel its HTTP requests. You can still bound how long your own code waits for the context to become ready; the request itself keeps running in the background and is limited only by the `Timeout` and `Retries` above.
 
 ```go
 import (
@@ -754,17 +776,15 @@ import (
     "github.com/absmartly/go-sdk/sdk"
 )
 
-func createContextWithTimeout() (*sdk.Context, error) {
-    ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+func createContextWithDeadline(absmartly sdk.ABsmartly, wait time.Duration) (*sdk.Context, error) {
+    ctx, cancel := context.WithTimeout(context.Background(), wait)
     defer cancel()
 
-    contextConfig := sdk.ContextConfig{
+    absmartlyCtx := absmartly.CreateContext(sdk.ContextConfig{
         Units_: map[string]string{
             "session_id": "5ebf06d8cb5d8137290c4abb64155584fbdb64d8",
         },
-    }
-
-    absmartlyCtx := absmartlySDK.CreateContext(contextConfig)
+    })
 
     done := make(chan struct{})
     go func() {
@@ -779,56 +799,10 @@ func createContextWithTimeout() (*sdk.Context, error) {
         }
         return absmartlyCtx, nil
     case <-ctx.Done():
+        // Stop using the context. Its background request is not cancelled.
         return nil, ctx.Err()
     }
 }
-```
-
-### Request Cancellation
-
-```go
-import (
-    "context"
-    "errors"
-    "github.com/absmartly/go-sdk/sdk"
-)
-
-func createContextWithCancellation() (*sdk.Context, context.CancelFunc, error) {
-    ctx, cancel := context.WithCancel(context.Background())
-
-    contextConfig := sdk.ContextConfig{
-        Units_: map[string]string{
-            "session_id": "5ebf06d8cb5d8137290c4abb64155584fbdb64d8",
-        },
-    }
-
-    absmartlyCtx := absmartlySDK.CreateContext(contextConfig)
-
-    done := make(chan struct{})
-    go func() {
-        absmartlyCtx.WaitUntilReady()
-        close(done)
-    }()
-
-    select {
-    case <-done:
-        if absmartlyCtx.IsFailed() {
-            return nil, cancel, errors.New("failed to load experiment data")
-        }
-        return absmartlyCtx, cancel, nil
-    case <-ctx.Done():
-        return nil, cancel, ctx.Err()
-    }
-}
-
-// Usage
-absmartlyContext, cancel, err := createContextWithCancellation()
-if err != nil {
-    log.Fatal(err)
-}
-
-// Cancel if needed (e.g., user navigates away)
-// cancel()
 ```
 
 ## About A/B Smartly
