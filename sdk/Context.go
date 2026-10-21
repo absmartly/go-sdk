@@ -152,7 +152,7 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	var units = config.Units_
 	if units != nil {
 		if err := cntx.SetUnits(units); err != nil && cntx.EventLogger_ != nil {
-			cntx.EventLogger_.HandleEvent(cntx, Error, errors.New("CreateContext: Failed to set units: "+err.Error()))
+			notifyLogger(cntx.EventLogger_, cntx, Error, errors.New("CreateContext: Failed to set units: "+err.Error()))
 		}
 	}
 
@@ -162,7 +162,7 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	var attributes = config.Attributes_
 	if attributes != nil {
 		if err := cntx.SetAttributes(attributes); err != nil && cntx.EventLogger_ != nil {
-			cntx.EventLogger_.HandleEvent(cntx, Error, errors.New("CreateContext: Failed to set attributes: "+err.Error()))
+			notifyLogger(cntx.EventLogger_, cntx, Error, errors.New("CreateContext: Failed to set attributes: "+err.Error()))
 		}
 	}
 
@@ -195,7 +195,11 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 		dataFuture.Listen(func(val future.Value, err error) {
 			if err == nil {
 				var result = val.(jsonmodels.ContextData)
-				tmp.SetData(result)
+				if panicErr := tmp.applyRefreshedData(result); panicErr != nil {
+					tmp.SetDataFailed(panicErr)
+					tmp.LogError(panicErr)
+					return
+				}
 				tmp.LogEvent(Ready, result)
 			} else {
 				tmp.SetDataFailed(err)
@@ -218,7 +222,13 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 					tmp.LogError(err)
 					return
 				}
-				tmp.SetData(result)
+				if panicErr := tmp.applyRefreshedData(result); panicErr != nil {
+					tmp.SetDataFailed(panicErr)
+					readyFutureDone(nil, panicErr)
+					cntx.setReadyFuture(nil)
+					tmp.LogError(panicErr)
+					return
+				}
 				readyFutureDone(result, nil)
 				cntx.setReadyFuture(nil)
 				tmp.LogEvent(Ready, result)
@@ -1115,7 +1125,7 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 				} else if strings.HasPrefix(customFieldValue.Type, "boolean") {
 					parsed, err := strconv.ParseBool(customValue)
 					if err != nil && c.EventLogger_ != nil {
-						c.EventLogger_.HandleEvent(self, Error,
+						notifyLogger(c.EventLogger_, self, Error,
 							errors.New("SetData: Failed to parse boolean custom field '"+customFieldValue.Name+
 								"' in experiment '"+experiment.Name+"': "+err.Error()))
 					}
@@ -1123,7 +1133,7 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 				} else if strings.HasPrefix(customFieldValue.Type, "number") {
 					parsed, err := strconv.ParseInt(customValue, 10, 64)
 					if err != nil && c.EventLogger_ != nil {
-						c.EventLogger_.HandleEvent(self, Error,
+						notifyLogger(c.EventLogger_, self, Error,
 							errors.New("SetData: Failed to parse number custom field '"+customFieldValue.Name+
 								"' in experiment '"+experiment.Name+"': "+err.Error()))
 					}
@@ -1169,12 +1179,23 @@ func (c *Context) logEvent(event EventType, data interface{}) (panicErr error) {
 	if c.EventLogger_ == nil {
 		return nil
 	}
+	return notifyLogger(c.EventLogger_, c.snapshot(), event, data)
+}
+
+// notifyLogger calls an event logger and returns a panic from it as an error.
+// Every call into a logger goes through here, including the ones made while a
+// context is being created or its data parsed, so a logger can never end the
+// host process or abort the SDK code that reports to it.
+func notifyLogger(logger ContextEventLogger, ctx Context, event EventType, data interface{}) (panicErr error) {
+	if logger == nil {
+		return nil
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			panicErr = panicToError(r)
 		}
 	}()
-	c.EventLogger_.HandleEvent(c.snapshot(), event, data)
+	logger.HandleEvent(ctx, event, data)
 	return nil
 }
 

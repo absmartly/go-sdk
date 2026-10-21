@@ -129,14 +129,36 @@ type matrixLogger struct {
 	ctx      atomic.Pointer[Context]
 	used     atomic.Bool
 	inflight atomic.Int32
+
+	// fired counts how often the misbehaviour ran; seen counts the events the
+	// logger received. The cases assert on both, so a case cannot pass while its
+	// logger never ran.
+	fired atomic.Int32
+	mu    sync.Mutex
+	seen  map[EventType]int
+}
+
+func (l *matrixLogger) seenCount(event EventType) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.seen[event]
 }
 
 func (l *matrixLogger) HandleEvent(supplied Context, event EventType, _ interface{}) {
 	l.inflight.Add(1)
 	defer l.inflight.Add(-1)
+	l.mu.Lock()
+	if l.seen == nil {
+		l.seen = map[EventType]int{}
+	}
+	l.seen[event]++
+	l.mu.Unlock()
 	var c = l.ctx.Load()
 	// The "...ViaCopy" behaviors act through the Context value the SDK passed
-	// to the logger, not through the original pointer.
+	// to the logger, not through the original pointer. Whether that copy still
+	// lists the finished publish as in flight depends on scheduling the matrix
+	// cannot control, so that ordering is pinned deterministically by
+	// TestCloseThroughStaleCopyActsOnLiveContext instead.
 	var copied = supplied
 	var first = func() bool { return l.used.CompareAndSwap(false, true) }
 	switch {
@@ -144,22 +166,31 @@ func (l *matrixLogger) HandleEvent(supplied Context, event EventType, _ interfac
 		l.behavior == "panicError" && event == Error,
 		l.behavior == "panicClose" && event == Close,
 		l.behavior == "panicRefresh" && event == Refresh:
+		l.fired.Add(1)
 		panic("logger panic")
 	case l.behavior == "closeOnPublish" && event == Publish && c != nil && first():
+		l.fired.Add(1)
 		c.Close()
 	case l.behavior == "closeOnError" && event == Error && c != nil && first():
+		l.fired.Add(1)
 		c.Close()
 	case l.behavior == "publishOnPublish" && event == Publish && c != nil && first():
+		l.fired.Add(1)
 		_, _ = c.PublishAsync()
 	case l.behavior == "refreshOnPublish" && event == Publish && c != nil && first():
+		l.fired.Add(1)
 		c.Refresh()
 	case l.behavior == "closeViaCopy" && event == Publish && first():
+		l.fired.Add(1)
 		copied.Close()
 	case l.behavior == "closeViaCopyOnError" && event == Error && first():
+		l.fired.Add(1)
 		copied.Close()
 	case l.behavior == "publishViaCopy" && event == Publish && first():
+		l.fired.Add(1)
 		_, _ = copied.PublishAsync()
 	case l.behavior == "refreshViaCopy" && event == Publish && first():
+		l.fired.Add(1)
 		copied.Refresh()
 	}
 }
@@ -356,6 +387,28 @@ func runLifecycleCase(t *testing.T, mode, fault string, failing bool, loggerBeha
 		}
 	}
 
+	// The logger must really have run. A case whose logger never ran would pass
+	// every invariant below without testing anything.
+	if failing {
+		if logger.seenCount(Error) == 0 {
+			t.Fatalf("the logger never received the Error event of the failed publish: %s", state())
+		}
+	} else if logger.seenCount(Publish) == 0 {
+		t.Fatalf("the logger never received the Publish event: %s", state())
+	}
+	var mustFire = false
+	switch loggerBehavior {
+	case "panicPublish", "closeOnPublish", "publishOnPublish", "refreshOnPublish", "closeViaCopy", "publishViaCopy", "refreshViaCopy":
+		mustFire = !failing
+	case "panicError", "closeOnError", "closeViaCopyOnError":
+		mustFire = failing
+	case "panicClose":
+		mustFire = !failing && act.closes
+	}
+	if mustFire && logger.fired.Load() == 0 {
+		t.Fatalf("logger behavior %q never ran: %s", loggerBehavior, state())
+	}
+
 	var delivered = p.deliveredCopy()
 	if !failing {
 		if act.closes && !ctx.IsClosed() {
@@ -508,4 +561,82 @@ func TestCloseThroughStaleCopyActsOnLiveContext(t *testing.T) {
 	assertAny(nil, closeErr, t)
 	assertAny(nil, getWithTimeout(t, closing), t)
 	assertAny(true, ctx.IsClosed(), t)
+}
+
+// A logger that panics while the SDK reports malformed data during creation
+// must not leave the context's readiness pending.
+func TestLoggerPanicWhileParsingDoesNotStrandReadiness(t *testing.T) {
+	var malformed = jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{{
+		Id: 1, Name: "bad_config", UnitType: "session_id", Split: []float64{0.5, 0.5}, TrafficSplit: []float64{0, 1},
+		Variants:          []jsonmodels.ExperimentVariant{{Name: "A", Config: "{"}, {Name: "B", Config: `{"a":1}`}},
+		CustomFieldValues: []jsonmodels.CustomFieldValue{{Name: "flag", Type: "boolean", Value: "notabool"}, {Name: "n", Type: "number", Value: "x"}},
+	}}}
+	for _, name := range []string{"async-initial-future", "ready-initial-future"} {
+		t.Run(name, func(t *testing.T) {
+			setUp()
+			var logger = &matrixLogger{behavior: "panicError"}
+			var config = CreateDefaultContextConfig()
+			config.Units_ = units
+			config.PublishDelay_ = -1
+			config.RefreshInterval_ = 0
+			config.EventLogger_ = logger
+
+			var initial, settle = future.New()
+			if name == "ready-initial-future" {
+				settle(malformed, nil)
+			}
+			var ctx = createTrackedContext(clock, config, initial, dataProvider, eventHandler, logger, DefaultVariableParser{}, audienceMatcher)
+			if name == "async-initial-future" {
+				settle(malformed, nil)
+			}
+			var waited = make(chan struct{})
+			go func() { ctx.WaitUntilReady(); close(waited) }()
+			select {
+			case <-waited:
+			case <-time.After(5 * time.Second):
+				t.Fatal("WaitUntilReady never returned after a logger panic during parsing")
+			}
+			assertAny(true, ctx.IsReady(), t)
+			if logger.fired.Load() == 0 {
+				t.Fatal("the logger never saw the parse error")
+			}
+		})
+	}
+}
+
+// A variable parser that panics fails the data load instead of leaving the
+// context permanently not ready.
+func TestVariableParserPanicFailsLoadInsteadOfStrandingReadiness(t *testing.T) {
+	for _, name := range []string{"async-initial-future", "ready-initial-future"} {
+		t.Run(name, func(t *testing.T) {
+			setUp()
+			var config = CreateDefaultContextConfig()
+			config.Units_ = units
+			config.PublishDelay_ = -1
+			config.RefreshInterval_ = 0
+			var initial, settle = future.New()
+			if name == "ready-initial-future" {
+				settle(data, nil)
+			}
+			var ctx = createTrackedContext(clock, config, initial, dataProvider, eventHandler, nil, panickingParser{}, audienceMatcher)
+			if name == "async-initial-future" {
+				settle(data, nil)
+			}
+			var waited = make(chan struct{})
+			go func() { ctx.WaitUntilReady(); close(waited) }()
+			select {
+			case <-waited:
+			case <-time.After(5 * time.Second):
+				t.Fatal("WaitUntilReady never returned after the variable parser panicked")
+			}
+			assertAny(true, ctx.IsReady(), t)
+			assertAny(true, ctx.IsFailed(), t)
+		})
+	}
+}
+
+type panickingParser struct{}
+
+func (panickingParser) Parse(Context, string, string, string) map[string]interface{} {
+	panic("parser panic")
 }

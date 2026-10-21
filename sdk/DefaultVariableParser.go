@@ -13,7 +13,7 @@ func (vr DefaultVariableParser) Parse(context Context, experimentName string, va
 	var data map[string]interface{}
 	if err := json.Unmarshal([]byte(config), &data); err != nil {
 		if context.EventLogger_ != nil {
-			context.EventLogger_.HandleEvent(context, Error,
+			notifyLogger(context.EventLogger_, context, Error,
 				errors.New("DefaultVariableParser.Parse: Failed to parse variant config for experiment '"+experimentName+
 					"', variant '"+variantName+"': "+err.Error()))
 		}
