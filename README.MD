@@ -126,7 +126,7 @@ The builder pattern supports all the same options as the config-based approach.
 
 | Option       | Type                  | Default | Description                                                     |
 | :----------- | :-------------------- | :------ | :-------------------------------------------------------------- |
-| Timeout      | `time.Duration`       | `3s`    | Connection timeout duration.                                     |
+| Timeout      | `time.Duration`       | `3s`    | Request and connection timeout.                                   |
 | Retries      | `int`                 | `5`     | The number of retries before the SDK stops trying to connect.   |
 | ContextEventLogger | `ContextEventLogger` | `nil` | A callback interface which runs after SDK events.              |
 
@@ -337,7 +337,7 @@ contextConfig := sdk.ContextConfig{
         "session_id": "5ebf06d8cb5d8137290c4abb64155584fbdb64d8",
         "user_id":    "123456",
     },
-    RefreshInterval_: 4 * time.Hour, // Refresh every 4 hours
+    RefreshInterval_: (4 * time.Hour).Milliseconds(), // Refresh every 4 hours (the field is in milliseconds)
 }
 
 ctx := absmartly.CreateContext(contextConfig)
