@@ -31,7 +31,7 @@ func TestInvalidEndpoint(t *testing.T) {
 			client := CreateClient(config, HttpMock{})
 
 			if config.Endpoint_ == "" && client.url_ != "/context" {
-				t.Logf("Client created with empty endpoint results in url: %s", client.url_)
+				t.Errorf("Client created with empty endpoint results in url %q, want %q", client.url_, "/context")
 			}
 		})
 	}
@@ -68,7 +68,7 @@ func TestMissingRequiredConfig(t *testing.T) {
 		client := CreateClient(config, HttpMock{})
 
 		if client.query_["application"] != "" {
-			t.Logf("Client created with empty application: %v", client.query_)
+			t.Errorf("Client created with empty application has query %v, want an empty application", client.query_)
 		}
 	})
 
@@ -83,7 +83,7 @@ func TestMissingRequiredConfig(t *testing.T) {
 		client := CreateClient(config, HttpMock{})
 
 		if client.query_["environment"] != "" {
-			t.Logf("Client created with empty environment: %v", client.query_)
+			t.Errorf("Client created with empty environment has query %v, want an empty environment", client.query_)
 		}
 	})
 }
@@ -365,11 +365,11 @@ func TestContextWithEmptyUnits(t *testing.T) {
 
 	treatment, _ := ctx.GetTreatment("exp_test")
 	if treatment != 0 {
-		t.Logf("Treatment with no units: %v (expected 0)", treatment)
+		t.Errorf("Treatment with no units: %v, want 0", treatment)
 	}
 
 	_, err := ctx.GetData()
 	if err != nil {
-		t.Logf("Got error with empty units: %v", err)
+		t.Errorf("GetData with empty units returned error: %v", err)
 	}
 }

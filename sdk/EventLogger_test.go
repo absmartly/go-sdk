@@ -392,6 +392,6 @@ func TestEventLoggerErrorInCallback(t *testing.T) {
 	_ = createTrackedContext(clk, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
 
 	if logger.GetCallCount() == 0 {
-		t.Logf("Logger was called despite potential panic (expected behavior)")
+		t.Errorf("Expected the logger to be called while the context was created")
 	}
 }

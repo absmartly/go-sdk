@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -192,13 +193,16 @@ func TestClientTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
+	var started = time.Now()
 	_, err := client.GetContextData().Get(ctx)
-	if err == nil {
-		t.Logf("Request completed despite timeout - this can happen if the future doesn't respect context cancellation")
-	} else {
-		if !strings.Contains(err.Error(), "context") && !strings.Contains(err.Error(), "deadline") {
-			t.Logf("Got error: %v (may or may not be a timeout)", err)
-		}
+
+	// The deadline (50ms) is shorter than the request (200ms): Get must return
+	// the deadline error at the deadline, not wait for the request.
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Get returned %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 200*time.Millisecond {
+		t.Errorf("Get waited %v, want it to return near the 50ms deadline", elapsed)
 	}
 }
 
@@ -495,7 +499,7 @@ func TestClientRateLimiting(t *testing.T) {
 	if err == nil {
 		t.Errorf("Expected error for rate limiting, got nil")
 	} else if !strings.Contains(err.Error(), "Too Many Requests") && !strings.Contains(err.Error(), "429") {
-		t.Logf("Got rate limit error: %v", err)
+		t.Errorf("Expected a rate limit error, got: %v", err)
 	}
 	if actual != nil {
 		t.Errorf("Expected nil result for rate limiting, got: %v", actual)
@@ -522,76 +526,28 @@ func TestClientRateLimitingPublish(t *testing.T) {
 	}
 }
 
-type HttpMockPartialResponse struct {
-}
-
-func (h HttpMockPartialResponse) Get(url string, query map[string]string, headers map[string]string) *future.Future {
-	return future.Call(func() (future.Value, error) {
-		return &resty.Response{
-			Request: &resty.Request{},
-			RawResponse: &http.Response{
-				StatusCode: 200,
-				Status:     "OK",
-				Body:       ioutil.NopCloser(strings.NewReader(`{"experiments": [`)),
-			},
-		}, nil
-	})
-}
-
-func (h HttpMockPartialResponse) Put(url string, query map[string]string, headers map[string]string, body []byte) *future.Future {
-	return future.Call(func() (future.Value, error) {
-		return &resty.Response{
-			Request: &resty.Request{},
-			RawResponse: &http.Response{
-				StatusCode: 200,
-				Status:     "OK",
-				Body:       ioutil.NopCloser(strings.NewReader(`{"status": "partial`)),
-			},
-		}, nil
-	})
-}
-
-func (h HttpMockPartialResponse) Post(url string, query map[string]string, headers map[string]string, body []byte) *future.Future {
-	return future.Call(func() (future.Value, error) {
-		return &resty.Response{
-			Request: &resty.Request{},
-			RawResponse: &http.Response{
-				StatusCode: 200,
-				Status:     "OK",
-				Body:       ioutil.NopCloser(strings.NewReader(`{"status": "partial`)),
-			},
-		}, nil
-	})
-}
-
-type DeserMockWithError struct {
-}
-
-func (d DeserMockWithError) Deserialize(bytes []byte) (jsonmodels.ContextData, error) {
-	content := string(bytes)
-	if strings.Contains(content, "{") && !strings.Contains(content, "}") {
-		return jsonmodels.ContextData{}, errors.New("unexpected end of JSON input")
-	}
-	return jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{{}}}, nil
-}
-
 func TestClientPartialResponse(t *testing.T) {
+	// A real server sends a truncated body, so the real deserializer sees it.
+	var server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"experiments": [`))
+	}))
+	defer server.Close()
+
 	var config = ClientConfig{
-		Deserializer_: DeserMockWithError{},
-		Endpoint_:     "https://localhost/v1",
+		Deserializer_: DefaultContextDataDeserializer{},
+		Endpoint_:     server.URL,
 		ApiKey_:       "test-api-key",
 		Application_:  "website",
 		Environment_:  "dev",
 	}
-	var client = CreateClient(config, HttpMockPartialResponse{})
+	var client = CreateDefaultClient(config)
 
 	actual, err := client.GetContextData().Get(context.Background())
 	if err == nil {
-		t.Logf("Partial response was handled without error (may have default values)")
-		if actual != nil {
-			t.Logf("Received partial data: %v", actual)
-		}
-	} else {
-		t.Logf("Correctly identified partial response error: %v", err)
+		t.Errorf("Expected an error for a partial response, got result: %v", actual)
+	}
+	if data, ok := actual.(jsonmodels.ContextData); ok && len(data.Experiments) != 0 {
+		t.Errorf("Expected no experiments from a partial response, got: %v", data)
 	}
 }
