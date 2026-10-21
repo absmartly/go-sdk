@@ -605,3 +605,54 @@ func TestCloseWithSynchronousPublisherAndLoggerCallingClose(t *testing.T) {
 		t.Fatal("logger did not call Close")
 	}
 }
+
+type panickingLogger struct{ on EventType }
+
+func (l panickingLogger) HandleEvent(_ Context, event EventType, _ interface{}) {
+	if event == l.on {
+		panic("logger panic")
+	}
+}
+
+// A panicking Publish or Error logger must not end the process, and the
+// caller's future must still settle.
+func TestPanickingLoggersAreContained(t *testing.T) {
+	t.Run("publish logger", func(t *testing.T) {
+		setUp()
+		var logger = panickingLogger{on: Publish}
+		var config = CreateDefaultContextConfig()
+		config.Units_ = units
+		config.PublishDelay_ = -1
+		config.RefreshInterval_ = 0
+		config.EventLogger_ = logger
+		var ctx = createTrackedContext(clock, config, dataFutureReady, dataProvider, completedPublisher{}, logger, variableParser, audienceMatcher)
+		assertAny(nil, ctx.Track("goal1", nil), t)
+		fut, err := ctx.PublishAsync()
+		assertAny(nil, err, t)
+		if getWithTimeout(t, fut) == nil {
+			t.Fatal("expected the logger panic to be reported through the future")
+		}
+		assertAny(int32(0), ctx.GetPendingCount(), t)
+	})
+
+	t.Run("error logger", func(t *testing.T) {
+		setUp()
+		var publisher = &heldPublisher{}
+		var logger = panickingLogger{on: Error}
+		var config = CreateDefaultContextConfig()
+		config.Units_ = units
+		config.PublishDelay_ = -1
+		config.RefreshInterval_ = 0
+		config.EventLogger_ = logger
+		var ctx = createTrackedContext(clock, config, dataFutureReady, dataProvider, publisher, logger, variableParser, audienceMatcher)
+		assertAny(nil, ctx.Track("goal1", nil), t)
+		fut, err := ctx.PublishAsync()
+		assertAny(nil, err, t)
+		publisher.settle(t, 0, errors.New("Publish failed"))
+		if getWithTimeout(t, fut) == nil {
+			t.Fatal("expected an error")
+		}
+		// The failed batch stays queued for a retry.
+		assertAny(int32(1), ctx.GetPendingCount(), t)
+	})
+}

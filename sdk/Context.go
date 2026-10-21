@@ -1198,18 +1198,12 @@ func (c *Context) Flush() *future.Future {
 						if err == nil {
 							c.removeInflight(settled)
 							settledDone(nil, nil)
-							go func() {
-								c.LogEvent(Publish, event)
-								done(nil, nil)
-							}()
+							runLogger(done, nil, func() { c.LogEvent(Publish, event) })
 						} else {
 							c.requeueEvents(exposures, achievements, eventCount)
 							c.removeInflight(settled)
 							settledDone(nil, err)
-							go func() {
-								c.LogError(err)
-								done(nil, err)
-							}()
+							runLogger(done, err, func() { c.LogError(err) })
 						}
 					})
 
@@ -1256,6 +1250,28 @@ func (c *Context) inflightSnapshot() []*future.Future {
 	c.StateLock_.Lock()
 	defer c.StateLock_.Unlock()
 	return append([]*future.Future(nil), c.inflight_...)
+}
+
+// runLogger runs a logger callback on its own goroutine and then settles the
+// caller's future with result. A panic in the logger is contained and reported
+// through the future instead of ending the process, as it was when the logger
+// ran under future.Call.
+func runLogger(done future.SetResultFunc, result error, log func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				var panicErr error
+				if err, ok := r.(error); ok {
+					panicErr = err
+				} else {
+					panicErr = &future.PanicError{Value: r}
+				}
+				done(nil, panicErr)
+			}
+		}()
+		log()
+		done(nil, result)
+	}()
 }
 
 // requeueEvents puts the events of a failed publish back in the queue so a
