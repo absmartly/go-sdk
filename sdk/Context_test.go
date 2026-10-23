@@ -392,17 +392,17 @@ func TestErrorWhenClosing(t *testing.T) {
 	assertAny(nil, er, t)
 
 	var resErr = context.SetAttribute("attr1", "value1")
-	assertAny("ABSmartly Context is closing", resErr.Error(), t)
+	assertAny("ABsmartly Context is finalizing.", resErr.Error(), t)
 	assertAny(true, context.IsClosing(), t)
 	assertAny(false, context.IsClosed(), t)
 
 	_, resErr = context.GetTreatment("attr1")
-	assertAny("ABSmartly Context is closing", resErr.Error(), t)
+	assertAny("ABsmartly Context is finalizing.", resErr.Error(), t)
 	assertAny(true, context.IsClosing(), t)
 	assertAny(false, context.IsClosed(), t)
 
 	_, resErr = context.PeekVariableValue("attr1", jsonmodels.ContextData{})
-	assertAny("ABSmartly Context is closing", resErr.Error(), t)
+	assertAny("ABsmartly Context is finalizing.", resErr.Error(), t)
 	assertAny(true, context.IsClosing(), t)
 	assertAny(false, context.IsClosed(), t)
 
@@ -432,17 +432,17 @@ func TestErrorWhenClosed(t *testing.T) {
 	context.Close()
 
 	var resErr = context.SetAttribute("attr1", "value1")
-	assertAny("ABSmartly Context is closed", resErr.Error(), t)
+	assertAny("ABsmartly Context is finalized.", resErr.Error(), t)
 	assertAny(false, context.IsClosing(), t)
 	assertAny(true, context.IsClosed(), t)
 
 	_, resErr = context.GetTreatment("attr1")
-	assertAny("ABSmartly Context is closed", resErr.Error(), t)
+	assertAny("ABsmartly Context is finalized.", resErr.Error(), t)
 	assertAny(false, context.IsClosing(), t)
 	assertAny(true, context.IsClosed(), t)
 
 	_, resErr = context.PeekVariableValue("attr1", jsonmodels.ContextData{})
-	assertAny("ABSmartly Context is closed", resErr.Error(), t)
+	assertAny("ABsmartly Context is finalized.", resErr.Error(), t)
 	assertAny(false, context.IsClosing(), t)
 	assertAny(true, context.IsClosed(), t)
 }

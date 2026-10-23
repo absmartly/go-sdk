@@ -606,6 +606,77 @@ func TestCloseWithSynchronousPublisherAndLoggerCallingClose(t *testing.T) {
 	}
 }
 
+type barrierLogger struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (l *barrierLogger) HandleEvent(c Context, event EventType, _ interface{}) {
+	if event == Publish {
+		l.once.Do(func() {
+			close(l.entered)
+			<-l.release
+			c.Close()
+			_ = c.Publish()
+			c.Refresh()
+		})
+	}
+}
+
+func TestFinalizeFailureIsRetryable(t *testing.T) {
+	setUp()
+	publisher := &heldPublisher{}
+	logger := &MockEventLogger{}
+	ctx := createHeldPublisherContext(t, publisher, logger)
+	assertAny(nil, ctx.Track("goal", nil), t)
+	f, err := ctx.FinalizeAsync()
+	assertAny(nil, err, t)
+	publishErr := errors.New("final publish failed")
+	publisher.settle(t, 0, publishErr)
+	assertAny(publishErr, getWithTimeout(t, f), t)
+	assertAny(false, ctx.IsClosed(), t)
+	assertAny(int32(1), ctx.GetPendingCount(), t)
+	for _, event := range logger.GetEvents() {
+		if event.EventType == Finalize {
+			t.Fatal("failed finalize emitted finalize event")
+		}
+	}
+	f, err = ctx.FinalizeAsync()
+	assertAny(nil, err, t)
+	publisher.settle(t, 1, nil)
+	assertAny(nil, getWithTimeout(t, f), t)
+	events := logger.GetEvents()
+	assertAny(Finalize, events[len(events)-1].EventType, t)
+	assertAny("finalize", string(Finalize), t)
+	assertAny(Finalize, Close, t)
+	assertAny(int32(0), ctx.GetPendingCount(), t)
+}
+
+func TestFinalizeWaitsForPublishLoggerAndSupportsReentry(t *testing.T) {
+	setUp()
+	logger := &barrierLogger{entered: make(chan struct{}), release: make(chan struct{})}
+	config := CreateDefaultContextConfig()
+	config.Units_ = units
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = 0
+	ctx := createTrackedContext(clock, config, dataFutureReady, dataProvider, completedPublisher{}, logger, variableParser, audienceMatcher)
+	assertAny(nil, ctx.Track("goal", nil), t)
+	f, err := ctx.FinalizeAsync()
+	assertAny(nil, err, t)
+	select {
+	case <-logger.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("publish logger did not start")
+	}
+	if f.Ready() {
+		t.Fatal("finalize completed before publish logger returned")
+	}
+	close(logger.release)
+	assertAny(nil, getWithTimeout(t, f), t)
+	assertAny(true, ctx.IsClosed(), t)
+}
+
 type panickingLogger struct{ on EventType }
 
 func (l panickingLogger) HandleEvent(_ Context, event EventType, _ interface{}) {
@@ -629,9 +700,7 @@ func TestPanickingLoggersAreContained(t *testing.T) {
 		assertAny(nil, ctx.Track("goal1", nil), t)
 		fut, err := ctx.PublishAsync()
 		assertAny(nil, err, t)
-		if getWithTimeout(t, fut) == nil {
-			t.Fatal("expected the logger panic to be reported through the future")
-		}
+		assertAny(nil, getWithTimeout(t, fut), t)
 		assertAny(int32(0), ctx.GetPendingCount(), t)
 	})
 
@@ -648,9 +717,10 @@ func TestPanickingLoggersAreContained(t *testing.T) {
 		assertAny(nil, ctx.Track("goal1", nil), t)
 		fut, err := ctx.PublishAsync()
 		assertAny(nil, err, t)
-		publisher.settle(t, 0, errors.New("Publish failed"))
-		if getWithTimeout(t, fut) == nil {
-			t.Fatal("expected an error")
+		var publishErr = errors.New("Publish failed")
+		publisher.settle(t, 0, publishErr)
+		if err := getWithTimeout(t, fut); err != publishErr {
+			t.Fatalf("publish error replaced by logger panic: got %v, want %v", err, publishErr)
 		}
 		// The failed batch stays queued for a retry.
 		assertAny(int32(1), ctx.GetPendingCount(), t)

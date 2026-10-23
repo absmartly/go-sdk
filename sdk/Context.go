@@ -58,8 +58,12 @@ type Context struct {
 	Refreshing_          *atomic.Value
 	ReadyFuture_         *future.Future
 	ClosingFuture_       *future.Future
-	RefreshFuture_       *future.Future
-	TimeoutLock_         *sync.Mutex
+	// FinalizedFuture_ includes logger delivery; ClosingFuture_ only includes
+	// transport/sealing, allowing loggers to re-enter Close safely.
+	FinalizedFuture_ *future.Future
+	publishLogs_     []*future.Future
+	RefreshFuture_   *future.Future
+	TimeoutLock_     *sync.Mutex
 	// StateLock_ guards ReadyFuture_, RefreshFuture_, ClosingFuture_ and RefreshTimer_.
 	StateLock_ *sync.Mutex
 	// inflight_ holds the publishes that have been sent and not yet settled. Guarded by StateLock_.
@@ -588,10 +592,18 @@ func (c *Context) GetCustomFieldValueKeys() ([]string, error) {
 	return removeDuplicateValues(keys), nil
 }
 
+// GetCustomFieldValue is the legacy convenience API; it returns nil on errors.
+// Use GetCustomFieldValueE to receive readiness and finalization errors.
 func (c *Context) GetCustomFieldValue(experimentName string, key string) interface{} {
+	var value, _ = c.GetCustomFieldValueE(experimentName, key)
+	return value
+}
+
+// GetCustomFieldValueE returns a custom field value or the context read error.
+func (c *Context) GetCustomFieldValueE(experimentName string, key string) (interface{}, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	c.DataLock.Lock()
 	var customFieldValues = c.ContextCustomFields_[experimentName]
@@ -611,7 +623,7 @@ func (c *Context) GetCustomFieldValue(experimentName string, key string) interfa
 			experimentName + "': " + parseErr.Error()))
 	}
 
-	return value
+	return value, nil
 }
 
 func (c *Context) GetCustomFieldValueType(experimentName string, key string) string {
@@ -733,6 +745,12 @@ func (c *Context) RefreshAsync() *future.Future {
 		return tempfuture
 	}
 
+	if c.IsFailed() {
+		var resolved, done = future.New()
+		done(nil, nil)
+		return resolved
+	}
+
 	// Decide and publish under one lock so a concurrent caller that sees the
 	// refresh as running also sees its future.
 	c.StateLock_.Lock()
@@ -821,6 +839,8 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 	c.Closing_.Store(true)
 	var tempFuture, done = future.New()
 	c.ClosingFuture_ = tempFuture
+	var finalized, finalizeDone = future.New()
+	c.FinalizedFuture_ = finalized
 	c.StateLock_.Unlock()
 
 	c.ClearRefreshTimer()
@@ -888,16 +908,45 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 			c.StateLock_.Unlock()
 			c.SetRefreshTimer()
 			done(nil, err)
-			// event logger gets this error during publish
+			go func() {
+				c.waitPublishLogs()
+				finalizeDone(nil, err)
+			}()
 			return
 		}
 		c.Closing_.Store(false)
 		done(nil, nil)
-
-		c.LogEvent(Close, nil)
+		go func() {
+			c.waitPublishLogs()
+			c.LogEvent(Finalize, nil)
+			finalizeDone(nil, nil)
+		}()
 	}
 	settle()
 	return tempFuture, nil
+}
+
+// FinalizeAsync closes the context and waits for publish/error and finalize
+// logger callbacks to return. Unlike CloseAsync, this is an observer-delivery
+// barrier. Do not wait on it from a logger; loggers may re-enter Close instead.
+func (c *Context) FinalizeAsync() (*future.Future, error) {
+	c = c.live()
+	if _, err := c.CloseAsync(); err != nil {
+		return nil, err
+	}
+	c.StateLock_.Lock()
+	f := c.FinalizedFuture_
+	c.StateLock_.Unlock()
+	return f, nil
+}
+
+func (c *Context) waitPublishLogs() {
+	c.StateLock_.Lock()
+	logs := append([]*future.Future(nil), c.publishLogs_...)
+	c.StateLock_.Unlock()
+	for _, f := range logs {
+		f.Join(context.Background())
+	}
 }
 
 func (c *Context) Close() {
@@ -1068,16 +1117,16 @@ func (c *Context) AudienceMatches(experiment jsonmodels.Experiment, assignment *
 
 func (c *Context) CheckNotClosed() error {
 	if c.Closed_.Load().(bool) {
-		return errors.New("ABSmartly Context is closed")
+		return errors.New("ABsmartly Context is finalized.")
 	} else if c.Closing_.Load().(bool) {
-		return errors.New("ABSmartly Context is closing")
+		return errors.New("ABsmartly Context is finalizing.")
 	}
 	return nil
 }
 
 func (c *Context) CheckReady(expectNotClosed bool) error {
 	if !c.IsReady() {
-		return errors.New("ABSmartly Context is not yet ready")
+		return errors.New("ABsmartly Context is not yet ready.")
 	} else if expectNotClosed {
 		return c.CheckNotClosed()
 	}
@@ -1315,6 +1364,15 @@ func (c *Context) Flush() *future.Future {
 				// Register the publish in the same critical section that drains
 				// the queue, so CloseAsync cannot miss it.
 				c.addInflight(settled)
+				c.StateLock_.Lock()
+				var activeLogs []*future.Future
+				for _, f := range c.publishLogs_ {
+					if !f.Ready() {
+						activeLogs = append(activeLogs, f)
+					}
+				}
+				c.publishLogs_ = append(activeLogs, result)
+				c.StateLock_.Unlock()
 			}
 			c.EventLock_.Unlock()
 
@@ -1414,16 +1472,11 @@ func (c *Context) inflightSnapshot() []*future.Future {
 	return append([]*future.Future(nil), c.inflight_...)
 }
 
-// runLogger runs a logger callback on its own goroutine and then settles the
-// caller's future with result. A panic in the logger is contained and reported
-// through the future instead of ending the process, as it was when the logger
-// ran under future.Call.
+// runLogger runs an observer on its own goroutine so lifecycle re-entry cannot
+// block the publisher callback. Logger panics never replace the publish outcome.
 func runLogger(done future.SetResultFunc, result error, log func() error) {
 	go func() {
-		if panicErr := log(); panicErr != nil {
-			done(nil, panicErr)
-			return
-		}
+		_ = log()
 		done(nil, result)
 	}()
 }

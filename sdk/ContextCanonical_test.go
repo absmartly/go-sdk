@@ -53,6 +53,68 @@ func createCanonicalContext(t *testing.T, client *CapturingPublishClient, dataFu
 	return createTrackedContext(clk, config, dataFuture, dp, eh, el, vp, am)
 }
 
+func TestReadsBeforeReadyReturnExactError(t *testing.T) {
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	var pending, _ = future.New()
+	var ctx = CreateTestContext(config, pending)
+	const want = "ABsmartly Context is not yet ready."
+	var check = func(name string, err error) {
+		t.Helper()
+		if err == nil || err.Error() != want {
+			t.Fatalf("%s: got %v, want %q", name, err, want)
+		}
+	}
+	_, err := ctx.GetTreatment("exp_test_ab")
+	check("GetTreatment", err)
+	_, err = ctx.PeekTreatment("exp_test_ab")
+	check("PeekTreatment", err)
+	_, err = ctx.GetVariableValue("banner.size", "x")
+	check("GetVariableValue", err)
+	_, err = ctx.PeekVariableValue("banner.size", "x")
+	check("PeekVariableValue", err)
+	_, err = ctx.GetVariableKeys()
+	check("GetVariableKeys", err)
+	_, err = ctx.GetExperiments()
+	check("GetExperiments", err)
+	_, err = ctx.GetCustomFieldValueKeys()
+	check("GetCustomFieldValueKeys", err)
+	_, err = ctx.GetCustomFieldValueE("exp_test_ab", "country")
+	check("GetCustomFieldValueE", err)
+	assertAny(nil, ctx.GetCustomFieldValue("exp_test_ab", "country"), t)
+	assertAny(int32(0), ctx.GetPendingCount(), t)
+}
+
+func TestCustomFieldValueEAfterFinalize(t *testing.T) {
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	var ctx = CreateTestContext(config, dataFutureReady)
+	v, err := ctx.GetCustomFieldValueE("exp_test_ab", "country")
+	assertAny(nil, err, t)
+	assertAny("US,PT,ES,DE,FR", v, t)
+	ctx.Close()
+	_, err = ctx.GetCustomFieldValueE("exp_test_ab", "country")
+	if err == nil || err.Error() != "ABsmartly Context is finalized." {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestRefreshFailedContextIsNoOp(t *testing.T) {
+	setUp()
+	var client = &CapturingPublishClient{contextData: data}
+	var ctx = createCanonicalContext(t, client, dataFutureReady, nil)
+	ctx.SetDataFailed(errors.New("initial load failed"))
+	// A nil provider would produce an error if Refresh invoked it.
+	ctx.DataProvider_ = nil
+	assertAny(nil, getWithTimeout(t, ctx.RefreshAsync()), t)
+	assertAny(true, ctx.IsFailed(), t)
+	var experiments, err = ctx.GetExperiments()
+	assertAny(nil, err, t)
+	assertAny(0, len(experiments), t)
+}
+
 func TestTreatmentQueuesExposures(t *testing.T) {
 	setUp()
 	var config = CreateDefaultContextConfig()

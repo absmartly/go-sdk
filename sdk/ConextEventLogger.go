@@ -13,5 +13,7 @@ const (
 	Publish  EventType = "Publish"
 	Exposure EventType = "Exposure"
 	Goal     EventType = "Goal"
-	Close    EventType = "Close"
+	Finalize EventType = "finalize"
+	// Close is retained as a source-compatible alias for the finalize event.
+	Close EventType = Finalize
 )

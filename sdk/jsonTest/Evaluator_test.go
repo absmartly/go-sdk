@@ -743,3 +743,20 @@ func assert(want interface{}, got interface{}, t *testing.T) {
 		t.Errorf("got %q, wanted %q", got, want)
 	}
 }
+
+func TestCompareDeepEqualsCollections(t *testing.T) {
+	var e = eval.Evaluator{}
+
+	for i := 0; i < 50; i++ {
+		lhs := map[string]interface{}{"a": 1.0, "b": 2.0, "c": 3.0, "d": 4.0, "e": 5.0, "f": 6.0}
+		rhs := map[string]interface{}{"f": 6.0, "e": 5.0, "d": 4.0, "c": 3.0, "b": 2.0, "a": 1.0}
+		assert(0, e.Compare(reflect.ValueOf(lhs), reflect.ValueOf(rhs)), t)
+	}
+	assert(0, e.Compare(
+		reflect.ValueOf(map[string]interface{}{"a": map[string]interface{}{"x": 1.0}, "b": []interface{}{1.0, 2.0}}),
+		reflect.ValueOf(map[string]interface{}{"b": []interface{}{1, 2}, "a": map[string]interface{}{"x": 1}})), t)
+	assert(0, e.Compare(reflect.ValueOf([]interface{}{1.0, []interface{}{2.0, 3.0}, 4.0}),
+		reflect.ValueOf([]interface{}{1, []interface{}{2, 3}, 4})), t)
+	assert(nil, e.Compare(reflect.ValueOf([]interface{}{1.0, 2.0}), reflect.ValueOf([]interface{}{2.0, 1.0})), t)
+	assert(nil, e.Compare(reflect.ValueOf(map[string]interface{}{"a": 1.0}), reflect.ValueOf(map[string]interface{}{"b": 1.0})), t)
+}

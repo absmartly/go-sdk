@@ -9,6 +9,16 @@ It provides both a blocking and an asynchronous interfaces.
 
 **Breaking change:** `Context.GetVariableKeys()` now returns `map[string][]string` (variable key to the names of all experiments that define it), matching the other ABsmartly SDKs. It previously returned `map[string]string`. Callers must update their types.
 
+**Behavior changes:** Read methods (`GetTreatment`, `PeekTreatment`, `GetVariableValue`, `PeekVariableValue`, `GetVariableKeys`, `GetExperiments`, `GetCustomFieldValueKeys`, `GetData`) return the error `ABsmartly Context is not yet ready.` before the context is ready; callers must not treat the zero value as a result. Lifecycle error texts changed from `ABSmartly Context is closed`/`is closing` to `ABsmartly Context is finalized.`/`ABsmartly Context is finalizing.`, matching the JavaScript SDK; code matching the old strings must update. `GetCustomFieldValue` keeps its signature and returns nil on any error; use the new `GetCustomFieldValueE` to receive the error. Refreshing a context whose initial load failed is now a successful no-op; it does not call the data provider or replace the failed context's data. Create a new context to retry initialization. Panics in event loggers are contained and do not change the publisher's success or failure result.
+
+## Finalization and event delivery
+
+Use `f, err := ctx.FinalizeAsync()` and then `f.Get(context.Background())` when an adapter must return all publish/error and finalize logger events before responding. Failed final publishes return the publisher error, retain queued events, and leave the context retryable. `CloseAsync()`/`Close()` retain their transport-and-sealing completion semantics for compatibility and callback reentry; they are not logger-delivery barriers.
+
+Logger callbacks may call `Close`, `Publish`, or `Refresh`, including through a captured original context. Do not block on `FinalizeAsync()` inside a logger: it waits for logger callbacks to return.
+
+**Breaking event-name change:** the finalization event string is now `"finalize"`, previously `"Close"`. Use `sdk.Finalize`; `sdk.Close` remains a source-compatible constant alias. Consumers comparing literal strings must migrate.
+
 ## Getting Started
 
 ### Install the SDK
