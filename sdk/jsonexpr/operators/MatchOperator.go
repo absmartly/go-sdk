@@ -15,6 +15,9 @@ func (v MatchOperator) Binary(evaluator eval.Evaluator, lhs interface{}, rhs int
 	if lerror == nil {
 		var pattern, rerror = evaluator.StringConvert(reflect.ValueOf(rhs))
 		if rerror == nil {
+			if len(pattern) > 1000 {
+				return nil
+			}
 			regex, regerror := regexp.Compile(pattern)
 			if regerror == nil {
 				return regex.MatchString(text)

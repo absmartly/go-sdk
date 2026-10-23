@@ -23,14 +23,20 @@ func CreateResult(result bool) Result {
 }
 
 func (am AudienceMatcher) Evaluate(audience string, attributes map[string]interface{}) (Result, error) {
-	if result, err := am.Deserializer_.Deserialize([]byte(audience), 0, len(audience)); err != nil {
+	result, err := am.Deserializer_.Deserialize([]byte(audience), 0, len(audience))
+	if err != nil {
 		return Result{}, errors.New("can't evaluate data")
-	} else {
-		var filter = result["filter"]
-		var kind = reflect.ValueOf(filter).Kind()
-		if kind == reflect.Map || kind == reflect.Slice || kind == reflect.Array {
-			return CreateResult(jsonexpr.EvaluateBooleanExpr(filter, attributes)), nil
-		}
 	}
+
+	var filter = result["filter"]
+	if filter == nil {
+		return Result{}, errors.New("can't evaluate data")
+	}
+
+	var kind = reflect.ValueOf(filter).Kind()
+	if kind == reflect.Map || kind == reflect.Slice || kind == reflect.Array {
+		return CreateResult(jsonexpr.EvaluateBooleanExpr(filter, attributes)), nil
+	}
+
 	return Result{}, errors.New("can't evaluate data")
 }

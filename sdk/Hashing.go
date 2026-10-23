@@ -10,7 +10,10 @@ func HashUnit(unit string) []int8 {
 	var st [4]int32
 
 	var n = len(unit)
-	var bufferLen = n << 1
+	// A byte of invalid UTF-8 encodes as the three-byte replacement rune, so the
+	// encoded form can be three times the input. The extra bytes are room for
+	// the MD5 padding.
+	var bufferLen = n*3 + 72
 	if len(buffer) < bufferLen {
 		var bit = int32(32 - bits.LeadingZeros32(uint32(bufferLen-1)))
 		var newbuff = make([]int8, 1<<bit)

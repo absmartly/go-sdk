@@ -15,6 +15,11 @@ func ComputeIfAbsentRW(lock *sync.RWMutex, needlock bool, maps map[interface{}]i
 		lock.RUnlock()
 
 		lock.Lock()
+		value, exist = maps[key]
+		if exist {
+			lock.Unlock()
+			return value
+		}
 		var newValue = computer.Apply(key)
 		maps[key] = newValue
 		lock.Unlock()

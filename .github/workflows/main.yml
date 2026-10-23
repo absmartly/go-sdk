@@ -1,13 +1,18 @@
 name: Go SDK
-on: [push]
+on: [push, pull_request]
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ['1.23', 'stable']
     steps:
       - uses: actions/checkout@v3
 
       - name: Setup Go
         uses: actions/setup-go@v4
+        with:
+          go-version: ${{ matrix.go-version }}
 
       - name: Run Tests
         run:

@@ -25,7 +25,7 @@ func (c ClientABSMock) Publish(event jsonmodels.PublishEvent) *future.Future {
 }
 
 func TestCreateContext(t *testing.T) {
-	var config = ABSmartlyConfig{Client_: ClientABSMock{}}
+	var config = ABsmartlyConfig{Client_: ClientABSMock{}}
 	var abs = Create(config)
 	var contextConfig = ContextConfig{Units_: map[string]string{"user_id": "1234567"}}
 	var temp = abs.CreateContext(contextConfig)
@@ -35,7 +35,7 @@ func TestCreateContext(t *testing.T) {
 
 func TestContextWith(t *testing.T) {
 
-	var config = ABSmartlyConfig{Client_: ClientABSMock{}}
+	var config = ABsmartlyConfig{Client_: ClientABSMock{}}
 	var abs = Create(config)
 	var contextConfig = ContextConfig{Units_: map[string]string{"user_id": "1234567"}}
 	var result = abs.CreateContextWith(contextConfig, contextData)
@@ -47,7 +47,7 @@ func TestContextWith(t *testing.T) {
 
 func TestGetContext(t *testing.T) {
 
-	var config = ABSmartlyConfig{Client_: ClientABSMock{}, ContextDataProvider_: ClientABSMock{}}
+	var config = ABsmartlyConfig{Client_: ClientABSMock{}, ContextDataProvider_: ClientABSMock{}}
 	var abs = Create(config)
 	var result, err = abs.GetContextData().Get(context.Background())
 	assertAny(nil, err, t)
