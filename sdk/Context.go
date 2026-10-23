@@ -821,20 +821,32 @@ func (c *Context) Refresh() {
 }
 
 func (c *Context) CloseAsync() (*future.Future, error) {
-	c = c.live()
+	closing, _, err := c.live().closeAttempt()
+	return closing, err
+}
+
+// closeAttempt starts or joins a close and returns that attempt's close and
+// finalization futures together, so a later retry cannot replace them.
+func (c *Context) closeAttempt() (*future.Future, *future.Future, error) {
 	// Claim the close and publish its future in one critical section, so a
 	// concurrent caller that sees the context closing also gets the future of
 	// the close that is running.
 	c.StateLock_.Lock()
 	if c.Closed_.Load().(bool) || c.Closing_.Load().(bool) {
 		var existing = c.ClosingFuture_
+		var existingFinalized = c.FinalizedFuture_
 		c.StateLock_.Unlock()
+		if existingFinalized == nil {
+			var resolved, resolve = future.New()
+			resolve(nil, nil)
+			existingFinalized = resolved
+		}
 		if existing != nil {
-			return existing, nil
+			return existing, existingFinalized, nil
 		}
 		var resolved, resolve = future.New()
 		resolve(nil, nil)
-		return resolved, nil
+		return resolved, existingFinalized, nil
 	}
 	c.Closing_.Store(true)
 	var tempFuture, done = future.New()
@@ -907,23 +919,25 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 			c.Closing_.Store(false)
 			c.StateLock_.Unlock()
 			c.SetRefreshTimer()
-			done(nil, err)
+			// Start delivery before notifying Close listeners, which run
+			// synchronously and may wait for finalization.
 			go func() {
 				c.waitPublishLogs()
 				finalizeDone(nil, err)
 			}()
+			done(nil, err)
 			return
 		}
 		c.Closing_.Store(false)
-		done(nil, nil)
 		go func() {
 			c.waitPublishLogs()
 			c.LogEvent(Finalize, nil)
 			finalizeDone(nil, nil)
 		}()
+		done(nil, nil)
 	}
 	settle()
-	return tempFuture, nil
+	return tempFuture, finalized, nil
 }
 
 // FinalizeAsync closes the context and waits for publish/error and finalize
@@ -931,13 +945,11 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 // barrier. Do not wait on it from a logger; loggers may re-enter Close instead.
 func (c *Context) FinalizeAsync() (*future.Future, error) {
 	c = c.live()
-	if _, err := c.CloseAsync(); err != nil {
+	_, finalized, err := c.closeAttempt()
+	if err != nil {
 		return nil, err
 	}
-	c.StateLock_.Lock()
-	f := c.FinalizedFuture_
-	c.StateLock_.Unlock()
-	return f, nil
+	return finalized, nil
 }
 
 func (c *Context) waitPublishLogs() {

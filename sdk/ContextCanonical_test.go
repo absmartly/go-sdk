@@ -106,7 +106,6 @@ func TestRefreshFailedContextIsNoOp(t *testing.T) {
 	var client = &CapturingPublishClient{contextData: data}
 	var ctx = createCanonicalContext(t, client, dataFutureReady, nil)
 	ctx.SetDataFailed(errors.New("initial load failed"))
-	// A nil provider would produce an error if Refresh invoked it.
 	ctx.DataProvider_ = nil
 	assertAny(nil, getWithTimeout(t, ctx.RefreshAsync()), t)
 	assertAny(true, ctx.IsFailed(), t)

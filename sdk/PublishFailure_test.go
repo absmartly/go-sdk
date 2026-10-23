@@ -753,3 +753,68 @@ func TestClosePanicDoesNotStrandPublishFuture(t *testing.T) {
 
 	assertAny(nil, getWithTimeout(t, published), t)
 }
+
+func TestCloseListenerCanAwaitFinalize(t *testing.T) {
+	publisher := &heldPublisher{}
+	ctx := createHeldPublisherContext(t, publisher, &MockEventLogger{})
+	assertAny(nil, ctx.Track("goal", nil), t)
+	closing, err := ctx.CloseAsync()
+	assertAny(nil, err, t)
+	var listenerErr = make(chan error, 1)
+	closing.Listen(func(future.Value, error) {
+		f, err := ctx.FinalizeAsync()
+		if err != nil {
+			listenerErr <- err
+			return
+		}
+		waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, err = f.Get(waitCtx)
+		listenerErr <- err
+	})
+	publisher.settle(t, 0, nil)
+	assertAny(nil, <-listenerErr, t)
+}
+
+// retryingPublisher fails its first publish synchronously after registering a
+// Close listener that retries; later publishes succeed.
+type retryingPublisher struct {
+	ctx   *Context
+	err   error
+	calls int32
+	retry chan *future.Future
+}
+
+func (p *retryingPublisher) Publish(_ Context, _ jsonmodels.PublishEvent) *future.Future {
+	var result, done = future.New()
+	if atomic.AddInt32(&p.calls, 1) == 1 {
+		closing, _ := p.ctx.CloseAsync()
+		closing.Listen(func(future.Value, error) {
+			f, _ := p.ctx.CloseAsync()
+			p.retry <- f
+		})
+		done(nil, p.err)
+	} else {
+		done(nil, nil)
+	}
+	return result
+}
+
+func TestFinalizeReturnsItsOwnAttemptResult(t *testing.T) {
+	setUp()
+	publishErr := errors.New("final publish failed")
+	publisher := &retryingPublisher{err: publishErr, retry: make(chan *future.Future, 1)}
+	config := CreateDefaultContextConfig()
+	config.Units_ = units
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = 0
+	ctx := createTrackedContext(clock, config, dataFutureReady, dataProvider, publisher, nil, variableParser, audienceMatcher)
+	publisher.ctx = ctx
+	assertAny(nil, ctx.Track("goal", nil), t)
+	first, err := ctx.FinalizeAsync()
+	assertAny(nil, err, t)
+	assertAny(nil, getWithTimeout(t, <-publisher.retry), t)
+	if err := getWithTimeout(t, first); err == nil {
+		t.Fatal("finalize reported success for a failed close attempt")
+	}
+}
