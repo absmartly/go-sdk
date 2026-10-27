@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 	"math"
 	"reflect"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -90,6 +92,11 @@ type Context struct {
 	// unitValues_ keeps each unit as it was set (string or float64); Units_
 	// holds the string form that is hashed. Guarded by ContextLock_.
 	unitValues_ map[string]interface{}
+
+	// readyDeliverer_ is the goroutine that is logging the initial ready or
+	// load-error event, or 0. A readiness wait from that goroutine is the
+	// logger waiting for itself, so it returns at once.
+	readyDeliverer_ *atomic.Uint64
 }
 
 type ExperimentVariables struct {
@@ -155,6 +162,7 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 
 	cntx.AssignmentCache = map[string]*Assignment{}
 	cntx.unitValues_ = map[string]interface{}{}
+	cntx.readyDeliverer_ = &atomic.Uint64{}
 	cntx.Achievements_ = make([]jsonmodels.GoalAchievement, 0)
 	cntx.Exposures_ = make([]jsonmodels.Exposure, 0)
 	cntx.Attributes_ = make([]interface{}, 0)
@@ -225,6 +233,8 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 		var tempFuture, readyFutureDone = future.New()
 		cntx.setReadyFuture(tempFuture)
 		dataFuture.Listen(func(val future.Value, err error) {
+			tmp.readyDeliverer_.Store(goroutineID())
+			defer tmp.readyDeliverer_.Store(0)
 			if err == nil {
 				result, ok := val.(jsonmodels.ContextData)
 				if !ok {
@@ -305,7 +315,7 @@ func (c *Context) WaitUntilReady() Context {
 }
 
 func (c *Context) pendingReadyFuture() *future.Future {
-	if c.root_ != nil && c.Ready_.Load().(bool) {
+	if c.Ready_.Load().(bool) && (c.root_ != nil || c.live().readyDeliverer_.Load() == goroutineID()) {
 		return nil
 	}
 	return c.live().getReadyFuture()
@@ -1832,4 +1842,17 @@ func (c ComputerUnitHash) Apply(value interface{}) interface{} {
 
 type Pair struct {
 	a, b string
+}
+
+// goroutineID returns the id of the calling goroutine, read from its stack
+// header ("goroutine N [...").
+func goroutineID() uint64 {
+	var buf [64]byte
+	var b = buf[:runtime.Stack(buf[:], false)]
+	b = bytes.TrimPrefix(b, []byte("goroutine "))
+	if i := bytes.IndexByte(b, ' '); i >= 0 {
+		b = b[:i]
+	}
+	id, _ := strconv.ParseUint(string(b), 10, 64)
+	return id
 }

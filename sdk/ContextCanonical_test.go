@@ -2110,7 +2110,9 @@ func TestWaitUntilReadyInsideReadyOrErrorLoggerDoesNotHang(t *testing.T) {
 		event EventType
 		err   error
 	}{{"ready", Ready, nil}, {"error", Error, errors.New("load failed")}} {
+		var original *Context
 		for _, wait := range []func(ctx *Context){
+			func(*Context) { original.WaitUntilReady() },
 			func(ctx *Context) { ctx.WaitUntilReady() },
 			func(ctx *Context) {
 				c, cancel := gocontext.WithTimeout(gocontext.Background(), time.Second)
@@ -2127,6 +2129,7 @@ func TestWaitUntilReadyInsideReadyOrErrorLoggerDoesNotHang(t *testing.T) {
 			config.Units_ = units
 			config.EventLogger_ = logger
 			var context = CreateTestContext(config, pending)
+			original = context
 			var finished = make(chan struct{})
 			go func() {
 				if tc.err != nil {
