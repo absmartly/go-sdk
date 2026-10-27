@@ -2041,7 +2041,6 @@ func TestReadyEventLoggedBeforeWaitUntilReadyReturns(t *testing.T) {
 		config.EventLogger_ = logger
 		var context = CreateTestContext(config, pending)
 		go func() { done(data, nil) }()
-		// Let the load set the ready flag while the logger is still running.
 		time.Sleep(5 * time.Millisecond)
 		context.WaitUntilReady()
 		if logger.count.Load() == 0 {

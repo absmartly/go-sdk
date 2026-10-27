@@ -26,7 +26,6 @@ func contextConfigForTest(session string) ContextConfig {
 	return ContextConfig{Units_: map[string]string{"session_id": session}}
 }
 
-// A context built by the builder loads its data from the configured endpoint.
 func TestBuilderIntegrationContextCreation(t *testing.T) {
 	var requests int32
 	var server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

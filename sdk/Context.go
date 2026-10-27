@@ -1317,7 +1317,7 @@ func (b *diagnosticBuffer) take() []bufferedEvent {
 
 func (c *Context) dispatchDiagnostics(events []bufferedEvent) {
 	for _, e := range events {
-		_ = c.logEvent(e.event, e.data)
+		c.logEvent(e.event, e.data)
 	}
 }
 
@@ -1420,37 +1420,29 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 // observer: a panic in it is contained here, so it can neither end the host
 // process from an SDK goroutine nor leave the SDK's own state half updated.
 func (c *Context) LogEvent(event EventType, data interface{}) {
-	_ = c.logEvent(event, data)
+	c.logEvent(event, data)
 }
 
 func (c *Context) LogError(err error) {
-	_ = c.logEvent(Error, err)
+	c.logEvent(Error, err)
 }
 
-// logEvent returns the logger's panic as an error, for the callers that can
-// report it through a future.
-func (c *Context) logEvent(event EventType, data interface{}) (panicErr error) {
-	if c.EventLogger_ == nil {
-		return nil
+func (c *Context) logEvent(event EventType, data interface{}) {
+	if c.EventLogger_ != nil {
+		notifyLogger(c.EventLogger_, c.snapshot(), event, data)
 	}
-	return notifyLogger(c.EventLogger_, c.snapshot(), event, data)
 }
 
-// notifyLogger calls an event logger and returns a panic from it as an error.
-// Every call into a logger goes through here, including the ones made while a
+// notifyLogger calls an event logger and contains its panic. Every call into a
+// logger goes through here, including the ones made while a
 // context is being created or its data parsed, so a logger can never end the
 // host process or abort the SDK code that reports to it.
-func notifyLogger(logger ContextEventLogger, ctx Context, event EventType, data interface{}) (panicErr error) {
+func notifyLogger(logger ContextEventLogger, ctx Context, event EventType, data interface{}) {
 	if logger == nil {
-		return nil
+		return
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			panicErr = panicToError(r)
-		}
-	}()
+	defer func() { _ = recover() }()
 	logger.HandleEvent(ctx, event, data)
-	return nil
 }
 
 func panicToError(r interface{}) error {
@@ -1557,10 +1549,10 @@ func (c *Context) Flush() *future.Future {
 						// Start the logger first: settledDone runs Close's listeners
 						// synchronously, and a panic there must not leave the
 						// caller's future unsettled.
-						runLogger(done, nil, func() error { return c.logEvent(Publish, event) })
+						runLogger(done, nil, func() { c.logEvent(Publish, event) })
 					} else {
 						c.requeueEvents(exposures, achievements, eventCount)
-						runLogger(done, err, func() error { return c.logEvent(Error, err) })
+						runLogger(done, err, func() { c.logEvent(Error, err) })
 					}
 					c.removeInflight(settled)
 					settledDone(nil, err)
@@ -1612,9 +1604,9 @@ func (c *Context) inflightSnapshot() []*future.Future {
 
 // runLogger runs an observer on its own goroutine so lifecycle re-entry cannot
 // block the publisher callback. Logger panics never replace the publish outcome.
-func runLogger(done future.SetResultFunc, result error, log func() error) {
+func runLogger(done future.SetResultFunc, result error, log func()) {
 	go func() {
-		_ = log()
+		log()
 		done(nil, result)
 	}()
 }

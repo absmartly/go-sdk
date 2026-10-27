@@ -179,9 +179,10 @@ func (l *matrixLogger) HandleEvent(supplied Context, event EventType, _ interfac
 }
 
 type observedFuture struct {
-	kind  string
-	f     *future.Future
-	calls *int32
+	kind     string
+	f        *future.Future
+	calls    *int32
+	listened chan struct{}
 }
 
 type matrixAction struct {
@@ -306,8 +307,12 @@ func runLifecycleCase(t *testing.T, mode, fault string, failing bool, loggerBeha
 		if f == nil {
 			return
 		}
-		var o = &observedFuture{kind: kind, f: f, calls: new(int32)}
-		f.Listen(func(future.Value, error) { atomic.AddInt32(o.calls, 1) })
+		var o = &observedFuture{kind: kind, f: f, calls: new(int32), listened: make(chan struct{})}
+		f.Listen(func(future.Value, error) {
+			if atomic.AddInt32(o.calls, 1) == 1 {
+				close(o.listened)
+			}
+		})
 		mu.Lock()
 		observed = append(observed, o)
 		mu.Unlock()
@@ -333,7 +338,9 @@ func runLifecycleCase(t *testing.T, mode, fault string, failing bool, loggerBeha
 			mu.Lock()
 			var allReady = true
 			for _, o := range observed {
-				if !o.f.Ready() {
+				select {
+				case <-o.listened:
+				default:
 					allReady = false
 				}
 			}
@@ -396,8 +403,6 @@ func runLifecycleCase(t *testing.T, mode, fault string, failing bool, loggerBeha
 	case "panicClose":
 		mustFire = !failing && act.closes
 	}
-	// A refresh that succeeded must have reported a Refresh event. The event is
-	// logged right after the future settles, so give it a moment.
 	for _, o := range futs {
 		if o.kind != "refresh" {
 			continue
