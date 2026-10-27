@@ -7,6 +7,7 @@ import (
 	"github.com/absmartly/go-sdk/sdk/future"
 	"github.com/absmartly/go-sdk/sdk/internal"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
+	"math"
 	"reflect"
 	"sort"
 	"strconv"
@@ -85,6 +86,10 @@ type Context struct {
 	// parsing a "json" custom field. GetCustomFieldValue reports it through the
 	// event logger when the field is read. Guarded by DataLock.
 	customFieldErrors_ map[string]map[string]error
+
+	// unitValues_ keeps each unit as it was set (string or float64); Units_
+	// holds the string form that is hashed. Guarded by ContextLock_.
+	unitValues_ map[string]interface{}
 }
 
 type ExperimentVariables struct {
@@ -224,33 +229,35 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 				if !ok {
 					err = &TypeError{Expected: "jsonmodels.ContextData", Actual: val}
 					tmp.SetDataFailed(err)
+					tmp.LogError(err)
 					readyFutureDone(nil, err)
 					cntx.setReadyFuture(nil)
-					tmp.LogError(err)
 					return
 				}
 				var diagnostics, panicErr = tmp.applyRefreshedData(result)
 				if panicErr != nil {
 					tmp.SetDataFailed(panicErr)
-					readyFutureDone(nil, panicErr)
-					cntx.setReadyFuture(nil)
 					tmp.dispatchDiagnostics(diagnostics)
 					tmp.LogError(panicErr)
+					readyFutureDone(nil, panicErr)
+					cntx.setReadyFuture(nil)
 					return
 				}
-				readyFutureDone(result, nil)
-				cntx.setReadyFuture(nil)
+				// Log before settling, so WaitUntilReady returns after the
+				// logger has seen the ready event.
 				tmp.dispatchDiagnostics(diagnostics)
 				tmp.LogEvent(Ready, result)
+				readyFutureDone(result, nil)
+				cntx.setReadyFuture(nil)
 
 				if tmp.GetPendingCount() > 0 {
 					tmp.SetTimeout()
 				}
 			} else {
 				tmp.SetDataFailed(err)
+				tmp.LogError(err)
 				readyFutureDone(nil, err)
 				cntx.setReadyFuture(nil)
-				tmp.LogError(err)
 			}
 
 		})
@@ -275,21 +282,21 @@ func (c *Context) IsClosing() bool {
 	return !c.Closed_.Load().(bool) && c.Closing_.Load().(bool)
 }
 
+// WaitUntilReadyAsync and WaitUntilReady wait on the load future while one is
+// pending, not on the ready flag: the flag is set before the ready event is
+// logged, and the future settles after it.
 func (c *Context) WaitUntilReadyAsync() *future.Future {
-	if c.Ready_.Load().(bool) {
-		return future.Call(func() (future.Value, error) {
-			return c, nil
-		})
+	if ft := c.getReadyFuture(); ft != nil {
+		return ft
 	}
-	return c.getReadyFuture()
+	return future.Call(func() (future.Value, error) {
+		return c, nil
+	})
 }
 
 func (c *Context) WaitUntilReady() Context {
-	if !c.Ready_.Load().(bool) {
-		var ft = c.getReadyFuture()
-		if ft != nil && !ft.Ready() {
-			ft.Join(context.Background())
-		}
+	if ft := c.getReadyFuture(); ft != nil && !ft.Ready() {
+		ft.Join(context.Background())
 	}
 	return c.snapshot()
 }
@@ -365,12 +372,9 @@ func (c *Context) GetData() (jsonmodels.ContextData, error) {
 
 }
 
+// SetOverride is allowed after the context is finalized, like the other
+// ABsmartly SDKs: it only affects later reads and queues nothing.
 func (c *Context) SetOverride(experimentName string, variant int) error {
-	var err = c.CheckNotClosed()
-	if err != nil {
-		return err
-	}
-
 	PutRW(c.ContextLock_, c.Overrides_, experimentName, variant)
 	return nil
 }
@@ -395,12 +399,8 @@ func (c *Context) SetOverrides(overrides map[string]int) error {
 	return nil
 }
 
+// SetCustomAssignment is allowed after the context is finalized, like SetOverride.
 func (c *Context) SetCustomAssignment(experimentName string, variant int) error {
-	var err = c.CheckNotClosed()
-	if err != nil {
-		return err
-	}
-
 	PutRW(c.ContextLock_, c.Cassignments_, experimentName, variant)
 	return nil
 }
@@ -425,27 +425,130 @@ func (c *Context) SetCustomAssignments(customAssignments map[string]int) error {
 }
 
 func (c *Context) SetUnit(unitType string, uid string) error {
+	return c.setUnit(unitType, uid)
+}
+
+// SetUnitValue sets a unit from a string or a number. The value is kept as
+// given, so GetUnit and GetUnits return a number for a numeric unit. A number
+// is hashed and published as its rounded integer, like the other ABsmartly SDKs.
+func (c *Context) SetUnitValue(unitType string, uid interface{}) error {
+	switch v := uid.(type) {
+	case string:
+		return c.setUnit(unitType, v)
+	case float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return c.setUnit(unitType, v)
+	default:
+		var err = c.CheckNotClosed()
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("Unit '%s' must be a string or a number.", unitType) //nolint:staticcheck // canonical SDK error text
+	}
+}
+
+func (c *Context) setUnit(unitType string, uid interface{}) error {
 	var err = c.CheckNotClosed()
 	if err != nil {
 		return err
 	}
 
+	var value interface{}
+	var uidString string
+	if s, ok := uid.(string); ok {
+		uidString = strings.TrimSpace(s)
+		if len(uidString) == 0 {
+			return fmt.Errorf("Unit '%s' UID must not be blank.", unitType) //nolint:staticcheck // canonical SDK error text
+		}
+		value = uidString
+	} else {
+		var number = toFloat64(uid)
+		uidString = numericUnitString(number)
+		value = number
+	}
+
 	c.ContextLock_.Lock()
-	var previous, exist = c.Units_[unitType]
-	if exist && previous != uid {
-		c.ContextLock_.Unlock()
+	defer c.ContextLock_.Unlock()
+	if c.unitValues_ == nil {
+		c.unitValues_ = map[string]interface{}{}
+	}
+	var previous, exist = c.unitValues_[unitType]
+	if !exist {
+		if s, found := c.Units_[unitType]; found {
+			previous, exist = s, true
+		}
+	}
+	if exist && previous != value {
 		return fmt.Errorf("Unit '%s' UID already set.", unitType) //nolint:staticcheck // canonical SDK error text
 	}
 
-	var trimmed = strings.TrimSpace(uid)
-	if len(trimmed) <= 0 {
-		c.ContextLock_.Unlock()
-		return errors.New("unit  UID must not be blank.")
-	}
-
-	c.Units_[unitType] = trimmed
-	c.ContextLock_.Unlock()
+	c.Units_[unitType] = uidString
+	c.unitValues_[unitType] = value
 	return nil
+}
+
+// numericUnitString is the string a numeric UID is hashed as: the number
+// rounded to an integer, like JavaScript's toFixed(0).
+func numericUnitString(number float64) string {
+	return strconv.FormatFloat(math.Round(number), 'f', 0, 64)
+}
+
+func toFloat64(v interface{}) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case float32:
+		return float64(n)
+	case int:
+		return float64(n)
+	case int8:
+		return float64(n)
+	case int16:
+		return float64(n)
+	case int32:
+		return float64(n)
+	case int64:
+		return float64(n)
+	case uint:
+		return float64(n)
+	case uint8:
+		return float64(n)
+	case uint16:
+		return float64(n)
+	case uint32:
+		return float64(n)
+	case uint64:
+		return float64(n)
+	}
+	return 0
+}
+
+// GetUnit returns the UID set for a unit type, as it was set (a string or a
+// float64), or nil when the unit type is not set.
+func (c *Context) GetUnit(unitType string) interface{} {
+	c.ContextLock_.RLock()
+	defer c.ContextLock_.RUnlock()
+	if v, ok := c.unitValues_[unitType]; ok {
+		return v
+	}
+	if s, ok := c.Units_[unitType]; ok {
+		return s
+	}
+	return nil
+}
+
+// GetUnits returns a copy of all units, each as it was set.
+func (c *Context) GetUnits() map[string]interface{} {
+	c.ContextLock_.RLock()
+	defer c.ContextLock_.RUnlock()
+	var result = make(map[string]interface{}, len(c.Units_))
+	for k, s := range c.Units_ {
+		if v, ok := c.unitValues_[k]; ok {
+			result[k] = v
+		} else {
+			result[k] = s
+		}
+	}
+	return result
 }
 
 func (c *Context) SetUnits(units map[string]string) error {
@@ -470,6 +573,31 @@ func (c *Context) SetAttribute(name string, value interface{}) error {
 	atomic.AddInt32(&c.AttrsSeq_, 1)
 	c.ContextLock_.Unlock()
 	return nil
+}
+
+// GetAttribute returns the last value set for an attribute, or nil.
+func (c *Context) GetAttribute(name string) interface{} {
+	c.ContextLock_.RLock()
+	defer c.ContextLock_.RUnlock()
+	for i := len(c.Attributes_) - 1; i >= 0; i-- {
+		if a, ok := c.Attributes_[i].(jsonmodels.Attribute); ok && a.Name == name {
+			return a.Value
+		}
+	}
+	return nil
+}
+
+// GetAttributes returns the last value set for each attribute.
+func (c *Context) GetAttributes() map[string]interface{} {
+	c.ContextLock_.RLock()
+	defer c.ContextLock_.RUnlock()
+	var result = map[string]interface{}{}
+	for _, attr := range c.Attributes_ {
+		if a, ok := attr.(jsonmodels.Attribute); ok {
+			result[a.Name] = a.Value
+		}
+	}
+	return result
 }
 
 func (c *Context) SetAttributes(attributes map[string]interface{}) error {
@@ -789,15 +917,17 @@ func (c *Context) RefreshAsync() *future.Future {
 			}
 		}
 		c.Refreshing_.Store(false)
-		donefun(nil, outcome)
 
-		// The load is over; only now tell the logger what the parser found.
+		// The load is over, so a logger that calls Refresh starts a new one.
+		// Log before settling the future, so a caller that waits on Refresh
+		// returns after the logger has seen the refresh or error event.
 		c.dispatchDiagnostics(diagnostics)
 		if outcome == nil {
 			c.LogEvent(Refresh, result)
 		} else {
 			c.LogError(outcome)
 		}
+		donefun(nil, outcome)
 	})
 	return tempfuture
 }

@@ -494,7 +494,7 @@ func TestUnitEmpty(t *testing.T) {
 
 	var err = context.SetUnit("db_user_id", "")
 
-	assertAny("unit  UID must not be blank.", err.Error(), t)
+	assertAny("Unit 'db_user_id' UID must not be blank.", err.Error(), t)
 
 	err = context.SetUnit("session_id", "1")
 

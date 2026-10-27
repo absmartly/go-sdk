@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"encoding/json"
 	"errors"
 	"github.com/absmartly/go-sdk/sdk/future"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
@@ -592,7 +593,7 @@ func TestSetOverrideBeforeReady(t *testing.T) {
 	assertAny(2, res, t)
 }
 
-func TestSetOverrideThrowsAfterClose(t *testing.T) {
+func TestSetOverrideAllowedAfterClose(t *testing.T) {
 	setUp()
 	var config = CreateDefaultContextConfig()
 	config.Units_ = units
@@ -601,9 +602,10 @@ func TestSetOverrideThrowsAfterClose(t *testing.T) {
 	context.Close()
 
 	var err = context.SetOverride("exp_test", 2)
-	if err == nil {
-		t.Error("Expected error after close, got nil")
-	}
+	assertAny(nil, err, t)
+	var res, er = context.GetOverride("exp_test")
+	assertAny(nil, er, t)
+	assertAny(2, res, t)
 }
 
 func TestSetCustomAssignmentBeforeReady(t *testing.T) {
@@ -620,7 +622,7 @@ func TestSetCustomAssignmentBeforeReady(t *testing.T) {
 	assertAny(2, res, t)
 }
 
-func TestSetCustomAssignmentThrowsAfterClose(t *testing.T) {
+func TestSetCustomAssignmentAllowedAfterClose(t *testing.T) {
 	setUp()
 	var config = CreateDefaultContextConfig()
 	config.Units_ = units
@@ -629,9 +631,10 @@ func TestSetCustomAssignmentThrowsAfterClose(t *testing.T) {
 	context.Close()
 
 	var err = context.SetCustomAssignment("exp_test", 2)
-	if err == nil {
-		t.Error("Expected error after close, got nil")
-	}
+	assertAny(nil, err, t)
+	var res, er = context.GetCustomAssignment("exp_test")
+	assertAny(nil, er, t)
+	assertAny(2, res, t)
 }
 
 func TestRefreshKeepsOverrides(t *testing.T) {
@@ -1974,4 +1977,115 @@ func (c *CapturingClientWithRefresh) Publish(event jsonmodels.PublishEvent) *fut
 	return future.Call(func() (future.Value, error) {
 		return nil, nil
 	})
+}
+
+func TestUnknownExperimentExposureUnitIsNull(t *testing.T) {
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	var context = CreateTestContext(config, dataFutureReady)
+
+	_, err := context.GetTreatment("not_found")
+	assertAny(nil, err, t)
+	var out, merr = json.Marshal(context.Exposures_[0])
+	assertAny(nil, merr, t)
+	var decoded map[string]interface{}
+	_ = json.Unmarshal(out, &decoded)
+	var unit, present = decoded["unit"]
+	assertAny(true, present, t)
+	assertAny(nil, unit, t)
+}
+
+func TestUnitsKeepTheirTypeAndHashAsJS(t *testing.T) {
+	setUp()
+	var config = CreateDefaultContextConfig()
+	var context = CreateTestContext(config, dataFutureReady)
+
+	assertAny(nil, context.SetUnitValue("session_id", "abc"), t)
+	assertAny(nil, context.SetUnitValue("user_id", float64(125)), t)
+	assertAny(nil, context.SetUnitValue("float_id", 125.75), t)
+	assertAny("abc", context.GetUnit("session_id"), t)
+	assertAny(float64(125), context.GetUnit("user_id"), t)
+	assertAny(125.75, context.GetUnit("float_id"), t)
+	assertAny(nil, context.GetUnit("missing"), t)
+	assertAny(map[string]interface{}{"session_id": "abc", "user_id": float64(125), "float_id": 125.75}, context.GetUnits(), t)
+	// JS hashes a number as value.toFixed(0): 125.75 -> "126".
+	assertAny("126", context.Units_["float_id"], t)
+	assertAny(nil, context.SetUnitValue("user_id", float64(125)), t)
+	assertAny("Unit 'user_id' UID already set.", context.SetUnitValue("user_id", "125").Error(), t)
+	assertAny("Unit 'x' must be a string or a number.", context.SetUnitValue("x", true).Error(), t)
+}
+
+func TestAttributeGettersReturnLastValue(t *testing.T) {
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	var context = CreateTestContext(config, dataFutureReady)
+
+	assertAny(nil, context.GetAttribute("a"), t)
+	_ = context.SetAttribute("a", 1)
+	_ = context.SetAttribute("b", "x")
+	_ = context.SetAttribute("a", 2)
+	assertAny(2, context.GetAttribute("a"), t)
+	assertAny(map[string]interface{}{"a": 2, "b": "x"}, context.GetAttributes(), t)
+}
+
+func TestReadyEventLoggedBeforeWaitUntilReadyReturns(t *testing.T) {
+	setUp()
+	for i := 0; i < 5; i++ {
+		var pending, done = future.New()
+		var logger = &orderLogger{}
+		var config = CreateDefaultContextConfig()
+		config.Units_ = units
+		config.EventLogger_ = logger
+		var context = CreateTestContext(config, pending)
+		go func() { done(data, nil) }()
+		// Let the load set the ready flag while the logger is still running.
+		time.Sleep(5 * time.Millisecond)
+		context.WaitUntilReady()
+		if logger.count.Load() == 0 {
+			t.Fatal("WaitUntilReady returned before the ready event was logged")
+		}
+	}
+}
+
+type orderLogger struct{ count atomic.Int32 }
+
+func (l *orderLogger) HandleEvent(_ Context, event EventType, _ interface{}) {
+	if event == Ready {
+		time.Sleep(20 * time.Millisecond)
+		l.count.Add(1)
+	}
+}
+
+type asyncDataProvider struct{}
+
+func (asyncDataProvider) GetContextData() *future.Future {
+	var f, done = future.New()
+	go func() { done(data, nil) }()
+	return f
+}
+
+type refreshOrderLogger struct{ count atomic.Int32 }
+
+func (l *refreshOrderLogger) HandleEvent(_ Context, event EventType, _ interface{}) {
+	if event == Refresh {
+		time.Sleep(time.Millisecond)
+		l.count.Add(1)
+	}
+}
+
+func TestRefreshEventLoggedBeforeRefreshReturns(t *testing.T) {
+	setUp()
+	for i := 0; i < 20; i++ {
+		var logger = &refreshOrderLogger{}
+		var config = CreateDefaultContextConfig()
+		config.Units_ = units
+		config.EventLogger_ = logger
+		var context = trackContext(CreateContext(clock, config, dataFutureReady, asyncDataProvider{}, eventHandler, nil, variableParser, audienceMatcher))
+		context.Refresh()
+		if logger.count.Load() != 1 {
+			t.Fatal("Refresh returned before the refresh event was logged")
+		}
+	}
 }

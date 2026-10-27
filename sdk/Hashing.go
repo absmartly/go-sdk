@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"fmt"
 	"math/bits"
 )
 
@@ -24,4 +25,16 @@ func HashUnit(unit string) []int8 {
 		return DigestBase64UrlNoPadding(buffer[:], 0, encoded, block[:], st[:])
 	}
 
+}
+
+// HashUnitValue hashes a UID given as a string or a number, the way a unit set
+// with SetUnitValue is hashed. A number is hashed as its rounded integer.
+func HashUnitValue(uid interface{}) ([]int8, error) {
+	switch v := uid.(type) {
+	case string:
+		return HashUnit(v), nil
+	case float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return HashUnit(numericUnitString(toFloat64(v))), nil
+	}
+	return nil, fmt.Errorf("unit UID must be a string or a number, got %T", uid)
 }
