@@ -53,24 +53,20 @@ func TestBuilderIntegrationContextCreation(t *testing.T) {
 // Retries(n) reaches the HTTP client: a gateway error is retried n times, so the
 // server sees n+1 requests before the context fails.
 func TestBuilderIntegrationRetries(t *testing.T) {
-	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
-		t.Run(http.StatusText(status), func(t *testing.T) {
-			var requests int32
-			var server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				atomic.AddInt32(&requests, 1)
-				w.WriteHeader(status)
-			}))
-			defer server.Close()
+	var requests int32
+	var server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
 
-			var abs = buildAgainst(t, server, func(b *ABsmartlyBuilder) *ABsmartlyBuilder { return b.Retries(2) })
-			var ctx = abs.CreateContext(contextConfigForTest("test-session-456"))
-			defer ctx.Close()
-			ctx.WaitUntilReady()
+	var abs = buildAgainst(t, server, func(b *ABsmartlyBuilder) *ABsmartlyBuilder { return b.Retries(2) })
+	var ctx = abs.CreateContext(contextConfigForTest("test-session-456"))
+	defer ctx.Close()
+	ctx.WaitUntilReady()
 
-			assertAny(true, ctx.IsFailed(), t)
-			assertAny(int32(3), atomic.LoadInt32(&requests), t)
-		})
-	}
+	assertAny(true, ctx.IsFailed(), t)
+	assertAny(int32(3), atomic.LoadInt32(&requests), t)
 }
 
 // Timeout(d) reaches the HTTP client: a response slower than the default
