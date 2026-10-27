@@ -3,6 +3,7 @@ package sdk
 import (
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 	"io/ioutil"
+	"strings"
 	"testing"
 )
 
@@ -170,6 +171,10 @@ func TestDeserializeBrokenJson(t *testing.T) {
 	assertAny(nil, err, t)
 	var deser = DefaultContextDataDeserializer{}
 	var result, er = deser.Deserialize(content)
-	assertAny("invalid character '\\n' in string literal", er.Error(), t)
+	// Newer Go releases word this error differently ("in string" vs "in string
+	// literal"), so only compare the stable part.
+	if !strings.HasPrefix(er.Error(), "invalid character '\\n' in string") {
+		t.Errorf("unexpected error: %v", er)
+	}
 	assertAny(jsonmodels.ContextData{}, result, t)
 }

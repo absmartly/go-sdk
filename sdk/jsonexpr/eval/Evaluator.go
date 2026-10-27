@@ -2,6 +2,7 @@ package eval
 
 import (
 	"errors"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -17,7 +18,9 @@ func (e Evaluator) Evaluate(expr reflect.Value) interface{} {
 		return e.Operators["and"].Evaluate(e, expr.Interface())
 	} else if expr.Kind() == reflect.Map {
 		var entry = expr.MapRange()
-		entry.Next()
+		if !entry.Next() {
+			return nil
+		}
 		var op = e.Operators[entry.Key().String()]
 		if op != nil {
 			return op.Evaluate(e, entry.Value().Interface())
@@ -64,39 +67,20 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 		}
 	}
 
-	if (lhs.Kind() == reflect.Slice || lhs.Kind() == reflect.Array || lhs.Kind() == reflect.Map) && lhs.Kind() == rhs.Kind() {
-		if lhs.Len() > rhs.Len() {
-			return 1
-		} else if rhs.Len() > lhs.Len() {
-			return -1
-		}
-
-		if lhs.Kind() == reflect.Slice || lhs.Kind() == reflect.Array {
-			for i := 0; i < lhs.Len(); i++ {
-				if lhs.Index(i).Interface() != rhs.Index(i).Interface() {
-					return nil
-				}
-			}
-			return 0
-		} else if lhs.Kind() == reflect.Map {
-			var entry = lhs.MapRange()
-			var rentry = rhs.MapRange()
-			for entry.Next() {
-				rentry.Next()
-				if entry.Key().Interface() != rentry.Key().Interface() ||
-					entry.Value().Interface() != rentry.Value().Interface() {
-					return nil
-				}
-			}
+	if isCollection(lhs) && isCollection(rhs) {
+		if deepEquals(lhs, rhs) {
 			return 0
 		}
+		return nil
 	}
 
-	if lhs.IsValid() && rhs.IsValid() && lhs.Kind() == rhs.Kind() && lhs == rhs {
-		if lhs.IsNil() && rhs.IsNil() {
-			return nil
+	if lhs.IsValid() && rhs.IsValid() && lhs.Kind() == rhs.Kind() {
+		if lhs.Comparable() && rhs.Comparable() && lhs.Interface() == rhs.Interface() {
+			return 0
 		}
-		return 0
+		if reflect.DeepEqual(lhs.Interface(), rhs.Interface()) {
+			return 0
+		}
 	}
 
 	if !lhs.IsValid() && !rhs.IsValid() {
@@ -120,9 +104,17 @@ func (e Evaluator) BooleanConvert(x reflect.Value) bool {
 		return false
 	} else if x.IsValid() && (x.Interface() == true || x.Interface() == "true" || x.Interface() == "[true]") {
 		return true
-	} else {
-		return x.IsValid() && !x.IsNil()
+	} else if !x.IsValid() {
+		return false
 	}
+
+	kind := x.Kind()
+	if kind == reflect.Chan || kind == reflect.Func || kind == reflect.Interface ||
+		kind == reflect.Map || kind == reflect.Pointer || kind == reflect.Slice {
+		return !x.IsNil()
+	}
+
+	return true
 }
 
 func (e Evaluator) NumberConvert(x reflect.Value) (float64, error) {
@@ -195,4 +187,84 @@ func (e Evaluator) ExtractVar(path string) interface{} {
 	}
 
 	return target
+}
+
+func unwrap(v reflect.Value) reflect.Value {
+	for v.IsValid() && (v.Kind() == reflect.Interface || v.Kind() == reflect.Pointer) {
+		if v.IsNil() {
+			return reflect.Value{}
+		}
+		v = v.Elem()
+	}
+	return v
+}
+
+func isCollection(v reflect.Value) bool {
+	v = unwrap(v)
+	return v.IsValid() && (v.Kind() == reflect.Slice || v.Kind() == reflect.Array || v.Kind() == reflect.Map)
+}
+
+func toFloat(v reflect.Value) (float64, bool) {
+	switch v.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return float64(v.Int()), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return float64(v.Uint()), true
+	case reflect.Float32, reflect.Float64:
+		return v.Float(), true
+	}
+	return 0, false
+}
+
+func deepEquals(lhs reflect.Value, rhs reflect.Value) bool {
+	lhs = unwrap(lhs)
+	rhs = unwrap(rhs)
+	if !lhs.IsValid() || !rhs.IsValid() {
+		return !lhs.IsValid() && !rhs.IsValid()
+	}
+
+	if lf, ok := toFloat(lhs); ok {
+		rf, rok := toFloat(rhs)
+		return rok && (lf == rf || (math.IsNaN(lf) && math.IsNaN(rf)))
+	}
+
+	switch lhs.Kind() {
+	case reflect.Slice, reflect.Array:
+		if rhs.Kind() != reflect.Slice && rhs.Kind() != reflect.Array {
+			return false
+		}
+		if lhs.Len() != rhs.Len() {
+			return false
+		}
+		for i := 0; i < lhs.Len(); i++ {
+			if !deepEquals(lhs.Index(i), rhs.Index(i)) {
+				return false
+			}
+		}
+		return true
+	case reflect.Map:
+		if rhs.Kind() != reflect.Map || lhs.Len() != rhs.Len() {
+			return false
+		}
+		iter := lhs.MapRange()
+		for iter.Next() {
+			key := iter.Key()
+			if !key.Type().AssignableTo(rhs.Type().Key()) {
+				return false
+			}
+			rv := rhs.MapIndex(key)
+			if !rv.IsValid() || !deepEquals(iter.Value(), rv) {
+				return false
+			}
+		}
+		return true
+	}
+
+	if lhs.Kind() != rhs.Kind() {
+		return false
+	}
+	if lhs.Comparable() && rhs.Comparable() {
+		return lhs.Interface() == rhs.Interface()
+	}
+	return reflect.DeepEqual(lhs.Interface(), rhs.Interface())
 }
