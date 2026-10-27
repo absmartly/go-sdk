@@ -154,6 +154,7 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	cntx.StateLock_ = &sync.Mutex{}
 
 	cntx.AssignmentCache = map[string]*Assignment{}
+	cntx.unitValues_ = map[string]interface{}{}
 	cntx.Achievements_ = make([]jsonmodels.GoalAchievement, 0)
 	cntx.Exposures_ = make([]jsonmodels.Exposure, 0)
 	cntx.Attributes_ = make([]interface{}, 0)
@@ -284,9 +285,11 @@ func (c *Context) IsClosing() bool {
 
 // WaitUntilReadyAsync and WaitUntilReady wait on the load future while one is
 // pending, not on the ready flag: the flag is set before the ready event is
-// logged, and the future settles after it.
+// logged, and the future settles after it. The Context a logger receives is a
+// copy; on it they go by the flag, so a ready or error callback that waits for
+// readiness does not wait for itself.
 func (c *Context) WaitUntilReadyAsync() *future.Future {
-	if ft := c.getReadyFuture(); ft != nil {
+	if ft := c.pendingReadyFuture(); ft != nil {
 		return ft
 	}
 	return future.Call(func() (future.Value, error) {
@@ -295,10 +298,17 @@ func (c *Context) WaitUntilReadyAsync() *future.Future {
 }
 
 func (c *Context) WaitUntilReady() Context {
-	if ft := c.getReadyFuture(); ft != nil && !ft.Ready() {
+	if ft := c.pendingReadyFuture(); ft != nil && !ft.Ready() {
 		ft.Join(context.Background())
 	}
 	return c.snapshot()
+}
+
+func (c *Context) pendingReadyFuture() *future.Future {
+	if c.root_ != nil && c.Ready_.Load().(bool) {
+		return nil
+	}
+	return c.live().getReadyFuture()
 }
 
 func (c *Context) getReadyFuture() *future.Future {
@@ -447,6 +457,7 @@ func (c *Context) SetUnitValue(unitType string, uid interface{}) error {
 }
 
 func (c *Context) setUnit(unitType string, uid interface{}) error {
+	c = c.live()
 	var err = c.CheckNotClosed()
 	if err != nil {
 		return err
@@ -468,9 +479,6 @@ func (c *Context) setUnit(unitType string, uid interface{}) error {
 
 	c.ContextLock_.Lock()
 	defer c.ContextLock_.Unlock()
-	if c.unitValues_ == nil {
-		c.unitValues_ = map[string]interface{}{}
-	}
 	var previous, exist = c.unitValues_[unitType]
 	if !exist {
 		if s, found := c.Units_[unitType]; found {
@@ -522,9 +530,9 @@ func toFloat64(v interface{}) float64 {
 	return 0
 }
 
-// GetUnit returns the UID set for a unit type, as it was set (a string or a
-// float64), or nil when the unit type is not set.
+// GetUnit returns the UID of a unit type, or nil when it is not set.
 func (c *Context) GetUnit(unitType string) interface{} {
+	c = c.live()
 	c.ContextLock_.RLock()
 	defer c.ContextLock_.RUnlock()
 	if v, ok := c.unitValues_[unitType]; ok {
@@ -538,6 +546,7 @@ func (c *Context) GetUnit(unitType string) interface{} {
 
 // GetUnits returns a copy of all units, each as it was set.
 func (c *Context) GetUnits() map[string]interface{} {
+	c = c.live()
 	c.ContextLock_.RLock()
 	defer c.ContextLock_.RUnlock()
 	var result = make(map[string]interface{}, len(c.Units_))

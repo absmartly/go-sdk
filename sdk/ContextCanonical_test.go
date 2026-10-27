@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	gocontext "context"
 	"encoding/json"
 	"errors"
 	"github.com/absmartly/go-sdk/sdk/future"
@@ -2088,4 +2089,75 @@ func TestRefreshEventLoggedBeforeRefreshReturns(t *testing.T) {
 			t.Fatal("Refresh returned before the refresh event was logged")
 		}
 	}
+}
+
+type reentrantReadyLogger struct {
+	onEvent  EventType
+	call     func(ctx *Context)
+	returned atomic.Bool
+}
+
+func (l *reentrantReadyLogger) HandleEvent(ctx Context, event EventType, _ interface{}) {
+	if event == l.onEvent && !l.returned.Load() {
+		l.call(&ctx)
+		l.returned.Store(true)
+	}
+}
+
+func TestWaitUntilReadyInsideReadyOrErrorLoggerDoesNotHang(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		event EventType
+		err   error
+	}{{"ready", Ready, nil}, {"error", Error, errors.New("load failed")}} {
+		for _, wait := range []func(ctx *Context){
+			func(ctx *Context) { ctx.WaitUntilReady() },
+			func(ctx *Context) {
+				c, cancel := gocontext.WithTimeout(gocontext.Background(), time.Second)
+				defer cancel()
+				if _, err := ctx.WaitUntilReadyAsync().Get(c); err == gocontext.DeadlineExceeded {
+					t.Errorf("%s: WaitUntilReadyAsync waited on its own callback", tc.name)
+				}
+			},
+		} {
+			setUp()
+			var pending, done = future.New()
+			var logger = &reentrantReadyLogger{onEvent: tc.event, call: wait}
+			var config = CreateDefaultContextConfig()
+			config.Units_ = units
+			config.EventLogger_ = logger
+			var context = CreateTestContext(config, pending)
+			var finished = make(chan struct{})
+			go func() {
+				if tc.err != nil {
+					done(nil, tc.err)
+				} else {
+					done(data, nil)
+				}
+				close(finished)
+			}()
+			select {
+			case <-finished:
+			case <-time.After(3 * time.Second):
+				t.Fatalf("%s: readiness wait inside the logger hung", tc.name)
+			}
+			context.WaitUntilReady()
+			assertAny(true, logger.returned.Load(), t)
+		}
+	}
+}
+
+func TestSetUnitValueFromLoggerContextReachesLiveContext(t *testing.T) {
+	setUp()
+	var pending, done = future.New()
+	var logger = &reentrantReadyLogger{onEvent: Ready, call: func(ctx *Context) {
+		_ = ctx.SetUnitValue("user_id", 125)
+	}}
+	var config = CreateDefaultContextConfig()
+	config.EventLogger_ = logger
+	var context = CreateTestContext(config, pending)
+	go done(data, nil)
+	context.WaitUntilReady()
+	assertAny(float64(125), context.GetUnit("user_id"), t)
+	assertAny(nil, context.SetUnitValue("user_id", 125), t)
 }
