@@ -173,8 +173,6 @@ func TestClientTimeout(t *testing.T) {
 
 	_, err := client.GetContextData().Get(ctx)
 
-	// The deadline (50ms) is shorter than the request (200ms): Get must return
-	// the deadline error, not wait for the request and return its result.
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Get returned %v, want context.DeadlineExceeded", err)
 	}
@@ -501,7 +499,6 @@ func TestClientRateLimitingPublish(t *testing.T) {
 }
 
 func TestClientPartialResponse(t *testing.T) {
-	// A real server sends a truncated body, so the real deserializer sees it.
 	var server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"experiments": [`))

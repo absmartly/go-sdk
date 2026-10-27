@@ -153,7 +153,6 @@ func TestGetCustomFieldValueParsesNonObjectJSONValues(t *testing.T) {
 		t.Errorf("reading valid fields logged %d error events, want 0: %#v", len(errs), errs)
 	}
 
-	// Variant configs still go through Parse and still index variables.
 	keys, err := ctx.GetVariableKeys()
 	assertAny(nil, err, t)
 	assertAny(map[string][]string{"button.color": {"exp_test_abc"}}, keys, t)
@@ -231,8 +230,6 @@ func TestGetCustomFieldValueUsesLegacyParserParse(t *testing.T) {
 	}
 }
 
-// customFieldParser checks that a parser's own ParseCustomFieldValue is used,
-// and that its error is reported on read.
 type customFieldParser struct {
 	DefaultVariableParser
 }

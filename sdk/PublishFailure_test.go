@@ -13,8 +13,6 @@ import (
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
 
-// heldPublisher is a ContextEventHandler whose publish results the test
-// settles by hand, so a test can fail a publish or keep one in flight.
 type heldPublisher struct {
 	mu      sync.Mutex
 	events  []jsonmodels.PublishEvent
@@ -132,8 +130,6 @@ func TestPublishFailureKeepsEventsPending(t *testing.T) {
 	assertAny(0, len(ctx.Exposures_), t)
 	assertAny(0, len(ctx.Achievements_), t)
 
-	// The exposure was queued once and sent once more after the failure; a
-	// repeated treatment call must not queue it again.
 	_, _ = ctx.GetTreatment("exp_test_ab")
 	assertAny(int32(0), ctx.GetPendingCount(), t)
 }
@@ -146,7 +142,6 @@ func TestPublishFailureRequeuesBatchAheadOfEventsRecordedInFlight(t *testing.T) 
 	fut, err := ctx.PublishAsync()
 	assertAny(nil, err, t)
 
-	// The publish is in flight: its batch has left the queue.
 	assertAny(int32(0), ctx.GetPendingCount(), t)
 	assertAny(nil, ctx.Track("goal2", nil), t)
 	assertAny(int32(1), ctx.GetPendingCount(), t)
@@ -220,8 +215,6 @@ func TestPublishOnFailedContextStillDiscardsEvents(t *testing.T) {
 	assertAny(0, publisher.calls(), t)
 }
 
-// A close that fails to publish must leave the context open and its events
-// pending, so a later Close or Publish can send them.
 func TestFailedCloseKeepsContextOpenForRetry(t *testing.T) {
 	var publisher = &heldPublisher{}
 	var ctx = createHeldPublisherContext(t, publisher, nil)
@@ -247,8 +240,6 @@ func TestFailedCloseKeepsContextOpenForRetry(t *testing.T) {
 	assertAny(int32(0), ctx.GetPendingCount(), t)
 }
 
-// A publish that is already in flight when Close is called must hold the close
-// open: if it fails, its events are requeued and the context must still accept a retry.
 func TestCloseWaitsForInFlightPublishThatFails(t *testing.T) {
 	var publisher = &heldPublisher{}
 	var ctx = createHeldPublisherContext(t, publisher, nil)
@@ -271,7 +262,6 @@ func TestCloseWaitsForInFlightPublishThatFails(t *testing.T) {
 	assertAny(nil, ctx.Publish2ForTest(t, publisher, 1), t)
 }
 
-// A failed close must bring back the automatic refresh that Close stopped.
 func TestFailedCloseRestoresRefreshTimer(t *testing.T) {
 	var publisher = &heldPublisher{}
 	setUp()
@@ -304,8 +294,6 @@ func (c *Context) Publish2ForTest(t *testing.T, publisher *heldPublisher, i int)
 	return getWithTimeout(t, fut)
 }
 
-// Concurrent RefreshAsync callers must all get the future of the active
-// refresh and must not return before it settles.
 func TestConcurrentRefreshAsyncShareActiveFuture(t *testing.T) {
 	setUp()
 	var slow, settle = future.New()
@@ -343,8 +331,6 @@ type slowRefreshClient struct {
 
 func (c slowRefreshClient) GetContextData() *future.Future { return c.fut }
 
-// Close racing with a publish that has just drained the queue must not
-// close the context before that publish settles.
 func TestCloseRacingPublishNeverStrandsFailedBatch(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		var publisher = &heldPublisher{}
@@ -368,8 +354,6 @@ func TestCloseRacingPublishNeverStrandsFailedBatch(t *testing.T) {
 	}
 }
 
-// Every CloseAsync call that overlaps a running close must get the future of
-// that close and must not see it settled before the close finishes.
 func TestConcurrentCloseAsyncShareClosingFuture(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		var publisher = &heldPublisher{}
@@ -399,8 +383,6 @@ func TestConcurrentCloseAsyncShareClosingFuture(t *testing.T) {
 	}
 }
 
-// Two in-flight publishes that fail with different concrete error types must
-// not panic the close aggregation.
 func TestCloseAggregatesDifferentPublishErrorTypes(t *testing.T) {
 	var publisher = &heldPublisher{}
 	var ctx = createHeldPublisherContext(t, publisher, nil)
@@ -431,9 +413,6 @@ func TestCloseAggregatesDifferentPublishErrorTypes(t *testing.T) {
 	assertAny(int32(2), ctx.GetPendingCount(), t)
 }
 
-// An in-flight publish that fails while Close is running must either fail the
-// close or leave nothing pending; the context may never be closed with
-// requeued events.
 func TestCloseNeverSealsContextWithRequeuedEvents(t *testing.T) {
 	for i := 0; i < 300; i++ {
 		var publisher = &heldPublisher{}
@@ -449,8 +428,6 @@ func TestCloseNeverSealsContextWithRequeuedEvents(t *testing.T) {
 		go func() { defer wg.Done(); publisher.settle(t, 0, errors.New("Publish failed")) }()
 		wg.Wait()
 
-		// If the first publish failed before Close ran, Close sends the requeued
-		// events itself; settle that publish too.
 		if publisher.calls() > 1 {
 			publisher.settle(t, 1, errors.New("Publish failed"))
 		}
@@ -470,8 +447,6 @@ func TestCloseNeverSealsContextWithRequeuedEvents(t *testing.T) {
 	}
 }
 
-// An event logger that calls Close from its Publish callback must not wait on
-// the publish it is being called for.
 func TestEventLoggerCallingCloseFromPublishDoesNotDeadlock(t *testing.T) {
 	var publisher = &heldPublisher{}
 	var logger = &closingLogger{}
@@ -506,7 +481,6 @@ func (l *closingLogger) HandleEvent(_ Context, event EventType, _ interface{}) {
 	}
 }
 
-// Error events carry error values, as the README's logger contract says.
 func TestErrorEventsCarryErrorValues(t *testing.T) {
 	setUp()
 	var logger = &MockEventLogger{}
@@ -531,8 +505,6 @@ func TestErrorEventsCarryErrorValues(t *testing.T) {
 	}
 }
 
-// An in-flight publish that fails while a second publish and Close overlap
-// must never leave a closed context holding requeued events.
 func TestCloseWithOverlappingFailingPublishes(t *testing.T) {
 	for i := 0; i < 300; i++ {
 		var publisher = &heldPublisher{}
@@ -549,7 +521,6 @@ func TestCloseWithOverlappingFailingPublishes(t *testing.T) {
 		go func() { defer wg.Done(); publisher.settle(t, 0, errors.New("Publish failed")) }()
 		wg.Wait()
 
-		// Fail every further publish until the close settles.
 		var deadline = time.Now().Add(5 * time.Second)
 		var settled = 1
 		for !closing.Ready() && time.Now().Before(deadline) {
@@ -568,8 +539,6 @@ func TestCloseWithOverlappingFailingPublishes(t *testing.T) {
 	}
 }
 
-// completedPublisher returns publish futures that are already complete, so the
-// publish callback runs on the caller's stack.
 type completedPublisher struct{}
 
 func (completedPublisher) Publish(context Context, event jsonmodels.PublishEvent) *future.Future {
@@ -578,8 +547,6 @@ func (completedPublisher) Publish(context Context, event jsonmodels.PublishEvent
 	return result
 }
 
-// Close with queued events, a publisher that completes synchronously and a
-// logger that calls Close from its Publish callback must not hang.
 func TestCloseWithSynchronousPublisherAndLoggerCallingClose(t *testing.T) {
 	setUp()
 	var logger = &closingLogger{}
@@ -596,7 +563,6 @@ func TestCloseWithSynchronousPublisherAndLoggerCallingClose(t *testing.T) {
 	assertAny(nil, err, t)
 	assertAny(nil, getWithTimeout(t, closing), t)
 	assertAny(true, ctx.IsClosed(), t)
-	// The logger runs on its own goroutine; wait for it to call Close.
 	var deadline = time.Now().Add(5 * time.Second)
 	for !logger.closed.Load() && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
@@ -685,8 +651,6 @@ func (l panickingLogger) HandleEvent(_ Context, event EventType, _ interface{}) 
 	}
 }
 
-// A panicking Publish or Error logger must not end the process, and the
-// caller's future must still settle.
 func TestPanickingLoggersAreContained(t *testing.T) {
 	t.Run("publish logger", func(t *testing.T) {
 		setUp()
@@ -722,13 +686,10 @@ func TestPanickingLoggersAreContained(t *testing.T) {
 		if err := getWithTimeout(t, fut); err != publishErr {
 			t.Fatalf("publish error replaced by logger panic: got %v, want %v", err, publishErr)
 		}
-		// The failed batch stays queued for a retry.
 		assertAny(int32(1), ctx.GetPendingCount(), t)
 	})
 }
 
-// A panic in the Close logger, reached while a held publish settles, must not
-// leave the public publish future unsettled.
 func TestClosePanicDoesNotStrandPublishFuture(t *testing.T) {
 	var publisher = &heldPublisher{}
 	var logger = panickingLogger{on: Close}
@@ -776,8 +737,6 @@ func TestCloseListenerCanAwaitFinalize(t *testing.T) {
 	assertAny(nil, <-listenerErr, t)
 }
 
-// retryingPublisher fails its first publish synchronously after registering a
-// Close listener that retries; later publishes succeed.
 type retryingPublisher struct {
 	ctx   *Context
 	err   error

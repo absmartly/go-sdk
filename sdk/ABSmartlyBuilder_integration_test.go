@@ -50,8 +50,6 @@ func TestBuilderIntegrationContextCreation(t *testing.T) {
 	assertAny(int32(1), atomic.LoadInt32(&requests), t)
 }
 
-// Retries(n) reaches the HTTP client: a gateway error is retried n times, so the
-// server sees n+1 requests before the context fails.
 func TestBuilderIntegrationRetries(t *testing.T) {
 	var requests int32
 	var server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -69,9 +67,6 @@ func TestBuilderIntegrationRetries(t *testing.T) {
 	assertAny(int32(3), atomic.LoadInt32(&requests), t)
 }
 
-// Timeout(d) reaches the HTTP client: a response slower than the default
-// request timeout still succeeds when the builder raises the timeout, and
-// fails when the builder lowers it.
 func TestBuilderIntegrationTimeout(t *testing.T) {
 	var server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(1500 * time.Millisecond)

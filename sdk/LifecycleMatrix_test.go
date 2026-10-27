@@ -15,23 +15,6 @@ import (
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
 
-// This file checks the close / flush / refresh / logger-callback path against
-// its invariants for every combination of
-//
-//	publisher behaviour x publish outcome x logger behaviour x caller action
-//
-// Invariants, checked for every combination:
-//  1. Every future a caller gets settles, and a listener on it runs exactly once.
-//  2. A failed batch stays queued and is delivered exactly once by a later retry.
-//  3. A logger panic never reaches the host process (an escaped panic kills
-//     the test binary) and never changes what was delivered.
-//  4. Nothing deadlocks, including loggers that call Close, Publish or Refresh
-//     from inside a callback.
-//  5. A close that succeeds leaves nothing queued, nothing in flight, no
-//     closing state and no refresh timer.
-
-// matrixPublisher is the event handler and, through matrixProvider, the data
-// provider. It decides when and how each call completes.
 type matrixPublisher struct {
 	mode  string // "sync": already complete, "async": own goroutine, "held": test settles
 	fault string // "", "panic": panics when called, "nilfuture": returns nil
@@ -130,9 +113,6 @@ type matrixLogger struct {
 	used     atomic.Bool
 	inflight atomic.Int32
 
-	// fired counts how often the misbehaviour ran; seen counts the events the
-	// logger received. The cases assert on both, so a case cannot pass while its
-	// logger never ran.
 	fired atomic.Int32
 	mu    sync.Mutex
 	seen  map[EventType]int
@@ -344,8 +324,6 @@ func runLifecycleCase(t *testing.T, mode, fault string, failing bool, loggerBeha
 			ctx.IsClosed(), ctx.IsClosing(), ctx.GetPendingCount(), ctx.inflightCount(), logger.inflight.Load(), p.deliveredCopy(), ready)
 	}
 
-	// quiesce settles held calls until every future is ready and nothing is
-	// running, or fails the case after a deadline (a deadlock or a lost callback).
 	var quiesce = func(stage string) {
 		t.Helper()
 		var deadline = time.Now().Add(10 * time.Second)
@@ -360,7 +338,19 @@ func runLifecycleCase(t *testing.T, mode, fault string, failing bool, loggerBeha
 				}
 			}
 			mu.Unlock()
-			if !progressed && allReady && logger.inflight.Load() == 0 && ctx.inflightCount() == 0 {
+			ctx.StateLock_.Lock()
+			var logsDelivered = true
+			for _, f := range ctx.publishLogs_ {
+				if !f.Ready() {
+					logsDelivered = false
+				}
+			}
+			var finalized = ctx.FinalizedFuture_
+			ctx.StateLock_.Unlock()
+			if finalized != nil && !finalized.Ready() {
+				logsDelivered = false
+			}
+			if !progressed && allReady && logsDelivered && logger.inflight.Load() == 0 && ctx.inflightCount() == 0 {
 				stable++
 			} else {
 				stable = 0
@@ -390,8 +380,6 @@ func runLifecycleCase(t *testing.T, mode, fault string, failing bool, loggerBeha
 		}
 	}
 
-	// The logger must really have run. A case whose logger never ran would pass
-	// every invariant below without testing anything.
 	if failing {
 		if logger.seenCount(Error) == 0 {
 			t.Fatalf("the logger never received the Error event of the failed publish: %s", state())
@@ -483,7 +471,6 @@ func runLifecycleCase(t *testing.T, mode, fault string, failing bool, loggerBeha
 			}
 		}
 
-		// Retry: the same events must be delivered exactly once.
 		p.failing.Store(false)
 		p.fault = ""
 		logger.behavior = "none"
@@ -514,9 +501,6 @@ func runLifecycleCase(t *testing.T, mode, fault string, failing bool, loggerBeha
 	}
 }
 
-// Track racing Close: every Track call either returns an error or its event is
-// delivered. An event must never be accepted and then stranded behind a closed
-// context.
 func TestTrackRacingCloseNeverStrandsAnEvent(t *testing.T) {
 	for _, mode := range []string{"sync", "async"} {
 		for i := 0; i < 200; i++ {
@@ -586,8 +570,6 @@ func TestCloseThroughStaleCopyActsOnLiveContext(t *testing.T) {
 	assertAny(true, ctx.IsClosed(), t)
 }
 
-// A logger that panics while the SDK reports malformed data during creation
-// must not leave the context's readiness pending.
 func TestLoggerPanicWhileParsingDoesNotStrandReadiness(t *testing.T) {
 	var malformed = jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{{
 		Id: 1, Name: "bad_config", UnitType: "session_id", Split: []float64{0.5, 0.5}, TrafficSplit: []float64{0, 1},
@@ -627,8 +609,6 @@ func TestLoggerPanicWhileParsingDoesNotStrandReadiness(t *testing.T) {
 	}
 }
 
-// A variable parser that panics fails the data load instead of leaving the
-// context permanently not ready.
 func TestVariableParserPanicFailsLoadInsteadOfStrandingReadiness(t *testing.T) {
 	for _, name := range []string{"async-initial-future", "ready-initial-future"} {
 		t.Run(name, func(t *testing.T) {
@@ -664,22 +644,17 @@ func (panickingParser) Parse(Context, string, string, string) map[string]interfa
 	panic("parser panic")
 }
 
-// Rejecting an exposure because the context is closing must not consume the
-// assignment's exposure marker: a failed close reopens the context, and the
-// next GetTreatment has to queue the exposure.
 func TestRejectedExposureIsQueuedAfterFailedClose(t *testing.T) {
 	setUp()
 	var publisher = &heldPublisher{}
 	var ctx = createHeldPublisherContext(t, publisher, nil)
 
 	var assignment = ctx.GetAssignment("exp_test_ab")
-	// Close has begun by the time the exposure is queued.
 	ctx.Closing_.Store(true)
 	ctx.QueueExposure(assignment)
 	assertAny(false, assignment.Exposed.Load().(bool), t)
 	assertAny(int32(0), ctx.GetPendingCount(), t)
 
-	// The close failed and left the context open.
 	ctx.Closing_.Store(false)
 	_, err := ctx.GetTreatment("exp_test_ab")
 	assertAny(nil, err, t)

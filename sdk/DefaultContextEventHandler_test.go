@@ -89,8 +89,6 @@ func TestPublisherTimeout(t *testing.T) {
 
 	var result, err = eventHandler.Publish(context, event).Get(ctx)
 
-	// The deadline (50ms) is shorter than the publish (100ms): Get must return
-	// the deadline error, not wait for the publish and return its result.
 	if !errors.Is(err, context2.DeadlineExceeded) {
 		t.Fatalf("Get returned %v (result %v), want context.DeadlineExceeded", err, result)
 	}

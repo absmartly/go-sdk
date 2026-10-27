@@ -71,7 +71,6 @@ func TestHermeticWireContract(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// Configure the SDK's public client with endpoint = local server base.
 	sdk, err := NewBuilder().
 		Endpoint(server.URL).
 		ApiKey(apiKey).
@@ -94,13 +93,11 @@ func TestHermeticWireContract(t *testing.T) {
 		t.Fatal("Expected context to be created")
 	}
 
-	// Drives the real GET /context and blocks until the context is ready.
 	ctx.WaitUntilReady()
 	if !ctx.IsReady() {
 		t.Fatal("Expected context to be ready after WaitUntilReady")
 	}
 
-	// --- Assert GET /context ---
 	mu.Lock()
 	if !getSeen {
 		mu.Unlock()
@@ -120,7 +117,6 @@ func TestHermeticWireContract(t *testing.T) {
 	}
 	mu.Unlock()
 
-	// Queue an exposure (treatment) and a goal (track) so publish has a payload.
 	if _, err := ctx.GetTreatment("exp_test"); err != nil {
 		t.Fatalf("GetTreatment failed: %v", err)
 	}
@@ -128,12 +124,10 @@ func TestHermeticWireContract(t *testing.T) {
 		t.Fatalf("Track failed: %v", err)
 	}
 
-	// Drives the real PUT /context.
 	if err := ctx.Publish(); err != nil {
 		t.Fatalf("Publish failed: %v", err)
 	}
 
-	// --- Assert PUT /context ---
 	mu.Lock()
 	defer mu.Unlock()
 	if !putSeen {
@@ -162,7 +156,6 @@ func TestHermeticWireContract(t *testing.T) {
 		t.Error("PUT header X-Agent must be present and non-empty")
 	}
 
-	// Body fields per contract.
 	for _, field := range []string{"hashed", "units", "publishedAt"} {
 		if _, ok := putBody[field]; !ok {
 			t.Errorf("PUT body missing required field %q (body=%v)", field, putBody)

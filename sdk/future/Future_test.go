@@ -6,7 +6,6 @@ import (
 	"testing"
 )
 
-// Listen racing with completion must call the callback exactly once.
 func TestListenRacingSetResultCallsExactlyOnce(t *testing.T) {
 	for i := 0; i < 2000; i++ {
 		var f, done = New()
@@ -22,7 +21,6 @@ func TestListenRacingSetResultCallsExactlyOnce(t *testing.T) {
 	}
 }
 
-// A callback may register another listener on the same future.
 func TestListenFromInsideCallback(t *testing.T) {
 	var f, done = New()
 	var inner int32
@@ -35,7 +33,6 @@ func TestListenFromInsideCallback(t *testing.T) {
 	}
 }
 
-// Concurrent SetResult calls settle the future once: one value, callbacks run once.
 func TestConcurrentSetResultSettlesOnce(t *testing.T) {
 	for i := 0; i < 2000; i++ {
 		var f, done = New()
@@ -53,8 +50,6 @@ func TestConcurrentSetResultSettlesOnce(t *testing.T) {
 	}
 }
 
-// A callback that panics must not stop the callbacks after it or unwind into
-// the goroutine that settled the future.
 func TestPanickingCallbackDoesNotStopOthers(t *testing.T) {
 	var f, done = New()
 	var after int32

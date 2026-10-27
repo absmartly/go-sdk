@@ -354,8 +354,6 @@ func (c *Context) snapshot() Context {
 	return cp
 }
 
-// live returns the context that owns the lifecycle state: the context itself,
-// or, for a copy handed to a callback, the context it was copied from.
 func (c *Context) live() *Context {
 	if c.root_ != nil {
 		return c.root_
@@ -951,8 +949,6 @@ func (c *Context) RefreshAsync() *future.Future {
 	return tempfuture
 }
 
-// applyRefreshedData sets refreshed data and returns a panic from the variable
-// parser, or any other code SetData calls, as an error.
 func (c *Context) applyRefreshedData(data jsonmodels.ContextData) (diagnostics []bufferedEvent, panicErr error) {
 	var buffer = &diagnosticBuffer{}
 	defer func() {
@@ -1006,8 +1002,6 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 
 	c.ClearRefreshTimer()
 
-	// Send what is queued. The publish is registered in inflight_ in the same
-	// critical section that drains the queue.
 	c.Flush()
 
 	var failureLock sync.Mutex
@@ -1287,8 +1281,6 @@ func (c *Context) CheckReady(expectNotClosed bool) error {
 	return nil
 }
 
-// SetData sets the experiment data and then reports what it found while
-// parsing (malformed configs and custom fields) to the event logger.
 func (c *Context) SetData(data jsonmodels.ContextData) {
 	var buffer = &diagnosticBuffer{}
 	c.setData(data, buffer)
@@ -1329,8 +1321,6 @@ func (c *Context) dispatchDiagnostics(events []bufferedEvent) {
 	}
 }
 
-// setData does the work of SetData. Parse diagnostics go to buffer instead of
-// the event logger.
 func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer) {
 	var self = c.snapshot()
 	self.EventLogger_ = buffer
@@ -1349,9 +1339,6 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 			if len(variant.Config) > 0 {
 				var variables = c.VariableParser_.Parse(self, experiment.Name, variant.Name, variant.Config)
 				for key := range variables {
-					// Keep a list of experiments per variable key (matching the
-					// canonical SDKs). Guard against adding the same experiment
-					// twice when multiple variants define the same key.
 					var existing = indexVariables[key]
 					var already = false
 					for _, e := range existing {

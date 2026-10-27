@@ -97,7 +97,6 @@ var variableExperiments = map[string]string{
 	"show-modal":    "exp_test_new",
 }
 
-// GetVariableKeys returns a list of experiment names per variable key.
 var variableExperimentKeys = map[string][]string{
 	"banner.border": {"exp_test_ab"},
 	"banner.size":   {"exp_test_ab"},
