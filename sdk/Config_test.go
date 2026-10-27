@@ -38,9 +38,6 @@ func TestInvalidEndpoint(t *testing.T) {
 }
 
 func TestMissingRequiredConfig(t *testing.T) {
-	statusCode = 200
-	status = "OK"
-	bodyString = "{}"
 
 	t.Run("missing API key", func(t *testing.T) {
 		var config = ClientConfig{

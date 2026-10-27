@@ -15,11 +15,11 @@ func buildAgainst(t *testing.T, server *httptest.Server, configure func(*ABsmart
 		ApiKey("test-api-key").
 		Application("website").
 		Environment("development")
-	sdk, err := configure(builder).Build()
+	abs, err := configure(builder).Build()
 	if err != nil {
 		t.Fatalf("Failed to build SDK: %v", err)
 	}
-	return sdk
+	return abs
 }
 
 func contextConfigForTest(session string) ContextConfig {
@@ -36,8 +36,8 @@ func TestBuilderIntegrationContextCreation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	var sdk = buildAgainst(t, server, func(b *ABsmartlyBuilder) *ABsmartlyBuilder { return b })
-	var ctx = sdk.CreateContext(contextConfigForTest("test-session-123"))
+	var abs = buildAgainst(t, server, func(b *ABsmartlyBuilder) *ABsmartlyBuilder { return b })
+	var ctx = abs.CreateContext(contextConfigForTest("test-session-123"))
 	defer ctx.Close()
 	ctx.WaitUntilReady()
 
@@ -53,20 +53,24 @@ func TestBuilderIntegrationContextCreation(t *testing.T) {
 // Retries(n) reaches the HTTP client: a gateway error is retried n times, so the
 // server sees n+1 requests before the context fails.
 func TestBuilderIntegrationRetries(t *testing.T) {
-	var requests int32
-	var server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&requests, 1)
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer server.Close()
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var requests int32
+			var server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&requests, 1)
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
 
-	var sdk = buildAgainst(t, server, func(b *ABsmartlyBuilder) *ABsmartlyBuilder { return b.Retries(2) })
-	var ctx = sdk.CreateContext(contextConfigForTest("test-session-456"))
-	defer ctx.Close()
-	ctx.WaitUntilReady()
+			var abs = buildAgainst(t, server, func(b *ABsmartlyBuilder) *ABsmartlyBuilder { return b.Retries(2) })
+			var ctx = abs.CreateContext(contextConfigForTest("test-session-456"))
+			defer ctx.Close()
+			ctx.WaitUntilReady()
 
-	assertAny(true, ctx.IsFailed(), t)
-	assertAny(int32(3), atomic.LoadInt32(&requests), t)
+			assertAny(true, ctx.IsFailed(), t)
+			assertAny(int32(3), atomic.LoadInt32(&requests), t)
+		})
+	}
 }
 
 // Timeout(d) reaches the HTTP client: a response slower than the default
@@ -81,20 +85,20 @@ func TestBuilderIntegrationTimeout(t *testing.T) {
 	defer server.Close()
 
 	t.Run("raised timeout lets a slow response through", func(t *testing.T) {
-		var sdk = buildAgainst(t, server, func(b *ABsmartlyBuilder) *ABsmartlyBuilder {
+		var abs = buildAgainst(t, server, func(b *ABsmartlyBuilder) *ABsmartlyBuilder {
 			return b.Timeout(5 * time.Second).Retries(0)
 		})
-		var ctx = sdk.CreateContext(contextConfigForTest("slow-ok"))
+		var ctx = abs.CreateContext(contextConfigForTest("slow-ok"))
 		defer ctx.Close()
 		ctx.WaitUntilReady()
 		assertAny(false, ctx.IsFailed(), t)
 	})
 
 	t.Run("lowered timeout fails a slow response", func(t *testing.T) {
-		var sdk = buildAgainst(t, server, func(b *ABsmartlyBuilder) *ABsmartlyBuilder {
+		var abs = buildAgainst(t, server, func(b *ABsmartlyBuilder) *ABsmartlyBuilder {
 			return b.Timeout(200 * time.Millisecond).Retries(0)
 		})
-		var ctx = sdk.CreateContext(contextConfigForTest("slow-fail"))
+		var ctx = abs.CreateContext(contextConfigForTest("slow-fail"))
 		defer ctx.Close()
 		ctx.WaitUntilReady()
 		assertAny(true, ctx.IsFailed(), t)

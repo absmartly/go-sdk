@@ -11,9 +11,8 @@ type VariableParser interface {
 //
 // When the configured VariableParser implements this interface, Context uses it
 // for "json" custom fields and reports a returned error through the event
-// logger only when the field is read with GetCustomFieldValue. A parser that
-// does not implement it keeps the previous behaviour: Parse is called and its
-// map result is stored.
+// logger only when the field is read with GetCustomFieldValue. Other parsers use
+// Parse and store its map result.
 type CustomFieldValueParser interface {
 	ParseCustomFieldValue(context Context, experimentName string, fieldName string, value string) (interface{}, error)
 }

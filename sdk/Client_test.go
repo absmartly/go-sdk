@@ -7,7 +7,6 @@ import (
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 	"github.com/go-resty/resty/v2"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -24,60 +23,45 @@ func (d DeserMock) Deserialize(bytes []byte) (jsonmodels.ContextData, error) {
 }
 
 type HttpMock struct {
+	statusCode int
+	status     string
+	bodyString string
 }
 
-var statusCode = 200
-var status = "OK"
-var bodyString = "{}"
+func (h HttpMock) response() *resty.Response {
+	if h.statusCode == 0 {
+		h.statusCode = 200
+	}
+	if h.status == "" {
+		h.status = "OK"
+	}
+	return &resty.Response{Request: &resty.Request{}, RawResponse: &http.Response{StatusCode: h.statusCode, Status: h.status, Body: io.NopCloser(strings.NewReader(h.bodyString))}}
+}
 
 func (h HttpMock) Get(url string, query map[string]string, headers map[string]string) *future.Future {
 	fut := future.Call(func() (future.Value, error) {
-		return &resty.Response{
-			Request: &resty.Request{},
-			RawResponse: &http.Response{
-				StatusCode: statusCode,
-				Status:     status,
-				Body:       ioutil.NopCloser(strings.NewReader(bodyString)),
-			},
-		}, nil
+		return h.response(), nil
 	})
 	return fut
 }
 
 func (h HttpMock) Put(url string, query map[string]string, headers map[string]string, body []byte) *future.Future {
 	fut := future.Call(func() (future.Value, error) {
-		return &resty.Response{
-			Request: &resty.Request{},
-			RawResponse: &http.Response{
-				StatusCode: statusCode,
-				Status:     status,
-				Body:       ioutil.NopCloser(strings.NewReader(bodyString)),
-			},
-		}, nil
+		return h.response(), nil
 	})
 	return fut
 }
 func (h HttpMock) Post(url string, query map[string]string, headers map[string]string, body []byte) *future.Future {
 	fut := future.Call(func() (future.Value, error) {
-		return &resty.Response{
-			Request: &resty.Request{},
-			RawResponse: &http.Response{
-				StatusCode: statusCode,
-				Status:     status,
-				Body:       ioutil.NopCloser(strings.NewReader(bodyString)),
-			},
-		}, nil
+		return h.response(), nil
 	})
 	return fut
 }
 
 func TestGetContextData(t *testing.T) {
 
-	statusCode = 200
-	status = "OK"
-	bodyString = "{}"
 	var config = ClientConfig{Deserializer_: DeserMock{}, Endpoint_: "https://localhost/v1", ApiKey_: "test-api-key", Application_: "website", Environment_: "dev"}
-	var client = CreateClient(config, HttpMock{})
+	var client = CreateClient(config, HttpMock{statusCode: 200, status: "OK", bodyString: "{}"})
 	var expected = jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{{}}}
 	var actual, err = client.GetContextData().Get(context.Background())
 	assertAny(nil, err, t)
@@ -87,23 +71,19 @@ func TestGetContextData(t *testing.T) {
 
 func TestGetContextDataExceptionallyHTTP(t *testing.T) {
 
-	statusCode = 500
-	status = "Internal Server Error"
 	var config = ClientConfig{Deserializer_: DeserMock{}, Endpoint_: "https://localhost/v1", ApiKey_: "test-api-key", Application_: "website", Environment_: "dev"}
-	var client = CreateClient(config, HttpMock{})
+	var client = CreateClient(config, HttpMock{statusCode: 500, status: "Internal Server Error", bodyString: "{}"})
 	var actual, err = client.GetContextData().Get(context.Background())
 	assertAny(nil, actual, t)
-	assertAny(errors.New(status), err, t)
+	assertAny(errors.New("Internal Server Error"), err, t)
 }
 
 func TestPublish(t *testing.T) {
 
 	var event = jsonmodels.PublishEvent{}
-	statusCode = 200
-	status = "OK"
-	bodyString = "test"
+
 	var config = ClientConfig{Deserializer_: DeserMock{}, Endpoint_: "https://localhost/v1", ApiKey_: "test-api-key", Application_: "website", Environment_: "dev"}
-	var client = CreateClient(config, HttpMock{})
+	var client = CreateClient(config, HttpMock{statusCode: 200, status: "OK", bodyString: "test"})
 	var actual, err = client.Publish(event).Get(context.Background())
 	assertAny(nil, err, t)
 	buf := new(strings.Builder)
@@ -117,13 +97,11 @@ func TestPublish(t *testing.T) {
 func TestPublishExceptionally(t *testing.T) {
 
 	var event = jsonmodels.PublishEvent{}
-	statusCode = 500
-	status = "Internal Server Error"
-	bodyString = "test"
+
 	var config = ClientConfig{Deserializer_: DeserMock{}, Endpoint_: "https://localhost/v1", ApiKey_: "test-api-key", Application_: "website", Environment_: "dev"}
-	var client = CreateClient(config, HttpMock{})
+	var client = CreateClient(config, HttpMock{statusCode: 500, status: "Internal Server Error", bodyString: "test"})
 	var actual, err = client.Publish(event).Get(context.Background())
-	assertAny(errors.New(status), err, t)
+	assertAny(errors.New("Internal Server Error"), err, t)
 	assertAny(nil, actual, t)
 
 }
@@ -146,7 +124,7 @@ func (h HttpMockWithTimeout) Get(url string, query map[string]string, headers ma
 			RawResponse: &http.Response{
 				StatusCode: 200,
 				Status:     "OK",
-				Body:       ioutil.NopCloser(strings.NewReader("{}")),
+				Body:       io.NopCloser(strings.NewReader("{}")),
 			},
 		}, nil
 	})
@@ -160,7 +138,7 @@ func (h HttpMockWithTimeout) Put(url string, query map[string]string, headers ma
 			RawResponse: &http.Response{
 				StatusCode: 200,
 				Status:     "OK",
-				Body:       ioutil.NopCloser(strings.NewReader("{}")),
+				Body:       io.NopCloser(strings.NewReader("{}")),
 			},
 		}, nil
 	})
@@ -174,7 +152,7 @@ func (h HttpMockWithTimeout) Post(url string, query map[string]string, headers m
 			RawResponse: &http.Response{
 				StatusCode: 200,
 				Status:     "OK",
-				Body:       ioutil.NopCloser(strings.NewReader("{}")),
+				Body:       io.NopCloser(strings.NewReader("{}")),
 			},
 		}, nil
 	})
@@ -214,7 +192,7 @@ func (h HttpMock4xx) Get(url string, query map[string]string, headers map[string
 			RawResponse: &http.Response{
 				StatusCode: h.statusCode,
 				Status:     h.status,
-				Body:       ioutil.NopCloser(strings.NewReader(`{"error": "forbidden"}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"error": "forbidden"}`)),
 			},
 		}, nil
 	})
@@ -227,7 +205,7 @@ func (h HttpMock4xx) Put(url string, query map[string]string, headers map[string
 			RawResponse: &http.Response{
 				StatusCode: h.statusCode,
 				Status:     h.status,
-				Body:       ioutil.NopCloser(strings.NewReader(`{"error": "forbidden"}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"error": "forbidden"}`)),
 			},
 		}, nil
 	})
@@ -240,7 +218,7 @@ func (h HttpMock4xx) Post(url string, query map[string]string, headers map[strin
 			RawResponse: &http.Response{
 				StatusCode: h.statusCode,
 				Status:     h.status,
-				Body:       ioutil.NopCloser(strings.NewReader(`{"error": "forbidden"}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"error": "forbidden"}`)),
 			},
 		}, nil
 	})
@@ -371,7 +349,7 @@ func (h HttpMockNetworkErrorWithResponse) Get(url string, query map[string]strin
 			RawResponse: &http.Response{
 				StatusCode: 0,
 				Status:     h.errorMsg,
-				Body:       ioutil.NopCloser(strings.NewReader("")),
+				Body:       io.NopCloser(strings.NewReader("")),
 			},
 		}, errors.New(h.errorMsg)
 	})
@@ -384,7 +362,7 @@ func (h HttpMockNetworkErrorWithResponse) Put(url string, query map[string]strin
 			RawResponse: &http.Response{
 				StatusCode: 0,
 				Status:     h.errorMsg,
-				Body:       ioutil.NopCloser(strings.NewReader("")),
+				Body:       io.NopCloser(strings.NewReader("")),
 			},
 		}, errors.New(h.errorMsg)
 	})
@@ -397,7 +375,7 @@ func (h HttpMockNetworkErrorWithResponse) Post(url string, query map[string]stri
 			RawResponse: &http.Response{
 				StatusCode: 0,
 				Status:     h.errorMsg,
-				Body:       ioutil.NopCloser(strings.NewReader("")),
+				Body:       io.NopCloser(strings.NewReader("")),
 			},
 		}, errors.New(h.errorMsg)
 	})
@@ -432,7 +410,7 @@ func (h HttpMockRateLimited) Get(url string, query map[string]string, headers ma
 		resp := &http.Response{
 			StatusCode: 429,
 			Status:     "Too Many Requests",
-			Body:       ioutil.NopCloser(strings.NewReader(`{"error": "rate limited"}`)),
+			Body:       io.NopCloser(strings.NewReader(`{"error": "rate limited"}`)),
 			Header:     make(http.Header),
 		}
 		if h.retryAfter != "" {
@@ -450,7 +428,7 @@ func (h HttpMockRateLimited) Put(url string, query map[string]string, headers ma
 		resp := &http.Response{
 			StatusCode: 429,
 			Status:     "Too Many Requests",
-			Body:       ioutil.NopCloser(strings.NewReader(`{"error": "rate limited"}`)),
+			Body:       io.NopCloser(strings.NewReader(`{"error": "rate limited"}`)),
 			Header:     make(http.Header),
 		}
 		if h.retryAfter != "" {
@@ -468,7 +446,7 @@ func (h HttpMockRateLimited) Post(url string, query map[string]string, headers m
 		resp := &http.Response{
 			StatusCode: 429,
 			Status:     "Too Many Requests",
-			Body:       ioutil.NopCloser(strings.NewReader(`{"error": "rate limited"}`)),
+			Body:       io.NopCloser(strings.NewReader(`{"error": "rate limited"}`)),
 			Header:     make(http.Header),
 		}
 		if h.retryAfter != "" {

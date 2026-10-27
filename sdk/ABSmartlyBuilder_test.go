@@ -206,8 +206,8 @@ func TestBuilderFluentInterface(t *testing.T) {
 
 func TestBuilderWithAllCustomComponents(t *testing.T) {
 	logger := &CustomEventLogger{}
-	parser := DefaultVariableParser{}
-	deserializer := DefaultAudienceDeserializer{}
+	parser := &DefaultVariableParser{}
+	deserializer := &DefaultAudienceDeserializer{}
 
 	sdk, err := NewBuilder().
 		Endpoint("https://sandbox.absmartly.io/v1").
@@ -227,12 +227,12 @@ func TestBuilderWithAllCustomComponents(t *testing.T) {
 		t.Error("Expected custom logger to be set")
 	}
 
-	if sdk.VariableParser_ == nil {
-		t.Error("Expected custom variable parser to be set")
+	if sdk.VariableParser_ != parser {
+		t.Error("Expected custom variable parser identity to be preserved")
 	}
 
-	if sdk.AudienceDeserializer_ == nil {
-		t.Error("Expected custom audience deserializer to be set")
+	if sdk.AudienceDeserializer_ != deserializer {
+		t.Error("Expected custom audience deserializer identity to be preserved")
 	}
 }
 

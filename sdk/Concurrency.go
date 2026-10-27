@@ -15,14 +15,13 @@ func ComputeIfAbsentRW(lock *sync.RWMutex, needlock bool, maps map[interface{}]i
 		lock.RUnlock()
 
 		lock.Lock()
+		defer lock.Unlock()
 		value, exist = maps[key]
 		if exist {
-			lock.Unlock()
 			return value
 		}
 		var newValue = computer.Apply(key)
 		maps[key] = newValue
-		lock.Unlock()
 		return newValue
 	} else {
 		var value, exist = maps[key]
@@ -55,6 +54,7 @@ func PutRW(lock *sync.RWMutex, maps map[interface{}]interface{}, key interface{}
 	return value
 }
 
+// AddRW appends under lock. The caller must assign the returned slice header.
 func AddRW(lock *sync.RWMutex, list []interface{}, value interface{}) interface{} {
 	lock.Lock()
 	list = append(list, value)

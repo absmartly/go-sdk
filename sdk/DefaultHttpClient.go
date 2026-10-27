@@ -18,22 +18,13 @@ type Logger struct {
 	resty.Logger
 }
 
-func (l Logger) Errorf(format string, v ...interface{}) {
-	// Note: resty logs HTTP-level errors (connection failures, DNS issues, etc.)
-	// These are already propagated as errors from the HTTP client methods
-	// Logging them here would be duplicate. SDK users should handle errors from
-	// GetContextData/Publish or use ContextEventLogger for application-level logging.
-}
+// Logger is the default silent Resty logger. Set DefaultHttpClientConfig.Logger
+// to receive Resty retry and transport diagnostics.
+func (l Logger) Errorf(format string, v ...interface{}) {}
 
-func (l Logger) Warnf(format string, v ...interface{}) {
-	// Note: resty warnings (retries, redirects) are informational only.
-	// Critical errors are still returned as errors from HTTP methods.
-}
+func (l Logger) Warnf(format string, v ...interface{}) {}
 
-func (l Logger) Debugf(format string, v ...interface{}) {
-	// Debug logs from resty (request/response details) are not needed in production.
-	// Enable resty debug mode separately if detailed HTTP tracing is needed.
-}
+func (l Logger) Debugf(format string, v ...interface{}) {}
 
 func CreateDefaultHttpClient() DefaultHttpClient {
 	return DefaultHttpClient{httpClient_: resty.New()}

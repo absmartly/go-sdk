@@ -687,9 +687,7 @@ func TestRejectedExposureIsQueuedAfterFailedClose(t *testing.T) {
 	assertAny(1, len(ctx.Exposures_), t)
 }
 
-// A parse diagnostic must not wait on the load that reports it. A logger that
-// calls Refresh from its Error callback while a refresh is parsing malformed
-// data used to wait on that very refresh.
+// A parse diagnostic must not wait on the load that reports it.
 func TestParseDiagnosticLoggerCallingRefreshDoesNotSelfWait(t *testing.T) {
 	var malformed = jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{{
 		Id: 1, Name: "bad_config", UnitType: "session_id", Split: []float64{0.5, 0.5}, TrafficSplit: []float64{0, 1},

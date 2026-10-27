@@ -30,7 +30,6 @@ func DigestOffset(key []int8, offset int, length int, seed int) int {
 	case 1:
 		hash ^= scramble32(GetUInt8(key, i))
 	case 0:
-	default:
 	}
 	hash ^= length
 	hash = fmix32(hash)

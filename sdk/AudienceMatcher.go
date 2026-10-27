@@ -29,10 +29,6 @@ func (am AudienceMatcher) Evaluate(audience string, attributes map[string]interf
 	}
 
 	var filter = result["filter"]
-	if filter == nil {
-		return Result{}, errors.New("can't evaluate data")
-	}
-
 	var kind = reflect.ValueOf(filter).Kind()
 	if kind == reflect.Map || kind == reflect.Slice || kind == reflect.Array {
 		return CreateResult(jsonexpr.EvaluateBooleanExpr(filter, attributes)), nil

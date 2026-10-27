@@ -7,8 +7,8 @@ import (
 )
 
 type ABsmartly struct {
-	ContextDataProvider_  ContextDataProvider
-	ContextPublisher_     ContextEventHandler
+	ContextDataProvider_ ContextDataProvider
+	ContextPublisher_    ContextEventHandler
 	// Deprecated: Use ContextPublisher_ instead.
 	ContextEventHandler_  ContextEventHandler
 	ContextEventLogger_   ContextEventLogger

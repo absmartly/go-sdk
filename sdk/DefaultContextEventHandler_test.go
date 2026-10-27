@@ -120,8 +120,8 @@ func (c *ClientMockWithRetry) Publish(event jsonmodels.PublishEvent) *future.Fut
 	})
 }
 
-func TestPublisherRetryLogic(t *testing.T) {
-	client := &ClientMockWithRetry{attempts: 0, maxFailures: 2}
+func TestPublisherTransientFailureThenSuccess(t *testing.T) {
+	client := &ClientMockWithRetry{attempts: 0, maxFailures: 1}
 	var ctx = Context{}
 	var event = jsonmodels.PublishEvent{}
 	var eventHandler = DefaultContextEventHandler{client_: client}
@@ -131,7 +131,6 @@ func TestPublisherRetryLogic(t *testing.T) {
 		t.Errorf("Expected the first attempt to fail while failures remain")
 	}
 
-	atomic.StoreInt32(&client.attempts, 2)
 	_, err = eventHandler.Publish(ctx, event).Get(context2.Background())
 	if err != nil {
 		t.Errorf("Expected success after failures exhausted, got: %v", err)

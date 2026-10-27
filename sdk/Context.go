@@ -970,13 +970,13 @@ func (c *Context) Refresh() {
 }
 
 func (c *Context) CloseAsync() (*future.Future, error) {
-	closing, _, err := c.live().closeAttempt()
-	return closing, err
+	closing, _ := c.live().closeAttempt()
+	return closing, nil
 }
 
 // closeAttempt starts or joins a close and returns that attempt's close and
 // finalization futures together, so a later retry cannot replace them.
-func (c *Context) closeAttempt() (*future.Future, *future.Future, error) {
+func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 	// Claim the close and publish its future in one critical section, so a
 	// concurrent caller that sees the context closing also gets the future of
 	// the close that is running.
@@ -990,12 +990,12 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future, error) {
 			resolve(nil, nil)
 			existingFinalized = resolved
 		}
-		if existing != nil {
-			return existing, existingFinalized, nil
+		if existing == nil {
+			var resolved, resolve = future.New()
+			resolve(nil, nil)
+			existing = resolved
 		}
-		var resolved, resolve = future.New()
-		resolve(nil, nil)
-		return resolved, existingFinalized, nil
+		return existing, existingFinalized
 	}
 	c.Closing_.Store(true)
 	var tempFuture, done = future.New()
@@ -1086,7 +1086,7 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future, error) {
 		done(nil, nil)
 	}
 	settle()
-	return tempFuture, finalized, nil
+	return tempFuture, finalized
 }
 
 // FinalizeAsync closes the context and waits for publish/error and finalize
@@ -1094,10 +1094,7 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future, error) {
 // barrier. Do not wait on it from a logger; loggers may re-enter Close instead.
 func (c *Context) FinalizeAsync() (*future.Future, error) {
 	c = c.live()
-	_, finalized, err := c.closeAttempt()
-	if err != nil {
-		return nil, err
-	}
+	_, finalized := c.closeAttempt()
 	return finalized, nil
 }
 
@@ -1112,7 +1109,6 @@ func (c *Context) waitPublishLogs() {
 
 func (c *Context) Close() {
 	c = c.live()
-	c.ClearRefreshTimer()
 	var fut, err = c.CloseAsync()
 	if err == nil {
 		fut.Join(context.Background())
@@ -1144,9 +1140,6 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 			}
 		}
 	}
-	c.ContextLock_.Unlock()
-	// cache miss or out-dated
-	c.ContextLock_.Lock()
 
 	var custom, cfound = c.Cassignments_[experimentName]
 	var override, ofound = c.Overrides_[experimentName]
@@ -1499,100 +1492,94 @@ func (c *Context) Flush() *future.Future {
 		// Read the count under EventLock_: a Track or exposure that passed its
 		// closed check before Close began appends under this lock, and must be
 		// drained by this flush rather than left queued behind it.
-		{
-			var eventCount int32
+		var eventCount int32
 
-			c.EventLock_.Lock()
-			eventCount = c.PendingCount_.Load().(int32)
-			var exposures = make([]jsonmodels.Exposure, len(c.Exposures_))
-			var achievements = make([]jsonmodels.GoalAchievement, len(c.Achievements_))
-			// settled is the future Close waits on. It settles before the event
-			// logger runs, so a logger that calls Close cannot wait on its own
-			// publish. result is the future callers get; it settles after the
-			// logger has run.
-			var settled, settledDone = future.New()
-			var result, done = future.New()
+		c.EventLock_.Lock()
+		eventCount = c.PendingCount_.Load().(int32)
+		var exposures = make([]jsonmodels.Exposure, len(c.Exposures_))
+		var achievements = make([]jsonmodels.GoalAchievement, len(c.Achievements_))
+		// Close waits on transport settlement independently of logger delivery.
+		// Publish callers wait on result, which includes logger delivery.
+		var settled, settledDone = future.New()
+		var result, done = future.New()
 
-			if eventCount > 0 {
-				if len(c.Exposures_) > 0 {
-					copy(exposures, c.Exposures_)
-					c.Exposures_ = make([]jsonmodels.Exposure, 0)
-				}
-
-				if len(c.Achievements_) > 0 {
-					copy(achievements, c.Achievements_)
-					c.Achievements_ = nil
-				}
-
-				c.PendingCount_.Store(int32(0))
-				// Register the publish in the same critical section that drains
-				// the queue, so CloseAsync cannot miss it.
-				c.addInflight(settled)
-				c.StateLock_.Lock()
-				var activeLogs []*future.Future
-				for _, f := range c.publishLogs_ {
-					if !f.Ready() {
-						activeLogs = append(activeLogs, f)
-					}
-				}
-				c.publishLogs_ = append(activeLogs, result)
-				c.StateLock_.Unlock()
+		if eventCount > 0 {
+			if len(c.Exposures_) > 0 {
+				copy(exposures, c.Exposures_)
+				c.Exposures_ = make([]jsonmodels.Exposure, 0)
 			}
-			c.EventLock_.Unlock()
 
-			if eventCount > 0 {
-				var event = jsonmodels.PublishEvent{}
-				event.Hashed = true
-				event.PublishedAt = c.Clock_.Millis()
-
-				c.ContextLock_.Lock()
-				var entrySet []interface{}
-				for key, value := range c.Units_ {
-					entrySet = append(entrySet, Pair{a: key, b: value})
-				}
-
-				var mapper = FlushMapper{Context: c}
-				var temp = MapSetToArray(entrySet, make([]interface{}, 0), mapper)
-				event.Units = make([]jsonmodels.Unit, 0)
-				for _, value := range temp {
-					event.Units = append(event.Units, value.(jsonmodels.Unit))
-				}
-				if len(c.Attributes_) == 0 {
-					event.Attributes = make([]jsonmodels.Attribute, 0)
-				} else {
-					event.Attributes = make([]jsonmodels.Attribute, len(c.Attributes_))
-					for key, value := range c.Attributes_ {
-						event.Attributes[key] = value.(jsonmodels.Attribute)
-					}
-				}
-				c.ContextLock_.Unlock()
-				event.Goals = achievements
-				event.Exposures = exposures
-
-				c.callPublisher(event).Listen(
-					func(value future.Value, err error) {
-						// The publisher may return a future that is already complete,
-						// which runs this callback on the caller's stack, for example
-						// inside CloseAsync. Run the logger and settle the caller's
-						// future on their own goroutine, so a logger that calls Close
-						// cannot block the call that started the publish.
-						if err == nil {
-							// Start the logger first: settledDone runs Close's listeners
-							// synchronously, and a panic there must not leave the
-							// caller's future unsettled.
-							runLogger(done, nil, func() error { return c.logEvent(Publish, event) })
-							c.removeInflight(settled)
-							settledDone(nil, nil)
-						} else {
-							c.requeueEvents(exposures, achievements, eventCount)
-							runLogger(done, err, func() error { return c.logEvent(Error, err) })
-							c.removeInflight(settled)
-							settledDone(nil, err)
-						}
-					})
-
-				return result
+			if len(c.Achievements_) > 0 {
+				copy(achievements, c.Achievements_)
+				c.Achievements_ = nil
 			}
+
+			c.PendingCount_.Store(int32(0))
+			// Register the publish in the same critical section that drains
+			// the queue, so CloseAsync cannot miss it.
+			c.addInflight(settled)
+			c.StateLock_.Lock()
+			var activeLogs []*future.Future
+			for _, f := range c.publishLogs_ {
+				if !f.Ready() {
+					activeLogs = append(activeLogs, f)
+				}
+			}
+			c.publishLogs_ = append(activeLogs, result)
+			c.StateLock_.Unlock()
+		}
+		c.EventLock_.Unlock()
+
+		if eventCount > 0 {
+			var event = jsonmodels.PublishEvent{}
+			event.Hashed = true
+			event.PublishedAt = c.Clock_.Millis()
+
+			c.ContextLock_.Lock()
+			var entrySet []interface{}
+			for key, value := range c.Units_ {
+				entrySet = append(entrySet, Pair{a: key, b: value})
+			}
+
+			var mapper = FlushMapper{Context: c}
+			var temp = MapSetToArray(entrySet, make([]interface{}, 0), mapper)
+			event.Units = make([]jsonmodels.Unit, 0)
+			for _, value := range temp {
+				event.Units = append(event.Units, value.(jsonmodels.Unit))
+			}
+			if len(c.Attributes_) == 0 {
+				event.Attributes = make([]jsonmodels.Attribute, 0)
+			} else {
+				event.Attributes = make([]jsonmodels.Attribute, len(c.Attributes_))
+				for key, value := range c.Attributes_ {
+					event.Attributes[key] = value.(jsonmodels.Attribute)
+				}
+			}
+			c.ContextLock_.Unlock()
+			event.Goals = achievements
+			event.Exposures = exposures
+
+			c.callPublisher(event).Listen(
+				func(value future.Value, err error) {
+					// The publisher may return a future that is already complete,
+					// which runs this callback on the caller's stack, for example
+					// inside CloseAsync. Run the logger and settle the caller's
+					// future on their own goroutine, so a logger that calls Close
+					// cannot block the call that started the publish.
+					if err == nil {
+						// Start the logger first: settledDone runs Close's listeners
+						// synchronously, and a panic there must not leave the
+						// caller's future unsettled.
+						runLogger(done, nil, func() error { return c.logEvent(Publish, event) })
+					} else {
+						c.requeueEvents(exposures, achievements, eventCount)
+						runLogger(done, err, func() error { return c.logEvent(Error, err) })
+					}
+					c.removeInflight(settled)
+					settledDone(nil, err)
+				})
+
+			return result
 		}
 	} else {
 		c.EventLock_.Lock()
@@ -1743,20 +1730,18 @@ func (c *Context) ClearTimeout() {
 func (c *Context) SetTimeout() {
 	c = c.live()
 	if c.IsReady() {
-		{
-			c.TimeoutLock_.Lock()
-			if c.Timeout_ == nil && c.PublishDelay_ >= 0 {
-				var delay = uint64(c.PublishDelay_ * int64(time.Millisecond))
-				if delay < 1 {
-					delay = 1
-				}
-
-				c.Timeout_ = time.AfterFunc(time.Duration(delay), func() {
-					c.Flush()
-				})
+		c.TimeoutLock_.Lock()
+		if c.Timeout_ == nil && c.PublishDelay_ >= 0 {
+			var delay = uint64(c.PublishDelay_ * int64(time.Millisecond))
+			if delay < 1 {
+				delay = 1
 			}
-			c.TimeoutLock_.Unlock()
+
+			c.Timeout_ = time.AfterFunc(time.Duration(delay), func() {
+				c.Flush()
+			})
 		}
+		c.TimeoutLock_.Unlock()
 	}
 }
 

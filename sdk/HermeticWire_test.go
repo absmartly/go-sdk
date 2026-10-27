@@ -10,12 +10,7 @@ import (
 	"testing"
 )
 
-// TestHermeticWireContract drives the PUBLIC SDK API against a local
-// httptest.Server so the SDK's REAL HTTP client makes real GET /context
-// (refresh -> ready) and PUT /context (publish) requests. It asserts the
-// wire contract documented in /tmp/absmartly-wire-contract.md.
-//
-// Per the contract, Go sends NO auth headers on GET (auth is via query
+// Go sends NO auth headers on GET (auth is via query
 // params), so API-key headers are only asserted on the PUT.
 func TestHermeticWireContract(t *testing.T) {
 	const (

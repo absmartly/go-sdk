@@ -1,13 +1,12 @@
 package sdk
 
 import (
+	"context"
 	"errors"
 	"github.com/absmartly/go-sdk/sdk/future"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 	"sync"
-	"sync/atomic"
 	"testing"
-	"time"
 )
 
 type MockEventLogger struct {
@@ -25,7 +24,7 @@ type LoggedEvent struct {
 func (m *MockEventLogger) HandleEvent(context Context, eventType EventType, data interface{}) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	atomic.AddInt32(&m.callCount, 1)
+	m.callCount++
 	m.events = append(m.events, LoggedEvent{EventType: eventType, Data: data})
 	if m.shouldFail {
 		panic("intentional logger failure")
@@ -41,14 +40,16 @@ func (m *MockEventLogger) GetEvents() []LoggedEvent {
 }
 
 func (m *MockEventLogger) GetCallCount() int32 {
-	return atomic.LoadInt32(&m.callCount)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.callCount
 }
 
 func (m *MockEventLogger) Reset() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.events = nil
-	atomic.StoreInt32(&m.callCount, 0)
+	m.callCount = 0
 }
 
 type EventLoggerClientMock struct {
@@ -113,8 +114,6 @@ func TestEventLoggerCalledOnReady(t *testing.T) {
 
 	ctx.WaitUntilReady()
 
-	time.Sleep(10 * time.Millisecond)
-
 	events := logger.GetEvents()
 	foundReady := false
 	for _, event := range events {
@@ -133,11 +132,10 @@ func TestEventLoggerCalledOnError(t *testing.T) {
 	logger := &MockEventLogger{}
 
 	dataFuture, done := future.New()
-	_ = createEventLoggerTestContext(logger, dataFuture)
+	ctx := createEventLoggerTestContext(logger, dataFuture)
 
 	done(nil, errors.New("context data fetch failed"))
-
-	time.Sleep(10 * time.Millisecond)
+	ctx.WaitUntilReady()
 
 	events := logger.GetEvents()
 	foundError := false
@@ -180,8 +178,6 @@ func TestEventLoggerCalledOnExposure(t *testing.T) {
 		t.Fatalf("GetTreatment failed: %v", err)
 	}
 
-	time.Sleep(10 * time.Millisecond)
-
 	events := logger.GetEvents()
 	foundExposure := false
 	for _, event := range events {
@@ -222,8 +218,6 @@ func TestEventLoggerCalledOnGoal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Track failed: %v", err)
 	}
-
-	time.Sleep(10 * time.Millisecond)
 
 	events := logger.GetEvents()
 	foundGoal := false
@@ -271,8 +265,6 @@ func TestEventLoggerCalledOnPublish(t *testing.T) {
 		t.Fatalf("Publish failed: %v", err)
 	}
 
-	time.Sleep(50 * time.Millisecond)
-
 	events := logger.GetEvents()
 	foundPublish := false
 	for _, event := range events {
@@ -311,8 +303,6 @@ func TestEventLoggerCalledOnRefresh(t *testing.T) {
 
 	ctx.Refresh()
 
-	time.Sleep(50 * time.Millisecond)
-
 	events := logger.GetEvents()
 	foundRefresh := false
 	for _, event := range events {
@@ -346,9 +336,13 @@ func TestEventLoggerCalledOnClose(t *testing.T) {
 
 	logger.Reset()
 
-	ctx.Close()
-
-	time.Sleep(10 * time.Millisecond)
+	finalized, err := ctx.FinalizeAsync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = finalized.Get(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 
 	events := logger.GetEvents()
 	foundClose := false
@@ -372,9 +366,6 @@ func TestEventLoggerErrorInCallback(t *testing.T) {
 	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	config.EventLogger_ = logger
-	// The logger panics while the context is constructed, so the context is never
-	// returned or tracked. A refresh timer would later call the logger and crash
-	// the test binary.
 	config.RefreshInterval_ = 0
 
 	var client = EventLoggerClientMock{}
@@ -384,13 +375,14 @@ func TestEventLoggerErrorInCallback(t *testing.T) {
 	var audienceMatcher = AudienceMatcher{audeser}
 	var clk = FixedClockForTest{millis: 1620000000000}
 
-	defer func() {
-		if r := recover(); r != nil {
-		}
-	}()
+	ctx := createTrackedContext(clk, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
 
-	_ = createTrackedContext(clk, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
-
+	if !ctx.IsReady() {
+		t.Fatal("logger panic prevented readiness")
+	}
+	if err := ctx.Track("after_logger_panic", nil); err != nil {
+		t.Fatal(err)
+	}
 	if logger.GetCallCount() == 0 {
 		t.Errorf("Expected the logger to be called while the context was created")
 	}

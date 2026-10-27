@@ -6,20 +6,20 @@ import (
 )
 
 type ABsmartlyBuilder struct {
-	endpoint_              string
-	apiKey_                string
-	application_           string
-	environment_           string
-	timeout_               *time.Duration
-	retries_               *int
-	contextDataProvider_   ContextDataProvider
-	contextEventHandler_   ContextEventHandler
-	contextEventLogger_    ContextEventLogger
-	variableParser_        VariableParser
-	audienceDeserializer_  AudienceDeserializer
-	deserializer_          ContextDataDeserializer
-	serializer_            ContextEventSerializer
-	httpClient_            HTTPClient
+	endpoint_             string
+	apiKey_               string
+	application_          string
+	environment_          string
+	timeout_              *time.Duration
+	retries_              *int
+	contextDataProvider_  ContextDataProvider
+	contextEventHandler_  ContextEventHandler
+	contextEventLogger_   ContextEventLogger
+	variableParser_       VariableParser
+	audienceDeserializer_ AudienceDeserializer
+	deserializer_         ContextDataDeserializer
+	serializer_           ContextEventSerializer
+	httpClient_           HTTPClient
 }
 
 type ABSmartlyBuilder = ABsmartlyBuilder
@@ -118,11 +118,9 @@ func (b *ABsmartlyBuilder) Build() (ABsmartly, error) {
 		Serializer_:   b.serializer_,
 	}
 
-	var client ClientI
-	if b.httpClient_ != nil {
-		client = CreateClient(clientConfig, b.httpClient_)
-	} else {
-		var httpClient = CreateDefaultHttpClient()
+	httpClient := b.httpClient_
+	if httpClient == nil {
+		var defaultClient = CreateDefaultHttpClient()
 
 		httpClientConfig := CreateDefaultHttpClientConfig()
 		if b.timeout_ != nil {
@@ -133,9 +131,10 @@ func (b *ABsmartlyBuilder) Build() (ABsmartly, error) {
 			httpClientConfig.MaxRetries_ = *b.retries_
 		}
 
-		httpClient.DefaultHttpClientConfig(httpClientConfig)
-		client = CreateClient(clientConfig, httpClient)
+		defaultClient.DefaultHttpClientConfig(httpClientConfig)
+		httpClient = defaultClient
 	}
+	client := CreateClient(clientConfig, httpClient)
 
 	sdkConfig := ABsmartlyConfig{
 		Client_:               client,

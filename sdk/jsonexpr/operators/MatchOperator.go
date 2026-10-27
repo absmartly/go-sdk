@@ -6,6 +6,8 @@ import (
 	"regexp"
 )
 
+const maxPatternBytes = 1000
+
 type MatchOperator struct {
 	BinaryOperator
 }
@@ -15,7 +17,7 @@ func (v MatchOperator) Binary(evaluator eval.Evaluator, lhs interface{}, rhs int
 	if lerror == nil {
 		var pattern, rerror = evaluator.StringConvert(reflect.ValueOf(rhs))
 		if rerror == nil {
-			if len(pattern) > 1000 {
+			if len(pattern) > maxPatternBytes {
 				return nil
 			}
 			regex, regerror := regexp.Compile(pattern)
