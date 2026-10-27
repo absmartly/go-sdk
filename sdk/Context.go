@@ -1496,7 +1496,10 @@ func (c *Context) Flush() *future.Future {
 	c.ClearTimeout()
 
 	if !c.Failed_.Load().(bool) {
-		if c.PendingCount_.Load().(int32) > 0 {
+		// Read the count under EventLock_: a Track or exposure that passed its
+		// closed check before Close began appends under this lock, and must be
+		// drained by this flush rather than left queued behind it.
+		{
 			var eventCount int32
 
 			c.EventLock_.Lock()
