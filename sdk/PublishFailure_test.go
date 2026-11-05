@@ -298,8 +298,8 @@ func TestFailedCloseDoesNotRestartRefreshTimer(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	assertAny(before, atomic.LoadInt32(&provider.calls), t)
 
-	// An explicit Refresh still works but does not re-arm the timer either.
 	ctx.Refresh()
+	assertAny(before+1, atomic.LoadInt32(&provider.calls), t)
 	ctx.StateLock_.Lock()
 	var timer = ctx.RefreshTimer_
 	ctx.StateLock_.Unlock()
@@ -861,7 +861,6 @@ func TestCloseFromLoggerDoesNotWaitForItself(t *testing.T) {
 				_, _ = ctx.PublishAsync()
 			}
 		}()
-		// The close (or the explicit publish) sends one batch; let it succeed.
 		var deadline = time.Now().Add(2 * time.Second)
 		for publisher.calls() == 0 && time.Now().Before(deadline) {
 			time.Sleep(time.Millisecond)
