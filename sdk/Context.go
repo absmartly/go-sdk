@@ -1131,30 +1131,51 @@ func (c *Context) Close() {
 	}
 }
 
-func (c *Context) GetAssignment(experimentName string) *Assignment {
+// cachedAssignment returns the cached assignment for experimentName if it is
+// still valid, or nil. It only reads, so it may run under ContextLock_ held for
+// reading or writing.
+func (c *Context) cachedAssignment(experimentName string) *Assignment {
+	var assignment, found = c.AssignmentCache[experimentName]
+	if !found {
+		return nil
+	}
+	var custom, cfound = c.Cassignments_[experimentName]
+	var override, ofound = c.Overrides_[experimentName]
+	var experiment, efound = c.GetExperiment(experimentName)
 
-	c.ContextLock_.Lock()
-	if assignment, found := c.AssignmentCache[experimentName]; found {
-		var custom, cfound = c.Cassignments_[experimentName]
-		var override, ofound = c.Overrides_[experimentName]
-		var experiment, efound = c.GetExperiment(experimentName)
-
-		if ofound {
-			if assignment.Overridden && assignment.Variant == override.(int) {
-				c.ContextLock_.Unlock()
-				return assignment
-			}
-		} else if !efound {
-			if !assignment.Assigned {
-				c.ContextLock_.Unlock()
-				return assignment
-			}
-		} else if !cfound || custom.(int) == assignment.Variant {
-			if c.ExperimentMatches(experiment.Data, *assignment) && c.AudienceMatches(experiment.Data, assignment) {
-				c.ContextLock_.Unlock()
-				return assignment
-			}
+	if ofound {
+		if assignment.Overridden && assignment.Variant == override.(int) {
+			return assignment
 		}
+	} else if !efound {
+		if !assignment.Assigned {
+			return assignment
+		}
+	} else if !cfound || custom.(int) == assignment.Variant {
+		if c.ExperimentMatches(experiment.Data, *assignment) && c.AudienceMatches(experiment.Data, assignment) {
+			return assignment
+		}
+	}
+	return nil
+}
+
+func (c *Context) GetAssignment(experimentName string) *Assignment {
+	// A valid cached assignment only needs the read lock, so concurrent reads
+	// of a shared context do not serialise.
+	c.ContextLock_.RLock()
+	if assignment := c.cachedAssignment(experimentName); assignment != nil {
+		c.ContextLock_.RUnlock()
+		return assignment
+	}
+	c.ContextLock_.RUnlock()
+
+	// Cache miss or out of date. Check again under the write lock: another
+	// goroutine may have rebuilt the assignment meanwhile, and replacing it
+	// would lose its exposed flag and queue a second exposure.
+	c.ContextLock_.Lock()
+	if assignment := c.cachedAssignment(experimentName); assignment != nil {
+		c.ContextLock_.Unlock()
+		return assignment
 	}
 
 	var custom, cfound = c.Cassignments_[experimentName]

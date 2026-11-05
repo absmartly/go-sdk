@@ -10,6 +10,7 @@ import (
 	"io/ioutil"
 	"sync"
 	"testing"
+	"time"
 )
 
 type ClientContextMock struct {
@@ -1450,4 +1451,50 @@ func TestClearAssignmentCacheForExperimentIdChange(t *testing.T) {
 func createTrackedContext(clk internal.Clock, config ContextConfig, dataFuture *future.Future, dp ContextDataProvider,
 	eh ContextEventHandler, el ContextEventLogger, vp VariableParser, am AudienceMatcher) *Context {
 	return trackContext(CreateContext(clk, config, dataFuture, dp, eh, el, vp, am))
+}
+
+func TestCachedAssignmentUsesReadLock(t *testing.T) {
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	var context = CreateTestContext(config, dataFutureReady)
+	context.SetAttribute("age", 25)
+
+	want, err := context.PeekTreatment("exp_test_ab")
+	assertAny(nil, err, t)
+
+	// While another reader holds the lock, a cache hit must not wait for the
+	// exclusive lock.
+	context.ContextLock_.RLock()
+	var done = make(chan int, 1)
+	go func() {
+		variant, _ := context.PeekTreatment("exp_test_ab")
+		done <- variant
+	}()
+	select {
+	case got := <-done:
+		context.ContextLock_.RUnlock()
+		assertAny(want, got, t)
+	case <-time.After(2 * time.Second):
+		context.ContextLock_.RUnlock()
+		t.Fatal("cached PeekTreatment waited for the exclusive context lock")
+	}
+}
+
+func TestConcurrentGetTreatmentQueuesOneExposure(t *testing.T) {
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	var context = CreateTestContext(config, dataFutureReady)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = context.GetTreatment("exp_test_ab")
+		}()
+	}
+	wg.Wait()
+	assertAny(int32(1), context.GetPendingCount(), t)
 }
