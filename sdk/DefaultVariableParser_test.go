@@ -153,7 +153,7 @@ func TestGetCustomFieldValueParsesNonObjectJSONValues(t *testing.T) {
 		t.Errorf("reading valid fields logged %d error events, want 0: %#v", len(errs), errs)
 	}
 
-	keys, err := ctx.GetVariableKeys()
+	keys, err := ctx.GetVariableKeysAll()
 	assertAny(nil, err, t)
 	assertAny(map[string][]string{"button.color": {"exp_test_abc"}}, keys, t)
 }

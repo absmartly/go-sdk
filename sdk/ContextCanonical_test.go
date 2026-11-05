@@ -61,7 +61,7 @@ func TestReadsBeforeReadyReturnExactError(t *testing.T) {
 	config.Units_ = units
 	var pending, _ = future.New()
 	var ctx = CreateTestContext(config, pending)
-	const want = "ABsmartly Context is not yet ready."
+	const want = "ABSmartly Context is not yet ready"
 	var check = func(name string, err error) {
 		t.Helper()
 		if err == nil || err.Error() != want {
@@ -98,7 +98,7 @@ func TestCustomFieldValueEAfterFinalize(t *testing.T) {
 	assertAny("US,PT,ES,DE,FR", v, t)
 	ctx.Close()
 	_, err = ctx.GetCustomFieldValueE("exp_test_ab", "country")
-	if err == nil || err.Error() != "ABsmartly Context is finalized." {
+	if err == nil || err.Error() != "ABSmartly Context is closed" {
 		t.Fatalf("got %v", err)
 	}
 }
@@ -1158,7 +1158,7 @@ func TestVariableKeysReturnsAllActiveKeys(t *testing.T) {
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureRefresh)
 
-	var res, err = context.GetVariableKeys()
+	var res, err = context.GetVariableKeysAll()
 	assertAny(nil, err, t)
 	assertAny(variableExperimentKeys, res, t)
 }

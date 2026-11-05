@@ -391,17 +391,17 @@ func TestErrorWhenClosing(t *testing.T) {
 	assertAny(nil, er, t)
 
 	var resErr = context.SetAttribute("attr1", "value1")
-	assertAny("ABsmartly Context is finalizing.", resErr.Error(), t)
+	assertAny("ABSmartly Context is closing", resErr.Error(), t)
 	assertAny(true, context.IsClosing(), t)
 	assertAny(false, context.IsClosed(), t)
 
 	_, resErr = context.GetTreatment("attr1")
-	assertAny("ABsmartly Context is finalizing.", resErr.Error(), t)
+	assertAny("ABSmartly Context is closing", resErr.Error(), t)
 	assertAny(true, context.IsClosing(), t)
 	assertAny(false, context.IsClosed(), t)
 
 	_, resErr = context.PeekVariableValue("attr1", jsonmodels.ContextData{})
-	assertAny("ABsmartly Context is finalizing.", resErr.Error(), t)
+	assertAny("ABSmartly Context is closing", resErr.Error(), t)
 	assertAny(true, context.IsClosing(), t)
 	assertAny(false, context.IsClosed(), t)
 
@@ -431,17 +431,17 @@ func TestErrorWhenClosed(t *testing.T) {
 	context.Close()
 
 	var resErr = context.SetAttribute("attr1", "value1")
-	assertAny("ABsmartly Context is finalized.", resErr.Error(), t)
+	assertAny("ABSmartly Context is closed", resErr.Error(), t)
 	assertAny(false, context.IsClosing(), t)
 	assertAny(true, context.IsClosed(), t)
 
 	_, resErr = context.GetTreatment("attr1")
-	assertAny("ABsmartly Context is finalized.", resErr.Error(), t)
+	assertAny("ABSmartly Context is closed", resErr.Error(), t)
 	assertAny(false, context.IsClosing(), t)
 	assertAny(true, context.IsClosed(), t)
 
 	_, resErr = context.PeekVariableValue("attr1", jsonmodels.ContextData{})
-	assertAny("ABsmartly Context is finalized.", resErr.Error(), t)
+	assertAny("ABSmartly Context is closed", resErr.Error(), t)
 	assertAny(false, context.IsClosing(), t)
 	assertAny(true, context.IsClosed(), t)
 }
@@ -832,10 +832,70 @@ func TestGetVariableKeys(t *testing.T) {
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
 
-	var res, _ = context.GetVariableKeys()
+	var res, _ = context.GetVariableKeysAll()
 	assertAny(variableExperimentKeys, res, t)
 
 	assertAny(int32(0), context.GetPendingCount(), t)
+}
+
+func TestGetVariableKeysKeepsV1Signature(t *testing.T) {
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	var context = CreateTestContext(config, dataFutureRefresh)
+
+	// v1.1.x callers assign the values to string; this must keep compiling.
+	var res map[string]string
+	res, err := context.GetVariableKeys()
+	assertAny(nil, err, t)
+	var want = map[string]string{}
+	for key, names := range variableExperimentKeys {
+		want[key] = names[0]
+	}
+	assertAny(want, res, t)
+	var name string = res["button.color"]
+	assertAny("exp_test_abc", name, t)
+}
+
+func TestGetVariableKeysReturnsFirstExperimentPerKey(t *testing.T) {
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	var context = CreateTestContext(config, dataFutureRefresh)
+
+	context.DataLock.Lock()
+	context.IndexVariables_["shared.key"] = []ExperimentVariables{
+		{Data: jsonmodels.Experiment{Name: "first"}},
+		{Data: jsonmodels.Experiment{Name: "second"}},
+	}
+	context.DataLock.Unlock()
+
+	keys, err := context.GetVariableKeys()
+	assertAny(nil, err, t)
+	assertAny("first", keys["shared.key"], t)
+	all, err := context.GetVariableKeysAll()
+	assertAny(nil, err, t)
+	assertAny([]string{"first", "second"}, all["shared.key"], t)
+}
+
+func TestContextErrorTextsMatchV1(t *testing.T) {
+	assertAny("ABSmartly Context is closed", ErrContextClosed.Error(), t)
+	assertAny("ABSmartly Context is closing", ErrContextClosing.Error(), t)
+	assertAny("ABSmartly Context is not yet ready", ErrContextNotReady.Error(), t)
+
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	var pending, _ = future.New()
+	var notReady = CreateTestContext(config, pending)
+	_, err := notReady.GetTreatment("exp_test_ab")
+	assertAny(true, errors.Is(err, ErrContextNotReady), t)
+
+	var ctx = CreateTestContext(config, dataFutureReady)
+	ctx.Close()
+	_, err = ctx.GetTreatment("exp_test_ab")
+	assertAny(true, errors.Is(err, ErrContextClosed), t)
+	assertAny("ABSmartly Context is closed", err.Error(), t)
 }
 
 func TestGetCustomFieldValueKeys(t *testing.T) {

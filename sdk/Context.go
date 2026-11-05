@@ -679,7 +679,29 @@ func (c *Context) PeekTreatment(experimentName string) (int, error) {
 	return c.GetAssignment(experimentName).Variant, nil
 }
 
-func (c *Context) GetVariableKeys() (map[string][]string, error) {
+// GetVariableKeys returns, for each variable key, the name of the first
+// experiment that defines it. Use GetVariableKeysAll to get every experiment.
+func (c *Context) GetVariableKeys() (map[string]string, error) {
+	var err = c.CheckReady(true)
+	if err != nil {
+		return nil, err
+	}
+
+	var variableKeys = map[string]string{}
+
+	c.DataLock.RLock()
+	for key, experiments := range c.IndexVariables_ {
+		if len(experiments) > 0 {
+			variableKeys[key] = experiments[0].Data.Name
+		}
+	}
+	c.DataLock.RUnlock()
+	return variableKeys, nil
+}
+
+// GetVariableKeysAll returns, for each variable key, the names of all
+// experiments that define it.
+func (c *Context) GetVariableKeysAll() (map[string][]string, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
@@ -1263,18 +1285,27 @@ func (c *Context) AudienceMatches(experiment jsonmodels.Experiment, assignment *
 	return true
 }
 
+// Errors returned by context reads and writes. The texts are the ones
+// v1.1.x returned, so callers comparing err.Error() keep working; new code
+// should use errors.Is.
+var (
+	ErrContextClosed   = errors.New("ABSmartly Context is closed")
+	ErrContextClosing  = errors.New("ABSmartly Context is closing")
+	ErrContextNotReady = errors.New("ABSmartly Context is not yet ready")
+)
+
 func (c *Context) CheckNotClosed() error {
 	if c.Closed_.Load().(bool) {
-		return errors.New("ABsmartly Context is finalized.")
+		return ErrContextClosed
 	} else if c.Closing_.Load().(bool) {
-		return errors.New("ABsmartly Context is finalizing.")
+		return ErrContextClosing
 	}
 	return nil
 }
 
 func (c *Context) CheckReady(expectNotClosed bool) error {
 	if !c.IsReady() {
-		return errors.New("ABsmartly Context is not yet ready.")
+		return ErrContextNotReady
 	} else if expectNotClosed {
 		return c.CheckNotClosed()
 	}
