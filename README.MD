@@ -4,20 +4,20 @@ Go SDK for [ABsmartly](https://www.absmartly.com/) A/B testing platform.
 
 ## Compatibility
 
-The A/B Smartly Go SDK is compatible with Go versions 1.23 and later (the minimum required by the `resty` HTTP client dependency). Earlier releases of this SDK declared Go 1.15; dropping Go 1.15-1.22 is a deliberate breaking change of this release, and CI builds and tests on Go 1.23 and the latest stable Go.
+The A/B Smartly Go SDK is compatible with Go versions 1.20 and later. CI builds and tests on Go 1.20, 1.23 and the latest stable Go. The module pins `resty` v2.16.5, the last release that supports Go 1.20; upgrading `resty` to v2.17+ in your own module raises your Go floor to 1.23.
 It provides both a blocking and an asynchronous interfaces.
 
-**Breaking change:** `Context.GetVariableKeys()` now returns `map[string][]string` (variable key to the names of all experiments that define it), matching the other ABsmartly SDKs. It previously returned `map[string]string`. Callers must update their types.
+`Context.GetVariableKeys()` keeps its v1.1 signature (`map[string]string`, the first experiment that defines each key). Use the new `Context.GetVariableKeysAll()` to get every experiment per key (`map[string][]string`), as the other ABsmartly SDKs return.
 
-**Behavior changes:** Read methods (`GetTreatment`, `PeekTreatment`, `GetVariableValue`, `PeekVariableValue`, `GetVariableKeys`, `GetExperiments`, `GetCustomFieldValueKeys`, `GetData`) return the error `ABsmartly Context is not yet ready.` before the context is ready; callers must not treat the zero value as a result. Lifecycle error texts changed from `ABSmartly Context is closed`/`is closing` to `ABsmartly Context is finalized.`/`ABsmartly Context is finalizing.`, matching the JavaScript SDK; code matching the old strings must update. `GetCustomFieldValue` keeps its signature and returns nil on any error; use the new `GetCustomFieldValueE` to receive the error. Refreshing a context whose initial load failed is now a successful no-op; it does not call the data provider or replace the failed context's data. Create a new context to retry initialization. Panics in event loggers are contained and do not change the publisher's success or failure result.
+**Behavior changes:** Read methods (`GetTreatment`, `PeekTreatment`, `GetVariableValue`, `PeekVariableValue`, `GetVariableKeys`, `GetExperiments`, `GetCustomFieldValueKeys`, `GetData`) return `sdk.ErrContextNotReady` (`ABSmartly Context is not yet ready`) before the context is ready; callers must not treat the zero value as a result. After close they return `sdk.ErrContextClosing`/`sdk.ErrContextClosed`; the texts are unchanged from v1.1 (`ABSmartly Context is closing`/`ABSmartly Context is closed`), and the errors can also be matched with `errors.Is`. `GetCustomFieldValue` keeps its signature and returns nil on any error; use the new `GetCustomFieldValueE` to receive the error. Refreshing a context whose initial load failed is now a successful no-op; it does not call the data provider or replace the failed context's data. Create a new context to retry initialization. Panics in event loggers are contained and do not change the publisher's success or failure result.
 
 ## Finalization and event delivery
 
-Use `f, err := ctx.FinalizeAsync()` and then `f.Get(context.Background())` when an adapter must return all publish/error and finalize logger events before responding. Failed final publishes return the publisher error, retain queued events, and leave the context retryable. `CloseAsync()`/`Close()` retain their transport-and-sealing completion semantics for compatibility and callback reentry; they are not logger-delivery barriers.
+Use `f, err := ctx.FinalizeAsync()` and then `f.Get(context.Background())` when an adapter must return all publish/error and finalize logger events before responding. Failed final publishes return the publisher error, retain queued events, and leave the context retryable. `Close()` returns after the `Close` event has been logged, as in v1.1. Called from inside one of the context's event loggers, it only waits for the close itself. `CloseAsync()` completes on transport and sealing and is not a logger-delivery barrier. A failed close does not restart the refresh timer.
 
 Logger callbacks may call `Close`, `Publish`, or `Refresh`, including through a captured original context. Do not block on `FinalizeAsync()` inside a logger: it waits for logger callbacks to return.
 
-**Breaking event-name change:** the finalization event string is now `"finalize"`, previously `"Close"`. Use `sdk.Finalize`; `sdk.Close` remains a source-compatible constant alias. Consumers comparing literal strings must migrate.
+The finalization event is still `sdk.Close` with the value `"Close"`; `sdk.Finalize` is an alias with the same value.
 
 ## Getting Started
 
