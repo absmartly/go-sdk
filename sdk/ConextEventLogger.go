@@ -13,7 +13,8 @@ const (
 	Publish  EventType = "Publish"
 	Exposure EventType = "Exposure"
 	Goal     EventType = "Goal"
-	Finalize EventType = "finalize"
-	// Close is retained as a source-compatible alias for the finalize event.
-	Close EventType = Finalize
+	Close    EventType = "Close"
+	// Finalize is an alias for Close; the event value stays "Close" for
+	// compatibility with loggers written against v1.1.x.
+	Finalize EventType = Close
 )

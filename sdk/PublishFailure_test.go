@@ -614,7 +614,7 @@ func TestFinalizeFailureIsRetryable(t *testing.T) {
 	assertAny(nil, getWithTimeout(t, f), t)
 	events := logger.GetEvents()
 	assertAny(Finalize, events[len(events)-1].EventType, t)
-	assertAny("finalize", string(Finalize), t)
+	assertAny("Close", string(Close), t)
 	assertAny(Finalize, Close, t)
 	assertAny(int32(0), ctx.GetPendingCount(), t)
 }
