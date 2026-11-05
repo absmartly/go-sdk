@@ -262,14 +262,26 @@ func TestCloseWaitsForInFlightPublishThatFails(t *testing.T) {
 	assertAny(nil, ctx.Publish2ForTest(t, publisher, 1), t)
 }
 
-func TestFailedCloseRestoresRefreshTimer(t *testing.T) {
+type countingDataProvider struct {
+	calls int32
+}
+
+func (p *countingDataProvider) GetContextData() *future.Future {
+	atomic.AddInt32(&p.calls, 1)
+	var result, done = future.New()
+	done(data, nil)
+	return result
+}
+
+func TestFailedCloseDoesNotRestartRefreshTimer(t *testing.T) {
 	var publisher = &heldPublisher{}
+	var provider = &countingDataProvider{}
 	setUp()
 	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	config.PublishDelay_ = -1
-	config.RefreshInterval_ = 5000
-	var ctx = createTrackedContext(clock, config, dataFutureReady, dataProvider, publisher, nil, variableParser, audienceMatcher)
+	config.RefreshInterval_ = 20
+	var ctx = createTrackedContext(clock, config, dataFutureReady, provider, publisher, nil, variableParser, audienceMatcher)
 	defer ctx.ClearRefreshTimer()
 
 	assertAny(nil, ctx.Track("goal1", nil), t)
@@ -277,11 +289,23 @@ func TestFailedCloseRestoresRefreshTimer(t *testing.T) {
 	assertAny(nil, err, t)
 	publisher.settle(t, 0, errors.New("Publish failed"))
 	_ = getWithTimeout(t, closing)
+	assertAny(false, ctx.IsClosed(), t)
+	assertAny(int32(1), ctx.GetPendingCount(), t)
 
+	// The context stays retryable, but it must not keep polling: Close
+	// returns nothing, so the caller cannot know to stop the timer.
+	var before = atomic.LoadInt32(&provider.calls)
+	time.Sleep(200 * time.Millisecond)
+	assertAny(before, atomic.LoadInt32(&provider.calls), t)
+
+	// An explicit Refresh still works but does not re-arm the timer either.
+	ctx.Refresh()
 	ctx.StateLock_.Lock()
-	var restored = ctx.RefreshTimer_ != nil
+	var timer = ctx.RefreshTimer_
 	ctx.StateLock_.Unlock()
-	assertAny(true, restored, t)
+	if timer != nil {
+		t.Fatal("refresh timer re-armed after a failed close")
+	}
 }
 
 func (c *Context) Publish2ForTest(t *testing.T, publisher *heldPublisher, i int) error {
@@ -775,5 +799,79 @@ func TestFinalizeReturnsItsOwnAttemptResult(t *testing.T) {
 	assertAny(nil, getWithTimeout(t, <-publisher.retry), t)
 	if err := getWithTimeout(t, first); err == nil {
 		t.Fatal("finalize reported success for a failed close attempt")
+	}
+}
+
+func TestCloseLogsCloseEventBeforeReturning(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		var logger = &MockEventLogger{}
+		setUp()
+		var config = CreateDefaultContextConfig()
+		config.Units_ = units
+		config.RefreshInterval_ = 0
+		config.EventLogger_ = logger
+		var ctx = createTrackedContext(clock, config, dataFutureReady, dataProvider, &heldPublisher{}, logger, variableParser, audienceMatcher)
+
+		ctx.Close()
+
+		var events = logger.GetEvents()
+		if len(events) == 0 || events[len(events)-1].EventType != Close {
+			t.Fatalf("run %d: Close returned before the Close event was logged: %#v", i, events)
+		}
+		assertAny("Close", string(events[len(events)-1].EventType), t)
+	}
+}
+
+type closeOnEventLogger struct {
+	on       EventType
+	returned chan struct{}
+	once     sync.Once
+}
+
+func (l *closeOnEventLogger) HandleEvent(c Context, event EventType, _ interface{}) {
+	if event == l.on {
+		l.once.Do(func() {
+			c.Close()
+			close(l.returned)
+		})
+	}
+}
+
+func TestCloseFromLoggerDoesNotWaitForItself(t *testing.T) {
+	for _, on := range []EventType{Exposure, Goal, Publish} {
+		var logger = &closeOnEventLogger{on: on, returned: make(chan struct{})}
+		var publisher = &heldPublisher{}
+		setUp()
+		var config = CreateDefaultContextConfig()
+		config.Units_ = units
+		config.PublishDelay_ = -1
+		config.RefreshInterval_ = 0
+		config.EventLogger_ = logger
+		var ctx = createTrackedContext(clock, config, dataFutureReady, dataProvider, publisher, logger, variableParser, audienceMatcher)
+
+		var trigger = make(chan struct{})
+		go func() {
+			defer close(trigger)
+			if on == Exposure {
+				_, _ = ctx.GetTreatment("exp_test_ab")
+				return
+			}
+			_ = ctx.Track("goal1", nil)
+			if on == Publish {
+				_, _ = ctx.PublishAsync()
+			}
+		}()
+		// The close (or the explicit publish) sends one batch; let it succeed.
+		var deadline = time.Now().Add(2 * time.Second)
+		for publisher.calls() == 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		publisher.settle(t, 0, nil)
+		select {
+		case <-logger.returned:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("Close called from the %s logger did not return", on)
+		}
+		<-trigger
 	}
 }

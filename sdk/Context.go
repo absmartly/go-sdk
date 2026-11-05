@@ -67,7 +67,7 @@ type Context struct {
 	publishLogs_     []*future.Future
 	RefreshFuture_   *future.Future
 	TimeoutLock_     *sync.Mutex
-	// StateLock_ guards ReadyFuture_, RefreshFuture_, ClosingFuture_ and RefreshTimer_.
+	// StateLock_ guards ReadyFuture_, RefreshFuture_, ClosingFuture_, RefreshTimer_ and closeStarted_.
 	StateLock_ *sync.Mutex
 	// inflight_ holds the publishes that have been sent and not yet settled. Guarded by StateLock_.
 	inflight_ []*future.Future
@@ -97,6 +97,44 @@ type Context struct {
 	// load-error event, or 0. A readiness wait from that goroutine is the
 	// logger waiting for itself, so it returns at once.
 	readyDeliverer_ *atomic.Uint64
+
+	// loggers_ records the goroutines that are inside an event logger call
+	// on this context, so a blocking Close from a logger does not wait for
+	// logger delivery that cannot finish until it returns.
+	loggers_ *loggerGoroutines
+
+	// closeStarted_ is set once Close has been called. The refresh timer
+	// that Close stops is never installed again, even if the close fails and
+	// leaves the context open for a retry. Guarded by StateLock_.
+	closeStarted_ bool
+}
+
+type loggerGoroutines struct {
+	mu  sync.Mutex
+	ids map[uint64]int
+}
+
+func (l *loggerGoroutines) enter() uint64 {
+	var id = goroutineID()
+	l.mu.Lock()
+	l.ids[id]++
+	l.mu.Unlock()
+	return id
+}
+
+func (l *loggerGoroutines) exit(id uint64) {
+	l.mu.Lock()
+	if l.ids[id]--; l.ids[id] <= 0 {
+		delete(l.ids, id)
+	}
+	l.mu.Unlock()
+}
+
+func (l *loggerGoroutines) current() bool {
+	var id = goroutineID()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.ids[id] > 0
 }
 
 type ExperimentVariables struct {
@@ -163,6 +201,7 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	cntx.AssignmentCache = map[string]*Assignment{}
 	cntx.unitValues_ = map[string]interface{}{}
 	cntx.readyDeliverer_ = &atomic.Uint64{}
+	cntx.loggers_ = &loggerGoroutines{ids: map[uint64]int{}}
 	cntx.Achievements_ = make([]jsonmodels.GoalAchievement, 0)
 	cntx.Exposures_ = make([]jsonmodels.Exposure, 0)
 	cntx.Attributes_ = make([]interface{}, 0)
@@ -1016,6 +1055,7 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 		return existing, existingFinalized
 	}
 	c.Closing_.Store(true)
+	c.closeStarted_ = true
 	var tempFuture, done = future.New()
 	c.ClosingFuture_ = tempFuture
 	var finalized, finalizeDone = future.New()
@@ -1077,13 +1117,12 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 
 		if err != nil {
 			// The failed batch is back in the queue. Leave the context open so
-			// Publish or Close can retry it, and bring back the refresh timer
-			// that Close stopped.
+			// Publish or Close can retry it. The refresh timer stays stopped:
+			// Close returns nothing, so the caller cannot know it must stop it.
 			c.StateLock_.Lock()
 			c.ClosingFuture_ = nil
 			c.Closing_.Store(false)
 			c.StateLock_.Unlock()
-			c.SetRefreshTimer()
 			// Start delivery before notifying Close listeners, which run
 			// synchronously and may wait for finalization.
 			go func() {
@@ -1123,12 +1162,18 @@ func (c *Context) waitPublishLogs() {
 	}
 }
 
+// Close closes the context and, like v1.1.x, returns after the Close event
+// has been logged. Called from inside an event logger of this context, it
+// only waits for the close itself: logger delivery cannot finish until that
+// logger returns.
 func (c *Context) Close() {
 	c = c.live()
-	var fut, err = c.CloseAsync()
-	if err == nil {
-		fut.Join(context.Background())
+	closing, finalized := c.closeAttempt()
+	if c.loggers_ != nil && c.loggers_.current() {
+		closing.Join(context.Background())
+		return
 	}
+	finalized.Join(context.Background())
 }
 
 // cachedAssignment returns the cached assignment for experimentName if it is
@@ -1481,7 +1526,12 @@ func (c *Context) LogError(err error) {
 
 func (c *Context) logEvent(event EventType, data interface{}) {
 	if c.EventLogger_ != nil {
-		notifyLogger(c.EventLogger_, c.snapshot(), event, data)
+		var snapshot = c.snapshot()
+		if loggers := c.live().loggers_; loggers != nil {
+			var id = loggers.enter()
+			defer loggers.exit(id)
+		}
+		notifyLogger(c.EventLogger_, snapshot, event, data)
 	}
 }
 
@@ -1782,7 +1832,7 @@ func (c *Context) SetRefreshTimer() {
 	defer c.StateLock_.Unlock()
 	// A refresh that finishes after Close began calls SetData, which gets here.
 	// Installing the timer then would leave a timer on a closed context.
-	if c.Closed_.Load().(bool) || c.Closing_.Load().(bool) {
+	if c.Closed_.Load().(bool) || c.Closing_.Load().(bool) || c.closeStarted_ {
 		return
 	}
 	if c.RefreshInterval_ > 0 && c.RefreshTimer_ == nil {
