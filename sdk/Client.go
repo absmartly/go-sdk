@@ -3,8 +3,6 @@ package sdk
 import (
 	"context"
 	"errors"
-	"log"
-	"net/url"
 
 	"github.com/absmartly/go-sdk/sdk/future"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
@@ -33,15 +31,6 @@ func CreateDefaultClient(config ClientConfig) Client {
 }
 
 func CreateClient(config ClientConfig, httpClient HTTPClient) Client {
-	if config.Endpoint_ != "" {
-		parsedURL, err := url.Parse(config.Endpoint_)
-		if err == nil && parsedURL.Scheme != "" {
-			if parsedURL.Scheme != "https" {
-				log.Printf("WARNING: Endpoint is not using HTTPS. API key will be transmitted insecurely: %s", config.Endpoint_)
-			}
-		}
-	}
-
 	var cl = Client{url_: config.Endpoint_ + "/context", serializer_: config.Serializer_, deserializer_: config.Deserializer_, httpClient_: httpClient}
 	if cl.deserializer_ == nil {
 		cl.deserializer_ = DefaultContextDataDeserializer{}

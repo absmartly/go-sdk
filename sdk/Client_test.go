@@ -1,12 +1,14 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"github.com/absmartly/go-sdk/sdk/future"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 	"github.com/go-resty/resty/v2"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -520,5 +522,19 @@ func TestClientPartialResponse(t *testing.T) {
 	}
 	if data, ok := actual.(jsonmodels.ContextData); ok && len(data.Experiments) != 0 {
 		t.Errorf("Expected no experiments from a partial response, got: %v", data)
+	}
+}
+
+func TestCreateClientHTTPEndpointDoesNotWriteGlobalLog(t *testing.T) {
+	var buf bytes.Buffer
+	var prevOut = log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(prevOut)
+
+	var config = ClientConfig{Deserializer_: DeserMock{}, Endpoint_: "http://localhost:8080/v1", ApiKey_: "test-api-key", Application_: "website", Environment_: "dev"}
+	CreateClient(config, HttpMock{statusCode: 200, status: "OK", bodyString: "{}"})
+
+	if buf.Len() != 0 {
+		t.Fatalf("CreateClient wrote to the global logger: %q", buf.String())
 	}
 }
