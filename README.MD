@@ -13,7 +13,7 @@ It provides both a blocking and an asynchronous interfaces.
 
 ## Finalization and event delivery
 
-Use `f, err := ctx.FinalizeAsync()` and then `f.Get(context.Background())` when an adapter must return all publish/error and finalize logger events before responding. Failed final publishes return the publisher error, retain queued events, and leave the context retryable. `Close()` returns after the `Close` event has been logged, as in v1.1. Called from inside one of the context's event loggers, it only waits for the close itself. `CloseAsync()` completes on transport and sealing and is not a logger-delivery barrier. A failed close does not restart the refresh timer.
+Use `f, err := ctx.FinalizeAsync()` and then `f.Get(context.Background())` when an adapter must return all publish/error and finalize logger events before responding. Failed final publishes return the publisher error, retain queued events, and leave the context retryable. On success, `Close()` returns after the `Close` event has been logged, as in v1.1, and so does `CloseAsync()` when no events are queued. Called from inside one of the context's event loggers, it only waits for the close itself. `CloseAsync()` completes on transport and sealing and is not a logger-delivery barrier. A failed close does not restart the refresh timer.
 
 Logger callbacks may call `Close`, `Publish`, or `Refresh`, including through a captured original context. Do not block on `FinalizeAsync()` inside a logger: it waits for logger callbacks to return.
 
@@ -29,7 +29,7 @@ go get github.com/absmartly/go-sdk/sdk
 
 ### Dependencies
 ```
-github.com/go-resty/resty/v2@v2.7.0
+github.com/go-resty/resty/v2@v2.16.5
 ```
 
 ## Import and Initialize the SDK
