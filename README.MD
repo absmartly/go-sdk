@@ -754,7 +754,7 @@ func main() {
 
 ### HTTP Timeout and Retries
 
-The SDK's HTTP client is configured on the builder. `Timeout` bounds how long a request may take and `Retries` sets how often a failed request (network error, 502, 503 or 504) is retried:
+The SDK's HTTP client is configured on the builder. `Timeout` bounds how long a request may take and `Retries` sets how often a failed request (network error, 502 or 503) is retried:
 
 ```go
 import (
