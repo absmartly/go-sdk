@@ -7,7 +7,7 @@ Go versions are released as git tags only; this entry tracks changes since v1.1.
 ### BREAKING
 - Users whose unit UID contains non-ASCII characters will be reassigned in running experiments: UIDs are now hashed from their UTF-8 bytes, as in the other SDKs. ASCII UIDs keep their assignments.
 - Audiences are re-evaluated after `SetAttribute`/`SetAttributes`: a cached assignment whose audience result changes with the new attributes is recomputed, so a user can move in or out of an experiment's audience within one context.
-- When several experiments define the same variable key, `GetVariableValue`, `PeekVariableValue`, `GetVariableKeys` and `IndexVariables_` now use the first experiment in the context data; v1.1.1 used the last one.
+- When several experiments define the same variable key, the value is read from the first experiment, by id, that the unit is assigned to or overridden in; each experiment visited is exposed (v1.1.1 used the last experiment in the payload). This matches the JS SDK's `_resolveVariableValue` rule and affects `GetVariableValue`, `PeekVariableValue`, `GetVariableKeys`, `GetVariableKeysAll` and `IndexVariables_`, all of which now follow experiment-id order.
 - Go 1.20 or later is required (v1.1.1 built on Go 1.17). `resty` is pinned to v2.16.5.
 - JSON custom fields parse any JSON value.
 
