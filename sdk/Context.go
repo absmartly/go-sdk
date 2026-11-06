@@ -528,9 +528,6 @@ func (c *Context) setUnit(unitType string, uid interface{}) error {
 	var uidString string
 	if s, ok := uid.(string); ok {
 		uidString = strings.TrimSpace(s)
-		if len(uidString) == 0 {
-			return fmt.Errorf("Unit '%s' UID must not be blank.", unitType) //nolint:staticcheck // canonical SDK error text
-		}
 		value = uidString
 	} else {
 		var number = toFloat64(uid)
@@ -546,8 +543,12 @@ func (c *Context) setUnit(unitType string, uid interface{}) error {
 			previous, exist = s, true
 		}
 	}
+	// v1.1.1 order: a unit that is already set is reported before a blank UID.
 	if exist && previous != value {
-		return fmt.Errorf("Unit '%s' UID already set.", unitType) //nolint:staticcheck // canonical SDK error text
+		return &UnitError{UnitType: unitType, Err: ErrUnitAlreadySet}
+	}
+	if len(uidString) == 0 {
+		return &UnitError{UnitType: unitType, Err: ErrUnitBlank}
 	}
 
 	c.Units_[unitType] = uidString
@@ -1399,6 +1400,41 @@ var (
 	ErrContextClosing  = errors.New("ABSmartly Context is closing")
 	ErrContextNotReady = errors.New("ABSmartly Context is not yet ready")
 )
+
+// ErrUnitAlreadySet and ErrUnitBlank keep the v1.1.1 error texts. SetUnit
+// and SetUnitValue return them wrapped in a *UnitError, so they can be
+// matched with errors.Is.
+var (
+	ErrUnitAlreadySet = errors.New("unit already set")
+	ErrUnitBlank      = errors.New("unit  UID must not be blank.") //nolint:staticcheck // v1.1.1 error text
+)
+
+// UnitError is returned when a unit cannot be set. Error returns the v1.1.1
+// text; Canonical returns the text the other ABsmartly SDKs use.
+type UnitError struct {
+	UnitType string
+	Err      error
+}
+
+func (e *UnitError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *UnitError) Unwrap() error {
+	return e.Err
+}
+
+// Canonical returns the cross-SDK error text, for example
+// "Unit 'user_id' UID already set.".
+func (e *UnitError) Canonical() string {
+	switch e.Err {
+	case ErrUnitAlreadySet:
+		return fmt.Sprintf("Unit '%s' UID already set.", e.UnitType)
+	case ErrUnitBlank:
+		return fmt.Sprintf("Unit '%s' UID must not be blank.", e.UnitType)
+	}
+	return e.Err.Error()
+}
 
 func (c *Context) CheckNotClosed() error {
 	if c.Closed_.Load().(bool) {

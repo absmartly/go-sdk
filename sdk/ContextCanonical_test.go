@@ -2013,7 +2013,7 @@ func TestUnitsKeepTheirTypeAndHashAsJS(t *testing.T) {
 	// JS hashes a number as value.toFixed(0): 125.75 -> "126".
 	assertAny("126", context.Units_["float_id"], t)
 	assertAny(nil, context.SetUnitValue("user_id", float64(125)), t)
-	assertAny("Unit 'user_id' UID already set.", context.SetUnitValue("user_id", "125").Error(), t)
+	assertAny("Unit 'user_id' UID already set.", context.SetUnitValue("user_id", "125").(*UnitError).Canonical(), t)
 	assertAny("Unit 'x' must be a string or a number.", context.SetUnitValue("x", true).Error(), t)
 }
 

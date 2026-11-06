@@ -494,11 +494,22 @@ func TestUnitEmpty(t *testing.T) {
 
 	var err = context.SetUnit("db_user_id", "")
 
-	assertAny("Unit 'db_user_id' UID must not be blank.", err.Error(), t)
+	assertAny("unit  UID must not be blank.", err.Error(), t)
+	assertAny(true, errors.Is(err, ErrUnitBlank), t)
+	var unitErr *UnitError
+	assertAny(true, errors.As(err, &unitErr), t)
+	assertAny("Unit 'db_user_id' UID must not be blank.", unitErr.Canonical(), t)
 
 	err = context.SetUnit("session_id", "1")
 
-	assertAny("Unit 'session_id' UID already set.", err.Error(), t)
+	assertAny("unit already set", err.Error(), t)
+	assertAny(true, errors.Is(err, ErrUnitAlreadySet), t)
+	assertAny(true, errors.As(err, &unitErr), t)
+	assertAny("Unit 'session_id' UID already set.", unitErr.Canonical(), t)
+
+	// v1.1.1 checks for an existing unit before a blank UID.
+	err = context.SetUnit("session_id", "")
+	assertAny("unit already set", err.Error(), t)
 }
 
 func TestSetAttributes(t *testing.T) {
