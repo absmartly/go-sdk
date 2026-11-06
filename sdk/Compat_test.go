@@ -2,8 +2,11 @@ package sdk
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/absmartly/go-sdk/sdk/future"
 )
 
 // The exported field types below were released in v1.1.1; changing them is a
@@ -92,5 +95,66 @@ func TestEmptyCloseAsyncFromCloseLoggerDoesNotHang(t *testing.T) {
 		t.Fatal("CloseAsync re-entered from the Close logger hung")
 	}
 	assertAny(true, <-reentered, t)
+	assertAny(true, ctx.IsClosed(), t)
+}
+
+type blockingCloseLogger struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (l *blockingCloseLogger) HandleEvent(_ Context, event EventType, _ interface{}) {
+	if event == Close {
+		l.once.Do(func() {
+			close(l.entered)
+			<-l.release
+		})
+	}
+}
+
+// A finalization listener registered while the Close logger runs may join
+// the close future; the empty-queue close must still settle it.
+func TestEmptyCloseFinalizeListenerCanJoinClose(t *testing.T) {
+	setUp()
+	var logger = &blockingCloseLogger{entered: make(chan struct{}), release: make(chan struct{})}
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	config.EventLogger_ = logger
+	var ctx = CreateTestContext(config, dataFutureReady)
+
+	var closed = make(chan *future.Future, 1)
+	go func() {
+		closing, _ := ctx.CloseAsync()
+		closed <- closing
+	}()
+	<-logger.entered
+
+	finalized, err := ctx.FinalizeAsync()
+	assertAny(nil, err, t)
+	var joined = make(chan error, 1)
+	finalized.Listen(func(future.Value, error) {
+		closing, _ := ctx.CloseAsync()
+		waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, err := closing.Get(waitCtx)
+		joined <- err
+	})
+	close(logger.release)
+
+	select {
+	case closing := <-closed:
+		if !closing.Ready() {
+			t.Fatal("empty-queue CloseAsync returned an unsettled future")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("CloseAsync hung behind a finalization listener")
+	}
+	select {
+	case err := <-joined:
+		assertAny(nil, err, t)
+	case <-time.After(3 * time.Second):
+		t.Fatal("finalization listener did not run")
+	}
 	assertAny(true, ctx.IsClosed(), t)
 }

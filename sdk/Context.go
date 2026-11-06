@@ -1156,9 +1156,11 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 		// future settles. A logger that re-enters Close is the exception: it
 		// cannot wait for logger delivery that only finishes once it returns.
 		// So is a close that would have to wait for an earlier publish logger.
+		// Each future's listeners run synchronously and may wait for the
+		// other future, so finalization settles on its own goroutine.
 		if synchronous && c.publishLogsDone() && (c.loggers_ == nil || !c.loggers_.current()) {
 			c.LogEvent(Finalize, nil)
-			finalizeDone(nil, nil)
+			go finalizeDone(nil, nil)
 			done(nil, nil)
 			return
 		}
