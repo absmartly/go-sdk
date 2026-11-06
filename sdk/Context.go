@@ -44,23 +44,28 @@ type Context struct {
 	Data_                jsonmodels.ContextData
 	Index_               map[string]ExperimentVariables
 	ContextCustomFields_ map[string]map[string]ContextCustomFieldValue
-	IndexVariables_      map[string][]ExperimentVariables
-	ContextLock_         *sync.RWMutex
-	HashedUnits_         map[interface{}]interface{}
-	Assigners_           map[interface{}]interface{}
-	AssignmentCache      map[string]*Assignment
-	EventLock_           *sync.Mutex
-	Exposures_           []jsonmodels.Exposure
-	Achievements_        []jsonmodels.GoalAchievement
-	Attributes_          []interface{}
-	Overrides_           map[interface{}]interface{}
-	Cassignments_        map[interface{}]interface{}
-	PendingCount_        *atomic.Value
-	Closing_             *atomic.Value
-	Closed_              *atomic.Value
-	Refreshing_          *atomic.Value
-	ReadyFuture_         *future.Future
-	ClosingFuture_       *future.Future
+	// Deprecated: IndexVariables_ keeps its v1.1.1 type; each key maps to the
+	// first ExperimentVariables that defines it. Use GetVariableKeysAll for
+	// every experiment per key.
+	IndexVariables_ map[interface{}]interface{}
+	ContextLock_    *sync.RWMutex
+	HashedUnits_    map[interface{}]interface{}
+	Assigners_      map[interface{}]interface{}
+	// Deprecated: AssignmentCache keeps its v1.1.1 type and is a read-only
+	// copy of the internal cache, written under ContextLock_.
+	AssignmentCache map[string]Assignment
+	EventLock_      *sync.Mutex
+	Exposures_      []jsonmodels.Exposure
+	Achievements_   []jsonmodels.GoalAchievement
+	Attributes_     []interface{}
+	Overrides_      map[interface{}]interface{}
+	Cassignments_   map[interface{}]interface{}
+	PendingCount_   *atomic.Value
+	Closing_        *atomic.Value
+	Closed_         *atomic.Value
+	Refreshing_     *atomic.Value
+	ReadyFuture_    *future.Future
+	ClosingFuture_  *future.Future
 	// FinalizedFuture_ includes logger delivery; ClosingFuture_ only includes
 	// transport/sealing, allowing loggers to re-enter Close safely.
 	FinalizedFuture_ *future.Future
@@ -107,6 +112,14 @@ type Context struct {
 	// that Close stops is never installed again, even if the close fails and
 	// leaves the context open for a retry. Guarded by StateLock_.
 	closeStarted_ bool
+
+	// indexVariables_ lists, per variable key, every experiment that defines
+	// it, in data order. Guarded by DataLock.
+	indexVariables_ map[string][]ExperimentVariables
+
+	// assignmentCache_ holds the assignments by experiment name. Guarded by
+	// ContextLock_.
+	assignmentCache_ map[string]*Assignment
 }
 
 type loggerGoroutines struct {
@@ -198,7 +211,8 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	cntx.TimeoutLock_ = &sync.Mutex{}
 	cntx.StateLock_ = &sync.Mutex{}
 
-	cntx.AssignmentCache = map[string]*Assignment{}
+	cntx.AssignmentCache = map[string]Assignment{}
+	cntx.assignmentCache_ = map[string]*Assignment{}
 	cntx.unitValues_ = map[string]interface{}{}
 	cntx.readyDeliverer_ = &atomic.Uint64{}
 	cntx.loggers_ = &loggerGoroutines{ids: map[uint64]int{}}
@@ -729,7 +743,7 @@ func (c *Context) GetVariableKeys() (map[string]string, error) {
 	var variableKeys = map[string]string{}
 
 	c.DataLock.RLock()
-	for key, experiments := range c.IndexVariables_ {
+	for key, experiments := range c.indexVariables_ {
 		if len(experiments) > 0 {
 			variableKeys[key] = experiments[0].Data.Name
 		}
@@ -749,7 +763,7 @@ func (c *Context) GetVariableKeysAll() (map[string][]string, error) {
 	var variableKeys = map[string][]string{}
 
 	c.DataLock.RLock()
-	for key, experiments := range c.IndexVariables_ {
+	for key, experiments := range c.indexVariables_ {
 		var names = make([]string, 0, len(experiments))
 		for _, value := range experiments {
 			names = append(names, value.Data.Name)
@@ -1180,7 +1194,7 @@ func (c *Context) Close() {
 // still valid, or nil. It only reads, so it may run under ContextLock_ held for
 // reading or writing.
 func (c *Context) cachedAssignment(experimentName string) *Assignment {
-	var assignment, found = c.AssignmentCache[experimentName]
+	var assignment, found = c.assignmentCache_[experimentName]
 	if !found {
 		return nil
 	}
@@ -1301,7 +1315,8 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 		assignment.Variables = experiment.Variables[assignment.Variant]
 	}
 
-	c.AssignmentCache[experimentName] = assignment
+	c.assignmentCache_[experimentName] = assignment
+	c.AssignmentCache[experimentName] = *assignment
 	c.ContextLock_.Unlock()
 	return assignment
 }
@@ -1505,7 +1520,8 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	c.Index_ = index
 	c.ContextCustomFields_ = contextCustomFields
 	c.customFieldErrors_ = customFieldErrors
-	c.IndexVariables_ = indexVariables
+	c.indexVariables_ = indexVariables
+	c.IndexVariables_ = legacyIndexVariables(indexVariables)
 	c.Data_ = data
 	c.Ready_.Store(true)
 
@@ -1557,7 +1573,8 @@ func panicToError(r interface{}) error {
 func (c *Context) SetDataFailed(err error) {
 	c.DataLock.Lock()
 	c.Index_ = map[string]ExperimentVariables{}
-	c.IndexVariables_ = map[string][]ExperimentVariables{}
+	c.indexVariables_ = map[string][]ExperimentVariables{}
+	c.IndexVariables_ = map[interface{}]interface{}{}
 	c.customFieldErrors_ = nil
 	c.Data_ = jsonmodels.ContextData{}
 	c.Ready_.Store(true)
@@ -1622,7 +1639,7 @@ func (c *Context) Flush() *future.Future {
 				entrySet = append(entrySet, Pair{a: key, b: value})
 			}
 
-			var mapper = FlushMapper{Context: c}
+			var mapper = FlushMapper{ctx: c}
 			var temp = MapSetToArray(entrySet, make([]interface{}, 0), mapper)
 			event.Units = make([]jsonmodels.Unit, 0)
 			for _, value := range temp {
@@ -1775,13 +1792,18 @@ func (c *Context) requeueEvents(exposures []jsonmodels.Exposure, achievements []
 
 type FlushMapper struct {
 	MapperInt
-	Context *Context
+	Context Context
+	// ctx is the live context the SDK flushes; when nil, Context is used.
+	ctx *Context
 }
 
 func (f FlushMapper) Apply(value interface{}) interface{} {
 	var key = value.(Pair).a
 	var val = value.(Pair).b
-	var cntx = f.Context
+	var cntx = f.ctx
+	if cntx == nil {
+		cntx = &f.Context
+	}
 	var data [22]byte
 	var uid = cntx.GetUnitHash(key, val, data[:], false)
 	var res = f.forceASCII(string(uid))
@@ -1877,9 +1899,19 @@ func (c *Context) GetVariableAssignment(key string) (*Assignment, error) {
 	return &Assignment{Exposed: exposed}, err
 }
 
+func legacyIndexVariables(index map[string][]ExperimentVariables) map[interface{}]interface{} {
+	var legacy = make(map[interface{}]interface{}, len(index))
+	for key, experiments := range index {
+		if len(experiments) > 0 {
+			legacy[key] = experiments[0]
+		}
+	}
+	return legacy
+}
+
 func (c *Context) GetVariableExperiment(key string) (ExperimentVariables, error) {
 	c.DataLock.RLock()
-	var experiments = c.IndexVariables_[key]
+	var experiments = c.indexVariables_[key]
 	c.DataLock.RUnlock()
 	if len(experiments) == 0 {
 		return ExperimentVariables{}, errors.New("result is nil")
