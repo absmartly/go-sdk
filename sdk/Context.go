@@ -864,35 +864,42 @@ func (c *Context) GetCustomFieldValueType(experimentName string, key string) str
 }
 
 func (c *Context) GetVariableValue(key string, defaultValue interface{}) (interface{}, error) {
-	var err = c.CheckReady(true)
-	if err != nil {
-		return nil, err
-	}
-
-	var assignment, errres = c.GetVariableAssignment(key)
-	if errres == nil && assignment.Variables != nil {
-		if !assignment.Exposed.Load().(bool) {
-			c.QueueExposure(assignment)
-		}
-
-		var value, exist = assignment.Variables[key]
-		if exist {
-			return value, nil
-		}
-	}
-	return defaultValue, nil
+	return c.resolveVariableValue(key, defaultValue, true)
 }
 
 func (c *Context) PeekVariableValue(key string, defaultValue interface{}) (interface{}, error) {
+	return c.resolveVariableValue(key, defaultValue, false)
+}
+
+// resolveVariableValue implements the JS SDK's _resolveVariableValue rule so
+// shared variable keys behave the same across SDKs. It walks the experiments
+// that define key in experiment-id order (see indexVariables_), and returns
+// the value from the first experiment the unit is actually assigned to or
+// overridden in. Each experiment visited on the way is exposed when expose is
+// set, so a fall-through still records that the unit saw the earlier
+// experiment. When no experiment along the way assigns the key, the caller's
+// default is returned. v1.1.1 read only the last experiment in the payload.
+func (c *Context) resolveVariableValue(key string, defaultValue interface{}, expose bool) (interface{}, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
 	}
 
-	var assignment, errres = c.GetVariableAssignment(key)
-	if errres == nil {
-		var value, exist = assignment.Variables[key]
-		if exist {
+	c.DataLock.RLock()
+	var experiments = c.indexVariables_[key]
+	c.DataLock.RUnlock()
+
+	for _, experiment := range experiments {
+		var assignment = c.GetAssignment(experiment.Data.Name)
+		if assignment.Variables == nil {
+			continue
+		}
+
+		if expose && !assignment.Exposed.Load().(bool) {
+			c.QueueExposure(assignment)
+		}
+
+		if value, exist := assignment.Variables[key]; exist && (assignment.Assigned || assignment.Overridden) {
 			return value, nil
 		}
 	}
@@ -1576,6 +1583,19 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		}
 		contextCustomFields[experiment.Name] = experimentCustomFields
 		index[experiment.Name] = experiemntVariables
+	}
+
+	// Keep each key's experiments sorted and unique by experiment id, matching
+	// the JS SDK's insertUniqueSorted. GetVariableValue/PeekVariableValue walk
+	// this list in id order, so a shared key resolves to the lowest-id
+	// experiment the unit is assigned to or overridden in, regardless of the
+	// experiment order in the payload. GetVariableKeys, GetVariableKeysAll and
+	// IndexVariables_ follow the same id order.
+	for key := range indexVariables {
+		var experiments = indexVariables[key]
+		sort.SliceStable(experiments, func(i, j int) bool {
+			return experiments[i].Data.Id < experiments[j].Data.Id
+		})
 	}
 
 	c.DataLock.Lock()
