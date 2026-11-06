@@ -1061,7 +1061,10 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 			resolve(nil, nil)
 			existingFinalized = resolved
 		}
-		if existing == nil {
+		// A logger that re-enters a close that has already succeeded gets a
+		// settled future, as in v1.1.1: the close future may only settle once
+		// that logger returns.
+		if existing == nil || (c.Closed_.Load().(bool) && c.loggers_ != nil && c.loggers_.current()) {
 			var resolved, resolve = future.New()
 			resolve(nil, nil)
 			existing = resolved
@@ -1100,8 +1103,8 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 	// flight. Only then is the queue checked and the context sealed, in one
 	// critical section. A close that finds events still queued fails and leaves
 	// the context open for a retry.
-	var settle func()
-	settle = func() {
+	var settle func(synchronous bool)
+	settle = func(synchronous bool) {
 		c.EventLock_.Lock()
 		var waitFor = c.inflightSnapshot()
 		if len(waitFor) > 0 {
@@ -1111,7 +1114,7 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 				f.Listen(func(value future.Value, err error) {
 					recordFailure(err)
 					if atomic.AddInt32(&remaining, -1) == 0 {
-						settle()
+						settle(false)
 					}
 				})
 			}
@@ -1147,6 +1150,17 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 			return
 		}
 		c.Closing_.Store(false)
+		// With nothing in flight when the close started, the close completes
+		// in this call and, like v1.1.1, the Close event is logged before the
+		// future settles. A logger that re-enters Close is the exception: it
+		// cannot wait for logger delivery that only finishes once it returns.
+		// So is a close that would have to wait for an earlier publish logger.
+		if synchronous && c.publishLogsDone() && (c.loggers_ == nil || !c.loggers_.current()) {
+			c.LogEvent(Finalize, nil)
+			finalizeDone(nil, nil)
+			done(nil, nil)
+			return
+		}
 		go func() {
 			c.waitPublishLogs()
 			c.LogEvent(Finalize, nil)
@@ -1154,7 +1168,7 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 		}()
 		done(nil, nil)
 	}
-	settle()
+	settle(true)
 	return tempFuture, finalized
 }
 
@@ -1165,6 +1179,17 @@ func (c *Context) FinalizeAsync() (*future.Future, error) {
 	c = c.live()
 	_, finalized := c.closeAttempt()
 	return finalized, nil
+}
+
+func (c *Context) publishLogsDone() bool {
+	c.StateLock_.Lock()
+	defer c.StateLock_.Unlock()
+	for _, f := range c.publishLogs_ {
+		if !f.Ready() {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Context) waitPublishLogs() {
