@@ -114,7 +114,7 @@ type Context struct {
 	closeStarted_ bool
 
 	// indexVariables_ lists, per variable key, every experiment that defines
-	// it, in data order. Guarded by DataLock.
+	// it, in experiment-id order. Guarded by DataLock.
 	indexVariables_ map[string][]ExperimentVariables
 
 	// assignmentCache_ holds the assignments by experiment name. Guarded by
