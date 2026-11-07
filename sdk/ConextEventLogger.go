@@ -14,4 +14,7 @@ const (
 	Exposure EventType = "Exposure"
 	Goal     EventType = "Goal"
 	Close    EventType = "Close"
+	// Finalize is an alias for Close; the event value stays "Close" for
+	// compatibility with loggers written against v1.1.x.
+	Finalize EventType = Close
 )

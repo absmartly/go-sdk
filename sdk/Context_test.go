@@ -8,7 +8,9 @@ import (
 	"github.com/absmartly/go-sdk/sdk/internal"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 	"io/ioutil"
+	"sync"
 	"testing"
+	"time"
 )
 
 type ClientContextMock struct {
@@ -16,14 +18,35 @@ type ClientContextMock struct {
 
 var experiment = jsonmodels.Experiment{Name: "test"}
 
-var fut = future.Call(func() (future.Value, error) {
-	return jsonmodels.ContextData{
-		Experiments: []jsonmodels.Experiment{experiment},
-	}, nil
-})
+func newDefaultFut() *future.Future {
+	var exp = experiment
+	return future.Call(func() (future.Value, error) {
+		return jsonmodels.ContextData{
+			Experiments: []jsonmodels.Experiment{exp},
+		}, nil
+	})
+}
+
+var fut = newDefaultFut()
+
+var futLock sync.Mutex
+
+// setFut and getFut guard fut: refresh timers of earlier tests can still call
+// the mock while a later test replaces the future.
+func setFut(f *future.Future) {
+	futLock.Lock()
+	fut = f
+	futLock.Unlock()
+}
+
+func getFut() *future.Future {
+	futLock.Lock()
+	defer futLock.Unlock()
+	return fut
+}
 
 func (c ClientContextMock) GetContextData() *future.Future {
-	return fut
+	return getFut()
 }
 
 func (c ClientContextMock) Publish(event jsonmodels.PublishEvent) *future.Future {
@@ -75,6 +98,16 @@ var variableExperiments = map[string]string{
 	"show-modal":    "exp_test_new",
 }
 
+var variableExperimentKeys = map[string][]string{
+	"banner.border": {"exp_test_ab"},
+	"banner.size":   {"exp_test_ab"},
+	"button.color":  {"exp_test_abc"},
+	"card.width":    {"exp_test_not_eligible"},
+	"submit.color":  {"exp_test_fullon"},
+	"submit.shape":  {"exp_test_fullon"},
+	"show-modal":    {"exp_test_new"},
+}
+
 var units = map[string]string{
 	"session_id": "e791e240fcd3df7d238cfc285f475e8152fcc0ec",
 	"user_id":    "123456789",
@@ -99,7 +132,34 @@ var eventLogger ContextEventLogger
 var variableParser DefaultVariableParser
 var audienceMatcher AudienceMatcher
 
+var createdContexts []*Context
+var createdContextsLock sync.Mutex
+
+func trackContext(c *Context) *Context {
+	createdContextsLock.Lock()
+	createdContexts = append(createdContexts, c)
+	createdContextsLock.Unlock()
+	return c
+}
+
+// stopLeakedTimers stops the refresh timers of contexts earlier tests created,
+// so they cannot fire while a later test replaces the shared fixtures.
+func stopLeakedTimers() {
+	createdContextsLock.Lock()
+	var old = createdContexts
+	createdContexts = nil
+	createdContextsLock.Unlock()
+	for _, c := range old {
+		c.ClearRefreshTimer()
+	}
+}
+
 func setUp() {
+	stopLeakedTimers()
+	// Tests replace fut; start every test from the default so results do not
+	// depend on test order or -count.
+	experiment = jsonmodels.Experiment{Name: "test"}
+	setFut(newDefaultFut())
 	content, _ := ioutil.ReadFile("testAssets/context.json")
 	contentstrict, _ := ioutil.ReadFile("testAssets/context-strict.json")
 	refreshed, _ := ioutil.ReadFile("testAssets/refreshed.json")
@@ -130,11 +190,11 @@ func setUp() {
 }
 
 func CreateTestContext(config ContextConfig, dataFuture *future.Future) *Context {
-	return CreateContext(clock, config, dataFuture, dataProvider, eventHandler, eventLogger, variableParser, audienceMatcher)
+	return trackContext(CreateContext(clock, config, dataFuture, dataProvider, eventHandler, eventLogger, variableParser, audienceMatcher))
 }
 
 func CreateTestPublishContext(config ContextConfig, dataFuture *future.Future) *Context {
-	return CreateContext(clock, config, dataFuture, DefaultContextDataProvider{client_: ClientContextPublishMock{}}, DefaultContextEventHandler{client_: ClientContextPublishMock{}}, eventLogger, variableParser, audienceMatcher)
+	return trackContext(CreateContext(clock, config, dataFuture, DefaultContextDataProvider{client_: ClientContextPublishMock{}}, DefaultContextEventHandler{client_: ClientContextPublishMock{}}, eventLogger, variableParser, audienceMatcher))
 }
 
 func TestConstructorSetsOverrides(t *testing.T) {
@@ -313,10 +373,10 @@ func TestWaitUntilReadyAsynCompleted(t *testing.T) {
 }
 
 func TestErrorWhenClosing(t *testing.T) {
-	setUp()
-	var config = CreateDefaultContextConfig()
-	config.Units_ = units
-	var context = CreateTestContext(config, dataFutureReady)
+	// Hold the publish so the context stays in the closing state while the
+	// test checks it, instead of racing the publish that finishes the close.
+	var publisher = &heldPublisher{}
+	var context = createHeldPublisherContext(t, publisher, nil)
 
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
@@ -345,6 +405,12 @@ func TestErrorWhenClosing(t *testing.T) {
 	assertAny("ABSmartly Context is closing", resErr.Error(), t)
 	assertAny(true, context.IsClosing(), t)
 	assertAny(false, context.IsClosed(), t)
+
+	publisher.settle(t, 0, nil)
+	var closing, _ = context.CloseAsync()
+	assertAny(nil, getWithTimeout(t, closing), t)
+	assertAny(true, context.IsClosed(), t)
+	assertAny(false, context.IsClosing(), t)
 }
 
 func TestErrorWhenClosed(t *testing.T) {
@@ -429,9 +495,20 @@ func TestUnitEmpty(t *testing.T) {
 	var err = context.SetUnit("db_user_id", "")
 
 	assertAny("unit  UID must not be blank.", err.Error(), t)
+	assertAny(true, errors.Is(err, ErrUnitBlank), t)
+	var unitErr *UnitError
+	assertAny(true, errors.As(err, &unitErr), t)
+	assertAny("Unit 'db_user_id' UID must not be blank.", unitErr.Canonical(), t)
 
 	err = context.SetUnit("session_id", "1")
 
+	assertAny("unit already set", err.Error(), t)
+	assertAny(true, errors.Is(err, ErrUnitAlreadySet), t)
+	assertAny(true, errors.As(err, &unitErr), t)
+	assertAny("Unit 'session_id' UID already set.", unitErr.Canonical(), t)
+
+	// v1.1.1 checks for an existing unit before a blank UID.
+	err = context.SetUnit("session_id", "")
 	assertAny("unit already set", err.Error(), t)
 }
 
@@ -767,10 +844,70 @@ func TestGetVariableKeys(t *testing.T) {
 	assertAny(true, context.IsReady(), t)
 	assertAny(false, context.IsFailed(), t)
 
-	var res, _ = context.GetVariableKeys()
-	assertAny(variableExperiments, res, t)
+	var res, _ = context.GetVariableKeysAll()
+	assertAny(variableExperimentKeys, res, t)
 
 	assertAny(int32(0), context.GetPendingCount(), t)
+}
+
+func TestGetVariableKeysKeepsV1Signature(t *testing.T) {
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	var context = CreateTestContext(config, dataFutureRefresh)
+
+	// v1.1.x callers assign the values to string; this must keep compiling.
+	var res map[string]string
+	res, err := context.GetVariableKeys()
+	assertAny(nil, err, t)
+	var want = map[string]string{}
+	for key, names := range variableExperimentKeys {
+		want[key] = names[0]
+	}
+	assertAny(want, res, t)
+	var name string = res["button.color"]
+	assertAny("exp_test_abc", name, t)
+}
+
+func TestGetVariableKeysReturnsFirstExperimentPerKey(t *testing.T) {
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	var context = CreateTestContext(config, dataFutureRefresh)
+
+	context.DataLock.Lock()
+	context.indexVariables_["shared.key"] = []ExperimentVariables{
+		{Data: jsonmodels.Experiment{Name: "first"}},
+		{Data: jsonmodels.Experiment{Name: "second"}},
+	}
+	context.DataLock.Unlock()
+
+	keys, err := context.GetVariableKeys()
+	assertAny(nil, err, t)
+	assertAny("first", keys["shared.key"], t)
+	all, err := context.GetVariableKeysAll()
+	assertAny(nil, err, t)
+	assertAny([]string{"first", "second"}, all["shared.key"], t)
+}
+
+func TestContextErrorTextsMatchV1(t *testing.T) {
+	assertAny("ABSmartly Context is closed", ErrContextClosed.Error(), t)
+	assertAny("ABSmartly Context is closing", ErrContextClosing.Error(), t)
+	assertAny("ABSmartly Context is not yet ready", ErrContextNotReady.Error(), t)
+
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	var pending, _ = future.New()
+	var notReady = CreateTestContext(config, pending)
+	_, err := notReady.GetTreatment("exp_test_ab")
+	assertAny(true, errors.Is(err, ErrContextNotReady), t)
+
+	var ctx = CreateTestContext(config, dataFutureReady)
+	ctx.Close()
+	_, err = ctx.GetTreatment("exp_test_ab")
+	assertAny(true, errors.Is(err, ErrContextClosed), t)
+	assertAny("ABSmartly Context is closed", err.Error(), t)
 }
 
 func TestGetCustomFieldValueKeys(t *testing.T) {
@@ -1065,6 +1202,7 @@ func TestPublishSuccess(t *testing.T) {
 		}},
 		Attributes: []jsonmodels.Attribute{{Name: "test", Value: "value1", SetAt: 1620000000000}},
 	}
+	publishResult = nil
 	assertAny(nil, publishResult, t)
 	var attrErr = context.SetAttribute("test", "value1")
 	assertAny(nil, attrErr, t)
@@ -1246,7 +1384,7 @@ func TestRefreshClearAssignmentCacheForStartedExperiment(t *testing.T) {
 	assertAny(0, res, t)
 	assertAny(nil, err, t)
 
-	fut = dataFutureRefresh
+	setFut(dataFutureRefresh)
 	experiment.Name = "exp_test_new"
 	experiment.Id = 2
 	assertAny(false, context.RefreshTimer_ == nil, t)
@@ -1295,11 +1433,11 @@ func TestClearAssignmentCacheForExperimentIdChange(t *testing.T) {
 	context.Data_.Experiments[4].SeedHi = 77498863
 	context.Data_.Experiments[4].SeedLo = 34737352
 	experiment = context.Data_.Experiments[4]
-	fut = future.Call(func() (future.Value, error) {
+	setFut(future.Call(func() (future.Value, error) {
 		return jsonmodels.ContextData{
 			Experiments: []jsonmodels.Experiment{experiment},
 		}, nil
-	})
+	}))
 	assertAny(true, context.RefreshTimer_ == nil, t)
 	var ft = context.RefreshAsync()
 	assertAny(true, context.RefreshTimer_ == nil, t)
@@ -1319,4 +1457,55 @@ func TestClearAssignmentCacheForExperimentIdChange(t *testing.T) {
 	res, err = context.GetTreatment("not_found")
 	assertAny(0, res, t)
 	assertAny(nil, err, t)
+}
+
+func createTrackedContext(clk internal.Clock, config ContextConfig, dataFuture *future.Future, dp ContextDataProvider,
+	eh ContextEventHandler, el ContextEventLogger, vp VariableParser, am AudienceMatcher) *Context {
+	return trackContext(CreateContext(clk, config, dataFuture, dp, eh, el, vp, am))
+}
+
+func TestCachedAssignmentUsesReadLock(t *testing.T) {
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	var context = CreateTestContext(config, dataFutureReady)
+	context.SetAttribute("age", 25)
+
+	want, err := context.PeekTreatment("exp_test_ab")
+	assertAny(nil, err, t)
+
+	// While another reader holds the lock, a cache hit must not wait for the
+	// exclusive lock.
+	context.ContextLock_.RLock()
+	var done = make(chan int, 1)
+	go func() {
+		variant, _ := context.PeekTreatment("exp_test_ab")
+		done <- variant
+	}()
+	select {
+	case got := <-done:
+		context.ContextLock_.RUnlock()
+		assertAny(want, got, t)
+	case <-time.After(2 * time.Second):
+		context.ContextLock_.RUnlock()
+		t.Fatal("cached PeekTreatment waited for the exclusive context lock")
+	}
+}
+
+func TestConcurrentGetTreatmentQueuesOneExposure(t *testing.T) {
+	setUp()
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	var context = CreateTestContext(config, dataFutureReady)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = context.GetTreatment("exp_test_ab")
+		}()
+	}
+	wg.Wait()
+	assertAny(int32(1), context.GetPendingCount(), t)
 }

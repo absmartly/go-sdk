@@ -18,8 +18,12 @@ type Logger struct {
 	resty.Logger
 }
 
+// Logger is the default silent Resty logger. Set DefaultHttpClientConfig.Logger
+// to receive Resty retry and transport diagnostics.
 func (l Logger) Errorf(format string, v ...interface{}) {}
-func (l Logger) Warnf(format string, v ...interface{})  {}
+
+func (l Logger) Warnf(format string, v ...interface{}) {}
+
 func (l Logger) Debugf(format string, v ...interface{}) {}
 
 func CreateDefaultHttpClient() DefaultHttpClient {
@@ -47,7 +51,9 @@ func (e DefaultHttpClient) DefaultHttpClientConfig(config DefaultHttpClientConfi
 		MaxConnsPerHost:    config.MaxConnectionsPerHost_,
 	}
 	e.httpClient_.SetTransport(transport)
-	e.httpClient_.SetTLSClientConfig(&tls.Config{})
+	e.httpClient_.SetTLSClientConfig(&tls.Config{
+		MinVersion: tls.VersionTLS12,
+	})
 }
 
 func (e DefaultHttpClient) Get(url string, query map[string]string, headers map[string]string) *future.Future {

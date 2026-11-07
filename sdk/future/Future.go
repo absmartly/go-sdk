@@ -2,6 +2,7 @@ package future
 
 import (
 	"context"
+	"fmt"
 	"sync"
 )
 
@@ -53,23 +54,33 @@ func (f *Future) Ready() bool {
 	}
 }
 
+// SetResult settles the future. Only the first call has an effect, even when
+// several goroutines settle the future at the same time.
 func (f *Future) SetResult(v Value, err error) {
+	f.mu.Lock()
 	select {
 	case <-f.ready:
+		f.mu.Unlock()
+		return
 	default:
-		f.val, f.err = v, err
-		close(f.ready)
-		f.NotifyCallbacks()
 	}
+	f.val, f.err = v, err
+	close(f.ready)
+	f.mu.Unlock()
+	f.NotifyCallbacks()
 }
 
 // Listen for the result.
 func (f *Future) Listen(callback SetResultFunc) {
+	// Check readiness while holding the lock that NotifyCallbacks takes. Checking
+	// first and locking after would lose the callback when the future completes
+	// in between: NotifyCallbacks would already have run without it.
+	f.mu.Lock()
 	select {
 	case <-f.ready:
+		f.mu.Unlock()
 		callback(f.val, f.err)
 	default:
-		f.mu.Lock()
 		f.callbacks = append(f.callbacks, callback)
 		f.mu.Unlock()
 	}
@@ -77,27 +88,51 @@ func (f *Future) Listen(callback SetResultFunc) {
 
 func (f *Future) NotifyCallbacks() {
 	f.mu.Lock()
-	for _, callback := range f.callbacks {
-		callback(f.val, f.err)
-	}
+	var callbacks = f.callbacks
+	f.callbacks = nil
 	f.mu.Unlock()
+	// Run the callbacks without the lock so one of them can call Listen on
+	// this future. A callback that panics must not stop the callbacks after it
+	// (they would never run) or unwind into whoever settled the future.
+	for _, callback := range callbacks {
+		f.runCallback(callback)
+	}
+}
+
+func (f *Future) runCallback(callback SetResultFunc) {
+	defer func() { _ = recover() }()
+	callback(f.val, f.err)
 }
 
 func (f *Future) Join(ctx context.Context) {
-	f.mu.Lock()
-	var _, _ = f.Get(ctx)
-	for _, callback := range f.callbacks {
-		callback(f.val, f.err)
-	}
-	f.mu.Unlock()
+	f.Get(ctx)
 }
 
 // Call will converts the sync function call as async call.
 func Call(f func() (Value, error)) *Future {
 	fut, setDone := New()
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				var panicErr error
+				if err, ok := r.(error); ok {
+					panicErr = err
+				} else {
+					panicErr = &PanicError{Value: r}
+				}
+				setDone(nil, panicErr)
+			}
+		}()
 		res, err := f()
 		setDone(res, err)
 	}()
 	return fut
+}
+
+type PanicError struct {
+	Value interface{}
+}
+
+func (e *PanicError) Error() string {
+	return fmt.Sprintf("panic: %v", e.Value)
 }
