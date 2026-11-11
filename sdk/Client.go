@@ -58,6 +58,20 @@ func CreateClient(config ClientConfig, httpClient HTTPClient) Client {
 	return cl
 }
 
+// GetApplication returns the application name from the client config, which the
+// context injects into the attribute map audiences are evaluated against. It is
+// the same value sent as the "application" request query parameter.
+func (c Client) GetApplication() string {
+	return c.query_["application"]
+}
+
+// GetEnvironment returns the environment name from the client config, which the
+// context injects into the attribute map audiences are evaluated against. It is
+// the same value sent as the "environment" request query parameter.
+func (c Client) GetEnvironment() string {
+	return c.query_["environment"]
+}
+
 func (c Client) GetContextData() *future.Future {
 	var dataFuture = future.Call(func() (future.Value, error) {
 		var fut = c.httpClient_.Get(c.url_, c.query_, nil)

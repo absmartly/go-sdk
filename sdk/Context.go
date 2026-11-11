@@ -89,6 +89,15 @@ type Context struct {
 	Clock_        internal.Clock
 	AttrsSeq_     int32
 
+	// Application_ and Environment_ are the application and environment names
+	// from the client config. They are injected into the attribute map that
+	// audiences are evaluated against (system values first, user attributes
+	// overlaid on top), so filters can target them, exactly as the collector
+	// attaches them to every exposure server-side. They are never published as
+	// attributes and are set once at creation, so they need no locking.
+	Application_ string
+	Environment_ string
+
 	// customFieldErrors_ holds, per experiment and field name, the error from
 	// parsing a "json" custom field. GetCustomFieldValue reports it through the
 	// event logger when the field is read. Guarded by DataLock.
@@ -185,7 +194,8 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	audienceMatcher AudienceMatcher) *Context {
 	var cntx = Context{Clock_: clock, PublishDelay_: config.PublishDelay_, RefreshInterval_: config.RefreshInterval_,
 		EventHandler_: eventHandler, DataProvider_: dataProvider, VariableParser_: variableParser,
-		AudienceMatcher_: audienceMatcher, Units_: map[string]string{}}
+		AudienceMatcher_: audienceMatcher, Units_: map[string]string{},
+		Application_: config.application_, Environment_: config.environment_}
 
 	if config.EventLogger_ != nil {
 		cntx.EventLogger_ = config.EventLogger_
@@ -669,6 +679,29 @@ func (c *Context) GetAttributes() map[string]interface{} {
 		}
 	}
 	return result
+}
+
+// evaluationAttributes builds the attribute map audiences are evaluated
+// against. The system attributes application and environment go in first, and
+// user-set attributes are overlaid on top, so a user-set value of the same
+// name always wins, even one set after an assignment was cached (the AttrsSeq_
+// bump invalidates it). Empty system values are left out rather than set to an
+// empty string, so a filter on a name that is not configured does not match.
+// These values are never published as attributes; the collector adds them to
+// exposures server-side. The caller must hold ContextLock_.
+func (c *Context) evaluationAttributes() map[string]interface{} {
+	var attrs = map[string]interface{}{}
+	if len(c.Application_) > 0 {
+		attrs["application"] = c.Application_
+	}
+	if len(c.Environment_) > 0 {
+		attrs["environment"] = c.Environment_
+	}
+	for _, v := range c.Attributes_ {
+		var attribute = v.(jsonmodels.Attribute)
+		attrs[attribute.Name] = attribute.Value
+	}
+	return attrs
 }
 
 func (c *Context) SetAttributes(attributes map[string]interface{}) error {
@@ -1295,10 +1328,7 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 			var unitType = experiment.Data.UnitType
 
 			if len(experiment.Data.Audience) > 0 {
-				var attrs = map[string]interface{}{}
-				for _, v := range c.Attributes_ {
-					attrs[v.(jsonmodels.Attribute).Name] = v.(jsonmodels.Attribute).Value
-				}
+				var attrs = c.evaluationAttributes()
 
 				var match, err = c.AudienceMatcher_.Evaluate(experiment.Data.Audience, attrs)
 				if err == nil {
@@ -1382,10 +1412,7 @@ func (c *Context) ExperimentMatches(experiment jsonmodels.Experiment, assignment
 func (c *Context) AudienceMatches(experiment jsonmodels.Experiment, assignment *Assignment) bool {
 	if len(experiment.Audience) > 0 {
 		if atomic.LoadInt32(&c.AttrsSeq_) > assignment.AttrsSeq {
-			var attrs = map[string]interface{}{}
-			for _, v := range c.Attributes_ {
-				attrs[v.(jsonmodels.Attribute).Name] = v.(jsonmodels.Attribute).Value
-			}
+			var attrs = c.evaluationAttributes()
 
 			var match, err = c.AudienceMatcher_.Evaluate(experiment.Audience, attrs)
 			var newAudienceMismatch = false

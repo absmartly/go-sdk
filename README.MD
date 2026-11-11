@@ -474,6 +474,15 @@ ctx.SetAttributes(map[string]interface{}{
 })
 ```
 
+The `application` and `environment` names from the client configuration are
+always injected into the attribute map that audiences are evaluated against, so
+an audience filter can target `application` or `environment` without setting
+them explicitly. A value left unset or empty is omitted, so a filter can rely on
+it only when it is configured or set explicitly. A user-set attribute of the
+same name always takes precedence, including one set after the context is
+created. These values are not added to the publish payload; the collector
+attaches them to every exposure server-side.
+
 ### Custom Assignments
 
 Sometimes it may be necessary to override the automatic selection of a
