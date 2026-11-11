@@ -82,7 +82,6 @@ const (
 )
 
 // §4.1: a strict audience on environment matches the configured environment.
-// Without injection (pre-patch) this served variant 0: the regression this pins.
 func TestSystemAttributes_StrictEnvironmentMatches(t *testing.T) {
 	var ctx, _ = newSystemAttrContext("website", "production",
 		audienceExperiment("exp_env", envFilter, true))
@@ -128,7 +127,6 @@ func TestSystemAttributes_UserValueOverrides(t *testing.T) {
 	var ctx, _ = newSystemAttrContext("website", "production",
 		audienceExperiment("exp_env", envFilterStg, true))
 
-	// Cache an assignment while only the system environment (production) is set.
 	var before = ctx.GetAssignment("exp_env")
 	assertAny(0, before.Variant, t)
 	assertAny(true, before.AudienceMismatch, t)
@@ -137,7 +135,6 @@ func TestSystemAttributes_UserValueOverrides(t *testing.T) {
 		t.Fatalf("SetAttribute failed: %v", err)
 	}
 
-	// The AttrsSeq_ bump invalidates the cached assignment, which is recomputed.
 	var after = ctx.GetAssignment("exp_env")
 	assertAny(1, after.Variant, t)
 	assertAny(false, after.AudienceMismatch, t)
@@ -203,7 +200,6 @@ func TestSystemAttributes_NothingExtraPublished(t *testing.T) {
 		t.Fatalf("expected exactly one publish, got %d", len(client.published))
 	}
 
-	// Check the serialized payload, not an in-memory object.
 	var serializer = DefaultContextEventSerializer{}
 	var body, err = serializer.Serialize(client.published[0])
 	if err != nil {
@@ -349,10 +345,8 @@ func TestSystemAttributes_ReadyLoggerSeesSystemAttributes(t *testing.T) {
 	if !logger.seen {
 		t.Fatal("Ready logger did not run")
 	}
-	// The logger, evaluating during construction, must have matched the
-	// production environment and cached variant 1.
+	// The logger evaluates its audience synchronously during construction.
 	assertAny(1, logger.variant, t)
 
-	// The same assignment holds when read again after construction.
 	assertAny(1, ctx.GetAssignment("exp_env").Variant, t)
 }
