@@ -82,8 +82,7 @@ const (
 )
 
 // §4.1: a strict audience on environment matches the configured environment.
-// On 1.13.4 behaviour (no injection) this served variant 0; the injection is
-// what this pins.
+// Without injection (pre-patch) this served variant 0: the regression this pins.
 func TestSystemAttributes_StrictEnvironmentMatches(t *testing.T) {
 	var ctx, _ = newSystemAttrContext("website", "production",
 		audienceExperiment("exp_env", envFilter, true))
@@ -129,19 +128,16 @@ func TestSystemAttributes_UserValueOverrides(t *testing.T) {
 	var ctx, _ = newSystemAttrContext("website", "production",
 		audienceExperiment("exp_env", envFilterStg, true))
 
-	// Cache an assignment with the system environment (production): the
-	// staging filter does not match, so variant 0.
+	// Cache an assignment while only the system environment (production) is set.
 	var before = ctx.GetAssignment("exp_env")
 	assertAny(0, before.Variant, t)
 	assertAny(true, before.AudienceMismatch, t)
 
-	// Set the user attribute after creation: it overlays the system value.
 	if err := ctx.SetAttribute("environment", "staging"); err != nil {
 		t.Fatalf("SetAttribute failed: %v", err)
 	}
 
-	// The cached assignment is invalidated and recomputed: staging now
-	// matches, so variant 1.
+	// The AttrsSeq_ bump invalidates the cached assignment, which is recomputed.
 	var after = ctx.GetAssignment("exp_env")
 	assertAny(1, after.Variant, t)
 	assertAny(false, after.AudienceMismatch, t)
@@ -178,7 +174,6 @@ func TestSystemAttributes_MissingEnvironmentConfig(t *testing.T) {
 	var assignment = ctx.GetAssignment("exp_env")
 	assertAny(true, assignment.AudienceMismatch, t)
 
-	// The evaluation map has no environment key when none is configured.
 	ctx.ContextLock_.RLock()
 	var attrs = ctx.evaluationAttributes()
 	ctx.ContextLock_.RUnlock()
