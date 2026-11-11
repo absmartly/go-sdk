@@ -307,3 +307,57 @@ func TestSystemAttributes_LegacyClientNoSystemAttributes(t *testing.T) {
 		t.Errorf("a legacy client must contribute no system attributes, got %v", attrs)
 	}
 }
+
+// readyAssignmentLogger evaluates an experiment's assignment from inside the
+// Ready callback, which CreateContextWith delivers synchronously during
+// construction. It records the variant it saw.
+type readyAssignmentLogger struct {
+	experiment string
+	variant    int
+	seen       bool
+}
+
+func (l *readyAssignmentLogger) HandleEvent(ctx Context, event EventType, data interface{}) {
+	if event == Ready {
+		l.variant = ctx.GetAssignment(l.experiment).Variant
+		l.seen = true
+	}
+}
+
+// A Ready logger that evaluates a strict environment audience during
+// construction must already see the system attributes, so it caches the correct
+// variant. CreateContextWith settles the data future before CreateContext runs,
+// so the Ready callback fires synchronously; the system values have to be set
+// on the context before the listener is attached, not afterwards.
+func TestSystemAttributes_ReadyLoggerSeesSystemAttributes(t *testing.T) {
+	var logger = &readyAssignmentLogger{experiment: "exp_env"}
+	var client = &systemAttrClient{application: "website", environment: "production"}
+	var sdkConfig = ABsmartlyConfig{
+		Client_:              client,
+		ContextDataProvider_: DefaultContextDataProvider{client_: client},
+		ContextEventHandler_: DefaultContextEventHandler{client_: client},
+	}
+	var abs = Create(sdkConfig)
+
+	var config = CreateDefaultContextConfig()
+	config.Units_ = map[string]string{"session_id": "e791e240fcd3df7d238cfc285f475e8152fcc0ec"}
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = -1
+	config.EventLogger_ = logger
+
+	var data = jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+		audienceExperiment("exp_env", envFilter, true),
+	}}
+	var ctx = abs.CreateContextWith(config, data)
+	ctx.WaitUntilReady()
+
+	if !logger.seen {
+		t.Fatal("Ready logger did not run")
+	}
+	// The logger, evaluating during construction, must have matched the
+	// production environment and cached variant 1.
+	assertAny(1, logger.variant, t)
+
+	// The same assignment holds when read again after construction.
+	assertAny(1, ctx.GetAssignment("exp_env").Variant, t)
+}

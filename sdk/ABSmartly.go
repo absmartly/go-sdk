@@ -55,31 +55,34 @@ func Create(config ABsmartlyConfig) ABsmartly {
 
 // CreateContext
 func (abs ABsmartly) CreateContext(config ContextConfig) *Context {
-	var cntx = CreateContext(internal.SystemClockUTC{}, config, abs.ContextDataProvider_.GetContextData(), abs.ContextDataProvider_,
+	config = abs.withSystemAttributes(config)
+	return CreateContext(internal.SystemClockUTC{}, config, abs.ContextDataProvider_.GetContextData(), abs.ContextDataProvider_,
 		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_})
-	abs.setSystemAttributes(cntx)
-	return cntx
 }
 
 // CreateContextWith
 func (abs ABsmartly) CreateContextWith(config ContextConfig, data jsonmodels.ContextData) *Context {
+	config = abs.withSystemAttributes(config)
 	var ft, done = future.New()
 	done(data, nil)
-	var cntx = CreateContext(internal.SystemClockUTC{}, config, ft, abs.ContextDataProvider_,
+	return CreateContext(internal.SystemClockUTC{}, config, ft, abs.ContextDataProvider_,
 		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_})
-	abs.setSystemAttributes(cntx)
-	return cntx
 }
 
-// setSystemAttributes copies the application and environment names from the
-// client onto the context, so audiences and rule conditions can target them.
-// The collector adds the same values to every exposure server-side, so they
-// are never published as attributes here.
-func (abs ABsmartly) setSystemAttributes(cntx *Context) {
+// withSystemAttributes copies the application and environment names from the
+// client into the context config, so CreateContext sets them on the context
+// before the data future delivers its Ready callback. CreateContextWith settles
+// that future before CreateContext runs, so the Ready callback fires
+// synchronously during construction; a Ready logger that evaluates an audience
+// must already see these values, or it would cache an assignment built without
+// them. The collector adds the same values to every exposure server-side, so
+// they are never published as attributes here.
+func (abs ABsmartly) withSystemAttributes(config ContextConfig) ContextConfig {
 	if client, ok := abs.Client_.(clientSystemAttributes); ok {
-		cntx.Application_ = client.GetApplication()
-		cntx.Environment_ = client.GetEnvironment()
+		config.application_ = client.GetApplication()
+		config.environment_ = client.GetEnvironment()
 	}
+	return config
 }
 
 func (abs ABsmartly) GetContextData() *future.Future {

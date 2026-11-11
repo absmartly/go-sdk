@@ -194,7 +194,8 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	audienceMatcher AudienceMatcher) *Context {
 	var cntx = Context{Clock_: clock, PublishDelay_: config.PublishDelay_, RefreshInterval_: config.RefreshInterval_,
 		EventHandler_: eventHandler, DataProvider_: dataProvider, VariableParser_: variableParser,
-		AudienceMatcher_: audienceMatcher, Units_: map[string]string{}}
+		AudienceMatcher_: audienceMatcher, Units_: map[string]string{},
+		Application_: config.application_, Environment_: config.environment_}
 
 	if config.EventLogger_ != nil {
 		cntx.EventLogger_ = config.EventLogger_
