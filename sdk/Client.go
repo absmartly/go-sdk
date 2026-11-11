@@ -18,6 +18,8 @@ type Client struct {
 	url_          string
 	query_        map[string]string
 	headers_      map[string]string
+	application_  string
+	environment_  string
 	httpClient_   HTTPClient
 	deserializer_ ContextDataDeserializer
 	serializer_   ContextEventSerializer
@@ -55,7 +57,23 @@ func CreateClient(config ClientConfig, httpClient HTTPClient) Client {
 		"environment": config.Environment_,
 	}
 	cl.query_ = query
+	cl.application_ = config.Application_
+	cl.environment_ = config.Environment_
 	return cl
+}
+
+// GetApplication returns the application name from the client config. The
+// context injects it into the attribute map that audiences are evaluated
+// against.
+func (c Client) GetApplication() string {
+	return c.application_
+}
+
+// GetEnvironment returns the environment name from the client config. The
+// context injects it into the attribute map that audiences are evaluated
+// against.
+func (c Client) GetEnvironment() string {
+	return c.environment_
 }
 
 func (c Client) GetContextData() *future.Future {
