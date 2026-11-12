@@ -1,138 +1,135 @@
 package eval
 
 import (
-	"fmt"
 	"reflect"
-	"strconv"
 	"strings"
 )
 
-// CompareSemver compares permissively parsed semantic-version-like values.
-func CompareSemver(lhs, rhs interface{}) (int, bool) {
-	l, lok := semverString(lhs)
-	r, rok := semverString(rhs)
+// VersionCompare compares two semantic versions for the semver_* operators,
+// returning -1, 0 or 1, or nil when either side is not a string, number or
+// boolean, is empty, or has an empty version core. It mirrors the JS and Java
+// SDKs: a leading "v"/"V" and build metadata are ignored, missing core parts
+// count as 0, numeric identifiers compare numerically (leading zeros ignored)
+// and rank below alphanumeric ones, and a release ranks above its
+// pre-releases. Parsing is as permissive as the other SDKs', so a
+// non-numeric core part ("1.x") is compared as an alphanumeric identifier.
+func (e Evaluator) VersionCompare(lhs reflect.Value, rhs reflect.Value) interface{} {
+	var lhsStr, lerr = e.StringConvert(lhs)
+	var rhsStr, rerr = e.StringConvert(rhs)
+	if lerr != nil || rerr != nil || lhsStr == "" || rhsStr == "" {
+		return nil
+	}
+
+	var l, lok = parseSemver(lhsStr)
+	var r, rok = parseSemver(rhsStr)
 	if !lok || !rok {
-		return 0, false
+		return nil
 	}
-	lv, lok := parseVersion(l)
-	rv, rok := parseVersion(r)
-	if !lok || !rok {
-		return 0, false
-	}
-	for i := 0; i < max(len(lv.core), len(rv.core)); i++ {
-		a, b := "0", "0"
-		if i < len(lv.core) {
-			a = lv.core[i]
+
+	for i := 0; i < len(l.parts) || i < len(r.parts); i++ {
+		var lPart, rPart = "0", "0"
+		if i < len(l.parts) {
+			lPart = l.parts[i]
 		}
-		if i < len(rv.core) {
-			b = rv.core[i]
+		if i < len(r.parts) {
+			rPart = r.parts[i]
 		}
-		if c := compareIdentifier(a, b); c != 0 {
-			return c, true
+		if result := compareIdentifiers(lPart, rPart); result != 0 {
+			return result
 		}
 	}
-	if lv.pre == "" && rv.pre != "" {
-		return 1, true
+
+	if l.preRelease == "" && r.preRelease == "" {
+		return 0
+	} else if l.preRelease == "" {
+		return 1
+	} else if r.preRelease == "" {
+		return -1
 	}
-	if lv.pre != "" && rv.pre == "" {
-		return -1, true
-	}
-	if lv.pre == "" && rv.pre == "" {
-		return 0, true
-	}
-	la, lb := strings.Split(lv.pre, "."), strings.Split(rv.pre, ".")
-	for i := 0; i < max(len(la), len(lb)); i++ {
-		if i >= len(la) {
-			return -1, true
+
+	var lPre = strings.Split(l.preRelease, ".")
+	var rPre = strings.Split(r.preRelease, ".")
+	for i := 0; i < len(lPre) || i < len(rPre); i++ {
+		if i >= len(lPre) {
+			return -1
 		}
-		if i >= len(lb) {
-			return 1, true
+		if i >= len(rPre) {
+			return 1
 		}
-		if c := compareIdentifier(la[i], lb[i]); c != 0 {
-			return c, true
+		if result := compareIdentifiers(lPre[i], rPre[i]); result != 0 {
+			return result
 		}
 	}
-	return 0, true
+	return 0
 }
 
 type semver struct {
-	core []string
-	pre  string
+	parts      []string
+	preRelease string
 }
 
-func semverString(v interface{}) (string, bool) {
-	rv := reflect.ValueOf(v)
-	if !rv.IsValid() {
-		return "", false
+func parseSemver(version string) (semver, bool) {
+	var v = version
+	if strings.HasPrefix(v, "v") || strings.HasPrefix(v, "V") {
+		v = v[1:]
 	}
-	switch rv.Kind() {
-	case reflect.String:
-		return rv.String(), true
-	case reflect.Bool:
-		return strconv.FormatBool(rv.Bool()), true
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return strconv.FormatInt(rv.Int(), 10), true
-	case reflect.Float32, reflect.Float64:
-		return fmt.Sprintf("%g", rv.Float()), true
+	if i := strings.IndexByte(v, '+'); i >= 0 {
+		v = v[:i]
 	}
-	return "", false
-}
-func parseVersion(s string) (semver, bool) {
-	s = strings.TrimPrefix(strings.TrimPrefix(s, "v"), "V")
-	if i := strings.IndexByte(s, '+'); i >= 0 {
-		s = s[:i]
-	}
-	if s == "" {
+	if v == "" {
 		return semver{}, false
 	}
-	p := ""
-	if i := strings.IndexByte(s, '-'); i >= 0 {
-		p = s[i+1:]
-		s = s[:i]
+
+	var core, preRelease = v, ""
+	if i := strings.IndexByte(v, '-'); i >= 0 {
+		core, preRelease = v[:i], v[i+1:]
 	}
-	if s == "" {
+	if core == "" {
 		return semver{}, false
 	}
-	return semver{strings.Split(s, "."), p}, true
+	return semver{parts: strings.Split(core, "."), preRelease: preRelease}, true
 }
-func numeric(s string) bool {
+
+func isNumericIdentifier(s string) bool {
 	if s == "" {
 		return false
 	}
-	for _, c := range s {
-		if c < '0' || c > '9' {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
 			return false
 		}
 	}
 	return true
 }
-func compareIdentifier(a, b string) int {
-	an, bn := numeric(a), numeric(b)
-	if an && bn {
-		a = strings.TrimLeft(a, "0")
-		b = strings.TrimLeft(b, "0")
-		if a == "" {
-			a = "0"
-		}
-		if b == "" {
-			b = "0"
-		}
-		if len(a) != len(b) {
-			if len(a) > len(b) {
+
+func stripLeadingZeros(s string) string {
+	var stripped = strings.TrimLeft(s, "0")
+	if stripped == "" {
+		return "0"
+	}
+	return stripped
+}
+
+func compareIdentifiers(a string, b string) int {
+	var aIsNum = isNumericIdentifier(a)
+	var bIsNum = isNumericIdentifier(b)
+
+	if aIsNum && bIsNum {
+		var aNorm = stripLeadingZeros(a)
+		var bNorm = stripLeadingZeros(b)
+		if len(aNorm) != len(bNorm) {
+			if len(aNorm) > len(bNorm) {
 				return 1
 			}
 			return -1
 		}
-	} else if an {
+		return strings.Compare(aNorm, bNorm)
+	}
+	if aIsNum {
 		return -1
-	} else if bn {
+	}
+	if bIsNum {
 		return 1
 	}
 	return strings.Compare(a, b)
-}
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

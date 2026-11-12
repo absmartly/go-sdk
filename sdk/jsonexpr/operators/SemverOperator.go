@@ -2,25 +2,65 @@ package operators
 
 import (
 	"github.com/absmartly/go-sdk/sdk/jsonexpr/eval"
+	"reflect"
 )
 
-type SemverOperator struct{ Mode int }
+type SemverEqualsOperator struct {
+	BinaryOperator
+}
 
-func (o SemverOperator) Binary(_ eval.Evaluator, lhs, rhs interface{}) interface{} {
-	c, ok := eval.CompareSemver(lhs, rhs)
-	if !ok {
-		return nil
+func (v SemverEqualsOperator) Binary(evaluator eval.Evaluator, lhs interface{}, rhs interface{}) interface{} {
+	var result = evaluator.VersionCompare(reflect.ValueOf(lhs), reflect.ValueOf(rhs))
+	if result != nil {
+		return result.(int) == 0
 	}
-	switch o.Mode {
-	case 0:
-		return c == 0
-	case 1:
-		return c > 0
-	case 2:
-		return c >= 0
-	case 3:
-		return c < 0
-	default:
-		return c <= 0
+	return nil
+}
+
+type SemverGreaterThanOperator struct {
+	BinaryOperator
+}
+
+func (v SemverGreaterThanOperator) Binary(evaluator eval.Evaluator, lhs interface{}, rhs interface{}) interface{} {
+	var result = evaluator.VersionCompare(reflect.ValueOf(lhs), reflect.ValueOf(rhs))
+	if result != nil {
+		return result.(int) > 0
 	}
+	return nil
+}
+
+type SemverGreaterThanOrEqualOperator struct {
+	BinaryOperator
+}
+
+func (v SemverGreaterThanOrEqualOperator) Binary(evaluator eval.Evaluator, lhs interface{}, rhs interface{}) interface{} {
+	var result = evaluator.VersionCompare(reflect.ValueOf(lhs), reflect.ValueOf(rhs))
+	if result != nil {
+		return result.(int) >= 0
+	}
+	return nil
+}
+
+type SemverLessThanOperator struct {
+	BinaryOperator
+}
+
+func (v SemverLessThanOperator) Binary(evaluator eval.Evaluator, lhs interface{}, rhs interface{}) interface{} {
+	var result = evaluator.VersionCompare(reflect.ValueOf(lhs), reflect.ValueOf(rhs))
+	if result != nil {
+		return result.(int) < 0
+	}
+	return nil
+}
+
+type SemverLessThanOrEqualOperator struct {
+	BinaryOperator
+}
+
+func (v SemverLessThanOrEqualOperator) Binary(evaluator eval.Evaluator, lhs interface{}, rhs interface{}) interface{} {
+	var result = evaluator.VersionCompare(reflect.ValueOf(lhs), reflect.ValueOf(rhs))
+	if result != nil {
+		return result.(int) <= 0
+	}
+	return nil
 }
