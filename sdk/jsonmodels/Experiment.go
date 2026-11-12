@@ -17,4 +17,5 @@ type Experiment struct {
 	CustomFieldValues []CustomFieldValue      `json:"customFieldValues"`
 	AudienceStrict    bool                    `json:"audienceStrict"`
 	Audience          string                  `json:"audience"`
+	AssignmentRules   string                  `json:"assignmentRules"`
 }

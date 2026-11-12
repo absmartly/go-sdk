@@ -184,6 +184,8 @@ type Assignment struct {
 	FullOn           bool
 	Custom           bool
 	AudienceMismatch bool
+	RuleOverride     bool
+	RuleMissingUnit  bool
 	Variables        map[string]interface{}
 	Exposed          *atomic.Value
 	AttrsSeq         int32
@@ -733,7 +735,7 @@ func (c *Context) QueueExposure(assignment *Assignment) {
 		var exposure = jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
 			Variant: assignment.Variant, ExposedAt: c.Clock_.Millis(), Assigned: assignment.Assigned,
 			Eligible: assignment.Eligible, Overridden: assignment.Overridden, FullOn: assignment.FullOn,
-			Custom: assignment.Custom, AudienceMismatch: assignment.AudienceMismatch}
+			Custom: assignment.Custom, AudienceMismatch: assignment.AudienceMismatch, RuleOverride: assignment.RuleOverride}
 
 		c.EventLock_.Lock()
 		// Close seals the context under EventLock_, so this check and the
@@ -1278,7 +1280,7 @@ func (c *Context) cachedAssignment(experimentName string) *Assignment {
 		if !assignment.Assigned {
 			return assignment
 		}
-	} else if !cfound || custom.(int) == assignment.Variant {
+	} else if assignment.RuleOverride || !cfound || custom.(int) == assignment.Variant {
 		if c.ExperimentMatches(experiment.Data, *assignment) && c.AudienceMatches(experiment.Data, assignment) {
 			return assignment
 		}
@@ -1327,7 +1329,27 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 		if efound {
 			var unitType = experiment.Data.UnitType
 
-			if len(experiment.Data.Audience) > 0 {
+			if experiment.Data.AssignmentRules != "" {
+				action := c.AudienceMatcher_.EvaluateRules(experiment.Data.AssignmentRules, c.Environment_, c.evaluationAttributes())
+				if action != nil {
+					if action.Variant != nil && *action.Variant >= 0 && *action.Variant < len(experiment.Data.Variants) {
+						assignment.Variant = *action.Variant
+						assignment.RuleOverride = true
+					} else if len(action.Split) == len(experiment.Data.Variants) {
+						if uid, ok := c.Units_[unitType]; ok {
+							var data [22]byte
+							assigner := c.GetVariantAssigner(unitType, c.GetUnitHash(unitType, uid, data[:], false), false)
+							assignment.Variant = assigner.Assign(action.Split, experiment.Data.SeedHi, experiment.Data.SeedLo, make([]int8, 22))
+						} else {
+							assignment.Variant = experiment.Data.FullOnVariant
+							assignment.RuleMissingUnit = true
+						}
+						assignment.RuleOverride = true
+					}
+				}
+			}
+
+			if !assignment.RuleOverride && len(experiment.Data.Audience) > 0 {
 				var attrs = c.evaluationAttributes()
 
 				var match, err = c.AudienceMatcher_.Evaluate(experiment.Data.Audience, attrs)
@@ -1336,35 +1358,37 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 				}
 			}
 
-			var assignBuf [12]int8
-			if experiment.Data.AudienceStrict && assignment.AudienceMismatch {
-				assignment.Variant = 0
-			} else if experiment.Data.FullOnVariant == 0 {
-				var uid, ufound = c.Units_[experiment.Data.UnitType]
-				if ufound {
-					var data [22]byte
-					var unitHash = c.GetUnitHash(unitType, uid, data[:], false)
-					var assigner = c.GetVariantAssigner(unitType, unitHash, false)
-					var eligible = assigner.Assign(experiment.Data.TrafficSplit, experiment.Data.TrafficSeedHi,
-						experiment.Data.TrafficSeedLo, assignBuf[:]) == 1
-					if eligible {
-						if cfound {
-							assignment.Variant = custom.(int)
-							assignment.Custom = true
+			if !assignment.RuleOverride {
+				var assignBuf [12]int8
+				if experiment.Data.AudienceStrict && assignment.AudienceMismatch {
+					assignment.Variant = 0
+				} else if experiment.Data.FullOnVariant == 0 {
+					var uid, ufound = c.Units_[experiment.Data.UnitType]
+					if ufound {
+						var data [22]byte
+						var unitHash = c.GetUnitHash(unitType, uid, data[:], false)
+						var assigner = c.GetVariantAssigner(unitType, unitHash, false)
+						var eligible = assigner.Assign(experiment.Data.TrafficSplit, experiment.Data.TrafficSeedHi,
+							experiment.Data.TrafficSeedLo, assignBuf[:]) == 1
+						if eligible {
+							if cfound {
+								assignment.Variant = custom.(int)
+								assignment.Custom = true
+							} else {
+								assignment.Variant = assigner.Assign(experiment.Data.Split, experiment.Data.SeedHi,
+									experiment.Data.SeedLo, assignBuf[:])
+							}
 						} else {
-							assignment.Variant = assigner.Assign(experiment.Data.Split, experiment.Data.SeedHi,
-								experiment.Data.SeedLo, assignBuf[:])
+							assignment.Eligible = false
+							assignment.Variant = 0
 						}
-					} else {
-						assignment.Eligible = false
-						assignment.Variant = 0
+						assignment.Assigned = true
 					}
+				} else {
 					assignment.Assigned = true
+					assignment.Variant = experiment.Data.FullOnVariant
+					assignment.FullOn = true
 				}
-			} else {
-				assignment.Assigned = true
-				assignment.Variant = experiment.Data.FullOnVariant
-				assignment.FullOn = true
 			}
 
 			assignment.UnitType = unitType

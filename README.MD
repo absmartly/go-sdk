@@ -851,3 +851,6 @@ A/B Smartly's real-time analytics helps engineering and product teams ensure tha
 ## License
 
 See [LICENSE](LICENSE) for details.
+### Assignment rules and semantic versions
+
+Experiments may provide `assignmentRules` containing ordered `assign` or `split` rules. The first matching rule wins; rules can specify `environments` and JSON expression `conditions`. Rule-based exposures include `ruleOverride: true` and are excluded from analysis. Audience expressions support `semver_eq`, `semver_gt`, `semver_gte`, `semver_lt`, and `semver_lte` operators.
