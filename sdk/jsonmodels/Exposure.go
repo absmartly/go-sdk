@@ -14,7 +14,7 @@ type Exposure struct {
 	FullOn           bool   `json:"fullOn"`
 	Custom           bool   `json:"custom"`
 	AudienceMismatch bool   `json:"audienceMismatch"`
-	RuleOverride     bool   `json:"ruleOverride,omitempty"`
+	RuleOverride     bool   `json:"ruleOverride"`
 }
 
 func (e Exposure) MarshalJSON() ([]byte, error) {
@@ -34,6 +34,6 @@ func (e Exposure) MarshalJSON() ([]byte, error) {
 		FullOn           bool    `json:"fullOn"`
 		Custom           bool    `json:"custom"`
 		AudienceMismatch bool    `json:"audienceMismatch"`
-		RuleOverride     bool    `json:"ruleOverride,omitempty"`
+		RuleOverride     bool    `json:"ruleOverride"`
 	}{e.Id, e.Name, unit, e.Variant, e.ExposedAt, e.Assigned, e.Eligible, e.Overridden, e.FullOn, e.Custom, e.AudienceMismatch, e.RuleOverride})
 }
