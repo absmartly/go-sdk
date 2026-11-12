@@ -162,6 +162,10 @@ func (l *loggerGoroutines) current() bool {
 type ExperimentVariables struct {
 	Data      jsonmodels.Experiment
 	Variables []map[string]interface{}
+
+	// rules is Data.AssignmentRules parsed when the data is installed, or nil
+	// when the experiment has none or they could not be parsed.
+	rules *assignmentRules
 }
 
 type ContextCustomFieldValue struct {
@@ -184,11 +188,21 @@ type Assignment struct {
 	FullOn           bool
 	Custom           bool
 	AudienceMismatch bool
-	RuleOverride     bool
-	RuleMissingUnit  bool
-	Variables        map[string]interface{}
-	Exposed          *atomic.Value
-	AttrsSeq         int32
+	// RuleOverride is set when a matching assignment rule chose the variant.
+	// The exposure carries it so the collector leaves the unit out of the
+	// analysis, as it does for overrides.
+	RuleOverride bool
+	Variables    map[string]interface{}
+	Exposed      *atomic.Value
+	AttrsSeq     int32
+
+	// ruleKey is the assignmentRules text the assignment was resolved
+	// against, so a refresh that changes the rules re-resolves it.
+	ruleKey string
+	// ruleMissingUnit is set when a split rule matched while the
+	// experiment's unit was not set, so the variant is the experiment's
+	// no-unit result rather than a hash of the unit.
+	ruleMissingUnit bool
 }
 
 func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *future.Future, dataProvider ContextDataProvider,
@@ -565,7 +579,25 @@ func (c *Context) setUnit(unitType string, uid interface{}) error {
 
 	c.Units_[unitType] = uidString
 	c.unitValues_[unitType] = value
+	c.evictRuleAssignmentsMissingUnit(unitType)
 	return nil
+}
+
+// evictRuleAssignmentsMissingUnit drops the cached split-rule assignments that
+// were resolved without unitType's unit, so they are hashed with the unit now
+// that it is set. Assign rules never need the unit and keep their assignment.
+// An exposed assignment is kept: re-resolving it would switch the user's
+// variant and queue a second, conflicting exposure. An evicted assignment is
+// marked exposed so a caller still holding it cannot queue it. The caller
+// holds ContextLock_ for writing.
+func (c *Context) evictRuleAssignmentsMissingUnit(unitType string) {
+	for name, assignment := range c.assignmentCache_ {
+		if assignment.RuleOverride && assignment.ruleMissingUnit && assignment.UnitType == unitType &&
+			assignment.Exposed.CompareAndSwap(false, true) {
+			delete(c.assignmentCache_, name)
+			delete(c.AssignmentCache, name)
+		}
+	}
 }
 
 // numericUnitString is the string a numeric UID is hashed as: the number
@@ -1277,26 +1309,123 @@ func (c *Context) cachedAssignment(experimentName string) *Assignment {
 			return assignment
 		}
 	} else if !efound {
-		if !assignment.Assigned {
-			if assignment.RuleMissingUnit && assignment.UnitType != "" {
-				if _, supplied := c.Units_[assignment.UnitType]; supplied {
-					return nil
-				}
-			}
+		// A rule-won assignment is not assigned either, but its variant came
+		// from the experiment's rules, so it is rebuilt once the experiment
+		// is gone.
+		if !assignment.Assigned && !assignment.RuleOverride {
 			return assignment
 		}
 	} else if assignment.RuleOverride || !cfound || custom.(int) == assignment.Variant {
-		if c.ExperimentMatches(experiment.Data, *assignment) && c.AudienceMatches(experiment.Data, assignment) {
-			if experiment.Data.AssignmentRules != "" {
-				action := c.AudienceMatcher_.EvaluateRules(experiment.Data.AssignmentRules, c.Environment_, c.evaluationAttributes())
-				if action == nil || (action.Variant != nil && (*action.Variant != assignment.Variant)) {
-					return nil
-				}
-			}
+		// A matching rule wins over a custom assignment, so a custom
+		// assignment that differs from a rule-won variant is not staleness.
+		if c.ExperimentMatches(experiment.Data, *assignment) && c.ruleMatches(experiment, assignment) &&
+			c.AudienceMatches(experiment.Data, assignment) {
 			return assignment
 		}
 	}
 	return nil
+}
+
+// ruleMatches reports whether the experiment's assignment rules still give the
+// cached assignment's outcome. It runs under the read lock, so it never
+// updates the assignment; a changed outcome is reported as stale for
+// GetAssignment to rebuild under the write lock. The rules are re-resolved
+// only when a refresh changed them or an attribute was set since the
+// assignment was built.
+func (c *Context) ruleMatches(experiment ExperimentVariables, assignment *Assignment) bool {
+	if experiment.Data.AssignmentRules == assignment.ruleKey && atomic.LoadInt32(&c.AttrsSeq_) <= assignment.AttrsSeq {
+		return true
+	}
+
+	// An exposed split resolved without its unit keeps resolving as if the
+	// unit were still missing, so a unit set afterwards cannot switch the
+	// variant the user already saw.
+	var pinnedMissing = assignment.ruleMissingUnit && assignment.Exposed.Load().(bool)
+	var rule = c.resolveRule(experiment, pinnedMissing, false)
+	if (rule != nil) != assignment.RuleOverride {
+		return false
+	}
+	if rule == nil {
+		return true
+	}
+	// Same variant, but now resolved by a split without its unit, or no
+	// longer so: stale, so GetAssignment refreshes the flag. It keeps an
+	// exposed assignment in place (see reuseExposedRuleAssignment).
+	return rule.variant == assignment.Variant && rule.missingUnit == assignment.ruleMissingUnit
+}
+
+type ruleResolution struct {
+	variant     int
+	missingUnit bool
+}
+
+// resolveRule resolves the experiment's assignment rules to a variant, or nil
+// when no rule applies. An assign rule whose variant is out of range, or a
+// split whose value count differs from the variant count, stops rule
+// evaluation and falls back to normal assignment. A split with no unit to hash
+// gives the experiment's own no-unit result (the full-on variant, or 0) and is
+// flagged missingUnit. The unit is hashed with the experiment's own seed, so
+// a split equal to the experiment split keeps every unit on its variant.
+//
+// The caller holds ContextLock_. cache is false on the read path, where the
+// hashed-unit and assigner caches must not be written.
+func (c *Context) resolveRule(experiment ExperimentVariables, unitPinnedMissing bool, cache bool) *ruleResolution {
+	if experiment.rules == nil {
+		return nil
+	}
+
+	var data = experiment.Data
+	var action = c.AudienceMatcher_.evaluateRules(experiment.rules, c.Environment_, c.evaluationAttributes())
+	if action == nil {
+		return nil
+	}
+
+	var variantCount = len(data.Variants)
+	if action.split == nil {
+		if action.variant >= 0 && action.variant < variantCount {
+			return &ruleResolution{variant: action.variant}
+		}
+		return nil
+	}
+	if len(action.split) != variantCount {
+		return nil
+	}
+
+	var uid, ufound = c.Units_[data.UnitType]
+	if len(data.UnitType) == 0 || !ufound || unitPinnedMissing {
+		return &ruleResolution{variant: data.FullOnVariant, missingUnit: true}
+	}
+
+	var assigner *VariantAssigner
+	if cache {
+		var hash [22]byte
+		assigner = c.GetVariantAssigner(data.UnitType, c.GetUnitHash(data.UnitType, uid, hash[:], false), false)
+	} else if cached, found := c.Assigners_[data.UnitType]; found {
+		assigner = cached.(*VariantAssigner)
+	} else if hash, found := c.HashedUnits_[data.UnitType]; found {
+		assigner = NewVariantAssigner(hash.([]int8))
+	} else {
+		assigner = NewVariantAssigner(HashUnit(uid))
+	}
+	var buf [12]int8
+	return &ruleResolution{variant: assigner.Assign(action.split, data.SeedHi, data.SeedLo, buf[:])}
+}
+
+// reuseExposedRuleAssignment keeps an exposed rule-won assignment when the
+// rebuilt one is a rule win on the same variant for the same experiment run,
+// refreshing only its rule bookkeeping. A new Assignment would reset its
+// exposed flag and publish the same decision a second time. The caller holds
+// ContextLock_ for writing.
+func (c *Context) reuseExposedRuleAssignment(experiment ExperimentVariables, previous *Assignment, fresh *Assignment) *Assignment {
+	if previous == nil || !fresh.RuleOverride || !previous.RuleOverride || previous.Overridden ||
+		previous.Variant != fresh.Variant || !previous.Exposed.Load().(bool) ||
+		!c.ExperimentMatches(experiment.Data, *previous) {
+		return nil
+	}
+	previous.ruleKey = fresh.ruleKey
+	previous.ruleMissingUnit = fresh.ruleMissingUnit
+	previous.AttrsSeq = fresh.AttrsSeq
+	return previous
 }
 
 func (c *Context) GetAssignment(experimentName string) *Assignment {
@@ -1340,24 +1469,17 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 		if efound {
 			var unitType = experiment.Data.UnitType
 
-			if experiment.Data.AssignmentRules != "" {
-				action := c.AudienceMatcher_.EvaluateRules(experiment.Data.AssignmentRules, c.Environment_, c.evaluationAttributes())
-				if action != nil {
-					if action.Variant != nil && *action.Variant >= 0 && *action.Variant < len(experiment.Data.Variants) {
-						assignment.Variant = *action.Variant
-						assignment.RuleOverride = true
-					} else if len(action.Split) == len(experiment.Data.Variants) {
-						if uid, ok := c.Units_[unitType]; ok {
-							var data [22]byte
-							assigner := c.GetVariantAssigner(unitType, c.GetUnitHash(unitType, uid, data[:], false), false)
-							assignment.Variant = assigner.Assign(action.Split, experiment.Data.SeedHi, experiment.Data.SeedLo, make([]int8, 22))
-						} else {
-							assignment.Variant = experiment.Data.FullOnVariant
-							assignment.RuleMissingUnit = true
-						}
-						assignment.RuleOverride = true
-					}
-				}
+			// ruleKey is recorded even when no rule matches, so ruleMatches
+			// only re-resolves after a refresh changes the rules or an
+			// attribute is set.
+			assignment.ruleKey = experiment.Data.AssignmentRules
+			// A matching rule is an explicit assignment, like an override: it
+			// wins over the audience, audienceStrict, traffic eligibility,
+			// full-on and custom assignments.
+			if rule := c.resolveRule(experiment, false, true); rule != nil {
+				assignment.Variant = rule.variant
+				assignment.RuleOverride = true
+				assignment.ruleMissingUnit = rule.missingUnit
 			}
 
 			if !assignment.RuleOverride && len(experiment.Data.Audience) > 0 {
@@ -1413,6 +1535,14 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 
 	if efound && assignment.Variant >= 0 && (assignment.Variant < len(experiment.Data.Variants)) {
 		assignment.Variables = experiment.Variables[assignment.Variant]
+	}
+
+	if efound {
+		if reused := c.reuseExposedRuleAssignment(experiment, c.assignmentCache_[experimentName], assignment); reused != nil {
+			c.AssignmentCache[experimentName] = *reused
+			c.ContextLock_.Unlock()
+			return reused
+		}
 	}
 
 	c.assignmentCache_[experimentName] = assignment
@@ -1643,6 +1773,17 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 				experimentCustomFields[value.Name] = value
 			}
 		}
+		if experiment.AssignmentRulesIgnored() {
+			buffer.HandleEvent(self, Error, errors.New("SetData: Ignoring assignmentRules for experiment '"+
+				experiment.Name+"': expected a JSON string"))
+		}
+		var rules, rulesErr = c.AudienceMatcher_.parseRules(experiment.AssignmentRules)
+		if rulesErr != nil {
+			buffer.HandleEvent(self, Error, errors.New("SetData: Failed to parse assignmentRules for experiment '"+
+				experiment.Name+"'; its rules are ignored: "+rulesErr.Error()))
+		}
+		experiemntVariables.rules = rules
+
 		contextCustomFields[experiment.Name] = experimentCustomFields
 		index[experiment.Name] = experiemntVariables
 	}
