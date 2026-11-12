@@ -654,3 +654,169 @@ func TestRules_RebuiltExposedRuleAssignmentServesRefreshedVariables(t *testing.T
 	assertAny(2, treatment(t, ctx, "exp"), t)
 	expectExposures(t, ctx, 1)
 }
+
+func TestRules_ExposureSerializesRuleOverride(t *testing.T) {
+	for _, want := range []bool{true, false} {
+		var body, err = json.Marshal(jsonmodels.Exposure{Name: "exp", RuleOverride: want})
+		assertAny(nil, err, t)
+		var decoded map[string]interface{}
+		assertAny(nil, json.Unmarshal(body, &decoded), t)
+		assertAny(want, decoded["ruleOverride"], t)
+	}
+}
+
+func TestRules_PublishedExposureCarriesRuleOverride(t *testing.T) {
+	var ctx, client = newRuleContext(t, "production", withUnit(),
+		ruleExperiment("exp", rulesJSON(`{"type":"assign","variant":2}`)))
+	treatment(t, ctx, "exp")
+	assertAny(nil, ctx.Publish(), t)
+
+	if len(client.published) != 1 || len(client.published[0].Exposures) != 1 {
+		t.Fatalf("published %+v", client.published)
+	}
+	assertAny(true, client.published[0].Exposures[0].RuleOverride, t)
+}
+
+func TestRules_ParseRules(t *testing.T) {
+	var matcher = AudienceMatcher{Deserializer_: DefaultAudienceDeserializer{}}
+
+	var parsed, err = matcher.parseRules("")
+	assertAny((*assignmentRules)(nil), parsed, t)
+	assertAny(nil, err, t)
+
+	parsed, err = matcher.parseRules(`{"other":1}`)
+	assertAny((*assignmentRules)(nil), parsed, t)
+	assertAny(nil, err, t)
+
+	_, err = matcher.parseRules(`{`)
+	if err == nil {
+		t.Error("invalid JSON parsed without an error")
+	}
+
+	_, err = matcher.parseRules(`null`)
+	if err == nil {
+		t.Error("null parsed without an error")
+	}
+}
+
+func evaluate(t *testing.T, rules string, environment string, attrs map[string]interface{}) *ruleAction {
+	t.Helper()
+	var matcher = AudienceMatcher{Deserializer_: DefaultAudienceDeserializer{}}
+	var parsed, err = matcher.parseRules(rules)
+	if err != nil {
+		t.Fatalf("parseRules(%s): %v", rules, err)
+	}
+	return matcher.evaluateRules(parsed, environment, attrs)
+}
+
+func TestRules_EvaluateRules(t *testing.T) {
+	var gold = map[string]interface{}{"tier": "gold"}
+	var cases = []struct {
+		name        string
+		rules       string
+		environment string
+		want        *ruleAction
+	}{
+		{"no rules", `{"rules":[]}`, "", nil},
+		{"first match wins", rulesJSON(`{"type":"assign","variant":1}`, `{"type":"assign","variant":2}`), "", &ruleAction{variant: 1}},
+		{"conditions match", rulesJSON(`{"type":"assign","variant":1,"conditions":{"eq":[{"var":"tier"},{"value":"gold"}]}}`), "", &ruleAction{variant: 1}},
+		{"conditions do not match", rulesJSON(`{"type":"assign","variant":1,"conditions":{"eq":[{"var":"tier"},{"value":"silver"}]}}`), "", nil},
+		{"null conditions match", rulesJSON(`{"type":"assign","variant":1,"conditions":null}`), "", &ruleAction{variant: 1}},
+		{"non-object conditions skipped", rulesJSON(`{"type":"assign","variant":1,"conditions":[{"value":true}]}`, `{"type":"assign","variant":2}`), "", &ruleAction{variant: 2}},
+		{"non-object rule skipped", rulesJSON(`5`, `null`, `{"type":"assign","variant":2}`), "", &ruleAction{variant: 2}},
+		{"unknown type skipped", rulesJSON(`{"type":"other","variant":1}`, `{"type":"assign","variant":2}`), "", &ruleAction{variant: 2}},
+		{"missing type skipped", rulesJSON(`{"variant":1}`), "", nil},
+		{"integral float variant", rulesJSON(`{"type":"assign","variant":2.0}`), "", &ruleAction{variant: 2}},
+		{"fractional variant skipped", rulesJSON(`{"type":"assign","variant":1.5}`, `{"type":"assign","variant":0}`), "", &ruleAction{variant: 0}},
+		{"string variant skipped", rulesJSON(`{"type":"assign","variant":"1"}`), "", nil},
+		{"negative variant kept for the caller", rulesJSON(`{"type":"assign","variant":-1}`), "", &ruleAction{variant: -1}},
+		{"non-list environments skipped", rulesJSON(`{"type":"assign","variant":1,"environments":"production"}`, `{"type":"assign","variant":2}`), "production", &ruleAction{variant: 2}},
+		{"null environments match", rulesJSON(`{"type":"assign","variant":1,"environments":null}`), "", &ruleAction{variant: 1}},
+		{"environment matches", rulesJSON(`{"type":"assign","variant":1,"environments":["staging","production"]}`), "production", &ruleAction{variant: 1}},
+		{"environment is case-sensitive", rulesJSON(`{"type":"assign","variant":1,"environments":["production"]}`), "PRODUCTION", nil},
+		{"no environment never matches a list", rulesJSON(`{"type":"assign","variant":1,"environments":["production"]}`), "", nil},
+		{"split", rulesJSON(`{"type":"split","percentages":"20/30/50"}`), "", &ruleAction{split: []float64{0.2, 0.3, 0.5}}},
+		{"split conditions do not match", rulesJSON(`{"type":"split","percentages":"20/30/50","conditions":{"value":false}}`), "", nil},
+	}
+	for _, tc := range cases {
+		var got = evaluate(t, tc.rules, tc.environment, gold)
+		if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+			t.Errorf("%s: got %+v, want %+v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestRules_ParseSplitPercentages(t *testing.T) {
+	var cases = []struct {
+		percentages interface{}
+		want        []float64
+	}{
+		{"20/30/50", []float64{0.2, 0.3, 0.5}},
+		{"100", []float64{1}},
+		{" 50/50", []float64{0.5, 0.5}},
+		{"50abc/50", []float64{0.5, 0.5}},
+		{"5e1/50", []float64{0.5, 0.5}},
+		{"0/0/100", []float64{0, 0, 1}},
+		// The gap from 100 is rounded to two decimals before the tolerance.
+		{"50/50.014", []float64{0.5, 0.50014}},
+		{"50/49.99", []float64{0.5, 0.4999}},
+		{"50/50.015", nil},
+		{"50/49.985", nil},
+		{"20/30/40", nil},
+		{"abc/100", nil},
+		{"/100", nil},
+		{"-10/110", nil},
+		{"Infinity/0", nil},
+		{"", nil},
+		{100, nil},
+		{nil, nil},
+	}
+	for _, tc := range cases {
+		var got = parseSplitPercentages(tc.percentages)
+		if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+			t.Errorf("parseSplitPercentages(%#v) = %v, want %v", tc.percentages, got, tc.want)
+		}
+	}
+}
+
+// Concurrent reads, attribute changes and refreshes that change the rules must
+// not race, and every queued exposure must carry a variant the rules or normal
+// assignment can give.
+func TestRules_Concurrency(t *testing.T) {
+	var rules = rulesJSON(
+		`{"type":"split","percentages":"0/50/50","conditions":{"eq":[{"var":"tier"},{"value":"gold"}]}}`,
+		`{"type":"assign","variant":1}`)
+	var experiment = ruleExperiment("exp", rules)
+	var ctx, _ = newRuleContext(t, "production", withUnit(), experiment)
+
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				switch (g + i) % 4 {
+				case 0:
+					_, _ = ctx.GetTreatment("exp")
+				case 1:
+					_, _ = ctx.GetVariableValue("color", "none")
+				case 2:
+					_ = ctx.SetAttribute("tier", []string{"gold", "silver"}[i%2])
+				default:
+					var refreshed = experiment
+					if i%2 == 0 {
+						refreshed.AssignmentRules = rulesJSON(`{"type":"assign","variant":2}`)
+					}
+					ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{refreshed}})
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	for _, exposure := range queuedExposures(ctx) {
+		if exposure.Variant < 0 || exposure.Variant > 2 || (exposure.RuleOverride && exposure.Variant == 0) {
+			t.Fatalf("unexpected exposure %+v", exposure)
+		}
+	}
+}
