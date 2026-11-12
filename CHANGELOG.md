@@ -11,8 +11,14 @@ Go versions are released as git tags only; this entry tracks changes since v1.1.
 - When several experiments define the same variable key, the value is read from the first experiment, by id, that the unit is assigned to or overridden in; `GetVariableValue` exposes each experiment visited, while `PeekVariableValue` exposes none (v1.1.1 used the last experiment in the payload). This matches the JS SDK's `_resolveVariableValue` rule and affects `GetVariableValue`, `PeekVariableValue`, `GetVariableKeys`, `GetVariableKeysAll` and `IndexVariables_`, all of which now follow experiment-id order.
 - Go 1.20 or later is required (v1.1.1 built on Go 1.17). `resty` is pinned to v2.16.5.
 - JSON custom fields parse any JSON value.
+- Published exposures include `"ruleOverride"` (false unless an assignment rule chose the variant).
 
 ### Added
+- Assignment rules (`Experiment.AssignmentRules`): ordered `assign` rules (a fixed variant) and `split` rules (percentages such as `20/30/50`, hashed with the experiment's own seed), limited by environment and by JSON-expression conditions. The first matching rule wins over the audience/`audienceStrict`, traffic, full-on and custom assignments; only `SetOverride` beats it. Exposures carry a new `ruleOverride` flag so the collector leaves them out of analysis. A `split` that matches before its unit is set gives the experiment's no-unit result and is re-resolved once the unit is set, unless already exposed. Malformed rules are skipped; a non-string `assignmentRules` in the payload only drops that experiment's rules. Matches the JS (#66) and Java (#17) SDKs.
+- `semver_eq`, `semver_gt`, `semver_gte`, `semver_lt` and `semver_lte` JSON expression operators.
+- `X-Agent` is now `absmartly-go-sdk/<version>` (`SDKName`, `SDKVersion`, `SDKAgent`, `Client.GetAgent`), instead of `absmartly-go-sdk`.
+- `ClientConfig.ApplicationVersion_` and `Builder.ApplicationVersion`: sent as `X-Application-Version` when it is a whole number, `"0"` otherwise (the collector rejects other values). Previously always `"0"`.
+- Release workflow: pushing a `vX.Y.Z` tag that matches `SDKVersion` runs the tests and creates the GitHub release.
 - `FinalizeAsync`, which also waits for logger delivery; `Finalize` event type alias (value `"Close"`).
 - `GetCustomFieldValueE` (error-returning custom field access).
 - `GetVariableKeysAll` returns every experiment per variable key; `GetVariableKeys` keeps returning the first one.
@@ -28,11 +34,6 @@ Go versions are released as git tags only; this entry tracks changes since v1.1.
 - The ready, error and refresh events are logged before `WaitUntilReady`/`Refresh` return.
 - JSON expr: `eq` null handling, nested deep equality; `eq(null, null)` returns null.
 - Close/flush/refresh: events kept pending on failed publish, concurrent `CloseAsync` callers share one future, no lost publishes, logger panics contained.
-- Data races on `ReadyFuture_`, `RefreshFuture_`, `ClosingFuture_`, `RefreshTimer_`, `Timeout_` and `Attributes_`, and the `AttrsSeq` write during audience matching. Known remaining race, inherited from v1.1.1: `Index_` is written under `DataLock` by a refresh and read under `ContextLock_` by `GetTreatment`/`PeekTreatment`.
+- Data races on `ReadyFuture_`, `RefreshFuture_`, `ClosingFuture_`, `RefreshTimer_`, `Timeout_` and `Attributes_`, and the `AttrsSeq` write during audience matching., and between a refresh writing `Index_` under `DataLock` and `GetTreatment`/`PeekTreatment` reading it (inherited from v1.1.1).
 - A failed close no longer restarts the refresh timer. On success, `Close()` and an empty-queue `CloseAsync()` settle after the `Close` event is logged, as in v1.1.1.
 - Builder `Timeout` applies to requests; the retry condition no longer panics on a nil response (502 and 503 are retried, as before).
-
-### Assignment rules and semantic versions
-- Add `assign` and percentage `split` assignment rules, including environment and condition matching.
-- Add `semver_eq`, `semver_gt`, `semver_gte`, `semver_lt`, and `semver_lte` audience operators.
-- Publish `X-Agent: absmartly-go-sdk/1.2.0` and expose `ruleOverride` on rule-based exposures.
