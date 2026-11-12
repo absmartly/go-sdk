@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -537,4 +538,67 @@ func TestCreateClientHTTPEndpointDoesNotWriteGlobalLog(t *testing.T) {
 	if buf.Len() != 0 {
 		t.Fatalf("CreateClient wrote to the global logger: %q", buf.String())
 	}
+}
+
+type headerCapturingHttp struct {
+	HttpMock
+	headers *map[string]string
+}
+
+func (h headerCapturingHttp) Put(url string, query map[string]string, headers map[string]string, body []byte) *future.Future {
+	*h.headers = headers
+	return h.HttpMock.Put(url, query, headers, body)
+}
+
+func TestPublishSendsVersionedAgentAndApplicationVersion(t *testing.T) {
+	var headers map[string]string
+	var config = ClientConfig{Endpoint_: "https://localhost/v1", ApiKey_: "test-api-key", Application_: "website",
+		Environment_: "dev", ApplicationVersion_: "1000123"}
+	var client = CreateClient(config, headerCapturingHttp{HttpMock{bodyString: "{}"}, &headers})
+	var _, err = client.Publish(jsonmodels.PublishEvent{}).Get(context.Background())
+	assertAny(nil, err, t)
+
+	assertAny("absmartly-go-sdk/"+SDKVersion, headers["X-Agent"], t)
+	assertAny("1000123", headers["X-Application-Version"], t)
+	assertAny("absmartly-go-sdk/"+SDKVersion, client.GetAgent(), t)
+	assertAny("1000123", client.GetApplicationVersion(), t)
+}
+
+// The collector binds X-Application-Version as a whole number and rejects
+// the request otherwise, so anything else is sent as "0".
+func TestApplicationVersionHeaderIsSentOnlyWhenNumeric(t *testing.T) {
+	for version, want := range map[string]string{
+		"":                    "0",
+		"   ":                 "0",
+		"42":                  "42",
+		" 42 ":                "42",
+		"2.4.1":               "0",
+		"v2":                  "0",
+		"-1":                  "0",
+		"123456789012345678":  "123456789012345678",
+		"1234567890123456789": "0",
+	} {
+		var client = CreateClient(ClientConfig{ApplicationVersion_: version}, HttpMock{})
+		if got := client.GetApplicationVersion(); got != want {
+			t.Errorf("application version %q: header %q, want %q", version, got, want)
+		}
+	}
+}
+
+func TestSDKAgentFormat(t *testing.T) {
+	assertAny("absmartly-go-sdk", SDKName, t)
+	assertAny(SDKName+"/"+SDKVersion, SDKAgent, t)
+	if !regexp.MustCompile(`^\d+\.\d+\.\d+$`).MatchString(SDKVersion) {
+		t.Errorf("SDKVersion %q is not MAJOR.MINOR.PATCH", SDKVersion)
+	}
+}
+
+func TestBuilderApplicationVersion(t *testing.T) {
+	var headers map[string]string
+	var abs, err = NewBuilder().Endpoint("https://localhost/v1").ApiKey("key").Application("website").
+		Environment("dev").ApplicationVersion("7").HTTPClient(headerCapturingHttp{HttpMock{bodyString: "{}"}, &headers}).Build()
+	assertAny(nil, err, t)
+	_, err = abs.Client_.Publish(jsonmodels.PublishEvent{}).Get(context.Background())
+	assertAny(nil, err, t)
+	assertAny("7", headers["X-Application-Version"], t)
 }

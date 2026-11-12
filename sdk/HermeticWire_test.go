@@ -152,8 +152,8 @@ func TestHermeticWireContract(t *testing.T) {
 			t.Errorf("PUT header %s = %q, want %q", name, got, want)
 		}
 	}
-	if got := putHeaders.Get("X-Agent"); got == "" {
-		t.Error("PUT header X-Agent must be present and non-empty")
+	if got := putHeaders.Get("X-Agent"); got != "absmartly-go-sdk/"+SDKVersion {
+		t.Errorf("PUT header X-Agent = %q, want %q", got, "absmartly-go-sdk/"+SDKVersion)
 	}
 
 	for _, field := range []string{"hashed", "units", "publishedAt"} {
