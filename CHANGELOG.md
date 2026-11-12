@@ -32,8 +32,7 @@ Go versions are released as git tags only; this entry tracks changes since v1.1.
 - A failed close no longer restarts the refresh timer. On success, `Close()` and an empty-queue `CloseAsync()` settle after the `Close` event is logged, as in v1.1.1.
 - Builder `Timeout` applies to requests; the retry condition no longer panics on a nil response (502 and 503 are retried, as before).
 
-## Next
-
+### Assignment rules and semantic versions
 - Add `assign` and percentage `split` assignment rules, including environment and condition matching.
 - Add `semver_eq`, `semver_gt`, `semver_gte`, `semver_lt`, and `semver_lte` audience operators.
 - Publish `X-Agent: absmartly-go-sdk/1.2.0` and expose `ruleOverride` on rule-based exposures.

@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
@@ -23,7 +24,11 @@ func TestExposureRuleOverrideJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(b) == "{}" {
-		t.Fatal("empty exposure")
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["ruleOverride"] != true {
+		t.Fatalf("ruleOverride = %#v", decoded["ruleOverride"])
 	}
 }

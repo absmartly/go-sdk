@@ -61,7 +61,7 @@ func (am AudienceMatcher) EvaluateRules(rulesString, environment string, attribu
 			valid := true
 			for _, part := range strings.Split(text, "/") {
 				value, err := parseFloat(part)
-				if err != nil || value < 0 {
+				if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 					valid = false
 					break
 				}

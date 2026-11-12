@@ -934,7 +934,7 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 			c.QueueExposure(assignment)
 		}
 
-		if value, exist := assignment.Variables[key]; exist && (assignment.Assigned || assignment.Overridden) {
+		if value, exist := assignment.Variables[key]; exist && (assignment.Assigned || assignment.Overridden || assignment.RuleOverride) {
 			return value, nil
 		}
 	}
@@ -1278,10 +1278,21 @@ func (c *Context) cachedAssignment(experimentName string) *Assignment {
 		}
 	} else if !efound {
 		if !assignment.Assigned {
+			if assignment.RuleMissingUnit && assignment.UnitType != "" {
+				if _, supplied := c.Units_[assignment.UnitType]; supplied {
+					return nil
+				}
+			}
 			return assignment
 		}
 	} else if assignment.RuleOverride || !cfound || custom.(int) == assignment.Variant {
 		if c.ExperimentMatches(experiment.Data, *assignment) && c.AudienceMatches(experiment.Data, assignment) {
+			if experiment.Data.AssignmentRules != "" {
+				action := c.AudienceMatcher_.EvaluateRules(experiment.Data.AssignmentRules, c.Environment_, c.evaluationAttributes())
+				if action == nil || (action.Variant != nil && (*action.Variant != assignment.Variant)) {
+					return nil
+				}
+			}
 			return assignment
 		}
 	}
