@@ -1350,7 +1350,7 @@ func (c *Context) ruleMatches(experiment ExperimentVariables, assignment *Assign
 	}
 	// Same variant, but now resolved by a split without its unit, or no
 	// longer so: stale, so GetAssignment refreshes the flag. It keeps an
-	// exposed assignment in place (see reuseExposedRuleAssignment).
+	// exposed assignment's exposed flag (see keepExposedRuleAssignment).
 	return rule.variant == assignment.Variant && rule.missingUnit == assignment.ruleMissingUnit
 }
 
@@ -1411,21 +1411,20 @@ func (c *Context) resolveRule(experiment ExperimentVariables, unitPinnedMissing 
 	return &ruleResolution{variant: assigner.Assign(action.split, data.SeedHi, data.SeedLo, buf[:])}
 }
 
-// reuseExposedRuleAssignment keeps an exposed rule-won assignment when the
-// rebuilt one is a rule win on the same variant for the same experiment run,
-// refreshing only its rule bookkeeping. A new Assignment would reset its
-// exposed flag and publish the same decision a second time. The caller holds
-// ContextLock_ for writing.
-func (c *Context) reuseExposedRuleAssignment(experiment ExperimentVariables, previous *Assignment, fresh *Assignment) *Assignment {
+// keepExposedRuleAssignment carries the exposed flag over to the rebuilt
+// assignment when both are rule wins on the same variant for the same
+// experiment run. A fresh exposed flag would publish the same decision a
+// second time. The rebuilt assignment is still the one installed, so it keeps
+// the refreshed variables and rule bookkeeping, and the cached one is never
+// mutated while a reader may hold it. The caller holds ContextLock_ for
+// writing.
+func (c *Context) keepExposedRuleAssignment(experiment ExperimentVariables, previous *Assignment, fresh *Assignment) {
 	if previous == nil || !fresh.RuleOverride || !previous.RuleOverride || previous.Overridden ||
 		previous.Variant != fresh.Variant || !previous.Exposed.Load().(bool) ||
 		!c.ExperimentMatches(experiment.Data, *previous) {
-		return nil
+		return
 	}
-	previous.ruleKey = fresh.ruleKey
-	previous.ruleMissingUnit = fresh.ruleMissingUnit
-	previous.AttrsSeq = fresh.AttrsSeq
-	return previous
+	fresh.Exposed = previous.Exposed
 }
 
 func (c *Context) GetAssignment(experimentName string) *Assignment {
@@ -1538,11 +1537,7 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 	}
 
 	if efound {
-		if reused := c.reuseExposedRuleAssignment(experiment, c.assignmentCache_[experimentName], assignment); reused != nil {
-			c.AssignmentCache[experimentName] = *reused
-			c.ContextLock_.Unlock()
-			return reused
-		}
+		c.keepExposedRuleAssignment(experiment, c.assignmentCache_[experimentName], assignment)
 	}
 
 	c.assignmentCache_[experimentName] = assignment

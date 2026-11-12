@@ -3,6 +3,7 @@ package sdk
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 
 	"github.com/absmartly/go-sdk/sdk/future"
@@ -91,13 +92,16 @@ func (c Client) GetAgent() string {
 // request otherwise), and "0" for anything else, including an empty version.
 func applicationVersionHeader(version string) string {
 	version = strings.TrimSpace(version)
-	if len(version) == 0 || len(version) > 18 {
+	if len(version) == 0 {
 		return "0"
 	}
 	for _, c := range version {
 		if c < '0' || c > '9' {
 			return "0"
 		}
+	}
+	if _, err := strconv.ParseInt(version, 10, 64); err != nil {
+		return "0"
 	}
 	return version
 }

@@ -71,9 +71,13 @@ func TestVersionCompare(t *testing.T) {
 		{"1.0.0-alpha+build1", "1.0.0-beta", -1},
 		{"1.0.0-alpha+build1", "1.0.0", -1},
 
-		// Non-numeric core parts compare as alphanumeric identifiers.
+		// Non-numeric core parts, including empty ones, compare as
+		// alphanumeric identifiers, exactly as the JS and Java SDKs do, so
+		// every SDK orders the same inputs the same way.
 		{"1.x", "1.0", 1},
 		{"abc", "1.0.0", 1},
+		{"2.4.", "2.4.999", 1},
+		{"1..0", "1.0.0", 1},
 
 		{1, "1.0.0", 0},
 		{"1.0.0", 1, 0},

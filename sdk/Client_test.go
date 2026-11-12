@@ -575,8 +575,10 @@ func TestApplicationVersionHeaderIsSentOnlyWhenNumeric(t *testing.T) {
 		"2.4.1":               "0",
 		"v2":                  "0",
 		"-1":                  "0",
-		"123456789012345678":  "123456789012345678",
-		"1234567890123456789": "0",
+		"1234567890123456789": "1234567890123456789",
+		"9223372036854775807": "9223372036854775807",
+		"9223372036854775808": "0",
+		"007":                 "007",
 	} {
 		var client = CreateClient(ClientConfig{ApplicationVersion_: version}, HttpMock{})
 		if got := client.GetApplicationVersion(); got != want {

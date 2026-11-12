@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -179,6 +180,15 @@ func parseRuleAction(rule map[string]interface{}) *ruleAction {
 // ruleVariant accepts integral numbers within int32 range, like JavaScript's
 // Number.isInteger (2.0 is an integer).
 func ruleVariant(value interface{}) (int, bool) {
+	// A custom AudienceDeserializer using json.Decoder.UseNumber gives
+	// json.Number, which is a string kind.
+	if number, ok := value.(json.Number); ok {
+		var f, err = number.Float64()
+		if err != nil {
+			return 0, false
+		}
+		value = f
+	}
 	var v = reflect.ValueOf(value)
 	var f float64
 	switch v.Kind() {
