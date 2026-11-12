@@ -1561,7 +1561,13 @@ func (c *Context) ClearRefreshTimer() {
 	}
 }
 
+// GetExperiment returns the experiment from the installed context data. It
+// takes DataLock for reading, so a refresh installing new data cannot race
+// it; callers may hold ContextLock_ (the lock order is ContextLock_, then
+// DataLock) but must not hold DataLock.
 func (c *Context) GetExperiment(experimentName string) (ExperimentVariables, bool) {
+	c.DataLock.RLock()
+	defer c.DataLock.RUnlock()
 	var result, found = c.Index_[experimentName]
 	return result, found
 }

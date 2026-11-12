@@ -67,8 +67,7 @@ func newSystemAttrContext(application, environment string, experiments ...jsonmo
 	config.Units_ = map[string]string{"session_id": "e791e240fcd3df7d238cfc285f475e8152fcc0ec"}
 	config.PublishDelay_ = -1
 	// No refresh timer: these contexts are not registered with the shared
-	// stopLeakedTimers helper, and a timer that fires later would hit the
-	// documented pre-existing Index_/GetExperiment race under -race.
+	// stopLeakedTimers helper, so a timer would keep refreshing after the test.
 	config.RefreshInterval_ = -1
 	var ctx = abs.CreateContextWith(config, jsonmodels.ContextData{Experiments: experiments})
 	ctx.WaitUntilReady()
