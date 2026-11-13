@@ -780,8 +780,10 @@ func TestRules_ParseSplitPercentages(t *testing.T) {
 }
 
 // Concurrent reads, attribute changes and refreshes that change the rules must
-// not race, and every queued exposure must carry a variant the rules or normal
-// assignment can give.
+// not race. In this fixture normal assignment always gives variant 0, while
+// every rule (the gold split, the fallback assign and the refreshed assign)
+// gives 1 or 2, so every exposure must be a rule win, and once the writers
+// stop the settled assignment must follow the installed rules.
 func TestRules_Concurrency(t *testing.T) {
 	var rules = rulesJSON(
 		`{"type":"split","percentages":"0/50/50","conditions":{"eq":[{"var":"tier"},{"value":"gold"}]}}`,
@@ -814,9 +816,29 @@ func TestRules_Concurrency(t *testing.T) {
 	}
 	wg.Wait()
 
-	for _, exposure := range queuedExposures(ctx) {
-		if exposure.Variant < 0 || exposure.Variant > 2 || (exposure.RuleOverride && exposure.Variant == 0) {
-			t.Fatalf("unexpected exposure %+v", exposure)
+	var exposures = queuedExposures(ctx)
+	if len(exposures) == 0 {
+		t.Fatal("no exposures queued")
+	}
+	for _, exposure := range exposures {
+		if !exposure.RuleOverride || exposure.Variant < 1 || exposure.Variant > 2 {
+			t.Fatalf("exposure not chosen by a rule: %+v", exposure)
 		}
 	}
+
+	ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{experiment}})
+	assertAny(nil, ctx.SetAttribute("tier", "gold"), t)
+	var variant, _ = ctx.PeekTreatment("exp")
+	assertAny(splitVariant([]float64{0, 0.5, 0.5}, experiment.SeedHi, experiment.SeedLo), variant, t)
+	assertAny(true, ctx.GetAssignment("exp").RuleOverride, t)
+
+	assertAny(nil, ctx.SetAttribute("tier", "silver"), t)
+	variant, _ = ctx.PeekTreatment("exp")
+	assertAny(1, variant, t)
+
+	var refreshed = experiment
+	refreshed.AssignmentRules = rulesJSON(`{"type":"assign","variant":2}`)
+	ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{refreshed}})
+	variant, _ = ctx.PeekTreatment("exp")
+	assertAny(2, variant, t)
 }
