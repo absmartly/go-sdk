@@ -108,7 +108,7 @@ func applicationVersionHeader(version string) string {
 
 func (c Client) GetContextData() *future.Future {
 	var dataFuture = future.Call(func() (future.Value, error) {
-		var fut = c.httpClient_.Get(c.url_, c.query_, nil)
+		var fut = c.httpClient_.Get(c.url_, c.query_, c.headers_)
 		var value, err = fut.Get(context.Background())
 		if err != nil {
 			return nil, err
