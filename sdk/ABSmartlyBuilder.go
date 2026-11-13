@@ -10,6 +10,7 @@ type ABsmartlyBuilder struct {
 	apiKey_               string
 	application_          string
 	environment_          string
+	applicationVersion_   string
 	timeout_              *time.Duration
 	retries_              *int
 	contextDataProvider_  ContextDataProvider
@@ -45,6 +46,14 @@ func (b *ABsmartlyBuilder) Application(application string) *ABsmartlyBuilder {
 
 func (b *ABsmartlyBuilder) Environment(environment string) *ABsmartlyBuilder {
 	b.environment_ = environment
+	return b
+}
+
+// ApplicationVersion sets the version of the application using the SDK. It is
+// sent as the X-Application-Version header when it is a whole number;
+// otherwise the header is "0".
+func (b *ABsmartlyBuilder) ApplicationVersion(version string) *ABsmartlyBuilder {
+	b.applicationVersion_ = version
 	return b
 }
 
@@ -116,6 +125,8 @@ func (b *ABsmartlyBuilder) Build() (ABsmartly, error) {
 		Application_:  b.application_,
 		Deserializer_: b.deserializer_,
 		Serializer_:   b.serializer_,
+
+		ApplicationVersion_: b.applicationVersion_,
 	}
 
 	httpClient := b.httpClient_

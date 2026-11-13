@@ -5,13 +5,21 @@
 Go versions are released as git tags only; this entry tracks changes since v1.1.1.
 
 ### BREAKING
+- Audience filters are now always evaluated with the client's `application` and `environment` names injected into the attribute map (system values first, user-set attributes overlaid on top), matching the collector, which already attaches both to every exposure server-side. This changes assignment for running experiments: a unit whose experiment has Audience enforced and an `environment`/`application` condition the client's values now satisfy (and which was not already satisfied by a user-set attribute of the same name) currently gets variant 0 (the condition never matched because the SDK did not supply those values), and after upgrading it gets randomised normally. Those experiments are broken today; this fixes them, but the assignment they produce changes. User-set attributes of the same name still win, including ones set after the context is created (the cached assignment is invalidated), and `app_version`/`application_version` are never injected. Nothing new is published: these values are not added to the publish payload.
 - Users whose unit UID contains non-ASCII characters will be reassigned in running experiments: UIDs are now hashed from their UTF-8 bytes, as in the other SDKs. ASCII UIDs keep their assignments.
 - Audiences are re-evaluated after `SetAttribute`/`SetAttributes`: a cached assignment whose audience result changes with the new attributes is recomputed, so a user can move in or out of an experiment's audience within one context.
 - When several experiments define the same variable key, the value is read from the first experiment, by id, that the unit is assigned to or overridden in; `GetVariableValue` exposes each experiment visited, while `PeekVariableValue` exposes none (v1.1.1 used the last experiment in the payload). This matches the JS SDK's `_resolveVariableValue` rule and affects `GetVariableValue`, `PeekVariableValue`, `GetVariableKeys`, `GetVariableKeysAll` and `IndexVariables_`, all of which now follow experiment-id order.
 - Go 1.20 or later is required (v1.1.1 built on Go 1.17). `resty` is pinned to v2.16.5.
 - JSON custom fields parse any JSON value.
+- Published exposures include `"ruleOverride"` (false unless an assignment rule chose the variant).
 
 ### Added
+- Assignment rules (`Experiment.AssignmentRules`): ordered `assign` rules (a fixed variant) and `split` rules (percentages such as `20/30/50`, hashed with the experiment's own seed), limited by environment and by JSON-expression conditions. The first matching rule wins over the audience/`audienceStrict`, traffic, full-on and custom assignments; only `SetOverride` beats it. Exposures carry a new `ruleOverride` flag, so the collector leaves them out of analysis. A `split` that matches before its unit is set gives the experiment's no-unit result and is re-resolved once the unit is set, unless already exposed. Malformed rules are skipped in favour of the next rule, except that an applicable `assign` rule with an out-of-range variant, or a `split` with a different number of values than the experiment has variants, stops rule evaluation and falls back to normal assignment without trying later rules (as in the JS SDK and the collector); a non-string `assignmentRules` in the payload only drops that experiment's rules. Matches the JS (#66) and Java (#17) SDKs.
+- `semver_eq`, `semver_gt`, `semver_gte`, `semver_lt` and `semver_lte` JSON expression operators.
+- `X-Agent` is now `absmartly-go-sdk/<version>` (`SDKName`, `SDKVersion`, `SDKAgent`, `Client.GetAgent`), instead of `absmartly-go-sdk`.
+- The context fetch (`GET /context`) now sends the same SDK headers as publish (`X-API-Key`, `X-Agent`, `X-Application`, `X-Environment`, `X-Application-Version`), as the JS SDK does on every request; previously it sent none.
+- `ClientConfig.ApplicationVersion_` and `Builder.ApplicationVersion`: sent as `X-Application-Version` when it is a whole number, `"0"` otherwise (the collector rejects other values). Previously always `"0"`.
+- Release workflow: pushing a `vX.Y.Z` tag that matches `SDKVersion` runs the tests and creates the GitHub release.
 - `FinalizeAsync`, which also waits for logger delivery; `Finalize` event type alias (value `"Close"`).
 - `GetCustomFieldValueE` (error-returning custom field access).
 - `GetVariableKeysAll` returns every experiment per variable key; `GetVariableKeys` keeps returning the first one.
@@ -27,6 +35,6 @@ Go versions are released as git tags only; this entry tracks changes since v1.1.
 - The ready, error and refresh events are logged before `WaitUntilReady`/`Refresh` return.
 - JSON expr: `eq` null handling, nested deep equality; `eq(null, null)` returns null.
 - Close/flush/refresh: events kept pending on failed publish, concurrent `CloseAsync` callers share one future, no lost publishes, logger panics contained.
-- Data races on `ReadyFuture_`, `RefreshFuture_`, `ClosingFuture_`, `RefreshTimer_`, `Timeout_` and `Attributes_`, and the `AttrsSeq` write during audience matching. Known remaining race, inherited from v1.1.1: `Index_` is written under `DataLock` by a refresh and read under `ContextLock_` by `GetTreatment`/`PeekTreatment`.
+- Data races on `ReadyFuture_`, `RefreshFuture_`, `ClosingFuture_`, `RefreshTimer_`, `Timeout_` and `Attributes_`, and the `AttrsSeq` write during audience matching., and between a refresh writing `Index_` under `DataLock` and `GetTreatment`/`PeekTreatment` reading it (inherited from v1.1.1).
 - A failed close no longer restarts the refresh timer. On success, `Close()` and an empty-queue `CloseAsync()` settle after the `Close` event is logged, as in v1.1.1.
 - Builder `Timeout` applies to requests; the retry condition no longer panics on a nil response (502 and 503 are retried, as before).

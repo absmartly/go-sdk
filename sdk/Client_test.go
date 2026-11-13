@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -537,4 +538,105 @@ func TestCreateClientHTTPEndpointDoesNotWriteGlobalLog(t *testing.T) {
 	if buf.Len() != 0 {
 		t.Fatalf("CreateClient wrote to the global logger: %q", buf.String())
 	}
+}
+
+type headerCapturingHttp struct {
+	HttpMock
+	headers *map[string]string
+}
+
+func (h headerCapturingHttp) Put(url string, query map[string]string, headers map[string]string, body []byte) *future.Future {
+	*h.headers = headers
+	return h.HttpMock.Put(url, query, headers, body)
+}
+
+func TestPublishSendsVersionedAgentAndApplicationVersion(t *testing.T) {
+	var headers map[string]string
+	var config = ClientConfig{Endpoint_: "https://localhost/v1", ApiKey_: "test-api-key", Application_: "website",
+		Environment_: "dev", ApplicationVersion_: "1000123"}
+	var client = CreateClient(config, headerCapturingHttp{HttpMock{bodyString: "{}"}, &headers})
+	var _, err = client.Publish(jsonmodels.PublishEvent{}).Get(context.Background())
+	assertAny(nil, err, t)
+
+	assertAny("absmartly-go-sdk/"+SDKVersion, headers["X-Agent"], t)
+	assertAny("1000123", headers["X-Application-Version"], t)
+	assertAny("absmartly-go-sdk/"+SDKVersion, client.GetAgent(), t)
+	assertAny("1000123", client.GetApplicationVersion(), t)
+}
+
+// The collector binds X-Application-Version as a whole number and rejects
+// the request otherwise, so anything else is sent as "0".
+func TestApplicationVersionHeaderIsSentOnlyWhenNumeric(t *testing.T) {
+	for version, want := range map[string]string{
+		"":                    "0",
+		"   ":                 "0",
+		"42":                  "42",
+		" 42 ":                "42",
+		"2.4.1":               "0",
+		"v2":                  "0",
+		"-1":                  "0",
+		"1234567890123456789": "1234567890123456789",
+		"9223372036854775807": "9223372036854775807",
+		"9223372036854775808": "0",
+		"007":                 "007",
+	} {
+		var client = CreateClient(ClientConfig{ApplicationVersion_: version}, HttpMock{})
+		if got := client.GetApplicationVersion(); got != want {
+			t.Errorf("application version %q: header %q, want %q", version, got, want)
+		}
+	}
+}
+
+func TestSDKAgentFormat(t *testing.T) {
+	assertAny("absmartly-go-sdk", SDKName, t)
+	assertAny(SDKName+"/"+SDKVersion, SDKAgent, t)
+	if !regexp.MustCompile(`^\d+\.\d+\.\d+$`).MatchString(SDKVersion) {
+		t.Errorf("SDKVersion %q is not MAJOR.MINOR.PATCH", SDKVersion)
+	}
+}
+
+func TestBuilderApplicationVersion(t *testing.T) {
+	var headers map[string]string
+	var abs, err = NewBuilder().Endpoint("https://localhost/v1").ApiKey("key").Application("website").
+		Environment("dev").ApplicationVersion("7").HTTPClient(headerCapturingHttp{HttpMock{bodyString: "{}"}, &headers}).Build()
+	assertAny(nil, err, t)
+	_, err = abs.Client_.Publish(jsonmodels.PublishEvent{}).Get(context.Background())
+	assertAny(nil, err, t)
+	assertAny("7", headers["X-Application-Version"], t)
+}
+
+// Cross-SDK scenario 320: the context fetch must carry the same SDK headers as
+// publish (X-API-Key, X-Agent, X-Environment, X-Application,
+// X-Application-Version), and keep its application/environment query.
+func TestGetContextDataSendsSDKHeaders(t *testing.T) {
+	var got *http.Request
+	var server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Clone(context.Background())
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"experiments":[]}`))
+	}))
+	defer server.Close()
+
+	var config = ClientConfig{Endpoint_: server.URL + "/v1", ApiKey_: "test-api-key", Application_: "website",
+		Environment_: "dev", ApplicationVersion_: "1000123"}
+	var client = CreateDefaultClient(config)
+	var _, err = client.GetContextData().Get(context.Background())
+	assertAny(nil, err, t)
+
+	if got == nil {
+		t.Fatal("no context request reached the server")
+	}
+	assertAny(http.MethodGet, got.Method, t)
+	assertAny("/v1/context", got.URL.Path, t)
+	assertAny("website", got.URL.Query().Get("application"), t)
+	assertAny("dev", got.URL.Query().Get("environment"), t)
+	assertAny("test-api-key", got.Header.Get("X-API-Key"), t)
+	assertAny("website", got.Header.Get("X-Application"), t)
+	assertAny("dev", got.Header.Get("X-Environment"), t)
+	assertAny("1000123", got.Header.Get("X-Application-Version"), t)
+	var agent = got.Header.Get("X-Agent")
+	if !regexp.MustCompile(`^absmartly-[a-z0-9]+-sdk/[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]*)?$`).MatchString(agent) {
+		t.Errorf("X-Agent %q does not match absmartly-<lang>-sdk/<semver>", agent)
+	}
+	assertAny(SDKAgent, agent, t)
 }

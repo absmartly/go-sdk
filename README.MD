@@ -138,6 +138,7 @@ The builder pattern supports all the same options as the config-based approach.
 | :----------- | :-------------------- | :------ | :-------------------------------------------------------------- |
 | Timeout      | `time.Duration`       | `3s`    | Request and connection timeout.                                   |
 | Retries      | `int`                 | `5`     | The number of retries before the SDK stops trying to connect.   |
+| ApplicationVersion | `string`        | `""`    | The version of your application. Sent as the `X-Application-Version` header when it is a whole number such as `"1042"`; any other value, or none, is sent as `"0"`. |
 | ContextEventLogger | `ContextEventLogger` | `nil` | A callback interface which runs after SDK events.              |
 
 #### Advanced Configuration (Config-Based Approach)
@@ -152,6 +153,7 @@ For advanced use cases requiring custom implementations, use the traditional con
 | ApiKey_          | `string` |  &#9989;  | `""`      | Your API key which can be found on the Web Console.                                                                                                                           |
 | Environment_     | `string` |  &#9989;  | `""`      | The environment of the platform where the SDK is installed. Environments are created on the Web Console and should match the available environments in your infrastructure.   |
 | Application_     | `string` |  &#9989;  | `""`      | The name of the application where the SDK is installed. Applications are created on the Web Console and should match the applications where your experiments will be running. |
+| ApplicationVersion_ | `string` | &#10060; | `""`     | The version of your application. Sent as the `X-Application-Version` header when it is a whole number; otherwise `"0"` is sent.                                         |
 | MaxRetries_      | `int`    | &#10060;  | `5`       | The number of retries before the SDK stops trying to connect.                                                                                                                 |
 | ConnectTimeout_  | `int`    | &#10060;  | `3000`    | An amount of time, in milliseconds, before the SDK will stop trying to connect.                                                                                               |
 
@@ -473,6 +475,59 @@ ctx.SetAttributes(map[string]interface{}{
     "user_score":   150,
 })
 ```
+
+The `application` and `environment` names from the client configuration are
+always injected into the attribute map that audiences are evaluated against, so
+an audience filter can target `application` or `environment` without setting
+them explicitly. A value left unset or empty is omitted, so a filter can rely on
+it only when it is configured or set explicitly. A user-set attribute of the
+same name always takes precedence, including one set after the context is
+created. These values are not added to the publish payload; the collector
+attaches them to every exposure server-side.
+
+Audience filters and assignment-rule conditions can compare semantic versions
+with `semver_eq`, `semver_gt`, `semver_gte`, `semver_lt` and `semver_lte`. A
+leading `v` and build metadata are ignored, missing parts count as `0`, and a
+pre-release ranks below its release, so `1.2` equals `1.2.0` and `2.0.0-beta`
+is less than `2.0.0`:
+
+```json
+{"filter": [{"semver_gte": [{"var": "app_version"}, {"value": "2.4.0"}]}]}
+```
+
+The SDK does not set `app_version` itself; set it with `SetAttribute`.
+
+### Assignment Rules
+
+An experiment can define assignment rules in the Web Console. They are
+evaluated in order and the first one that applies sets the variant:
+
+- an `assign` rule gives a fixed variant;
+- a `split` rule divides matching units across the variants by percentages,
+  such as `20/30/50`. Units are hashed with the experiment's own seed, so a
+  rule split equal to the experiment split keeps every unit on the variant it
+  already had.
+
+A rule can be limited to some environments (matched, case-sensitively, against
+the client's `Environment`) and to units whose attributes match its
+conditions, which use the same JSON expressions as audiences, including the
+`application` and `environment` names. A matching rule takes precedence over
+the audience and `audienceStrict`, traffic eligibility, full-on and custom
+assignments; only `SetOverride` takes precedence over it. Exposures from a rule
+carry `ruleOverride: true`, so they are left out of the experiment's analysis.
+
+Rules are re-evaluated when attributes change or a refresh changes them. A
+`split` rule that matches before its unit is set gives the experiment's no-unit
+result (the full-on variant, or `0`) and is resolved again once the unit is
+set, unless it has already been exposed: a user never switches variant or gets
+a second exposure. An invalid rule is skipped in favour of the next one; an
+`assign` variant out of range, or a split with a different number of values
+than the experiment has variants, stops rule evaluation and falls back to
+normal assignment.
+
+Older SDK versions ignore assignment rules, so their units fall through to
+normal assignment and are analysed. Use this version or later where rules must
+apply.
 
 ### Custom Assignments
 
@@ -814,6 +869,20 @@ func createContextWithDeadline(absmartly sdk.ABsmartly, wait time.Duration) (*sd
     }
 }
 ```
+
+## Releasing
+
+Go modules are published by git tags. To release:
+
+1. Set `SDKVersion` in `sdk/Version.go` to the new version (it is sent in the
+   `X-Agent` header) and move the `CHANGELOG.md` entry from unreleased to that
+   version.
+2. Merge to `main`, then tag that commit and push the tag:
+   `git tag v1.2.0 && git push origin v1.2.0`.
+
+The `Release` workflow checks that the tag matches `SDKVersion`, runs the
+tests, creates the GitHub release and asks the Go module proxy to fetch the
+new version.
 
 ## About A/B Smartly
 

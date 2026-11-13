@@ -42,6 +42,21 @@ var Operators = map[string]eval.Operator{
 	"lte": operators.BinaryOperator{
 		BinaryOp: operators.LessThanOrEqualOperator{},
 	},
+	"semver_eq": operators.BinaryOperator{
+		BinaryOp: operators.SemverEqualsOperator{},
+	},
+	"semver_gt": operators.BinaryOperator{
+		BinaryOp: operators.SemverGreaterThanOperator{},
+	},
+	"semver_gte": operators.BinaryOperator{
+		BinaryOp: operators.SemverGreaterThanOrEqualOperator{},
+	},
+	"semver_lt": operators.BinaryOperator{
+		BinaryOp: operators.SemverLessThanOperator{},
+	},
+	"semver_lte": operators.BinaryOperator{
+		BinaryOp: operators.SemverLessThanOrEqualOperator{},
+	},
 }
 
 func EvaluateBooleanExpr(expr interface{}, vars map[string]interface{}) bool {
