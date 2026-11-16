@@ -8,7 +8,6 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"github.com/absmartly/go-sdk/sdk/jsonexpr"
 )
@@ -177,8 +176,10 @@ func parseRuleAction(rule map[string]interface{}) *ruleAction {
 	return nil
 }
 
-// ruleVariant accepts integral numbers within int32 range, like JavaScript's
-// Number.isInteger (2.0 is an integer).
+// ruleVariant accepts integral numbers, like JavaScript's Number.isInteger
+// (2.0 is an integer). An integral variant too large for any experiment, such
+// as 2147483648, is still a valid assign rule, as in JS: it is returned as -1,
+// so the caller finds it out of range, stops rule evaluation and falls back.
 func ruleVariant(value interface{}) (int, bool) {
 	// A custom AudienceDeserializer using json.Decoder.UseNumber gives
 	// json.Number, which is a string kind.
@@ -201,8 +202,11 @@ func ruleVariant(value interface{}) (int, bool) {
 	default:
 		return 0, false
 	}
-	if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) || f > math.MaxInt32 || f < math.MinInt32 {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) {
 		return 0, false
+	}
+	if f > math.MaxInt32 || f < math.MinInt32 {
+		return -1, true
 	}
 	return int(f), true
 }
@@ -247,10 +251,22 @@ func parseSplitPercentages(percentages interface{}) []float64 {
 	return values
 }
 
-// jsParseFloat follows JavaScript's parseFloat: leading whitespace is skipped
-// and the longest decimal prefix is parsed, so "50abc" is 50 and "abc" is NaN.
+// isJSWhitespace reports whether r is ECMAScript WhiteSpace or LineTerminator,
+// which parseFloat skips. Unlike unicode.IsSpace, it includes U+FEFF and
+// excludes U+0085.
+func isJSWhitespace(r rune) bool {
+	switch r {
+	case '\t', '\n', '\v', '\f', '\r', ' ', 0xA0, 0x1680, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF:
+		return true
+	}
+	return r >= 0x2000 && r <= 0x200A
+}
+
+// jsParseFloat follows JavaScript's parseFloat: leading whitespace (the
+// ECMAScript WhiteSpace and LineTerminator characters) is skipped and the
+// longest decimal prefix is parsed, so "50abc" is 50 and "abc" is NaN.
 func jsParseFloat(s string) float64 {
-	s = strings.TrimLeftFunc(s, unicode.IsSpace)
+	s = strings.TrimLeftFunc(s, isJSWhitespace)
 	var i = 0
 	if i < len(s) && (s[i] == '+' || s[i] == '-') {
 		i++

@@ -1,7 +1,10 @@
 package eval
 
 import (
+	"math"
+	"math/big"
 	"reflect"
+	"strconv"
 	"strings"
 )
 
@@ -14,9 +17,9 @@ import (
 // pre-releases. Parsing is as permissive as the other SDKs', so a
 // non-numeric core part ("1.x") is compared as an alphanumeric identifier.
 func (e Evaluator) VersionCompare(lhs reflect.Value, rhs reflect.Value) interface{} {
-	var lhsStr, lerr = e.StringConvert(lhs)
-	var rhsStr, rerr = e.StringConvert(rhs)
-	if lerr != nil || rerr != nil || lhsStr == "" || rhsStr == "" {
+	var lhsStr, lconv = semverString(lhs)
+	var rhsStr, rconv = semverString(rhs)
+	if !lconv || !rconv || lhsStr == "" || rhsStr == "" {
 		return nil
 	}
 
@@ -132,4 +135,83 @@ func compareIdentifiers(a string, b string) int {
 		return 1
 	}
 	return strings.Compare(a, b)
+}
+
+// semverString converts a semver operand to a string the way the JS SDK's
+// stringConvert does: strings as is, booleans as "true"/"false", and numbers
+// with jsNumberString. It is local to the semver operators; the general
+// StringConvert used by the older operators is unchanged.
+func semverString(x reflect.Value) (string, bool) {
+	switch x.Kind() {
+	case reflect.String:
+		return x.String(), true
+	case reflect.Bool:
+		return strconv.FormatBool(x.Bool()), true
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return strconv.FormatInt(x.Int(), 10), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return strconv.FormatUint(x.Uint(), 10), true
+	case reflect.Float32, reflect.Float64:
+		return jsNumberString(x.Float()), true
+	}
+	return "", false
+}
+
+// jsNumberString formats a number like JavaScript's
+// x.toFixed(15).replace(/\.?0{0,15}$/, ""): fifteen decimals, rounded from
+// the exact binary value with ties away from zero, then trailing zeros and a
+// trailing point dropped. Like toFixed, it uses exponent notation (JavaScript's
+// shortest form, such as "1e+21") from 1e21 up, and keeps the sign of a
+// negative number that rounds to zero ("-0"). The trailing-zero strip applies
+// to the exponent form too, as the JS regex does ("1e+300" becomes "1e+3").
+func jsNumberString(x float64) string {
+	switch {
+	case math.IsNaN(x):
+		return "NaN"
+	case math.IsInf(x, 1):
+		return "Infinity"
+	case math.IsInf(x, -1):
+		return "-Infinity"
+	case math.Abs(x) >= 1e21:
+		return stripTrailingZeros(strconv.FormatFloat(x, 'g', -1, 64))
+	}
+
+	var negative = x < 0
+	// The exact decimal expansion of a float64 has at most 1074 fractional
+	// digits, so this prints it without rounding.
+	var exact = new(big.Float).SetFloat64(math.Abs(x)).Text('f', 1074)
+	var point = strings.IndexByte(exact, '.')
+	var digits = []byte(exact[:point] + exact[point+1:point+16])
+	if exact[point+16] >= '5' {
+		var i = len(digits) - 1
+		for ; i >= 0 && digits[i] == '9'; i-- {
+			digits[i] = '0'
+		}
+		if i < 0 {
+			digits = append([]byte{'1'}, digits...)
+		} else {
+			digits[i]++
+		}
+	}
+
+	var intLen = len(digits) - 15
+	var text = stripTrailingZeros(string(digits[:intLen]) + "." + string(digits[intLen:]))
+	if negative {
+		return "-" + text
+	}
+	return text
+}
+
+// stripTrailingZeros is JavaScript's s.replace(/\.?0{0,15}$/, ""): up to
+// fifteen trailing zeros go, and the point before them when they are all that
+// follows it.
+func stripTrailingZeros(s string) string {
+	var end = len(s)
+	for end > 0 && len(s)-end < 15 && s[end-1] == '0' {
+		end--
+	}
+	if end > 0 && s[end-1] == '.' {
+		end--
+	}
+	return s[:end]
 }

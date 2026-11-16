@@ -138,7 +138,7 @@ The builder pattern supports all the same options as the config-based approach.
 | :----------- | :-------------------- | :------ | :-------------------------------------------------------------- |
 | Timeout      | `time.Duration`       | `3s`    | Request and connection timeout.                                   |
 | Retries      | `int`                 | `5`     | The number of retries before the SDK stops trying to connect.   |
-| ApplicationVersion | `string`        | `""`    | The version of your application. Sent as the `X-Application-Version` header when it is a whole number such as `"1042"`; any other value, or none, is sent as `"0"`. |
+| ApplicationVersion | `string`        | `""`    | The version of your application. Sent as the `X-Application-Version` header when it is 1 to 18 digits such as `"1042"`; any other value, or none, is sent as `"0"`. |
 | ContextEventLogger | `ContextEventLogger` | `nil` | A callback interface which runs after SDK events.              |
 
 #### Advanced Configuration (Config-Based Approach)
@@ -153,9 +153,10 @@ For advanced use cases requiring custom implementations, use the traditional con
 | ApiKey_          | `string` |  &#9989;  | `""`      | Your API key which can be found on the Web Console.                                                                                                                           |
 | Environment_     | `string` |  &#9989;  | `""`      | The environment of the platform where the SDK is installed. Environments are created on the Web Console and should match the available environments in your infrastructure.   |
 | Application_     | `string` |  &#9989;  | `""`      | The name of the application where the SDK is installed. Applications are created on the Web Console and should match the applications where your experiments will be running. |
-| ApplicationVersion_ | `string` | &#10060; | `""`     | The version of your application. Sent as the `X-Application-Version` header when it is a whole number; otherwise `"0"` is sent.                                         |
 | MaxRetries_      | `int`    | &#10060;  | `5`       | The number of retries before the SDK stops trying to connect.                                                                                                                 |
 | ConnectTimeout_  | `int`    | &#10060;  | `3000`    | An amount of time, in milliseconds, before the SDK will stop trying to connect.                                                                                               |
+
+To send your application version with the config-based approach, call `WithApplicationVersion` on the client, for example `sdk.CreateDefaultClient(clientConfig).WithApplicationVersion("1042")`. It is sent as the `X-Application-Version` header when it is 1 to 18 digits; otherwise `"0"` is sent.
 
 #### ABsmartlyConfig
 

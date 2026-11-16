@@ -550,9 +550,9 @@ func TestRules_ParsingFailureOnlyDropsThatExperimentsRules(t *testing.T) {
 
 	assertAny(false, ctx.IsFailed(), t)
 	assertAny(0, treatment(t, ctx, "exp"), t)
-	if !logger.hasError("Failed to parse assignmentRules for experiment 'exp'") {
-		t.Errorf("no parse error logged: %v", logger.errors())
-	}
+	// Malformed rules only drop that experiment's rules; like the JS SDK, they
+	// are not reported to the customer's logger as an error.
+	assertAny(0, len(logger.errors()), t)
 }
 
 func TestRules_NonStringAssignmentRulesOnlySkipsThatExperiment(t *testing.T) {
@@ -562,9 +562,7 @@ func TestRules_NonStringAssignmentRulesOnlySkipsThatExperiment(t *testing.T) {
 	]}`))
 	assertAny(nil, err, t)
 	assertAny("", data.Experiments[0].AssignmentRules, t)
-	assertAny(true, data.Experiments[0].AssignmentRulesIgnored(), t)
 	assertAny(`{"rules":[]}`, data.Experiments[1].AssignmentRules, t)
-	assertAny(false, data.Experiments[1].AssignmentRulesIgnored(), t)
 }
 
 func TestRules_NonStringAssignmentRulesInPayloadKeepsOtherExperimentsRules(t *testing.T) {
@@ -596,9 +594,7 @@ func TestRules_NonStringAssignmentRulesInPayloadKeepsOtherExperimentsRules(t *te
 	assertAny(false, ctx.IsFailed(), t)
 	assertAny(0, treatment(t, ctx, "bad"), t)
 	assertAny(2, treatment(t, ctx, "good"), t)
-	if !logger.hasError("Ignoring assignmentRules for experiment 'bad'") {
-		t.Errorf("no warning for the non-string rules: %v", logger.errors())
-	}
+	assertAny(0, len(logger.errors()), t)
 }
 
 type numberAudienceDeserializer struct{}
@@ -616,7 +612,9 @@ func TestRules_JSONNumberVariantFromCustomDeserializer(t *testing.T) {
 		rulesJSON(`{"type":"assign","variant":2}`):                                    "&{2 []}",
 		rulesJSON(`{"type":"assign","variant":2.0}`):                                  "&{2 []}",
 		rulesJSON(`{"type":"assign","variant":1.5}`, `{"type":"assign","variant":0}`): "&{0 []}",
-		rulesJSON(`{"type":"assign","variant":1e20}`):                                 "<nil>",
+		// Integral but out of any experiment's range: selected, as in JS, as
+		// the out-of-range -1 the caller falls back on.
+		rulesJSON(`{"type":"assign","variant":1e20}`, `{"type":"assign","variant":0}`): "&{-1 []}",
 	} {
 		var parsed, err = matcher.parseRules(rules)
 		assertAny(nil, err, t)
@@ -754,6 +752,11 @@ func TestRules_ParseSplitPercentages(t *testing.T) {
 		{"20/30/50", []float64{0.2, 0.3, 0.5}},
 		{"100", []float64{1}},
 		{" 50/50", []float64{0.5, 0.5}},
+		// ECMAScript whitespace, as parseFloat skips it: U+FEFF is skipped,
+		// U+0085 (not JS whitespace) makes the value NaN.
+		{"\uFEFF50/\u300050", []float64{0.5, 0.5}},
+		{"\u202F50/\u2028 50", []float64{0.5, 0.5}},
+		{"\u008550/50", nil},
 		{"50abc/50", []float64{0.5, 0.5}},
 		{"5e1/50", []float64{0.5, 0.5}},
 		{"0/0/100", []float64{0, 0, 1}},

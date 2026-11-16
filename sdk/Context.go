@@ -89,14 +89,14 @@ type Context struct {
 	Clock_        internal.Clock
 	AttrsSeq_     int32
 
-	// Application_ and Environment_ are the application and environment names
+	// application_ and environment_ are the application and environment names
 	// from the client config. They are injected into the attribute map that
-	// audiences are evaluated against (system values first, user attributes
-	// overlaid on top), so filters can target them, exactly as the collector
-	// attaches them to every exposure server-side. They are never published as
-	// attributes and are set once at creation, so they need no locking.
-	Application_ string
-	Environment_ string
+	// audiences and assignment-rule conditions are evaluated against (system
+	// values first, user attributes overlaid on top), and environment_ scopes
+	// assignment rules. They are never published as attributes and are set
+	// once at creation, so they need no locking.
+	application_ string
+	environment_ string
 
 	// customFieldErrors_ holds, per experiment and field name, the error from
 	// parsing a "json" custom field. GetCustomFieldValue reports it through the
@@ -126,9 +126,40 @@ type Context struct {
 	// it, in experiment-id order. Guarded by DataLock.
 	indexVariables_ map[string][]ExperimentVariables
 
+	// rules_ holds each experiment's parsed assignment rules, by experiment
+	// name. Experiments without rules have no entry. Guarded by DataLock.
+	rules_ map[string]*experimentRules
+
 	// assignmentCache_ holds the assignments by experiment name. Guarded by
-	// ContextLock_.
-	assignmentCache_ map[string]*Assignment
+	// ContextLock_: entries are only written under the write lock.
+	assignmentCache_ map[string]*cachedAssignment
+}
+
+// experimentRules is an experiment's assignmentRules text and its parsed
+// rules (nil when they could not be parsed). It is built once when context
+// data is installed and reused by a refresh that leaves the text unchanged,
+// so the pointer identifies the rules a cached assignment was resolved
+// against.
+type experimentRules struct {
+	text   string
+	parsed *assignmentRules
+}
+
+// cachedAssignment is an assignment plus the state it was last validated
+// against. The assignment itself is shared with callers and never mutated;
+// the stamps are advanced under the write lock once a revalidation confirms
+// the assignment, so later reads take the fast path again.
+type cachedAssignment struct {
+	assignment *Assignment
+	// rules is the rule set the assignment was last validated against, or
+	// nil when the experiment had none.
+	rules *experimentRules
+	// attrsSeq is the attribute sequence it was last validated against.
+	attrsSeq int32
+	// ruleMissingUnit is set when a split rule matched while the
+	// experiment's unit was not set, so the variant is the experiment's
+	// no-unit result rather than a hash of the unit.
+	ruleMissingUnit bool
 }
 
 type loggerGoroutines struct {
@@ -162,10 +193,6 @@ func (l *loggerGoroutines) current() bool {
 type ExperimentVariables struct {
 	Data      jsonmodels.Experiment
 	Variables []map[string]interface{}
-
-	// rules is Data.AssignmentRules parsed when the data is installed, or nil
-	// when the experiment has none or they could not be parsed.
-	rules *assignmentRules
 }
 
 type ContextCustomFieldValue struct {
@@ -195,23 +222,26 @@ type Assignment struct {
 	Variables    map[string]interface{}
 	Exposed      *atomic.Value
 	AttrsSeq     int32
-
-	// ruleKey is the assignmentRules text the assignment was resolved
-	// against, so a refresh that changes the rules re-resolves it.
-	ruleKey string
-	// ruleMissingUnit is set when a split rule matched while the
-	// experiment's unit was not set, so the variant is the experiment's
-	// no-unit result rather than a hash of the unit.
-	ruleMissingUnit bool
 }
 
 func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *future.Future, dataProvider ContextDataProvider,
 	eventHandler ContextEventHandler, eventLogger ContextEventLogger, variableParser VariableParser,
 	audienceMatcher AudienceMatcher) *Context {
+	return createContext(clock, config, dataFuture, dataProvider, eventHandler, eventLogger, variableParser,
+		audienceMatcher, "", "")
+}
+
+// createContext is CreateContext with the client's application and
+// environment names, which ABsmartly.CreateContext(With) passes. They are set
+// before the data future can deliver its Ready callback (which may evaluate an
+// audience), so that callback already sees them.
+func createContext(clock internal.Clock, config ContextConfig, dataFuture *future.Future, dataProvider ContextDataProvider,
+	eventHandler ContextEventHandler, eventLogger ContextEventLogger, variableParser VariableParser,
+	audienceMatcher AudienceMatcher, application string, environment string) *Context {
 	var cntx = Context{Clock_: clock, PublishDelay_: config.PublishDelay_, RefreshInterval_: config.RefreshInterval_,
 		EventHandler_: eventHandler, DataProvider_: dataProvider, VariableParser_: variableParser,
 		AudienceMatcher_: audienceMatcher, Units_: map[string]string{},
-		Application_: config.application_, Environment_: config.environment_}
+		application_: application, environment_: environment}
 
 	if config.EventLogger_ != nil {
 		cntx.EventLogger_ = config.EventLogger_
@@ -238,7 +268,7 @@ func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	cntx.StateLock_ = &sync.Mutex{}
 
 	cntx.AssignmentCache = map[string]Assignment{}
-	cntx.assignmentCache_ = map[string]*Assignment{}
+	cntx.assignmentCache_ = map[string]*cachedAssignment{}
 	cntx.unitValues_ = map[string]interface{}{}
 	cntx.readyDeliverer_ = &atomic.Uint64{}
 	cntx.loggers_ = &loggerGoroutines{ids: map[uint64]int{}}
@@ -591,8 +621,9 @@ func (c *Context) setUnit(unitType string, uid interface{}) error {
 // marked exposed so a caller still holding it cannot queue it. The caller
 // holds ContextLock_ for writing.
 func (c *Context) evictRuleAssignmentsMissingUnit(unitType string) {
-	for name, assignment := range c.assignmentCache_ {
-		if assignment.RuleOverride && assignment.ruleMissingUnit && assignment.UnitType == unitType &&
+	for name, entry := range c.assignmentCache_ {
+		var assignment = entry.assignment
+		if assignment.RuleOverride && entry.ruleMissingUnit && assignment.UnitType == unitType &&
 			assignment.Exposed.CompareAndSwap(false, true) {
 			delete(c.assignmentCache_, name)
 			delete(c.AssignmentCache, name)
@@ -725,11 +756,11 @@ func (c *Context) GetAttributes() map[string]interface{} {
 // exposures server-side. The caller must hold ContextLock_.
 func (c *Context) evaluationAttributes() map[string]interface{} {
 	var attrs = map[string]interface{}{}
-	if len(c.Application_) > 0 {
-		attrs["application"] = c.Application_
+	if len(c.application_) > 0 {
+		attrs["application"] = c.application_
 	}
-	if len(c.Environment_) > 0 {
-		attrs["environment"] = c.Environment_
+	if len(c.environment_) > 0 {
+		attrs["environment"] = c.environment_
 	}
 	for _, v := range c.Attributes_ {
 		var attribute = v.(jsonmodels.Attribute)
@@ -1292,56 +1323,71 @@ func (c *Context) Close() {
 	finalized.Join(context.Background())
 }
 
-// cachedAssignment returns the cached assignment for experimentName if it is
-// still valid, or nil. It only reads, so it may run under ContextLock_ held for
-// reading or writing.
-func (c *Context) cachedAssignment(experimentName string) *Assignment {
-	var assignment, found = c.assignmentCache_[experimentName]
+// assignmentState is what validCachedAssignment found for a cached assignment.
+type assignmentState int
+
+const (
+	// assignmentStale means the assignment must be rebuilt.
+	assignmentStale assignmentState = iota
+	// assignmentValid means the assignment and its stamps are up to date.
+	assignmentValid
+	// assignmentRevalidated means the rules or attributes changed since the
+	// assignment was last validated, but they still give its outcome. Its
+	// stamps must be advanced under the write lock, or every later read would
+	// re-evaluate it.
+	assignmentRevalidated
+)
+
+// validCachedAssignment returns the cached assignment for experimentName and
+// whether it is still valid, with the rule set it was validated against. It
+// only reads, so it may run under ContextLock_ held for reading or writing.
+func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignment, *experimentRules, assignmentState) {
+	var entry, found = c.assignmentCache_[experimentName]
 	if !found {
-		return nil
+		return nil, nil, assignmentStale
 	}
+	var assignment = entry.assignment
 	var custom, cfound = c.Cassignments_[experimentName]
 	var override, ofound = c.Overrides_[experimentName]
-	var experiment, efound = c.GetExperiment(experimentName)
+	var experiment, rules, efound = c.experimentAndRules(experimentName)
 
 	if ofound {
 		if assignment.Overridden && assignment.Variant == override.(int) {
-			return assignment
+			return entry, rules, assignmentValid
 		}
 	} else if !efound {
 		// A rule-won assignment is not assigned either, but its variant came
 		// from the experiment's rules, so it is rebuilt once the experiment
 		// is gone.
 		if !assignment.Assigned && !assignment.RuleOverride {
-			return assignment
+			return entry, rules, assignmentValid
 		}
 	} else if assignment.RuleOverride || !cfound || custom.(int) == assignment.Variant {
 		// A matching rule wins over a custom assignment, so a custom
 		// assignment that differs from a rule-won variant is not staleness.
-		if c.ExperimentMatches(experiment.Data, *assignment) && c.ruleMatches(experiment, assignment) &&
-			c.AudienceMatches(experiment.Data, assignment) {
-			return assignment
+		if !c.ExperimentMatches(experiment.Data, *assignment) {
+			return entry, rules, assignmentStale
+		}
+		if rules == entry.rules && atomic.LoadInt32(&c.AttrsSeq_) <= entry.attrsSeq {
+			return entry, rules, assignmentValid
+		}
+		if c.ruleMatches(experiment.Data, rules, entry) && c.audienceMatches(experiment.Data, assignment) {
+			return entry, rules, assignmentRevalidated
 		}
 	}
-	return nil
+	return entry, rules, assignmentStale
 }
 
 // ruleMatches reports whether the experiment's assignment rules still give the
-// cached assignment's outcome. It runs under the read lock, so it never
-// updates the assignment; a changed outcome is reported as stale for
-// GetAssignment to rebuild under the write lock. The rules are re-resolved
-// only when a refresh changed them or an attribute was set since the
-// assignment was built.
-func (c *Context) ruleMatches(experiment ExperimentVariables, assignment *Assignment) bool {
-	if experiment.Data.AssignmentRules == assignment.ruleKey && atomic.LoadInt32(&c.AttrsSeq_) <= assignment.AttrsSeq {
-		return true
-	}
-
+// cached assignment's outcome. It never updates the entry; a changed outcome
+// is reported as stale for GetAssignment to rebuild under the write lock.
+func (c *Context) ruleMatches(data jsonmodels.Experiment, rules *experimentRules, entry *cachedAssignment) bool {
+	var assignment = entry.assignment
 	// An exposed split resolved without its unit keeps resolving as if the
 	// unit were still missing, so a unit set afterwards cannot switch the
 	// variant the user already saw.
-	var pinnedMissing = assignment.ruleMissingUnit && assignment.Exposed.Load().(bool)
-	var rule = c.resolveRule(experiment, pinnedMissing, false)
+	var pinnedMissing = entry.ruleMissingUnit && assignment.Exposed.Load().(bool)
+	var rule = c.resolveRule(data, rules, pinnedMissing, false)
 	if (rule != nil) != assignment.RuleOverride {
 		return false
 	}
@@ -1351,7 +1397,22 @@ func (c *Context) ruleMatches(experiment ExperimentVariables, assignment *Assign
 	// Same variant, but now resolved by a split without its unit, or no
 	// longer so: stale, so GetAssignment refreshes the flag. It keeps an
 	// exposed assignment's exposed flag (see keepExposedRuleAssignment).
-	return rule.variant == assignment.Variant && rule.missingUnit == assignment.ruleMissingUnit
+	return rule.variant == assignment.Variant && rule.missingUnit == entry.ruleMissingUnit
+}
+
+// audienceMatches reports whether the audience still gives the cached
+// assignment's audienceMismatch. A rule-won assignment skips the audience, as
+// in the JS SDK.
+func (c *Context) audienceMatches(data jsonmodels.Experiment, assignment *Assignment) bool {
+	if assignment.RuleOverride || len(data.Audience) == 0 {
+		return true
+	}
+	var match, err = c.AudienceMatcher_.Evaluate(data.Audience, c.evaluationAttributes())
+	var newAudienceMismatch = false
+	if err == nil {
+		newAudienceMismatch = !match.Get()
+	}
+	return newAudienceMismatch == assignment.AudienceMismatch
 }
 
 type ruleResolution struct {
@@ -1366,16 +1427,17 @@ type ruleResolution struct {
 // gives the experiment's own no-unit result (the full-on variant, or 0) and is
 // flagged missingUnit. The unit is hashed with the experiment's own seed, so
 // a split equal to the experiment split keeps every unit on its variant.
+// Rules are scoped by the configured environment, never by a user-set
+// "environment" attribute, which only conditions see.
 //
 // The caller holds ContextLock_. cache is false on the read path, where the
 // hashed-unit and assigner caches must not be written.
-func (c *Context) resolveRule(experiment ExperimentVariables, unitPinnedMissing bool, cache bool) *ruleResolution {
-	if experiment.rules == nil {
+func (c *Context) resolveRule(data jsonmodels.Experiment, rules *experimentRules, unitPinnedMissing bool, cache bool) *ruleResolution {
+	if rules == nil || rules.parsed == nil {
 		return nil
 	}
 
-	var data = experiment.Data
-	var action = c.AudienceMatcher_.evaluateRules(experiment.rules, c.Environment_, c.evaluationAttributes())
+	var action = c.AudienceMatcher_.evaluateRules(rules.parsed, c.environment_, c.evaluationAttributes())
 	if action == nil {
 		return nil
 	}
@@ -1418,43 +1480,60 @@ func (c *Context) resolveRule(experiment ExperimentVariables, unitPinnedMissing 
 // the refreshed variables and rule bookkeeping, and the cached one is never
 // mutated while a reader may hold it. The caller holds ContextLock_ for
 // writing.
-func (c *Context) keepExposedRuleAssignment(experiment ExperimentVariables, previous *Assignment, fresh *Assignment) {
-	if previous == nil || !fresh.RuleOverride || !previous.RuleOverride || previous.Overridden ||
-		previous.Variant != fresh.Variant || !previous.Exposed.Load().(bool) ||
-		!c.ExperimentMatches(experiment.Data, *previous) {
+func (c *Context) keepExposedRuleAssignment(data jsonmodels.Experiment, previous *cachedAssignment, fresh *Assignment) {
+	if previous == nil {
 		return
 	}
-	fresh.Exposed = previous.Exposed
+	var old = previous.assignment
+	if !fresh.RuleOverride || !old.RuleOverride || old.Overridden || old.Variant != fresh.Variant ||
+		!old.Exposed.Load().(bool) || !c.ExperimentMatches(data, *old) {
+		return
+	}
+	fresh.Exposed = previous.assignment.Exposed
 }
 
 func (c *Context) GetAssignment(experimentName string) *Assignment {
 	// A valid cached assignment only needs the read lock, so concurrent reads
 	// of a shared context do not serialise.
 	c.ContextLock_.RLock()
-	if assignment := c.cachedAssignment(experimentName); assignment != nil {
+	if entry, _, state := c.validCachedAssignment(experimentName); state == assignmentValid {
 		c.ContextLock_.RUnlock()
-		return assignment
+		return entry.assignment
 	}
 	c.ContextLock_.RUnlock()
 
-	// Cache miss or out of date. Check again under the write lock: another
-	// goroutine may have rebuilt the assignment meanwhile, and replacing it
-	// would lose its exposed flag and queue a second exposure.
+	// Cache miss, out of date, or revalidated. Check again under the write
+	// lock: another goroutine may have rebuilt the assignment meanwhile, and
+	// replacing it would lose its exposed flag and queue a second exposure.
 	c.ContextLock_.Lock()
-	if assignment := c.cachedAssignment(experimentName); assignment != nil {
+	var previous, validated, state = c.validCachedAssignment(experimentName)
+	if state == assignmentValid {
 		c.ContextLock_.Unlock()
-		return assignment
+		return previous.assignment
+	}
+	if state == assignmentRevalidated {
+		// Still the same outcome: acknowledge the rules and attributes it was
+		// validated against, so later reads take the fast path. The shared
+		// assignment, and so its exposed flag, is kept as is. SetAttribute
+		// needs the write lock held here, so the sequence is the one just
+		// validated; a refresh racing this records the old rule set, which
+		// only makes the next read revalidate.
+		previous.rules = validated
+		previous.attrsSeq = atomic.LoadInt32(&c.AttrsSeq_)
+		c.ContextLock_.Unlock()
+		return previous.assignment
 	}
 
 	var custom, cfound = c.Cassignments_[experimentName]
 	var override, ofound = c.Overrides_[experimentName]
-	var experiment, efound = c.GetExperiment(experimentName)
+	var experiment, rules, efound = c.experimentAndRules(experimentName)
 
 	var exposed = &atomic.Value{}
 	exposed.Store(false)
 	var assignment = &Assignment{Exposed: exposed}
 	assignment.Name = experimentName
 	assignment.Eligible = true
+	var entry = &cachedAssignment{assignment: assignment, rules: rules, attrsSeq: atomic.LoadInt32(&c.AttrsSeq_)}
 
 	if ofound {
 		if efound {
@@ -1468,17 +1547,13 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 		if efound {
 			var unitType = experiment.Data.UnitType
 
-			// ruleKey is recorded even when no rule matches, so ruleMatches
-			// only re-resolves after a refresh changes the rules or an
-			// attribute is set.
-			assignment.ruleKey = experiment.Data.AssignmentRules
 			// A matching rule is an explicit assignment, like an override: it
 			// wins over the audience, audienceStrict, traffic eligibility,
 			// full-on and custom assignments.
-			if rule := c.resolveRule(experiment, false, true); rule != nil {
+			if rule := c.resolveRule(experiment.Data, rules, false, true); rule != nil {
 				assignment.Variant = rule.variant
 				assignment.RuleOverride = true
-				assignment.ruleMissingUnit = rule.missingUnit
+				entry.ruleMissingUnit = rule.missingUnit
 			}
 
 			if !assignment.RuleOverride && len(experiment.Data.Audience) > 0 {
@@ -1537,10 +1612,10 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 	}
 
 	if efound {
-		c.keepExposedRuleAssignment(experiment, c.assignmentCache_[experimentName], assignment)
+		c.keepExposedRuleAssignment(experiment.Data, previous, assignment)
 	}
 
-	c.assignmentCache_[experimentName] = assignment
+	c.assignmentCache_[experimentName] = entry
 	c.AssignmentCache[experimentName] = *assignment
 	c.ContextLock_.Unlock()
 	return assignment
@@ -1565,6 +1640,15 @@ func (c *Context) GetExperiment(experimentName string) (ExperimentVariables, boo
 	defer c.DataLock.RUnlock()
 	var result, found = c.Index_[experimentName]
 	return result, found
+}
+
+// experimentAndRules is GetExperiment plus the experiment's parsed assignment
+// rules, read together under DataLock so they belong to the same data.
+func (c *Context) experimentAndRules(experimentName string) (ExperimentVariables, *experimentRules, bool) {
+	c.DataLock.RLock()
+	defer c.DataLock.RUnlock()
+	var result, found = c.Index_[experimentName]
+	return result, c.rules_[experimentName], found
 }
 
 func (c *Context) ExperimentMatches(experiment jsonmodels.Experiment, assignment Assignment) bool {
@@ -1703,6 +1787,10 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	var indexVariables = map[string][]ExperimentVariables{}
 	var contextCustomFields = map[string]map[string]ContextCustomFieldValue{}
 	var customFieldErrors = map[string]map[string]error{}
+	var rules = map[string]*experimentRules{}
+	c.DataLock.RLock()
+	var previousRules = c.rules_
+	c.DataLock.RUnlock()
 
 	for _, experiment := range data.Experiments {
 		var experiemntVariables = ExperimentVariables{}
@@ -1774,16 +1862,9 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 				experimentCustomFields[value.Name] = value
 			}
 		}
-		if experiment.AssignmentRulesIgnored() {
-			buffer.HandleEvent(self, Error, errors.New("SetData: Ignoring assignmentRules for experiment '"+
-				experiment.Name+"': expected a JSON string"))
+		if len(experiment.AssignmentRules) > 0 {
+			rules[experiment.Name] = c.experimentRulesFor(previousRules[experiment.Name], experiment.AssignmentRules)
 		}
-		var rules, rulesErr = c.AudienceMatcher_.parseRules(experiment.AssignmentRules)
-		if rulesErr != nil {
-			buffer.HandleEvent(self, Error, errors.New("SetData: Failed to parse assignmentRules for experiment '"+
-				experiment.Name+"'; its rules are ignored: "+rulesErr.Error()))
-		}
-		experiemntVariables.rules = rules
 
 		contextCustomFields[experiment.Name] = experimentCustomFields
 		index[experiment.Name] = experiemntVariables
@@ -1805,6 +1886,7 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	c.DataLock.Lock()
 
 	c.Index_ = index
+	c.rules_ = rules
 	c.ContextCustomFields_ = contextCustomFields
 	c.customFieldErrors_ = customFieldErrors
 	c.indexVariables_ = indexVariables
@@ -1814,6 +1896,20 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 
 	c.SetRefreshTimer()
 	c.DataLock.Unlock()
+}
+
+// experimentRulesFor parses an experiment's assignmentRules text, or returns
+// previous when a refresh left the text unchanged, so cached assignments keep
+// validating against the same rule set. Rules that cannot be parsed give no
+// rules for that experiment only. As in the JS SDK, which only writes them to
+// the console, they are not reported to the event logger as errors: the
+// context and its other experiments are unaffected.
+func (c *Context) experimentRulesFor(previous *experimentRules, text string) *experimentRules {
+	if previous != nil && previous.text == text {
+		return previous
+	}
+	var parsed, _ = c.AudienceMatcher_.parseRules(text)
+	return &experimentRules{text: text, parsed: parsed}
 }
 
 // LogEvent and LogError pass an event to the event logger. A logger is an
@@ -1860,6 +1956,7 @@ func panicToError(r interface{}) error {
 func (c *Context) SetDataFailed(err error) {
 	c.DataLock.Lock()
 	c.Index_ = map[string]ExperimentVariables{}
+	c.rules_ = nil
 	c.indexVariables_ = map[string][]ExperimentVariables{}
 	c.IndexVariables_ = map[interface{}]interface{}{}
 	c.customFieldErrors_ = nil

@@ -3,7 +3,6 @@ package sdk
 import (
 	"context"
 	"errors"
-	"strconv"
 	"strings"
 
 	"github.com/absmartly/go-sdk/sdk/future"
@@ -46,7 +45,7 @@ func CreateClient(config ClientConfig, httpClient HTTPClient) Client {
 		"X-API-Key":             config.ApiKey_,
 		"X-Application":         config.Application_,
 		"X-Environment":         config.Environment_,
-		"X-Application-Version": applicationVersionHeader(config.ApplicationVersion_),
+		"X-Application-Version": "0",
 		"X-Agent":               SDKAgent,
 		"Content-Type":          "application/json",
 	}
@@ -74,9 +73,25 @@ func (c Client) GetEnvironment() string {
 	return c.query_["environment"]
 }
 
+// WithApplicationVersion returns a copy of the client that sends version as
+// the X-Application-Version header on every request when it is 1 to 18 ASCII
+// digits (surrounding spaces are ignored), and "0" otherwise: the collector
+// reads the header as a 64-bit integer and rejects the request on anything
+// else. The receiver is left unchanged. It is a method rather than a
+// ClientConfig field so existing ClientConfig literals keep compiling.
+func (c Client) WithApplicationVersion(version string) Client {
+	var headers = make(map[string]string, len(c.headers_))
+	for key, value := range c.headers_ {
+		headers[key] = value
+	}
+	headers["X-Application-Version"] = applicationVersionHeader(version)
+	c.headers_ = headers
+	return c
+}
+
 // GetApplicationVersion returns the value sent as the X-Application-Version
-// header: the configured application version when it is a whole number,
-// otherwise "0".
+// header: the version set with WithApplicationVersion when it is 1 to 18
+// digits, otherwise "0".
 func (c Client) GetApplicationVersion() string {
 	return c.headers_["X-Application-Version"]
 }
@@ -87,21 +102,19 @@ func (c Client) GetAgent() string {
 	return c.headers_["X-Agent"]
 }
 
-// applicationVersionHeader returns version when it is a whole number the
-// collector can parse (it binds the header as a 64-bit integer and rejects the
-// request otherwise), and "0" for anything else, including an empty version.
+// applicationVersionHeader returns the trimmed version when it is 1 to 18
+// ASCII digits, which always fits the 64-bit integer the collector binds the
+// header to, and "0" for anything else, including an empty version. This is
+// the Java SDK's rule.
 func applicationVersionHeader(version string) string {
 	version = strings.TrimSpace(version)
-	if len(version) == 0 {
+	if len(version) == 0 || len(version) > 18 {
 		return "0"
 	}
-	for _, c := range version {
-		if c < '0' || c > '9' {
+	for i := 0; i < len(version); i++ {
+		if version[i] < '0' || version[i] > '9' {
 			return "0"
 		}
-	}
-	if _, err := strconv.ParseInt(version, 10, 64); err != nil {
-		return "0"
 	}
 	return version
 }

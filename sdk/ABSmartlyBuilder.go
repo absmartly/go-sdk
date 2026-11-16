@@ -50,7 +50,7 @@ func (b *ABsmartlyBuilder) Environment(environment string) *ABsmartlyBuilder {
 }
 
 // ApplicationVersion sets the version of the application using the SDK. It is
-// sent as the X-Application-Version header when it is a whole number;
+// sent as the X-Application-Version header when it is 1 to 18 digits;
 // otherwise the header is "0".
 func (b *ABsmartlyBuilder) ApplicationVersion(version string) *ABsmartlyBuilder {
 	b.applicationVersion_ = version
@@ -125,8 +125,6 @@ func (b *ABsmartlyBuilder) Build() (ABsmartly, error) {
 		Application_:  b.application_,
 		Deserializer_: b.deserializer_,
 		Serializer_:   b.serializer_,
-
-		ApplicationVersion_: b.applicationVersion_,
 	}
 
 	httpClient := b.httpClient_
@@ -145,7 +143,7 @@ func (b *ABsmartlyBuilder) Build() (ABsmartly, error) {
 		defaultClient.DefaultHttpClientConfig(httpClientConfig)
 		httpClient = defaultClient
 	}
-	client := CreateClient(clientConfig, httpClient)
+	client := CreateClient(clientConfig, httpClient).WithApplicationVersion(b.applicationVersion_)
 
 	sdkConfig := ABsmartlyConfig{
 		Client_:               client,

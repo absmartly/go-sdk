@@ -553,8 +553,8 @@ func (h headerCapturingHttp) Put(url string, query map[string]string, headers ma
 func TestPublishSendsVersionedAgentAndApplicationVersion(t *testing.T) {
 	var headers map[string]string
 	var config = ClientConfig{Endpoint_: "https://localhost/v1", ApiKey_: "test-api-key", Application_: "website",
-		Environment_: "dev", ApplicationVersion_: "1000123"}
-	var client = CreateClient(config, headerCapturingHttp{HttpMock{bodyString: "{}"}, &headers})
+		Environment_: "dev"}
+	var client = CreateClient(config, headerCapturingHttp{HttpMock{bodyString: "{}"}, &headers}).WithApplicationVersion("1000123")
 	var _, err = client.Publish(jsonmodels.PublishEvent{}).Get(context.Background())
 	assertAny(nil, err, t)
 
@@ -564,27 +564,44 @@ func TestPublishSendsVersionedAgentAndApplicationVersion(t *testing.T) {
 	assertAny("1000123", client.GetApplicationVersion(), t)
 }
 
-// The collector binds X-Application-Version as a whole number and rejects
-// the request otherwise, so anything else is sent as "0".
+// The collector binds X-Application-Version as a 64-bit integer and rejects
+// the request otherwise, so only 1 to 18 ASCII digits are sent (the Java
+// SDK's rule) and anything else is sent as "0".
 func TestApplicationVersionHeaderIsSentOnlyWhenNumeric(t *testing.T) {
 	for version, want := range map[string]string{
 		"":                    "0",
 		"   ":                 "0",
 		"42":                  "42",
-		" 42 ":                "42",
+		"1004":                "1004",
+		" 1004 ":              "1004",
 		"2.4.1":               "0",
+		"3.2.1":               "0",
 		"v2":                  "0",
 		"-1":                  "0",
-		"1234567890123456789": "1234567890123456789",
-		"9223372036854775807": "9223372036854775807",
-		"9223372036854775808": "0",
+		"+1":                  "0",
+		"١٢٣":                 "0",
+		"１２":                  "0",
+		"123456789012345678":  "123456789012345678",
+		"1234567890123456789": "0",
+		"9223372036854775807": "0",
 		"007":                 "007",
 	} {
-		var client = CreateClient(ClientConfig{ApplicationVersion_: version}, HttpMock{})
+		var client = CreateClient(ClientConfig{}, HttpMock{}).WithApplicationVersion(version)
 		if got := client.GetApplicationVersion(); got != want {
 			t.Errorf("application version %q: header %q, want %q", version, got, want)
 		}
 	}
+}
+
+func TestDefaultApplicationVersionHeaderIsZero(t *testing.T) {
+	assertAny("0", CreateClient(ClientConfig{}, HttpMock{}).GetApplicationVersion(), t)
+}
+
+func TestWithApplicationVersionLeavesReceiverUnchanged(t *testing.T) {
+	var client = CreateClient(ClientConfig{}, HttpMock{})
+	var versioned = client.WithApplicationVersion("12")
+	assertAny("0", client.GetApplicationVersion(), t)
+	assertAny("12", versioned.GetApplicationVersion(), t)
 }
 
 func TestSDKAgentFormat(t *testing.T) {
@@ -618,8 +635,8 @@ func TestGetContextDataSendsSDKHeaders(t *testing.T) {
 	defer server.Close()
 
 	var config = ClientConfig{Endpoint_: server.URL + "/v1", ApiKey_: "test-api-key", Application_: "website",
-		Environment_: "dev", ApplicationVersion_: "1000123"}
-	var client = CreateDefaultClient(config)
+		Environment_: "dev"}
+	var client = CreateDefaultClient(config).WithApplicationVersion("1000123")
 	var _, err = client.GetContextData().Get(context.Background())
 	assertAny(nil, err, t)
 
