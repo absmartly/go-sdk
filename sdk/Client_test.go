@@ -594,6 +594,29 @@ func TestApplicationVersionHeaderIsSentOnlyWhenNumeric(t *testing.T) {
 	}
 }
 
+// On the wire, GET /context and PUT /context both carry only a numeric
+// X-Application-Version.
+func TestApplicationVersionOnGetAndPut(t *testing.T) {
+	for version, want := range map[string]string{"3.2.1": "0", " 1004 ": "1004", "1234567890123456789": "0", "": "0"} {
+		var seen = map[string]string{}
+		var server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			seen[r.Method] = r.Header.Get("X-Application-Version")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"experiments":[]}`))
+		}))
+		var client = CreateDefaultClient(ClientConfig{Endpoint_: server.URL + "/v1", ApiKey_: "key",
+			Application_: "website", Environment_: "dev"}).WithApplicationVersion(version)
+		var _, err = client.GetContextData().Get(context.Background())
+		assertAny(nil, err, t)
+		_, err = client.Publish(jsonmodels.PublishEvent{}).Get(context.Background())
+		assertAny(nil, err, t)
+		server.Close()
+		if seen[http.MethodGet] != want || seen[http.MethodPut] != want {
+			t.Errorf("version %q: GET %q, PUT %q, want %q", version, seen[http.MethodGet], seen[http.MethodPut], want)
+		}
+	}
+}
+
 func TestDefaultApplicationVersionHeaderIsZero(t *testing.T) {
 	assertAny("0", CreateClient(ClientConfig{}, HttpMock{}).GetApplicationVersion(), t)
 }
