@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/absmartly/go-sdk/sdk/jsonexpr"
+	"github.com/absmartly/go-sdk/sdk/jsonexpr/eval"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
 
@@ -486,13 +488,27 @@ func TestRules_ExposedAssignThenSplitWithoutUnitOnSameVariantStaysPinned(t *test
 	expectExposures(t, ctx, 1)
 }
 
+type panickingOperator struct{}
+
+func (panickingOperator) Evaluate(eval.Evaluator, interface{}) interface{} {
+	panic("condition failed")
+}
+
+// A condition that panics is contained and its rule skipped; traversal goes on
+// to the next rule, as in JS, where a throwing condition is caught per rule.
 func TestRules_PanickingConditionIsSkipped(t *testing.T) {
+	jsonexpr.Operators["panics"] = panickingOperator{}
+	defer delete(jsonexpr.Operators, "panics")
 	var matcher = AudienceMatcher{Deserializer_: DefaultAudienceDeserializer{}}
 	var parsed = &assignmentRules{rules: []interface{}{
-		map[string]interface{}{"type": "assign", "variant": 1.0, "conditions": map[string]interface{}{"var": 5}},
+		map[string]interface{}{"type": "assign", "variant": 1.0, "conditions": map[string]interface{}{"panics": nil}},
 		map[string]interface{}{"type": "assign", "variant": 2.0},
 	}}
 	assertAny(&ruleAction{variant: 2}, matcher.evaluateRules(parsed, "", nil), t)
+
+	var ctx, _ = newRuleContext(t, "production", withUnit(), ruleExperiment("exp", rulesJSON(
+		`{"type":"assign","variant":1,"conditions":{"panics":null}}`, `{"type":"assign","variant":2}`)))
+	assertAny(2, treatment(t, ctx, "exp"), t)
 }
 
 type recordingLogger struct {

@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"regexp"
 	"strings"
@@ -602,6 +603,18 @@ func TestWithApplicationVersionLeavesReceiverUnchanged(t *testing.T) {
 	var versioned = client.WithApplicationVersion("12")
 	assertAny("0", client.GetApplicationVersion(), t)
 	assertAny("12", versioned.GetApplicationVersion(), t)
+}
+
+// The version in X-Agent must be the release being documented: the newest
+// CHANGELOG heading names SDKVersion (the release workflow checks the tag).
+func TestSDKVersionMatchesChangelog(t *testing.T) {
+	var changelog, err = os.ReadFile("../CHANGELOG.md")
+	assertAny(nil, err, t)
+	var heading = regexp.MustCompile(`(?m)^## v(\d+\.\d+\.\d+)`).FindStringSubmatch(string(changelog))
+	if heading == nil {
+		t.Fatal("no version heading in CHANGELOG.md")
+	}
+	assertAny(heading[1], SDKVersion, t)
 }
 
 func TestSDKAgentFormat(t *testing.T) {

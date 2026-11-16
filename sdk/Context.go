@@ -126,13 +126,23 @@ type Context struct {
 	// it, in experiment-id order. Guarded by DataLock.
 	indexVariables_ map[string][]ExperimentVariables
 
-	// rules_ holds each experiment's parsed assignment rules, by experiment
-	// name. Experiments without rules have no entry. Guarded by DataLock.
-	rules_ map[string]*experimentRules
+	// index_ is the installed experiment index and parsed assignment rules,
+	// replaced as a whole by setData under DataLock. The assignment read path
+	// loads it atomically instead of taking DataLock, so a cached read costs
+	// what it did before the index was guarded.
+	index_ *atomic.Pointer[contextIndex]
 
 	// assignmentCache_ holds the assignments by experiment name. Guarded by
 	// ContextLock_: entries are only written under the write lock.
 	assignmentCache_ map[string]*cachedAssignment
+}
+
+// contextIndex is an installed experiment index and, by experiment name, the
+// parsed assignment rules of the experiments that have any. It is never
+// modified once published in index_.
+type contextIndex struct {
+	experiments map[string]ExperimentVariables
+	rules       map[string]*experimentRules
 }
 
 // experimentRules is an experiment's assignmentRules text and its parsed
@@ -269,6 +279,7 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 
 	cntx.AssignmentCache = map[string]Assignment{}
 	cntx.assignmentCache_ = map[string]*cachedAssignment{}
+	cntx.index_ = &atomic.Pointer[contextIndex]{}
 	cntx.unitValues_ = map[string]interface{}{}
 	cntx.readyDeliverer_ = &atomic.Uint64{}
 	cntx.loggers_ = &loggerGoroutines{ids: map[uint64]int{}}
@@ -1632,23 +1643,22 @@ func (c *Context) ClearRefreshTimer() {
 }
 
 // GetExperiment returns the experiment from the installed context data. It
-// takes DataLock for reading, so a refresh installing new data cannot race
-// it; callers may hold ContextLock_ (the lock order is ContextLock_, then
-// DataLock) but must not hold DataLock.
+// reads the index setData published atomically, so a refresh installing new
+// data cannot race it, and it takes no lock.
 func (c *Context) GetExperiment(experimentName string) (ExperimentVariables, bool) {
-	c.DataLock.RLock()
-	defer c.DataLock.RUnlock()
-	var result, found = c.Index_[experimentName]
+	var result, _, found = c.experimentAndRules(experimentName)
 	return result, found
 }
 
 // experimentAndRules is GetExperiment plus the experiment's parsed assignment
-// rules, read together under DataLock so they belong to the same data.
+// rules, read from the same installed index.
 func (c *Context) experimentAndRules(experimentName string) (ExperimentVariables, *experimentRules, bool) {
-	c.DataLock.RLock()
-	defer c.DataLock.RUnlock()
-	var result, found = c.Index_[experimentName]
-	return result, c.rules_[experimentName], found
+	var index = c.index_.Load()
+	if index == nil {
+		return ExperimentVariables{}, nil, false
+	}
+	var result, found = index.experiments[experimentName]
+	return result, index.rules[experimentName], found
 }
 
 func (c *Context) ExperimentMatches(experiment jsonmodels.Experiment, assignment Assignment) bool {
@@ -1788,9 +1798,10 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	var contextCustomFields = map[string]map[string]ContextCustomFieldValue{}
 	var customFieldErrors = map[string]map[string]error{}
 	var rules = map[string]*experimentRules{}
-	c.DataLock.RLock()
-	var previousRules = c.rules_
-	c.DataLock.RUnlock()
+	var previousRules map[string]*experimentRules
+	if previous := c.index_.Load(); previous != nil {
+		previousRules = previous.rules
+	}
 
 	for _, experiment := range data.Experiments {
 		var experiemntVariables = ExperimentVariables{}
@@ -1886,7 +1897,7 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	c.DataLock.Lock()
 
 	c.Index_ = index
-	c.rules_ = rules
+	c.index_.Store(&contextIndex{experiments: index, rules: rules})
 	c.ContextCustomFields_ = contextCustomFields
 	c.customFieldErrors_ = customFieldErrors
 	c.indexVariables_ = indexVariables
@@ -1956,7 +1967,7 @@ func panicToError(r interface{}) error {
 func (c *Context) SetDataFailed(err error) {
 	c.DataLock.Lock()
 	c.Index_ = map[string]ExperimentVariables{}
-	c.rules_ = nil
+	c.index_.Store(&contextIndex{experiments: c.Index_})
 	c.indexVariables_ = map[string][]ExperimentVariables{}
 	c.IndexVariables_ = map[interface{}]interface{}{}
 	c.customFieldErrors_ = nil
