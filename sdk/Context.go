@@ -141,8 +141,14 @@ type Context struct {
 // parsed assignment rules of the experiments that have any. It is never
 // modified once published in index_.
 type contextIndex struct {
-	experiments map[string]ExperimentVariables
-	rules       map[string]*experimentRules
+	experiments map[string]*indexedExperiment
+}
+
+// indexedExperiment is an installed experiment with its parsed assignment
+// rules (nil when it has none), so a read finds both with one lookup.
+type indexedExperiment struct {
+	experiment ExperimentVariables
+	rules      *experimentRules
 }
 
 // experimentRules is an experiment's assignmentRules text and its parsed
@@ -1657,8 +1663,10 @@ func (c *Context) experimentAndRules(experimentName string) (ExperimentVariables
 	if index == nil {
 		return ExperimentVariables{}, nil, false
 	}
-	var result, found = index.experiments[experimentName]
-	return result, index.rules[experimentName], found
+	if entry, found := index.experiments[experimentName]; found {
+		return entry.experiment, entry.rules, true
+	}
+	return ExperimentVariables{}, nil, false
 }
 
 func (c *Context) ExperimentMatches(experiment jsonmodels.Experiment, assignment Assignment) bool {
@@ -1798,9 +1806,14 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	var contextCustomFields = map[string]map[string]ContextCustomFieldValue{}
 	var customFieldErrors = map[string]map[string]error{}
 	var rules = map[string]*experimentRules{}
-	var previousRules map[string]*experimentRules
-	if previous := c.index_.Load(); previous != nil {
-		previousRules = previous.rules
+	var previous = c.index_.Load()
+	var previousRules = func(name string) *experimentRules {
+		if previous != nil {
+			if entry, found := previous.experiments[name]; found {
+				return entry.rules
+			}
+		}
+		return nil
 	}
 
 	for _, experiment := range data.Experiments {
@@ -1874,7 +1887,7 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 			}
 		}
 		if len(experiment.AssignmentRules) > 0 {
-			rules[experiment.Name] = c.experimentRulesFor(previousRules[experiment.Name], experiment.AssignmentRules)
+			rules[experiment.Name] = c.experimentRulesFor(previousRules(experiment.Name), experiment.AssignmentRules)
 		}
 
 		contextCustomFields[experiment.Name] = experimentCustomFields
@@ -1897,7 +1910,11 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	c.DataLock.Lock()
 
 	c.Index_ = index
-	c.index_.Store(&contextIndex{experiments: index, rules: rules})
+	var indexed = make(map[string]*indexedExperiment, len(index))
+	for name, experiment := range index {
+		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name]}
+	}
+	c.index_.Store(&contextIndex{experiments: indexed})
 	c.ContextCustomFields_ = contextCustomFields
 	c.customFieldErrors_ = customFieldErrors
 	c.indexVariables_ = indexVariables
@@ -1967,7 +1984,7 @@ func panicToError(r interface{}) error {
 func (c *Context) SetDataFailed(err error) {
 	c.DataLock.Lock()
 	c.Index_ = map[string]ExperimentVariables{}
-	c.index_.Store(&contextIndex{experiments: c.Index_})
+	c.index_.Store(&contextIndex{})
 	c.indexVariables_ = map[string][]ExperimentVariables{}
 	c.IndexVariables_ = map[interface{}]interface{}{}
 	c.customFieldErrors_ = nil
