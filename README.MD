@@ -156,7 +156,14 @@ For advanced use cases requiring custom implementations, use the traditional con
 | MaxRetries_      | `int`    | &#10060;  | `5`       | The number of retries before the SDK stops trying to connect.                                                                                                                 |
 | ConnectTimeout_  | `int`    | &#10060;  | `3000`    | An amount of time, in milliseconds, before the SDK will stop trying to connect.                                                                                               |
 
-To send your application version with the config-based approach, call `WithApplicationVersion` on the client, for example `sdk.CreateDefaultClient(clientConfig).WithApplicationVersion("1042")`. It is sent as the `X-Application-Version` header when it is 1 to 18 digits; otherwise `"0"` is sent.
+To send your application version with the config-based approach, call `WithApplicationVersion` on the client and use the client it returns; it does not change the client it is called on:
+
+```go
+client := sdk.CreateDefaultClient(clientConfig).WithApplicationVersion("1042")
+sdkConfig := sdk.ABsmartlyConfig{Client_: client}
+```
+
+The version is sent as the `X-Application-Version` header when it is 1 to 18 digits; otherwise `"0"` is sent.
 
 #### ABsmartlyConfig
 
