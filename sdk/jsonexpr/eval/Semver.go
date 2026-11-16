@@ -176,27 +176,10 @@ func jsNumberString(x float64) string {
 		return stripTrailingZeros(strconv.FormatFloat(x, 'g', -1, 64))
 	}
 
-	var negative = x < 0
-	// The exact decimal expansion of a float64 has at most 1074 fractional
-	// digits, so this prints it without rounding.
-	var exact = new(big.Float).SetFloat64(math.Abs(x)).Text('f', 1074)
-	var point = strings.IndexByte(exact, '.')
-	var digits = []byte(exact[:point] + exact[point+1:point+16])
-	if exact[point+16] >= '5' {
-		var i = len(digits) - 1
-		for ; i >= 0 && digits[i] == '9'; i-- {
-			digits[i] = '0'
-		}
-		if i < 0 {
-			digits = append([]byte{'1'}, digits...)
-		} else {
-			digits[i]++
-		}
-	}
-
-	var intLen = len(digits) - 15
-	var text = stripTrailingZeros(string(digits[:intLen]) + "." + string(digits[intLen:]))
-	if negative {
+	// Rat holds the exact binary value, and FloatString rounds halves away
+	// from zero, as toFixed does.
+	var text = stripTrailingZeros(new(big.Rat).SetFloat64(math.Abs(x)).FloatString(15))
+	if x < 0 {
 		return "-" + text
 	}
 	return text

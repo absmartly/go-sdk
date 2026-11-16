@@ -32,7 +32,6 @@ type wireContextData struct {
 
 type wireExperiment struct {
 	jsonmodels.Experiment
-	// AssignmentRules shadows the embedded string field of the same name.
 	AssignmentRules json.RawMessage `json:"assignmentRules"`
 }
 

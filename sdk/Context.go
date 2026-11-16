@@ -167,11 +167,8 @@ type experimentRules struct {
 // the assignment, so later reads take the fast path again.
 type cachedAssignment struct {
 	assignment *Assignment
-	// rules is the rule set the assignment was last validated against, or
-	// nil when the experiment had none.
-	rules *experimentRules
-	// attrsSeq is the attribute sequence it was last validated against.
-	attrsSeq int32
+	rules      *experimentRules
+	attrsSeq   int32
 	// ruleMissingUnit is set when a split rule matched while the
 	// experiment's unit was not set, so the variant is the experiment's
 	// no-unit result rather than a hash of the unit.
@@ -1344,9 +1341,7 @@ func (c *Context) Close() {
 type assignmentState int
 
 const (
-	// assignmentStale means the assignment must be rebuilt.
 	assignmentStale assignmentState = iota
-	// assignmentValid means the assignment and its stamps are up to date.
 	assignmentValid
 	// assignmentRevalidated means the rules or attributes changed since the
 	// assignment was last validated, but they still give its outcome. Its

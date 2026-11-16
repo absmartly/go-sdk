@@ -67,7 +67,6 @@ func TestRules_RevalidationIsAcknowledged(t *testing.T) {
 			}
 			steady("fresh")
 
-			// An unrelated attribute: one revalidation, then the fast path.
 			assertAny(nil, ctx.SetAttribute("other", 1), t)
 			var before = atomic.LoadInt64(count)
 			assertAny(tc.want, treatment(t, ctx, "exp"), t)
@@ -76,15 +75,12 @@ func TestRules_RevalidationIsAcknowledged(t *testing.T) {
 			}
 			steady("after an unrelated attribute")
 
-			// A refresh changing the rules JSON but not the outcome.
 			var refreshed = experiment
 			refreshed.AssignmentRules = tc.rules + " "
 			ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{refreshed}})
 			assertAny(tc.want, treatment(t, ctx, "exp"), t)
 			steady("after a same-outcome refresh")
 
-			// A refresh with identical rules keeps the parsed rules, so it does
-			// not revalidate at all.
 			ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{refreshed}})
 			steady("after an identical refresh")
 
