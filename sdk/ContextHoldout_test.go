@@ -1527,3 +1527,43 @@ func BenchmarkHoldout_CachedVariableWithoutHoldouts(b *testing.B) {
 		ctx.GetVariableValue("color", "d")
 	}
 }
+
+// Duplicate holdout ids resolve to one covering entry (JS insertUniqueSorted).
+func TestHoldout_CoveringHoldoutsAreUniqueAndSorted(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA(), hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_dup", hoUnitType, 0, 12, 11, 999, 12, 11)))
+	var ids []int
+	for _, holdout := range h.ctx.indexedExperiment("exp_dup").holdouts {
+		ids = append(ids, holdout.Id)
+	}
+	expectValue(t, []int{11, 12}, ids)
+}
+
+// A held-out experiment skips its audience, as in the JS SDK and the
+// collector, so it is never flagged as an audience mismatch.
+func TestHoldout_SuppressedAssignmentSkipsTheAudience(t *testing.T) {
+	var experiment = hoExperiment(1, "exp_holdout_audience", hoUnitType, 0, 11)
+	experiment.Audience = hoAgeAudience
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+	h.setAttribute("age", 5)
+	expectInt(t, 0, h.treatment("exp_holdout_audience"))
+	var assignment = h.ctx.GetAssignment("exp_holdout_audience")
+	if assignment.AudienceMismatch || assignment.Assigned {
+		t.Fatalf("suppressed assignment %+v", assignment)
+	}
+}
+
+// A malformed holdout entry drops only itself: a valid one beside it applies.
+func TestHoldout_MalformedHoldoutEntryDoesNotDropTheOthers(t *testing.T) {
+	var payload = `{"experiments":[{"id":1,"name":"exp","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
+		"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"fullOnVariant":0,
+		"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
+		"holdouts":[null,5,"x",{"id":"bad"},{"id":11,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":[0.1,0.9]}]}`
+	var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var h = hoCreateFor(t, hoUID, data)
+	expectInt(t, 0, h.treatment("exp"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
