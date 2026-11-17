@@ -1648,13 +1648,21 @@ func (c *Context) resolveRule(data jsonmodels.Experiment, rules *experimentRules
 // the refreshed variables and rule bookkeeping, and the cached one is never
 // mutated while a reader may hold it. The caller holds ContextLock_ for
 // writing.
-func (c *Context) keepExposedRuleAssignment(data jsonmodels.Experiment, previous *cachedAssignment, fresh *Assignment) {
+func (c *Context) keepExposedRuleAssignment(data jsonmodels.Experiment, previous *cachedAssignment, entry *cachedAssignment) {
 	if previous == nil {
 		return
 	}
-	var old = previous.assignment
+	var old, fresh = previous.assignment, entry.assignment
 	if !fresh.RuleOverride || !old.RuleOverride || old.Overridden || old.Variant != fresh.Variant ||
 		!old.Exposed.Load().(bool) || !c.ExperimentMatches(data, *old) {
+		return
+	}
+	// Changed holdout coverage is a new decision, whose holdout exposures
+	// must fire: it is exposed again, as in the JS SDK.
+	if entry.holdouts != nil && !holdoutSetMatches(entry.holdouts.holdouts, previous.holdouts) {
+		return
+	}
+	if entry.holdouts == nil && previous.holdouts != nil {
 		return
 	}
 	fresh.Exposed = previous.assignment.Exposed
@@ -1800,7 +1808,13 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 	}
 
 	if efound {
-		c.keepExposedRuleAssignment(experiment.Data, previous, assignment)
+		c.keepExposedRuleAssignment(experiment.Data, previous, entry)
+	}
+	if previous != nil && previous.holdouts != nil && previous.assignment.Exposed != assignment.Exposed {
+		// Retire the replaced assignment, as eviction does: a caller still
+		// holding it must not publish a decision, or holdout arms, that the
+		// replacement has superseded.
+		previous.assignment.Exposed.CompareAndSwap(false, true)
 	}
 
 	c.assignmentCache_[experimentName] = entry

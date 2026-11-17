@@ -15,6 +15,7 @@ import (
 	"os"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -1564,6 +1565,58 @@ func TestHoldout_MalformedHoldoutEntryDoesNotDropTheOthers(t *testing.T) {
 		t.Fatal(err)
 	}
 	var h = hoCreateFor(t, hoUID, data)
+	expectInt(t, 0, h.treatment("exp"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
+// A holdout iteration bump re-resolves an exposed rule-won assignment, and
+// the new epoch's holdout exposure fires with the rule win exposed again, as
+// in the JS SDK.
+func TestHoldout_IterationBumpReExposesARuleWonAssignment(t *testing.T) {
+	var experiment = hoExperiment(1, "exp_rule", hoUnitType, 0, 11)
+	experiment.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_h", hoUnitType, hoSeedBHi, hoSeedBLo)}, experiment))
+	h.setAttribute("country", "US")
+	expectInt(t, 1, h.treatment("exp_rule"))
+	var next = hoHoldout(11, "holdout_h", hoUnitType, hoSeedAHi, hoSeedALo)
+	next.Iteration = 2
+	h.refresh(hoData([]jsonmodels.Holdout{next}, experiment))
+	expectInt(t, 1, h.treatment("exp_rule"))
+	var own = hoOwn(hoUnitType, 1, "exp_rule", 1)
+	own.Assigned = false
+	own.RuleOverride = true
+	var arm1 = hoExposure(hoUnitType, 11, "holdout_h", 1)
+	var arm0 = hoExposure(hoUnitType, 11, "holdout_h", 0)
+	h.expectPublished(own, arm1, own, arm0)
+}
+
+// An unchanged holdout set keeps an exposed rule win exposed across a
+// refresh that rebuilds it (here: unrelated rule text).
+func TestHoldout_UnchangedCoverageKeepsAnExposedRuleWin(t *testing.T) {
+	var experiment = hoExperiment(1, "exp_rule", hoUnitType, 0, 11)
+	experiment.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+	h.setAttribute("country", "US")
+	expectInt(t, 1, h.treatment("exp_rule"))
+	h.expectPending(2)
+	var refreshed = experiment
+	refreshed.AssignmentRules = strings.Replace(hoUSRule, "US Internal Users", "Renamed", 1)
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldoutA()}, refreshed))
+	expectInt(t, 1, h.treatment("exp_rule"))
+	h.expectPending(2)
+}
+
+// A suppressed assignment superseded by a refresh cannot publish through the
+// public QueueExposure: it never publishes an exposure of its own.
+func TestHoldout_SupersededSuppressedAssignmentPublishesNothing(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	var stale = h.ctx.GetAssignment("exp")
+	var next = hoHoldoutA()
+	next.Iteration = 2
+	h.refresh(hoData([]jsonmodels.Holdout{next}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.ctx.GetAssignment("exp")
+	h.ctx.QueueExposure(stale)
+	h.expectPending(0)
 	expectInt(t, 0, h.treatment("exp"))
 	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
 }
