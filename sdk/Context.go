@@ -138,7 +138,9 @@ type Context struct {
 
 	// holdoutArms_ holds each holdout's arm per unit type, so every
 	// experiment a holdout covers shares one arm and one exposure. An arm is
-	// kept until the holdout's iteration changes. Guarded by ContextLock_.
+	// kept until the holdout's iteration changes. Created with the first arm,
+	// so a context without holdouts never allocates it. Guarded by
+	// ContextLock_.
 	holdoutArms_ map[holdoutKey]*holdoutArm
 }
 
@@ -365,7 +367,6 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 
 	cntx.AssignmentCache = map[string]Assignment{}
 	cntx.assignmentCache_ = map[string]*cachedAssignment{}
-	cntx.holdoutArms_ = map[holdoutKey]*holdoutArm{}
 	cntx.index_ = &atomic.Pointer[contextIndex]{}
 	cntx.unitValues_ = map[string]interface{}{}
 	cntx.readyDeliverer_ = &atomic.Uint64{}
@@ -1871,6 +1872,9 @@ func (c *Context) holdoutArm(holdout *jsonmodels.Holdout, unitType string) *hold
 			Eligible: true, Exposed: exposed},
 		armCount: len(holdout.Split),
 	}
+	if c.holdoutArms_ == nil {
+		c.holdoutArms_ = map[holdoutKey]*holdoutArm{}
+	}
 	c.holdoutArms_[key] = arm
 	return arm
 }
@@ -2055,7 +2059,7 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 			}
 		}
 	}
-	var coverage = map[string][]*jsonmodels.Holdout{}
+	var coverage map[string][]*jsonmodels.Holdout
 	var previous = c.index_.Load()
 	var previousRules = func(name string) *experimentRules {
 		if previous != nil {
@@ -2141,6 +2145,9 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		}
 		if len(experiment.HoldoutIds) > 0 && len(holdoutsById) > 0 {
 			if covering := coveringHoldouts(experiment.HoldoutIds, holdoutsById); len(covering) > 0 {
+				if coverage == nil {
+					coverage = map[string][]*jsonmodels.Holdout{}
+				}
 				coverage[experiment.Name] = covering
 			}
 		}

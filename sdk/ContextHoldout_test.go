@@ -1620,3 +1620,125 @@ func TestHoldout_SupersededSuppressedAssignmentPublishesNothing(t *testing.T) {
 	expectInt(t, 0, h.treatment("exp"))
 	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
 }
+
+// A same-iteration seed edit must not re-expose a unit that is not held out
+// either: the holdout set identity is only (id, iteration).
+func TestHoldout_SeedEditDoesNotReExposeANotHeldOutUnit(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp"))
+	h.expectPending(2)
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_a", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp"))
+	h.expectPending(2)
+}
+
+// Coverage removed by a refresh is a coverage change for a rule win too: it
+// is exposed again, as in the JS SDK.
+func TestHoldout_CoverageRemovedReExposesARuleWin(t *testing.T) {
+	var experiment = hoExperiment(1, "exp_rule", hoUnitType, 0, 11)
+	experiment.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+	h.setAttribute("country", "US")
+	expectInt(t, 1, h.treatment("exp_rule"))
+	h.expectPending(2)
+	var uncovered = experiment
+	uncovered.HoldoutIds = nil
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldoutA()}, uncovered))
+	expectInt(t, 1, h.treatment("exp_rule"))
+	h.expectPending(3)
+}
+
+type hoCountingDeserializer struct {
+	mu    sync.Mutex
+	count int
+}
+
+func (d *hoCountingDeserializer) Deserialize(bytes []byte, offset int, length int) (map[string]interface{}, error) {
+	d.mu.Lock()
+	d.count++
+	d.mu.Unlock()
+	return DefaultAudienceDeserializer{}.Deserialize(bytes, offset, length)
+}
+
+// A suppressed assignment never evaluates its audience, also when a
+// SetAttribute makes it revalidate.
+func TestHoldout_SuppressedAssignmentNeverEvaluatesTheAudience(t *testing.T) {
+	var experiment = hoExperiment(1, "exp_audience", hoUnitType, 0, 11)
+	experiment.Audience = hoAgeAudience
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+	var counter = &hoCountingDeserializer{}
+	h.ctx.AudienceMatcher_ = AudienceMatcher{counter}
+	expectInt(t, 0, h.treatment("exp_audience"))
+	h.setAttribute("age", 10)
+	expectInt(t, 0, h.treatment("exp_audience"))
+	expectInt(t, 0, h.treatment("exp_audience"))
+	expectInt(t, 0, counter.count)
+}
+
+// The public QueueExposure on a suppressed assignment publishes only the
+// holdout's exposure, never the experiment's own.
+func TestHoldout_QueueExposureOfASuppressedAssignment(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.ctx.QueueExposure(h.ctx.GetAssignment("exp"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
+// A held-out experiment that a rule won is not suppressed, so it is never the
+// control-value fallback: the next suppressed experiment is.
+func TestHoldout_RuleWonHeldOutExperimentIsNotTheFallback(t *testing.T) {
+	var ruleWon = hoExperiment(1, "exp_rule_won", hoUnitType, 0, 11)
+	// It defines the key, so it is visited, but not in the variant the rule
+	// gives (1), so it does not win the key.
+	ruleWon.Variants[0].Config = `{"color":"rule_won_control"}`
+	ruleWon.Variants[1].Config = `{"other":"y"}`
+	ruleWon.AssignmentRules = hoUSRule
+	var suppressed = hoWithVariables(hoExperiment(2, "exp_suppressed", hoUnitType, 0, 11), "color")
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, ruleWon, suppressed))
+	h.setAttribute("country", "US")
+	expectValue(t, "control", h.peekVariable("color"))
+}
+
+// Holdout ids are integral numbers however written (10, 10.0, 1e1), as in
+// JavaScript; strings and fractions are not ids.
+func TestHoldout_IntegralHoldoutIdsInAnyNotation(t *testing.T) {
+	var payload = `{"experiments":[{"id":1,"name":"exp","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
+		"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"fullOnVariant":0,
+		"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[1.1e1, 12.0, "13", 14.5, true, 1e300]}],
+		"holdouts":[{"id":11.0,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":[0.1,0.9]},
+		{"id":1.2e1,"name":"holdout_b","iteration":1,"seedHi":1,"seedLo":222,"split":[0.1,0.9]},
+		{"id":"13","name":"holdout_string","iteration":1,"seedHi":13,"seedLo":111,"split":[0.1,0.9]}]}`
+	var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectValue(t, []int{11, 12}, data.Experiments[0].HoldoutIds)
+	expectInt(t, 2, len(data.Holdouts))
+	var h = hoCreateFor(t, hoUID, data)
+	expectInt(t, 0, h.treatment("exp"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0), hoExposure(hoUnitType, 12, "holdout_b", 1))
+}
+
+// Payloads without holdouts cost no more to decode or install than before
+// holdouts: the counts are the ones main 54b4e8a measured for context.json.
+func TestHoldout_NoHoldoutPayloadAllocations(t *testing.T) {
+	var raw, _ = os.ReadFile("testAssets/context.json")
+	var decode = testing.AllocsPerRun(50, func() { _, _ = DefaultContextDataDeserializer{}.Deserialize(raw) })
+	if decode > 95 {
+		t.Errorf("decoding context.json: %.0f allocations, main took 95", decode)
+	}
+	var data, _ = DefaultContextDataDeserializer{}.Deserialize(raw)
+	var config = CreateDefaultContextConfig()
+	config.Units_ = map[string]string{hoUnitType: hoUID}
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = -1
+	var install = testing.AllocsPerRun(50, func() {
+		var ft, done = future.New()
+		done(data, nil)
+		CreateContext(internal.FixedClock{Millis_: 1}, config, ft, DefaultContextDataProvider{}, DefaultContextEventHandler{}, nil,
+			DefaultVariableParser{}, AudienceMatcher{DefaultAudienceDeserializer{}})
+	})
+	if install > 213 {
+		t.Errorf("creating a context from context.json: %.0f allocations, main took 213", install)
+	}
+}

@@ -3,6 +3,7 @@ package sdk
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
@@ -53,34 +54,71 @@ func (w wireContextData) contextData() jsonmodels.ContextData {
 }
 
 // holdoutIds decodes an experiment's holdoutIds, skipping entries that are
-// not integers. Anything but an array gives none.
+// not integral numbers (2.0 and 1e1 are integers, as in JavaScript). Anything
+// but an array gives none.
 func holdoutIds(raw json.RawMessage) []int {
+	if len(raw) == 0 || raw[0] != '[' {
+		return nil
+	}
 	var entries []json.RawMessage
-	if len(raw) == 0 || json.Unmarshal(raw, &entries) != nil || len(entries) == 0 {
+	if json.Unmarshal(raw, &entries) != nil || len(entries) == 0 {
 		return nil
 	}
 	var ids = make([]int, 0, len(entries))
 	for _, entry := range entries {
-		var id int
-		if json.Unmarshal(entry, &id) == nil && !bytes.Equal(bytes.TrimSpace(entry), []byte("null")) {
+		if id, ok := holdoutId(entry); ok {
 			ids = append(ids, id)
 		}
 	}
 	return ids
 }
 
+// holdoutId decodes an integral JSON number that fits a holdout id.
+func holdoutId(raw json.RawMessage) (int, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] == '"' {
+		// json.Number also accepts a quoted number; an id must be a number.
+		return 0, false
+	}
+	var number json.Number
+	if json.Unmarshal(raw, &number) != nil || len(number) == 0 {
+		return 0, false
+	}
+	if id, err := number.Int64(); err == nil {
+		return int(id), id == int64(int(id))
+	}
+	var value, err = number.Float64()
+	if err != nil || value != math.Trunc(value) || math.Abs(value) > 1<<53 {
+		return 0, false
+	}
+	return int(value), true
+}
+
+// wireHoldout decodes a holdout with an id written as any integral number.
+type wireHoldout struct {
+	jsonmodels.Holdout
+	Id json.RawMessage `json:"id"`
+}
+
 // holdouts decodes the payload's holdouts, skipping entries that are not
 // holdout objects. Anything but an array gives none.
 func holdouts(raw json.RawMessage) []jsonmodels.Holdout {
+	if len(raw) == 0 || raw[0] != '[' {
+		return nil
+	}
 	var entries []json.RawMessage
-	if len(raw) == 0 || json.Unmarshal(raw, &entries) != nil || len(entries) == 0 {
+	if json.Unmarshal(raw, &entries) != nil || len(entries) == 0 {
 		return nil
 	}
 	var result = make([]jsonmodels.Holdout, 0, len(entries))
 	for _, entry := range entries {
-		var holdout jsonmodels.Holdout
-		if trimmed := bytes.TrimSpace(entry); len(trimmed) > 0 && trimmed[0] == '{' && json.Unmarshal(entry, &holdout) == nil {
-			result = append(result, holdout)
+		var holdout wireHoldout
+		if trimmed := bytes.TrimSpace(entry); len(trimmed) == 0 || trimmed[0] != '{' || json.Unmarshal(entry, &holdout) != nil {
+			continue
+		}
+		if id, ok := holdoutId(holdout.Id); ok {
+			holdout.Holdout.Id = id
+			result = append(result, holdout.Holdout)
 		}
 	}
 	return result
