@@ -12,7 +12,9 @@ package sdk
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"reflect"
+	"sort"
 	"sync"
 	"testing"
 
@@ -1431,4 +1433,97 @@ func TestHoldout_ModelJSON(t *testing.T) {
 	expectValue(t, []jsonmodels.Holdout{{Id: 3, Name: "h", UnitType: "u", Iteration: 2, SeedHi: 1, SeedLo: 2,
 		Split: []float64{0.5, 0.5}, HoldoutType: "full"}}, data.Holdouts)
 	expectValue(t, []int{3}, data.Experiments[0].HoldoutIds)
+}
+
+// hoPublishProbe treats every experiment of a payload with no holdouts for a
+// few units and returns each publish body as JSON, units sorted.
+func hoPublishProbe(t *testing.T, data jsonmodels.ContextData) string {
+	t.Helper()
+	var out []byte
+	for _, uid := range []string{"bleh@absmartly.com", "façade", "🚀rocket", hoUID, hoUIDNotHeldOut} {
+		var h = hoCreate(t, map[string]string{"session_id": uid, "user_id": uid + "u", "email": uid + "e"}, data)
+		h.setAttribute("age", 25)
+		for _, experiment := range data.Experiments {
+			h.treatment(experiment.Name)
+		}
+		var keys, _ = h.ctx.GetVariableKeys()
+		for key := range keys {
+			h.variable(key)
+		}
+		if err := h.ctx.Publish(); err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range h.publisher.events {
+			sort.Slice(event.Units, func(i, j int) bool { return event.Units[i].Type < event.Units[j].Type })
+			var raw, _ = json.Marshal(event)
+			out = append(append(out, raw...), '\n')
+		}
+	}
+	return string(out)
+}
+
+// Without holdouts the publish body is byte-identical to the one before
+// holdouts were added: testAssets/publish-no-holdouts.golden was written by
+// this probe at main 54b4e8a.
+func TestHoldout_PublishWithoutHoldoutsIsUnchanged(t *testing.T) {
+	var raw, _ = os.ReadFile("testAssets/context.json")
+	var data, err = DefaultContextDataDeserializer{}.Deserialize(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got = hoPublishProbe(t, data)
+	if os.Getenv("WRITE_GOLDEN") != "" {
+		_ = os.WriteFile("testAssets/publish-no-holdouts.golden", []byte(got), 0o644)
+	}
+	var want, _ = os.ReadFile("testAssets/publish-no-holdouts.golden")
+	if got != string(want) {
+		t.Fatalf("publish changed without holdouts:\n got %s\nwant %s", got, want)
+	}
+}
+
+func hoBenchContext(b *testing.B, data jsonmodels.ContextData) *Context {
+	var config = CreateDefaultContextConfig()
+	config.Units_ = map[string]string{hoUnitType: hoUID}
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = -1
+	var ft, done = future.New()
+	done(data, nil)
+	var ctx = CreateContext(internal.FixedClock{Millis_: hoMillis}, config, ft, &hoProvider{}, &hoPublisher{}, nil,
+		DefaultVariableParser{}, AudienceMatcher{DefaultAudienceDeserializer{}})
+	ctx.WaitUntilReady()
+	b.Cleanup(func() { ctx.ClearRefreshTimer() })
+	return ctx
+}
+
+func benchmarkCachedTreatment(b *testing.B, data jsonmodels.ContextData) {
+	var ctx = hoBenchContext(b, data)
+	ctx.GetTreatment("exp")
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			ctx.GetTreatment("exp")
+		}
+	})
+}
+
+// The cached read path for an experiment no holdout covers, which is every
+// experiment of a payload without holdouts.
+func BenchmarkHoldout_CachedTreatmentWithoutHoldouts(b *testing.B) {
+	benchmarkCachedTreatment(b, hoData(nil, hoWithVariables(hoExperiment(1, "exp", hoUnitType, 0), "color")))
+}
+
+func BenchmarkHoldout_CachedTreatmentCovered(b *testing.B) {
+	benchmarkCachedTreatment(b, hoData([]jsonmodels.Holdout{hoHoldoutA(), hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoWithVariables(hoExperiment(1, "exp", hoUnitType, 0, 11, 12), "color")))
+}
+
+func BenchmarkHoldout_CachedVariableWithoutHoldouts(b *testing.B) {
+	var ctx = hoBenchContext(b, hoData(nil, hoWithVariables(hoExperiment(1, "exp", hoUnitType, 0), "color")))
+	ctx.GetVariableValue("color", "d")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ctx.GetVariableValue("color", "d")
+	}
 }
