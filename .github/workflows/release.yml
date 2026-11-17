@@ -1,0 +1,41 @@
+name: Release
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      # X-Agent reports SDKVersion, so a tag that does not match it would
+      # publish a release whose requests claim a different version.
+      - name: Check the tag matches SDKVersion
+        run: |
+          version="$(sed -n 's/^[[:space:]]*SDKVersion[[:space:]]*=[[:space:]]*"\(.*\)"$/\1/p' sdk/Version.go)"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match SDKVersion ${version} in sdk/Version.go"
+            exit 1
+          fi
+
+      - name: Run Tests
+        run: ./test.sh
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"
+
+      # Go modules are published by the tag itself; ask the module proxy to
+      # fetch it now so pkg.go.dev and `go get` see it straight away.
+      - name: Warm the Go module proxy
+        run: GOPROXY=https://proxy.golang.org GOFLAGS=-mod=mod go list -m "github.com/absmartly/go-sdk@${GITHUB_REF_NAME}"

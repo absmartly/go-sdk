@@ -17,4 +17,9 @@ type Experiment struct {
 	CustomFieldValues []CustomFieldValue      `json:"customFieldValues"`
 	AudienceStrict    bool                    `json:"audienceStrict"`
 	Audience          string                  `json:"audience"`
+	// AssignmentRules is the experiment's custom assignment rules, a JSON
+	// string such as {"rules": [...]}, or empty when it has none. The first
+	// matching rule sets the variant, ahead of the audience, traffic and
+	// custom assignments; only an override beats it.
+	AssignmentRules string `json:"assignmentRules,omitempty"`
 }

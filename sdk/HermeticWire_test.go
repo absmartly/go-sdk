@@ -10,8 +10,8 @@ import (
 	"testing"
 )
 
-// Go sends NO auth headers on GET (auth is via query
-// params), so API-key headers are only asserted on the PUT.
+// The GET carries the same SDK headers as the PUT (X-API-Key, X-Agent), as
+// javascript-sdk does on every request (cross-SDK scenario 320).
 func TestHermeticWireContract(t *testing.T) {
 	const (
 		appName = "website"
@@ -22,10 +22,11 @@ func TestHermeticWireContract(t *testing.T) {
 	var (
 		mu sync.Mutex
 
-		getSeen   bool
-		getPath   string
-		getQuery  url.Values
-		getHasKey bool // X-API-Key present on GET (should be false for Go)
+		getSeen  bool
+		getPath  string
+		getQuery url.Values
+		getKey   string
+		getAgent string
 
 		putSeen    bool
 		putMethod  string
@@ -41,7 +42,8 @@ func TestHermeticWireContract(t *testing.T) {
 			getSeen = true
 			getPath = r.URL.Path
 			getQuery = r.URL.Query()
-			getHasKey = r.Header.Get("X-API-Key") != ""
+			getKey = r.Header.Get("X-API-Key")
+			getAgent = r.Header.Get("X-Agent")
 			mu.Unlock()
 
 			w.Header().Set("Content-Type", "application/json")
@@ -112,8 +114,11 @@ func TestHermeticWireContract(t *testing.T) {
 	if got := getQuery.Get("environment"); got != envName {
 		t.Errorf("GET query environment = %q, want %q", got, envName)
 	}
-	if getHasKey {
-		t.Error("GET must NOT send X-API-Key header (Go auths via query params)")
+	if getKey != apiKey {
+		t.Errorf("GET X-API-Key = %q, want %q", getKey, apiKey)
+	}
+	if getAgent != SDKAgent {
+		t.Errorf("GET X-Agent = %q, want %q", getAgent, SDKAgent)
 	}
 	mu.Unlock()
 
@@ -152,8 +157,8 @@ func TestHermeticWireContract(t *testing.T) {
 			t.Errorf("PUT header %s = %q, want %q", name, got, want)
 		}
 	}
-	if got := putHeaders.Get("X-Agent"); got == "" {
-		t.Error("PUT header X-Agent must be present and non-empty")
+	if got := putHeaders.Get("X-Agent"); got != "absmartly-go-sdk/"+SDKVersion {
+		t.Errorf("PUT header X-Agent = %q, want %q", got, "absmartly-go-sdk/"+SDKVersion)
 	}
 
 	for _, field := range []string{"hashed", "units", "publishedAt"} {

@@ -19,6 +19,16 @@ type ABsmartly struct {
 
 type ABSmartly = ABsmartly
 
+// clientSystemAttributes is the optional interface a client implements to
+// expose the application and environment names the context injects into the
+// attribute map that audiences are evaluated against. The default Client
+// implements it; a custom ClientI that does not simply contributes no system
+// attributes, so the public ClientI interface stays backward compatible.
+type clientSystemAttributes interface {
+	GetApplication() string
+	GetEnvironment() string
+}
+
 func Create(config ABsmartlyConfig) ABsmartly {
 	var abs = ABsmartly(config)
 	if abs.ContextPublisher_ != nil {
@@ -45,16 +55,34 @@ func Create(config ABsmartlyConfig) ABsmartly {
 
 // CreateContext
 func (abs ABsmartly) CreateContext(config ContextConfig) *Context {
-	return CreateContext(internal.SystemClockUTC{}, config, abs.ContextDataProvider_.GetContextData(), abs.ContextDataProvider_,
-		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_})
+	var application, environment = abs.systemAttributes()
+	return createContext(internal.SystemClockUTC{}, config, abs.ContextDataProvider_.GetContextData(), abs.ContextDataProvider_,
+		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_},
+		application, environment)
 }
 
 // CreateContextWith
 func (abs ABsmartly) CreateContextWith(config ContextConfig, data jsonmodels.ContextData) *Context {
+	var application, environment = abs.systemAttributes()
 	var ft, done = future.New()
 	done(data, nil)
-	return CreateContext(internal.SystemClockUTC{}, config, ft, abs.ContextDataProvider_,
-		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_})
+	return createContext(internal.SystemClockUTC{}, config, ft, abs.ContextDataProvider_,
+		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_},
+		application, environment)
+}
+
+// systemAttributes returns the client's application and environment names,
+// which the context evaluates audiences and assignment rules with. They are
+// passed to createContext so the context has them before the data future
+// delivers its Ready callback: CreateContextWith settles that future first, so
+// the callback fires during construction, and a Ready logger that evaluates an
+// audience must already see them. The collector adds the same values to every
+// exposure server-side, so they are never published as attributes here.
+func (abs ABsmartly) systemAttributes() (string, string) {
+	if client, ok := abs.Client_.(clientSystemAttributes); ok {
+		return client.GetApplication(), client.GetEnvironment()
+	}
+	return "", ""
 }
 
 func (abs ABsmartly) GetContextData() *future.Future {
