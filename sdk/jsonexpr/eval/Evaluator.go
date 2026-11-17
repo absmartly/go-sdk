@@ -75,7 +75,7 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 	}
 
 	if lhs.IsValid() && rhs.IsValid() && lhs.Kind() == rhs.Kind() {
-		if lhs.Comparable() && rhs.Comparable() && lhs.Interface() == rhs.Interface() {
+		if valueEquals(lhs, rhs) {
 			return 0
 		}
 		if reflect.DeepEqual(lhs.Interface(), rhs.Interface()) {
@@ -96,9 +96,11 @@ func (e Evaluator) BooleanConvert(x reflect.Value) bool {
 	} else if x.Kind() == reflect.String {
 		var str = x.String()
 		return str != "false" && str != "0" && str != ""
-	} else if x.Kind() == reflect.Int {
+	} else if kind := x.Kind(); kind >= reflect.Int && kind <= reflect.Int64 {
 		return x.Int() != 0
-	} else if x.Kind() == reflect.Float64 {
+	} else if kind >= reflect.Uint && kind <= reflect.Uintptr {
+		return x.Uint() != 0
+	} else if kind == reflect.Float32 || kind == reflect.Float64 {
 		return x.Float() != 0
 	} else if x.IsValid() && (x.Interface() == false || x.Interface() == "false" || x.Interface() == "[false]") {
 		return false
@@ -110,7 +112,7 @@ func (e Evaluator) BooleanConvert(x reflect.Value) bool {
 
 	kind := x.Kind()
 	if kind == reflect.Chan || kind == reflect.Func || kind == reflect.Interface ||
-		kind == reflect.Map || kind == reflect.Pointer || kind == reflect.Slice {
+		kind == reflect.Map || kind == reflect.Ptr || kind == reflect.Slice {
 		return !x.IsNil()
 	}
 
@@ -190,7 +192,7 @@ func (e Evaluator) ExtractVar(path string) interface{} {
 }
 
 func unwrap(v reflect.Value) reflect.Value {
-	for v.IsValid() && (v.Kind() == reflect.Interface || v.Kind() == reflect.Pointer) {
+	for v.IsValid() && (v.Kind() == reflect.Interface || v.Kind() == reflect.Ptr) {
 		if v.IsNil() {
 			return reflect.Value{}
 		}
@@ -263,8 +265,19 @@ func deepEquals(lhs reflect.Value, rhs reflect.Value) bool {
 	if lhs.Kind() != rhs.Kind() {
 		return false
 	}
-	if lhs.Comparable() && rhs.Comparable() {
-		return lhs.Interface() == rhs.Interface()
+	if valueEquals(lhs, rhs) {
+		return true
 	}
 	return reflect.DeepEqual(lhs.Interface(), rhs.Interface())
+}
+
+// valueEquals reports whether lhs == rhs, without panicking on values whose
+// dynamic type is not comparable (reflect.Value.Comparable needs Go 1.20).
+func valueEquals(lhs reflect.Value, rhs reflect.Value) (equal bool) {
+	defer func() {
+		if recover() != nil {
+			equal = false
+		}
+	}()
+	return lhs.Interface() == rhs.Interface()
 }

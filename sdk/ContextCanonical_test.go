@@ -103,17 +103,30 @@ func TestCustomFieldValueEAfterFinalize(t *testing.T) {
 	}
 }
 
-func TestRefreshFailedContextIsNoOp(t *testing.T) {
+// v1.1.1 behaviour: refreshing a context whose initial load failed fetches
+// the data and installs it, logging a Refresh event; the context still
+// reports failed.
+func TestRefreshFailedContextInstallsData(t *testing.T) {
 	setUp()
+	var logger = &MockEventLogger{}
 	var client = &CapturingPublishClient{contextData: data}
-	var ctx = createCanonicalContext(t, client, dataFutureReady, nil)
+	var ctx = createCanonicalContext(t, client, dataFutureReady, logger)
 	ctx.SetDataFailed(errors.New("initial load failed"))
-	ctx.DataProvider_ = nil
+	logger.Reset()
+
 	assertAny(nil, getWithTimeout(t, ctx.RefreshAsync()), t)
 	assertAny(true, ctx.IsFailed(), t)
 	var experiments, err = ctx.GetExperiments()
 	assertAny(nil, err, t)
-	assertAny(0, len(experiments), t)
+	assertAny(len(data.Experiments), len(experiments), t)
+
+	var refreshes = 0
+	for _, e := range logger.GetEvents() {
+		if e.EventType == Refresh {
+			refreshes++
+		}
+	}
+	assertAny(1, refreshes, t)
 }
 
 func TestTreatmentQueuesExposures(t *testing.T) {
@@ -2049,7 +2062,7 @@ func TestReadyEventLoggedBeforeWaitUntilReadyReturns(t *testing.T) {
 	}
 }
 
-type orderLogger struct{ count atomic.Int32 }
+type orderLogger struct{ count atomicInt32 }
 
 func (l *orderLogger) HandleEvent(_ Context, event EventType, _ interface{}) {
 	if event == Ready {
@@ -2066,7 +2079,7 @@ func (asyncDataProvider) GetContextData() *future.Future {
 	return f
 }
 
-type refreshOrderLogger struct{ count atomic.Int32 }
+type refreshOrderLogger struct{ count atomicInt32 }
 
 func (l *refreshOrderLogger) HandleEvent(_ Context, event EventType, _ interface{}) {
 	if event == Refresh {
@@ -2093,7 +2106,7 @@ func TestRefreshEventLoggedBeforeRefreshReturns(t *testing.T) {
 type reentrantReadyLogger struct {
 	onEvent  EventType
 	call     func(ctx *Context)
-	returned atomic.Bool
+	returned atomicBool
 }
 
 func (l *reentrantReadyLogger) HandleEvent(ctx Context, event EventType, _ interface{}) {

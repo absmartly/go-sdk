@@ -19,7 +19,7 @@ type matrixPublisher struct {
 	mode  string // "sync": already complete, "async": own goroutine, "held": test settles
 	fault string // "", "panic": panics when called, "nilfuture": returns nil
 
-	failing atomic.Bool
+	failing atomicBool
 
 	mu        sync.Mutex
 	heldPub   []func()
@@ -109,11 +109,11 @@ func (m matrixProvider) GetContextData() *future.Future {
 // matrixLogger misbehaves on one event type.
 type matrixLogger struct {
 	behavior string
-	ctx      atomic.Pointer[Context]
-	used     atomic.Bool
-	inflight atomic.Int32
+	ctx      atomicContext
+	used     atomicBool
+	inflight atomicInt32
 
-	fired atomic.Int32
+	fired atomicInt32
 	mu    sync.Mutex
 	seen  map[EventType]int
 }
@@ -145,7 +145,8 @@ func (l *matrixLogger) HandleEvent(supplied Context, event EventType, _ interfac
 	case l.behavior == "panicPublish" && event == Publish,
 		l.behavior == "panicError" && event == Error,
 		l.behavior == "panicClose" && event == Close,
-		l.behavior == "panicRefresh" && event == Refresh:
+		l.behavior == "panicRefresh" && event == Refresh,
+		l.behavior == "panicReady" && event == Ready:
 		l.fired.Add(1)
 		panic("logger panic")
 	case l.behavior == "closeOnPublish" && event == Publish && c != nil && first():
@@ -345,15 +346,15 @@ func runLifecycleCase(t *testing.T, mode, fault string, failing bool, loggerBeha
 				}
 			}
 			mu.Unlock()
-			ctx.StateLock_.Lock()
+			ctx.stateLock_.Lock()
 			var logsDelivered = true
 			for _, f := range ctx.publishLogs_ {
 				if !f.Ready() {
 					logsDelivered = false
 				}
 			}
-			var finalized = ctx.FinalizedFuture_
-			ctx.StateLock_.Unlock()
+			var finalized = ctx.finalizedFuture_
+			ctx.stateLock_.Unlock()
 			if finalized != nil && !finalized.Ready() {
 				logsDelivered = false
 			}
@@ -451,9 +452,9 @@ func runLifecycleCase(t *testing.T, mode, fault string, failing bool, loggerBeha
 			}
 		}
 		if act.refresh && ctx.IsClosed() {
-			ctx.StateLock_.Lock()
+			ctx.stateLock_.Lock()
 			var leaked = ctx.RefreshTimer_ != nil
-			ctx.StateLock_.Unlock()
+			ctx.stateLock_.Unlock()
 			if leaked {
 				t.Fatalf("closed context still has a refresh timer: %s", state())
 			}
@@ -575,7 +576,7 @@ func TestCloseThroughStaleCopyActsOnLiveContext(t *testing.T) {
 	assertAny(true, ctx.IsClosed(), t)
 }
 
-func TestLoggerPanicWhileParsingDoesNotStrandReadiness(t *testing.T) {
+func TestLoggerPanicOnMalformedDataDoesNotStrandReadiness(t *testing.T) {
 	var malformed = jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{{
 		Id: 1, Name: "bad_config", UnitType: "session_id", Split: []float64{0.5, 0.5}, TrafficSplit: []float64{0, 1},
 		Variants:          []jsonmodels.ExperimentVariant{{Name: "A", Config: "{"}, {Name: "B", Config: `{"a":1}`}},
@@ -584,7 +585,7 @@ func TestLoggerPanicWhileParsingDoesNotStrandReadiness(t *testing.T) {
 	for _, name := range []string{"async-initial-future", "ready-initial-future"} {
 		t.Run(name, func(t *testing.T) {
 			setUp()
-			var logger = &matrixLogger{behavior: "panicError"}
+			var logger = &matrixLogger{behavior: "panicReady"}
 			var config = CreateDefaultContextConfig()
 			config.Units_ = units
 			config.PublishDelay_ = -1
@@ -604,11 +605,13 @@ func TestLoggerPanicWhileParsingDoesNotStrandReadiness(t *testing.T) {
 			select {
 			case <-waited:
 			case <-time.After(5 * time.Second):
-				t.Fatal("WaitUntilReady never returned after a logger panic during parsing")
+				t.Fatal("WaitUntilReady never returned after a logger panic on malformed data")
 			}
 			assertAny(true, ctx.IsReady(), t)
+			// Malformed configs and custom fields are not logged (as in
+			// v1.1.1); the logger panics on the Ready event instead.
 			if logger.fired.Load() == 0 {
-				t.Fatal("the logger never saw the parse error")
+				t.Fatal("the logger never saw the ready event")
 			}
 		})
 	}
@@ -665,37 +668,4 @@ func TestRejectedExposureIsQueuedAfterFailedClose(t *testing.T) {
 	assertAny(nil, err, t)
 	assertAny(int32(1), ctx.GetPendingCount(), t)
 	assertAny(1, len(ctx.Exposures_), t)
-}
-
-// A parse diagnostic must not wait on the load that reports it.
-func TestParseDiagnosticLoggerCallingRefreshDoesNotSelfWait(t *testing.T) {
-	var malformed = jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{{
-		Id: 1, Name: "bad_config", UnitType: "session_id", Split: []float64{0.5, 0.5}, TrafficSplit: []float64{0, 1},
-		Variants:          []jsonmodels.ExperimentVariant{{Name: "A", Config: "{"}, {Name: "B", Config: `{"a":1}`}},
-		CustomFieldValues: []jsonmodels.CustomFieldValue{{Name: "flag", Type: "boolean", Value: "notabool"}},
-	}}}
-	setUp()
-	var p = &matrixPublisher{mode: "async", delivered: map[string]int{}}
-	var logger = &matrixLogger{behavior: "refreshOnError"}
-	var config = CreateDefaultContextConfig()
-	config.Units_ = units
-	config.PublishDelay_ = -1
-	config.RefreshInterval_ = 0
-	config.EventLogger_ = logger
-	var ctx = createTrackedContext(clock, config, dataFutureReady, matrixProvider{p: p, data: malformed}, p, logger, DefaultVariableParser{}, audienceMatcher)
-	logger.ctx.Store(ctx)
-
-	var refreshed = ctx.RefreshAsync()
-	assertAny(nil, getWithTimeout(t, refreshed), t)
-	var deadline = time.Now().Add(5 * time.Second)
-	for logger.inflight.Load() != 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if logger.fired.Load() == 0 {
-		t.Fatal("the logger never saw a parse diagnostic")
-	}
-	if logger.seenCount(Error) < 2 {
-		t.Fatalf("expected both the config and the custom field diagnostics, saw %d Error events", logger.seenCount(Error))
-	}
-	assertAny(nil, getWithTimeout(t, ctx.RefreshAsync()), t)
 }

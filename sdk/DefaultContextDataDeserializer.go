@@ -12,11 +12,20 @@ type DefaultContextDataDeserializer struct {
 }
 
 func (d DefaultContextDataDeserializer) Deserialize(bytes []byte) (jsonmodels.ContextData, error) {
-	var wire wireContextData
-	if err := json.Unmarshal(bytes, &wire); err != nil {
-		return wire.contextData(), err
+	// Decode as v1.1.1 did, so a malformed payload returns the same partial
+	// data and error text. Only when that fails is the payload decoded again
+	// tolerating any assignmentRules value; if that succeeds, the only
+	// problem was an experiment's rules, which are dropped.
+	var data jsonmodels.ContextData
+	var err = json.Unmarshal(bytes, &data)
+	if err == nil {
+		return data, nil
 	}
-	return wire.contextData(), nil
+	var wire wireContextData
+	if json.Unmarshal(bytes, &wire) == nil {
+		return wire.contextData(), nil
+	}
+	return data, err
 }
 
 // wireContextData is the context payload as the default deserializer decodes

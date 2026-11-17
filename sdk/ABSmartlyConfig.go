@@ -1,9 +1,7 @@
 package sdk
 
-type ABsmartlyConfig struct {
-	ContextDataProvider_ ContextDataProvider
-	ContextPublisher_    ContextEventHandler
-	// Deprecated: Use ContextPublisher_ instead.
+type ABSmartlyConfig struct {
+	ContextDataProvider_  ContextDataProvider
 	ContextEventHandler_  ContextEventHandler
 	ContextEventLogger_   ContextEventLogger
 	VariableParser_       VariableParser
@@ -11,4 +9,5 @@ type ABsmartlyConfig struct {
 	Client_               ClientI
 }
 
-type ABSmartlyConfig = ABsmartlyConfig
+// ABsmartlyConfig is an alias of ABSmartlyConfig, spelled as the product is.
+type ABsmartlyConfig = ABSmartlyConfig
