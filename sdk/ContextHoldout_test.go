@@ -1,0 +1,1434 @@
+package sdk
+
+// Holdouts, ported from the Java SDK's ContextHoldoutTest (java-sdk main,
+// core-api/src/test/java/com/absmartly/sdk/ContextHoldoutTest.java) with the
+// JS SDK (src/context.ts) as the reference where the two differ. A holdout is
+// a top-level payload entry; an experiment is covered by the holdouts its
+// holdoutIds name. Arm 0 holds the covered experiment out (control, not
+// assigned, no exposure of its own); in a three-arm holdout arm 1 holds out
+// experiments that are not full-on. Each holdout publishes one ordinary
+// exposure per unit type.
+
+import (
+	"context"
+	"encoding/json"
+	"reflect"
+	"sync"
+	"testing"
+
+	"github.com/absmartly/go-sdk/sdk/future"
+	"github.com/absmartly/go-sdk/sdk/internal"
+	"github.com/absmartly/go-sdk/sdk/jsonmodels"
+)
+
+const (
+	hoUnitType      = "session_id"
+	hoUID           = "e791e240fcd3df7d238cfc285f475e8152fcc0ec"
+	hoUIDNotHeldOut = "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3"
+
+	// split [0.5,0.5], seed 100/200: variant 1 for hoUID, 0 for hoUIDNotHeldOut.
+	hoNormalVariant = 1
+
+	// split [0.1,0.9], seed 13/111: arm 0 (held out) for hoUID, arm 1 for hoUIDNotHeldOut.
+	hoSeedAHi, hoSeedALo = 13, 111
+	// split [0.1,0.9], seed 1/222: arm 1 for both units.
+	hoSeedBHi, hoSeedBLo = 1, 222
+
+	// split [0.3,0.3,0.4] for hoUID: seedLo 1 -> arm 0, 3 -> arm 1, 0 -> arm 2.
+	hoThreeArm0Lo, hoThreeArm1Lo, hoThreeArm2Lo = 1, 3, 0
+
+	hoMillis int64 = 1_620_000_000_000
+)
+
+var hoThreeArmSplit = []float64{0.3, 0.3, 0.4}
+
+func hoExperiment(id int, name string, unitType string, fullOnVariant int, holdoutIds ...int) jsonmodels.Experiment {
+	var variants = []jsonmodels.ExperimentVariant{{Name: "A"}, {Name: "B"}}
+	if fullOnVariant >= 2 {
+		variants = append(variants, jsonmodels.ExperimentVariant{Name: "C"})
+	}
+	return jsonmodels.Experiment{
+		Id: id, Name: name, UnitType: unitType, Iteration: 1, SeedHi: 100, SeedLo: 200,
+		Split: []float64{0.5, 0.5}, TrafficSeedHi: 1, TrafficSeedLo: 2, TrafficSplit: []float64{0, 1},
+		FullOnVariant: fullOnVariant, Applications: []jsonmodels.ExperimentApplication{{Name: "website"}},
+		Variants: variants, HoldoutIds: holdoutIds,
+	}
+}
+
+func hoHoldout(id int, name string, unitType string, seedHi int, seedLo int) jsonmodels.Holdout {
+	return jsonmodels.Holdout{Id: id, Name: name, UnitType: unitType, Iteration: 1, SeedHi: seedHi, SeedLo: seedLo,
+		Split: []float64{0.1, 0.9}, HoldoutType: "full"}
+}
+
+func hoThreeArm(id int, name string, seedLo int) jsonmodels.Holdout {
+	var holdout = hoHoldout(id, name, hoUnitType, 0, seedLo)
+	holdout.Split = hoThreeArmSplit
+	holdout.HoldoutType = "all_full_on"
+	return holdout
+}
+
+func hoData(holdouts []jsonmodels.Holdout, experiments ...jsonmodels.Experiment) jsonmodels.ContextData {
+	return jsonmodels.ContextData{Experiments: experiments, Holdouts: holdouts}
+}
+
+func hoExposure(unitType string, id int, name string, variant int) jsonmodels.Exposure {
+	return jsonmodels.Exposure{Id: id, Name: name, Unit: unitType, Variant: variant, ExposedAt: hoMillis,
+		Assigned: true, Eligible: true}
+}
+
+func hoOwn(unitType string, id int, name string, variant int) jsonmodels.Exposure {
+	return hoExposure(unitType, id, name, variant)
+}
+
+type hoPublisher struct {
+	mu     sync.Mutex
+	events []jsonmodels.PublishEvent
+}
+
+func (p *hoPublisher) Publish(_ Context, event jsonmodels.PublishEvent) *future.Future {
+	p.mu.Lock()
+	p.events = append(p.events, event)
+	p.mu.Unlock()
+	var ft, done = future.New()
+	done(nil, nil)
+	return ft
+}
+
+type hoProvider struct {
+	mu   sync.Mutex
+	next jsonmodels.ContextData
+}
+
+func (p *hoProvider) GetContextData() *future.Future {
+	p.mu.Lock()
+	var data = p.next
+	p.mu.Unlock()
+	var ft, done = future.New()
+	done(data, nil)
+	return ft
+}
+
+type hoLogger struct {
+	mu      sync.Mutex
+	onEvent func(EventType, interface{})
+}
+
+func (l *hoLogger) HandleEvent(_ Context, event EventType, data interface{}) {
+	l.mu.Lock()
+	var on = l.onEvent
+	l.mu.Unlock()
+	if on != nil {
+		on(event, data)
+	}
+}
+
+type hoContext struct {
+	t         *testing.T
+	ctx       *Context
+	publisher *hoPublisher
+	provider  *hoProvider
+	logger    *hoLogger
+}
+
+type hoOption func(*ContextConfig)
+
+func hoOverride(name string, variant int) hoOption {
+	return func(c *ContextConfig) { c.Overrides_[name] = variant }
+}
+
+func hoCustom(name string, variant int) hoOption {
+	return func(c *ContextConfig) { c.Cassigmnents_[name] = variant }
+}
+
+func hoPublishDelay(delay int64) hoOption {
+	return func(c *ContextConfig) { c.PublishDelay_ = delay }
+}
+
+// hoCreate creates a ready context with the given units (nil for none).
+func hoCreate(t *testing.T, units map[string]string, data jsonmodels.ContextData, options ...hoOption) *hoContext {
+	t.Helper()
+	var config = CreateDefaultContextConfig()
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = -1
+	for k, v := range units {
+		config.Units_[k] = v
+	}
+	for _, option := range options {
+		option(&config)
+	}
+	var h = &hoContext{t: t, publisher: &hoPublisher{}, provider: &hoProvider{}, logger: &hoLogger{}}
+	var ft, done = future.New()
+	done(data, nil)
+	h.ctx = CreateContext(internal.FixedClock{Millis_: hoMillis}, config, ft, h.provider, h.publisher, h.logger,
+		DefaultVariableParser{}, AudienceMatcher{DefaultAudienceDeserializer{}})
+	h.ctx.WaitUntilReady()
+	if !h.ctx.IsReady() || h.ctx.IsFailed() {
+		t.Fatal("context not ready")
+	}
+	t.Cleanup(func() {
+		h.ctx.ClearTimeout()
+		h.ctx.ClearRefreshTimer()
+	})
+	return h
+}
+
+func hoCreateFor(t *testing.T, uid string, data jsonmodels.ContextData, options ...hoOption) *hoContext {
+	t.Helper()
+	return hoCreate(t, map[string]string{hoUnitType: uid}, data, options...)
+}
+
+func (h *hoContext) treatment(name string) int {
+	h.t.Helper()
+	var variant, err = h.ctx.GetTreatment(name)
+	if err != nil {
+		h.t.Fatalf("GetTreatment(%s): %v", name, err)
+	}
+	return variant
+}
+
+func (h *hoContext) peek(name string) int {
+	h.t.Helper()
+	var variant, err = h.ctx.PeekTreatment(name)
+	if err != nil {
+		h.t.Fatalf("PeekTreatment(%s): %v", name, err)
+	}
+	return variant
+}
+
+func (h *hoContext) variable(key string) interface{} {
+	h.t.Helper()
+	var value, err = h.ctx.GetVariableValue(key, "default")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return value
+}
+
+func (h *hoContext) peekVariable(key string) interface{} {
+	h.t.Helper()
+	var value, err = h.ctx.PeekVariableValue(key, "default")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return value
+}
+
+func (h *hoContext) refresh(data jsonmodels.ContextData) {
+	h.t.Helper()
+	h.provider.mu.Lock()
+	h.provider.next = data
+	h.provider.mu.Unlock()
+	if _, err := h.ctx.RefreshAsync().Get(context.Background()); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *hoContext) setUnit(unitType string, uid string) {
+	h.t.Helper()
+	if err := h.ctx.SetUnit(unitType, uid); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *hoContext) setAttribute(name string, value interface{}) {
+	h.t.Helper()
+	if err := h.ctx.SetAttribute(name, value); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *hoContext) expectPending(want int) {
+	h.t.Helper()
+	if got := int(h.ctx.GetPendingCount()); got != want {
+		h.t.Fatalf("pending %d, want %d: %+v", got, want, queuedExposures(h.ctx))
+	}
+}
+
+// expectPublished publishes and requires exactly these exposures, in order.
+func (h *hoContext) expectPublished(want ...jsonmodels.Exposure) jsonmodels.PublishEvent {
+	h.t.Helper()
+	if err := h.ctx.Publish(); err != nil {
+		h.t.Fatal(err)
+	}
+	h.publisher.mu.Lock()
+	defer h.publisher.mu.Unlock()
+	if len(h.publisher.events) != 1 {
+		h.t.Fatalf("published %d events, want 1", len(h.publisher.events))
+	}
+	var event = h.publisher.events[0]
+	if want == nil {
+		want = []jsonmodels.Exposure{}
+	}
+	var got = event.Exposures
+	if got == nil {
+		got = []jsonmodels.Exposure{}
+	}
+	if !reflect.DeepEqual(want, got) {
+		h.t.Fatalf("published exposures\n got %+v\nwant %+v", got, want)
+	}
+	return event
+}
+
+func expectInt(t *testing.T, want int, got int) {
+	t.Helper()
+	if want != got {
+		t.Fatalf("got %d, want %d", got, want)
+	}
+}
+
+func expectValue(t *testing.T, want interface{}, got interface{}) {
+	t.Helper()
+	if !reflect.DeepEqual(want, got) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func hoHoldoutA() jsonmodels.Holdout {
+	return hoHoldout(11, "holdout_a", hoUnitType, hoSeedAHi, hoSeedALo)
+}
+
+func TestHoldout_HeldOutUnitGetsControlAndOnlyTheHoldoutExposure(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+		hoExperiment(1, "exp_holdout_in", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.peek("exp_holdout_in"))
+	h.treatment("exp_holdout_in")
+	var event = h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+	expectValue(t, []jsonmodels.Unit{{Type: hoUnitType, Uid: string(hashUnitBytes(hoUID))}}, event.Units)
+}
+
+func hashUnitBytes(uid string) []byte {
+	var hash = HashUnit(uid)
+	var out = make([]byte, len(hash))
+	for i, b := range hash {
+		out[i] = byte(b)
+	}
+	return out
+}
+
+func TestHoldout_NotHeldOutUnitPublishesOwnExposureThenHoldoutArmOne(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+		hoExperiment(1, "exp_holdout_out", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp_holdout_out"))
+	h.expectPublished(hoOwn(hoUnitType, 1, "exp_holdout_out", 0), hoExposure(hoUnitType, 11, "holdout_a", 1))
+}
+
+func TestHoldout_ExperimentWithoutHoldoutIdsIsNotCovered(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+		hoExperiment(1, "exp_holdout_in", hoUnitType, 0, 11), hoExperiment(2, "exp_not_covered", hoUnitType, 0)))
+	expectInt(t, 0, h.treatment("exp_holdout_in"))
+	expectInt(t, hoNormalVariant, h.treatment("exp_not_covered"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0),
+		hoOwn(hoUnitType, 2, "exp_not_covered", hoNormalVariant))
+}
+
+func TestHoldout_UnionSuppressesAndEveryHoldoutPublishes(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA(),
+		hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_multi_holdout", hoUnitType, 0, 11, 12)))
+	expectInt(t, 0, h.treatment("exp_multi_holdout"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0), hoExposure(hoUnitType, 12, "holdout_b", 1))
+}
+
+// The deciding holdout is the higher id one, so an implementation that only
+// looks at the first holdout, or stops at the first one, fails here.
+func TestHoldout_UnionAppliesWhenOnlyTheHigherIdHoldoutHoldsOut(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{
+		hoHoldout(11, "holdout_low_id", hoUnitType, hoSeedBHi, hoSeedBLo),
+		hoHoldout(12, "holdout_high_id", hoUnitType, hoSeedAHi, hoSeedALo)},
+		hoExperiment(1, "exp_union_high_id_decides", hoUnitType, 0, 11, 12)))
+	expectInt(t, 0, h.treatment("exp_union_high_id_decides"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_low_id", 1), hoExposure(hoUnitType, 12, "holdout_high_id", 0))
+}
+
+func TestHoldout_UnitNotHeldOutByEitherHoldoutIsNotSuppressed(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA(),
+		hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_multi_holdout_miss", hoUnitType, 0, 11, 12)))
+	expectInt(t, 0, h.treatment("exp_multi_holdout_miss"))
+	h.expectPublished(hoOwn(hoUnitType, 1, "exp_multi_holdout_miss", 0),
+		hoExposure(hoUnitType, 11, "holdout_a", 1), hoExposure(hoUnitType, 12, "holdout_b", 1))
+}
+
+func TestHoldout_SuppressesFullOnExperiment(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+		hoExperiment(1, "exp_fullon_holdout", hoUnitType, 2, 11)))
+	expectInt(t, 0, h.treatment("exp_fullon_holdout"))
+}
+
+func TestHoldout_ThreeArmZeroHoldsOutFullOnAndNonFullOn(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoThreeArm(21, "holdout_three_arm", hoThreeArm0Lo)},
+		hoExperiment(1, "exp_non_fullon", hoUnitType, 0, 21), hoExperiment(2, "exp_fullon", hoUnitType, 2, 21)))
+	expectInt(t, 0, h.treatment("exp_non_fullon"))
+	expectInt(t, 0, h.treatment("exp_fullon"))
+	h.expectPublished(hoExposure(hoUnitType, 21, "holdout_three_arm", 0))
+}
+
+func TestHoldout_ThreeArmOneHoldsOutNonFullOnOnly(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoThreeArm(21, "holdout_three_arm", hoThreeArm1Lo)},
+		hoExperiment(1, "exp_non_fullon", hoUnitType, 0, 21), hoExperiment(2, "exp_fullon", hoUnitType, 2, 21)))
+	expectInt(t, 0, h.treatment("exp_non_fullon"))
+	expectInt(t, 2, h.treatment("exp_fullon"))
+	var fullOn = hoOwn(hoUnitType, 2, "exp_fullon", 2)
+	fullOn.FullOn = true
+	h.expectPublished(hoExposure(hoUnitType, 21, "holdout_three_arm", 1), fullOn)
+}
+
+func TestHoldout_ThreeArmTwoAssignsBothNormally(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoThreeArm(21, "holdout_three_arm", hoThreeArm2Lo)},
+		hoExperiment(1, "exp_non_fullon", hoUnitType, 0, 21), hoExperiment(2, "exp_fullon", hoUnitType, 2, 21)))
+	expectInt(t, hoNormalVariant, h.treatment("exp_non_fullon"))
+	expectInt(t, 2, h.treatment("exp_fullon"))
+	var fullOn = hoOwn(hoUnitType, 2, "exp_fullon", 2)
+	fullOn.FullOn = true
+	h.expectPublished(hoOwn(hoUnitType, 1, "exp_non_fullon", hoNormalVariant),
+		hoExposure(hoUnitType, 21, "holdout_three_arm", 2), fullOn)
+}
+
+func TestHoldout_TwoArmWinsUnionOverNonHoldingThreeArm(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_two_arm", hoUnitType, hoSeedAHi, hoSeedALo),
+		hoThreeArm(22, "holdout_three_arm", hoThreeArm2Lo)},
+		hoExperiment(1, "exp_union", hoUnitType, 0, 11, 22)))
+	expectInt(t, 0, h.treatment("exp_union"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_two_arm", 0), hoExposure(hoUnitType, 22, "holdout_three_arm", 2))
+}
+
+func TestHoldout_ThreeArmWinsUnionOverNonHoldingTwoArm(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_two_arm", hoUnitType, hoSeedBHi, hoSeedBLo),
+		hoThreeArm(22, "holdout_three_arm", hoThreeArm1Lo)},
+		hoExperiment(1, "exp_union", hoUnitType, 0, 11, 22)))
+	expectInt(t, 0, h.treatment("exp_union"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_two_arm", 1), hoExposure(hoUnitType, 22, "holdout_three_arm", 1))
+}
+
+const hoAgeAudience = `{"filter":[{"gte":[{"var":"age"},{"value":20}]}]}`
+
+// Arm 1 of a three-arm holdout defers a full-on experiment to its normal
+// path, so a strict audience mismatch still gives control, exactly as arm 2.
+func TestHoldout_ThreeArmOneDefersFullOnExperimentToStrictAudience(t *testing.T) {
+	for _, arm := range []struct {
+		seedLo  int
+		variant int
+	}{{hoThreeArm1Lo, 1}, {hoThreeArm2Lo, 2}} {
+		var experiment = hoExperiment(1, "exp_audience_fullon", hoUnitType, 2, 21)
+		experiment.AudienceStrict = true
+		experiment.Audience = hoAgeAudience
+		var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoThreeArm(21, "holdout_three_arm", arm.seedLo)}, experiment))
+		h.setAttribute("age", 5)
+		expectInt(t, 0, h.treatment("exp_audience_fullon"))
+		var own = hoOwn(hoUnitType, 1, "exp_audience_fullon", 0)
+		own.Assigned = false
+		own.AudienceMismatch = true
+		h.expectPublished(own, hoExposure(hoUnitType, 21, "holdout_three_arm", arm.variant))
+	}
+}
+
+// With the experiment's unit not set, no arm can be drawn, so nothing is
+// held out and no holdout exposure fires. The experiment publishes its own
+// unassigned exposure, as without holdouts. This follows the JS SDK; the
+// Java SDK publishes nothing here.
+func TestHoldout_UnsetUnitTypeGetsControlAndNoHoldoutExposure(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_user", "user_id", hoSeedAHi, hoSeedALo)},
+		hoExperiment(1, "exp_user_holdout", "user_id", 0, 11)))
+	expectInt(t, 0, h.peek("exp_user_holdout"))
+	h.treatment("exp_user_holdout")
+	var own = hoOwn("user_id", 1, "exp_user_holdout", 0)
+	own.Assigned = false
+	h.expectPublished(own)
+}
+
+func TestHoldout_AbsentHoldoutsAssignNormally(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp_no_holdouts_key", hoUnitType, 0)))
+	expectInt(t, hoNormalVariant, h.peek("exp_no_holdouts_key"))
+}
+
+func TestHoldout_DanglingHoldoutIdIsIgnored(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp_dangling", hoUnitType, 0, 999)))
+	expectInt(t, hoNormalVariant, h.treatment("exp_dangling"))
+	h.expectPublished(hoOwn(hoUnitType, 1, "exp_dangling", hoNormalVariant))
+}
+
+func TestHoldout_CustomAssignmentCannotOverrideHeldOutVariant(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+		hoExperiment(1, "exp_holdout_custom", hoUnitType, 0, 11)), hoCustom("exp_holdout_custom", 3))
+	expectInt(t, 0, h.peek("exp_holdout_custom"))
+}
+
+func TestHoldout_CachedHeldOutAssignmentWithCustomAssignmentIsReused(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+		hoExperiment(1, "exp_holdout_custom_cache", hoUnitType, 0, 11)), hoCustom("exp_holdout_custom_cache", 3))
+	var first = h.ctx.GetAssignment("exp_holdout_custom_cache")
+	expectInt(t, 0, h.treatment("exp_holdout_custom_cache"))
+	expectInt(t, 0, h.treatment("exp_holdout_custom_cache"))
+	if h.ctx.GetAssignment("exp_holdout_custom_cache") != first {
+		t.Fatal("the held-out assignment was rebuilt")
+	}
+	h.expectPending(1)
+}
+
+func TestHoldout_OverrideTakesPrecedence(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+		hoExperiment(1, "exp_holdout_override", hoUnitType, 0, 11)), hoOverride("exp_holdout_override", 3))
+	expectInt(t, 3, h.peek("exp_holdout_override"))
+}
+
+// Scenario 210: an override still fires the holdout's exposure, for both arms.
+func TestHoldout_OverriddenExperimentStillPublishesHoldoutExposure(t *testing.T) {
+	for _, c := range []struct {
+		uid string
+		arm int
+	}{{hoUID, 0}, {hoUIDNotHeldOut, 1}} {
+		var h = hoCreateFor(t, c.uid, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+			hoExperiment(1, "exp_override", hoUnitType, 0, 11)), hoOverride("exp_override", 3))
+		expectInt(t, 3, h.treatment("exp_override"))
+		var own = hoOwn(hoUnitType, 1, "exp_override", 3)
+		own.Assigned = false
+		own.Overridden = true
+		h.expectPublished(own, hoExposure(hoUnitType, 11, "holdout_a", c.arm))
+	}
+}
+
+func TestHoldout_TakesPrecedenceOverAudienceMismatch(t *testing.T) {
+	var experiment = hoExperiment(1, "exp_holdout_audience", hoUnitType, 0, 11)
+	experiment.AudienceStrict = true
+	experiment.Audience = hoAgeAudience
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+	h.setAttribute("age", 5)
+	expectInt(t, 0, h.treatment("exp_holdout_audience"))
+	// Suppressed: no audience was evaluated, so nothing but the holdout.
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
+func TestHoldout_ExposureOncePerContextAcrossSuppressedExperiments(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+		hoExperiment(1, "exp_shared_a", hoUnitType, 0, 11), hoExperiment(2, "exp_shared_b", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp_shared_a"))
+	expectInt(t, 0, h.treatment("exp_shared_b"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
+func TestHoldout_ExposureOnceAcrossAssignedExperiments(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+		hoExperiment(1, "exp_shared_a", hoUnitType, 0, 11), hoExperiment(2, "exp_shared_b", hoUnitType, 0, 11)))
+	h.treatment("exp_shared_a")
+	h.treatment("exp_shared_b")
+	h.expectPublished(hoOwn(hoUnitType, 1, "exp_shared_a", 0), hoExposure(hoUnitType, 11, "holdout_a", 1),
+		hoOwn(hoUnitType, 2, "exp_shared_b", 0))
+}
+
+func TestHoldout_RepeatedCallsReuseSuppressedAssignment(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+		hoExperiment(1, "exp_holdout_cache", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp_holdout_cache"))
+	expectInt(t, 0, h.treatment("exp_holdout_cache"))
+	h.expectPending(1)
+}
+
+// A same-iteration seed edit must neither move the unit nor re-expose it.
+func TestHoldout_SameIterationSeedChangeKeepsTheArm(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+		hoExperiment(1, "exp_seed_thrash", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp_seed_thrash"))
+	h.expectPending(1)
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_a", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_seed_thrash", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp_seed_thrash"))
+	h.expectPending(1)
+}
+
+func TestHoldout_CosmeticEditDoesNotReExposeHeldOutUnit(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+		hoExperiment(1, "exp_cosmetic", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp_cosmetic"))
+	var renamed = hoHoldout(11, "holdout_a_renamed", "user_id", hoSeedAHi, hoSeedALo)
+	renamed.HoldoutType = "all_full_on"
+	h.refresh(hoData([]jsonmodels.Holdout{renamed}, hoExperiment(1, "exp_cosmetic", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp_cosmetic"))
+	h.expectPending(1)
+}
+
+func TestHoldout_CosmeticEditDoesNotDuplicateCoveredExperimentExposure(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+		hoExperiment(1, "exp_cosmetic_covered", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp_cosmetic_covered"))
+	h.expectPending(2)
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_a_renamed", hoUnitType, hoSeedAHi, hoSeedALo)},
+		hoExperiment(1, "exp_cosmetic_covered", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp_cosmetic_covered"))
+	h.expectPending(2)
+}
+
+// Scenario 224: an iteration bump is a new epoch: one new arm, exposed once.
+func TestHoldout_IterationBumpReassignsToExactlyOneNewArm(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_a", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_iteration", hoUnitType, 0, 11)))
+	expectInt(t, hoNormalVariant, h.treatment("exp_iteration"))
+	h.expectPending(2)
+	var next = hoHoldoutA()
+	next.Iteration = 2
+	h.refresh(hoData([]jsonmodels.Holdout{next}, hoExperiment(1, "exp_iteration", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp_iteration"))
+	h.expectPending(3)
+	expectInt(t, 0, h.treatment("exp_iteration"))
+	h.expectPending(3)
+}
+
+// An experiment first evaluated after a same-iteration seed edit uses the
+// pinned arm, not one drawn from the new seed.
+func TestHoldout_NewlyEvaluatedExperimentUsesPinnedArmAfterSeedEdit(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+		hoExperiment(1, "exp_desync_a", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp_desync_a"))
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_a", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_desync_a", hoUnitType, 0, 11), hoExperiment(2, "exp_desync_b", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp_desync_b"))
+	expectInt(t, 0, h.treatment("exp_desync_a"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
+// Arity comes from the split the arm was drawn with: arm 1 of a two-arm
+// holdout keeps meaning "not held out" after a same-iteration change to
+// three arms.
+func TestHoldout_TwoToThreeArmsSameIterationKeepsArmMeaning(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldout(31, "holdout_arity", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_a", hoUnitType, 0, 31)))
+	expectInt(t, hoNormalVariant, h.treatment("exp_a"))
+	h.refresh(hoData([]jsonmodels.Holdout{hoThreeArm(31, "holdout_arity", hoThreeArm1Lo)},
+		hoExperiment(1, "exp_a", hoUnitType, 0, 31), hoExperiment(2, "exp_b", hoUnitType, 0, 31)))
+	expectInt(t, hoNormalVariant, h.treatment("exp_b"))
+	h.expectPublished(hoOwn(hoUnitType, 1, "exp_a", hoNormalVariant), hoExposure(hoUnitType, 31, "holdout_arity", 1),
+		hoOwn(hoUnitType, 2, "exp_b", hoNormalVariant))
+}
+
+func TestHoldout_ThreeToTwoArmsSameIterationKeepsArmMeaning(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoThreeArm(41, "holdout_arity_rev", hoThreeArm1Lo)},
+		hoExperiment(1, "exp_a", hoUnitType, 0, 41)))
+	expectInt(t, 0, h.treatment("exp_a"))
+	h.expectPending(1)
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldout(41, "holdout_arity_rev", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_a", hoUnitType, 0, 41), hoExperiment(2, "exp_b", hoUnitType, 0, 41)))
+	expectInt(t, 0, h.treatment("exp_b"))
+	h.expectPublished(hoExposure(hoUnitType, 41, "holdout_arity_rev", 1))
+}
+
+func TestHoldout_ExperimentsBeforeAndAfterArityChangeAgree(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldout(71, "holdout_c", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_pre", hoUnitType, 0, 71)))
+	expectInt(t, hoNormalVariant, h.treatment("exp_pre"))
+	h.refresh(hoData([]jsonmodels.Holdout{hoThreeArm(71, "holdout_c", hoThreeArm1Lo)},
+		hoExperiment(1, "exp_pre", hoUnitType, 0, 71), hoExperiment(2, "exp_post", hoUnitType, 0, 71)))
+	expectInt(t, hoNormalVariant, h.treatment("exp_post"))
+	expectInt(t, hoNormalVariant, h.treatment("exp_pre"))
+}
+
+// A refresh landing between the decision and its exposure must not publish a
+// holdout arm from the new epoch beside the experiment exposure of the old.
+func TestHoldout_ExposureFiresTheDecisionEpochDespiteARacingRefresh(t *testing.T) {
+	var iteration2 = hoHoldout(11, "holdout_h", hoUnitType, hoSeedAHi, hoSeedALo)
+	iteration2.Iteration = 2
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_h", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_epoch_race", hoUnitType, 0, 11)))
+	h.provider.next = hoData([]jsonmodels.Holdout{iteration2}, hoExperiment(1, "exp_epoch_race", hoUnitType, 0, 11))
+	var once sync.Once
+	h.logger.onEvent = func(event EventType, data interface{}) {
+		if exposure, ok := data.(jsonmodels.Exposure); ok && event == Exposure && exposure.Id == 1 {
+			once.Do(func() { h.ctx.RefreshAsync().Join(context.Background()) })
+		}
+	}
+	expectInt(t, hoNormalVariant, h.treatment("exp_epoch_race"))
+	h.expectPublished(hoOwn(hoUnitType, 1, "exp_epoch_race", hoNormalVariant), hoExposure(hoUnitType, 11, "holdout_h", 1))
+}
+
+// Scenario 221: an assignment resolved before its unit was set is resolved
+// again once it is, so the holdout exposure is not lost.
+func TestHoldout_SetUnitEvictsAssignmentWithAMissingArm(t *testing.T) {
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_user_id", "user_id", hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_null_snapshot_fullon", "user_id", 2, 11)))
+	expectInt(t, 2, h.peek("exp_null_snapshot_fullon"))
+	h.setUnit("user_id", hoUID)
+	expectInt(t, 2, h.treatment("exp_null_snapshot_fullon"))
+	h.expectPending(2)
+	var own = hoOwn("user_id", 1, "exp_null_snapshot_fullon", 2)
+	own.FullOn = true
+	var event = h.expectPublished(own, hoExposure("user_id", 11, "holdout_user_id", 1))
+	expectValue(t, []jsonmodels.Unit{{Type: "user_id", Uid: string(hashUnitBytes(hoUID))}}, event.Units)
+}
+
+func TestHoldout_SetUnitKeepsAnExposedAssignment(t *testing.T) {
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_user_id", "user_id", hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_exposed_before_unit", "user_id", 2, 11)))
+	expectInt(t, 2, h.treatment("exp_exposed_before_unit"))
+	h.expectPending(1)
+	var exposed = h.ctx.GetAssignment("exp_exposed_before_unit")
+	h.setUnit("user_id", hoUID)
+	expectInt(t, 2, h.treatment("exp_exposed_before_unit"))
+	h.expectPending(1)
+	if h.ctx.GetAssignment("exp_exposed_before_unit") != exposed {
+		t.Fatal("an exposed assignment was evicted")
+	}
+}
+
+func TestHoldout_SetUnitOfAnotherTypeEvictsNothing(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_a", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_unrelated_unit", hoUnitType, 0, 11)))
+	expectInt(t, hoNormalVariant, h.treatment("exp_unrelated_unit"))
+	h.expectPending(2)
+	h.setUnit("other_unit_type", "some-other-uid")
+	expectInt(t, hoNormalVariant, h.treatment("exp_unrelated_unit"))
+	h.expectPending(2)
+}
+
+func TestHoldout_SetUnitEvictsOnlyTheAffectedAssignment(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{
+		hoHoldout(11, "holdout_late", "user_id", hoSeedBHi, hoSeedBLo),
+		hoHoldout(12, "holdout_present", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_late_unit", "user_id", 2, 11), hoExperiment(2, "exp_present_unit", hoUnitType, 0, 12)))
+	expectInt(t, 2, h.peek("exp_late_unit"))
+	var present = h.ctx.GetAssignment("exp_present_unit")
+	expectInt(t, hoNormalVariant, h.treatment("exp_present_unit"))
+	h.expectPending(2)
+	h.setUnit("user_id", hoUID)
+	expectInt(t, 2, h.treatment("exp_late_unit"))
+	h.expectPending(4)
+	expectInt(t, hoNormalVariant, h.treatment("exp_present_unit"))
+	h.expectPending(4)
+	if h.ctx.GetAssignment("exp_present_unit") != present {
+		t.Fatal("an unaffected assignment was evicted")
+	}
+}
+
+// The arm is drawn with the covered experiment's unit type, never the
+// holdout's own (scenario 227), so that is the unit type that evicts.
+func TestHoldout_SetUnitEvictsByTheCoveredExperimentsUnitType(t *testing.T) {
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_declares_b", "B", hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_mismatched_unit_type", "A", 2, 11)))
+	expectInt(t, 2, h.peek("exp_mismatched_unit_type"))
+	h.setUnit("A", hoUID)
+	expectInt(t, 2, h.treatment("exp_mismatched_unit_type"))
+	h.expectPending(2)
+	expectValue(t, "A", queuedExposures(h.ctx)[1].Unit)
+}
+
+func TestHoldout_SetUnitRecomputesSuppressionWhenTheLateArmHoldsOut(t *testing.T) {
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_suppress", "user_id", hoSeedAHi, hoSeedALo)},
+		hoExperiment(1, "exp_null_snapshot_suppresses", "user_id", 2, 11)))
+	expectInt(t, 2, h.peek("exp_null_snapshot_suppresses"))
+	h.setUnit("user_id", hoUID)
+	expectInt(t, 0, h.treatment("exp_null_snapshot_suppresses"))
+	h.expectPublished(hoExposure("user_id", 11, "holdout_suppress", 0))
+}
+
+// A caller still holding an assignment that setUnit evicted cannot publish it
+// beside the replacement. Java: detachedTreatmentAssignmentCannotPublish...
+func TestHoldout_EvictedAssignmentCannotPublishBesideItsReplacement(t *testing.T) {
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_detached", "user_id", hoSeedAHi, hoSeedALo)},
+		hoExperiment(1, "exp_detached_suppressed", "user_id", 2, 11)))
+	var retained = h.ctx.GetAssignment("exp_detached_suppressed")
+	h.setUnit("user_id", hoUID)
+	expectInt(t, 0, h.treatment("exp_detached_suppressed"))
+	h.expectPending(1)
+	h.ctx.QueueExposure(retained)
+	h.expectPublished(hoExposure("user_id", 11, "holdout_detached", 0))
+}
+
+func TestHoldout_EvictedAssignmentLeavesTheReplacementToPublish(t *testing.T) {
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_detached_retry", "user_id", hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_detached_retry", "user_id", 2, 11)))
+	var retained = h.ctx.GetAssignment("exp_detached_retry")
+	h.setUnit("user_id", hoUID)
+	h.ctx.QueueExposure(retained)
+	h.expectPending(0)
+	expectInt(t, 2, h.treatment("exp_detached_retry"))
+	expectInt(t, 2, h.treatment("exp_detached_retry"))
+	h.expectPending(2)
+	var own = hoOwn("user_id", 1, "exp_detached_retry", 2)
+	own.FullOn = true
+	h.expectPublished(own, hoExposure("user_id", 11, "holdout_detached_retry", 1))
+}
+
+func TestHoldout_TreatmentAfterEvictionReturnsTheReplacementVariant(t *testing.T) {
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_detached_variant", "user_id", hoSeedAHi, hoSeedALo)},
+		hoExperiment(1, "exp_detached_variant", "user_id", 2, 11)))
+	expectInt(t, 2, h.ctx.GetAssignment("exp_detached_variant").Variant)
+	h.setUnit("user_id", hoUID)
+	expectInt(t, 0, h.treatment("exp_detached_variant"))
+	h.expectPending(1)
+}
+
+// Java settles an exposure through at most two retired assignments; Go never
+// retries an evicted one, so queueing it twice is a bounded no-op.
+func TestHoldout_EvictedAssignmentQueuesNothingHoweverOftenItIsQueued(t *testing.T) {
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_bounded", "user_id", hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_bounded_retry", "user_id", 1, 11)))
+	var retained = h.ctx.GetAssignment("exp_bounded_retry")
+	h.setUnit("user_id", hoUID)
+	for i := 0; i < 3; i++ {
+		h.ctx.QueueExposure(retained)
+	}
+	h.expectPending(0)
+}
+
+func TestHoldout_ExposureSettlesOnTheCurrentAssignmentAfterTwoEvictions(t *testing.T) {
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{
+		hoHoldout(11, "holdout_first", "first", hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_settled", "first", 1, 11)))
+	var stale = h.ctx.GetAssignment("exp_settled")
+	h.setUnit("first", hoUID)
+	h.ctx.QueueExposure(stale)
+	expectInt(t, 1, h.treatment("exp_settled"))
+	h.expectPending(2)
+}
+
+// After setUnit and a refresh adding a lower-id experiment for the key, the
+// variable resolves to the new winner, and the evicted assignment publishes
+// nothing.
+func TestHoldout_VariableAfterEvictionResolvesTheNewWinner(t *testing.T) {
+	var original = hoExperiment(2, "exp_detached_variable_old", "user_id", 1, 11)
+	original.Variants[1].Config = `{"detached_var":"old"}`
+	var holdout = hoHoldout(11, "holdout_detached_variable", "user_id", hoSeedBHi, hoSeedBLo)
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{holdout}, original))
+	var retained = h.ctx.GetAssignment(original.Name)
+	h.setUnit("user_id", hoUID)
+	var winner = hoExperiment(1, "exp_detached_variable_winner", "user_id", 1, 11)
+	winner.Variants[1].Config = `{"detached_var":"new winner"}`
+	h.refresh(hoData([]jsonmodels.Holdout{holdout}, winner, original))
+	h.ctx.QueueExposure(retained)
+	h.expectPending(0)
+	expectValue(t, "new winner", h.variable("detached_var"))
+	h.expectPending(2)
+	expectValue(t, "new winner", h.variable("detached_var"))
+	var own = hoOwn("user_id", 1, winner.Name, 1)
+	own.FullOn = true
+	h.expectPublished(own, hoExposure("user_id", 11, "holdout_detached_variable", 1))
+}
+
+// An exposed assignment that saw no unit keeps its missing arm: a later read
+// never draws the arm live and publishes a contradictory holdout exposure.
+func TestHoldout_PinnedMissingArmIsNeverDrawnForAnExposedAssignment(t *testing.T) {
+	var experiment = hoExperiment(1, "exp_pinned_null", "user_id", 1, 11)
+	experiment.Variants[1].Config = `{"my_var":"value_from_variant"}`
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_pinned_null", "user_id", hoSeedAHi, hoSeedALo)}, experiment))
+	expectInt(t, 1, h.treatment("exp_pinned_null"))
+	h.expectPending(1)
+	h.setUnit("user_id", hoUID)
+	expectValue(t, "value_from_variant", h.variable("my_var"))
+	h.expectPending(1)
+}
+
+func TestHoldout_SetUnitEvictsWhateverTheHoldoutsDeclareAsUnitType(t *testing.T) {
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{
+		hoHoldout(11, "holdout_11", "type_x", hoSeedBHi, hoSeedBLo),
+		hoHoldout(12, "holdout_12", "type_y", hoSeedBHi, hoSeedBLo),
+		hoHoldout(13, "holdout_13", "user_id", hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_multi_unit_types", "user_id", 2, 11, 12, 13)))
+	expectInt(t, 2, h.peek("exp_multi_unit_types"))
+	h.setUnit("user_id", hoUID)
+	expectInt(t, 2, h.treatment("exp_multi_unit_types"))
+	h.expectPending(4)
+}
+
+// Scenario 227 and H6: one holdout covering experiments of two unit types
+// keeps an arm, and an exposure, per unit type.
+func TestHoldout_OneHoldoutKeepsAnArmPerUnitType(t *testing.T) {
+	var h = hoCreate(t, map[string]string{"user_id": hoUID, hoUnitType: hoUID}, hoData(
+		[]jsonmodels.Holdout{hoHoldout(11, "holdout_shared", "user_id", hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_unit_a1", "user_id", 0, 11), hoExperiment(2, "exp_unit_b", hoUnitType, 0, 11),
+		hoExperiment(3, "exp_unit_a2", "user_id", 0, 11)))
+	expectInt(t, hoNormalVariant, h.treatment("exp_unit_a1"))
+	expectInt(t, hoNormalVariant, h.treatment("exp_unit_b"))
+	expectInt(t, hoNormalVariant, h.treatment("exp_unit_a2"))
+	h.expectPublished(hoOwn("user_id", 1, "exp_unit_a1", hoNormalVariant), hoExposure("user_id", 11, "holdout_shared", 1),
+		hoOwn(hoUnitType, 2, "exp_unit_b", hoNormalVariant), hoExposure(hoUnitType, 11, "holdout_shared", 1),
+		hoOwn("user_id", 3, "exp_unit_a2", hoNormalVariant))
+}
+
+func TestHoldout_SetUnitBeforeAnyAssignmentIsHarmless(t *testing.T) {
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_a", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_no_prior_assignment", hoUnitType, 0, 11)))
+	h.setUnit(hoUnitType, hoUID)
+	expectInt(t, hoNormalVariant, h.treatment("exp_no_prior_assignment"))
+}
+
+func TestHoldout_SetUnitTwiceWithTheSameUidIsANoOp(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_a", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_set_unit_twice", hoUnitType, 0, 11)))
+	expectInt(t, hoNormalVariant, h.treatment("exp_set_unit_twice"))
+	h.expectPending(2)
+	h.setUnit(hoUnitType, hoUID)
+	expectInt(t, hoNormalVariant, h.treatment("exp_set_unit_twice"))
+	h.expectPending(2)
+}
+
+// Only assignments with a missing arm are evicted. A fully resolved one
+// survives a redundant setUnit: a same-iteration split edit, which would give
+// a different variant if it were re-resolved, shows it was kept.
+func TestHoldout_RedundantSetUnitKeepsAFullyResolvedAssignment(t *testing.T) {
+	var holdout = hoHoldout(11, "holdout_a", hoUnitType, hoSeedBHi, hoSeedBLo)
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{holdout}, hoExperiment(1, "exp_redundant", hoUnitType, 0, 11)))
+	expectInt(t, hoNormalVariant, h.peek("exp_redundant"))
+	var refreshed = hoExperiment(1, "exp_redundant", hoUnitType, 0, 11)
+	refreshed.Split = []float64{1, 0}
+	h.refresh(hoData([]jsonmodels.Holdout{holdout}, refreshed))
+	h.setUnit(hoUnitType, hoUID)
+	expectInt(t, hoNormalVariant, h.treatment("exp_redundant"))
+	h.expectPublished(hoOwn(hoUnitType, 1, "exp_redundant", hoNormalVariant), hoExposure(hoUnitType, 11, "holdout_a", 1))
+}
+
+func TestHoldout_PeekVariableThenSetUnitRecomputesUnderALateHoldingArm(t *testing.T) {
+	var experiment = hoExperiment(1, "exp_var_late", "user_id", 1, 11)
+	experiment.Variants[1].Config = `{"my_var":"value_from_variant"}`
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_var_late", "user_id", hoSeedAHi, hoSeedALo)}, experiment))
+	expectValue(t, "value_from_variant", h.peekVariable("my_var"))
+	h.expectPending(0)
+	h.setUnit("user_id", hoUID)
+	expectValue(t, "default", h.variable("my_var"))
+	h.expectPublished(hoExposure("user_id", 11, "holdout_var_late", 0))
+}
+
+// An override resolved without the unit pins a missing arm too (the JS SDK
+// resolves holdouts for overrides as well), so setUnit re-resolves it while
+// it is unexposed and the holdout exposure fires with the unit.
+func TestHoldout_SetUnitResolvesTheHoldoutOfAnUnexposedOverride(t *testing.T) {
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_override_late", "user_id", hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_override_late_unit", "user_id", 0, 11)), hoOverride("exp_override_late_unit", 3))
+	expectInt(t, 3, h.peek("exp_override_late_unit"))
+	h.setUnit("user_id", hoUID)
+	expectInt(t, 3, h.treatment("exp_override_late_unit"))
+	h.expectPending(2)
+	var own = hoOwn("user_id", 1, "exp_override_late_unit", 3)
+	own.Assigned = false
+	own.Overridden = true
+	h.expectPublished(own, hoExposure("user_id", 11, "holdout_override_late", 1))
+}
+
+func TestHoldout_SetUnitLetsACustomAssignmentApply(t *testing.T) {
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_custom_late", "user_id", hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_custom_late_unit", "user_id", 0, 11)), hoCustom("exp_custom_late_unit", 3))
+	expectInt(t, 0, h.peek("exp_custom_late_unit"))
+	h.setUnit("user_id", hoUID)
+	expectInt(t, 3, h.treatment("exp_custom_late_unit"))
+	var own = hoOwn("user_id", 1, "exp_custom_late_unit", 3)
+	own.Custom = true
+	h.expectPublished(own, hoExposure("user_id", 11, "holdout_custom_late", 1))
+}
+
+// Cross-SDK parity vectors from the Java SDK, which pins them against the
+// collector's verdicts: unicode units, seeds with both sign bits set, the 1%
+// and 10% boundaries, and a unit held out by two holdouts.
+
+const hoVerdictUnitType = "verdict_unit_type"
+
+func hoVerdictContext(t *testing.T, uid string, holdouts ...jsonmodels.Holdout) *hoContext {
+	var ids []int
+	for _, holdout := range holdouts {
+		ids = append(ids, holdout.Id)
+	}
+	return hoCreate(t, map[string]string{hoVerdictUnitType: uid},
+		hoData(holdouts, hoExperiment(9, "verdict_vectors_experiment", hoVerdictUnitType, 0, ids...)))
+}
+
+func hoVerdictHoldout(id int, seedHi int, seedLo int, split ...float64) jsonmodels.Holdout {
+	var holdout = hoHoldout(id, "holdout_"+string(rune('0'+id/100))+string(rune('0'+id/10%10))+string(rune('0'+id%10)),
+		hoVerdictUnitType, seedHi, seedLo)
+	holdout.Split = split
+	return holdout
+}
+
+func hoExpectHeldOut(t *testing.T, h *hoContext, holdout jsonmodels.Holdout) {
+	t.Helper()
+	expectInt(t, 0, h.treatment("verdict_vectors_experiment"))
+	h.expectPublished(hoExposure(hoVerdictUnitType, holdout.Id, holdout.Name, 0))
+}
+
+func hoExpectNotHeldOut(t *testing.T, h *hoContext, holdout jsonmodels.Holdout) {
+	t.Helper()
+	h.treatment("verdict_vectors_experiment")
+	var exposures = queuedExposures(h.ctx)
+	if len(exposures) != 2 || exposures[1] != hoExposure(hoVerdictUnitType, holdout.Id, holdout.Name, 1) {
+		t.Fatalf("exposures %+v", exposures)
+	}
+}
+
+func TestHoldout_VerdictUnicodeUnits(t *testing.T) {
+	var holdout = hoVerdictHoldout(107, 0, 42, 0.1, 0.9)
+	hoExpectHeldOut(t, hoVerdictContext(t, "façade", holdout), holdout)
+	hoExpectNotHeldOut(t, hoVerdictContext(t, "unicode_emoji_\U0001F680_0", holdout), holdout)
+}
+
+func TestHoldout_VerdictSignedSeedHalves(t *testing.T) {
+	var seed int64 = -9223372034707292160
+	var holdout = hoVerdictHoldout(106, int(int32(seed>>32)), int(int32(seed)), 0.1, 0.9)
+	hoExpectHeldOut(t, hoVerdictContext(t, "signed_unit_4", holdout), holdout)
+	hoExpectNotHeldOut(t, hoVerdictContext(t, "signed_unit_b_1", holdout), holdout)
+}
+
+func TestHoldout_VerdictOnePercentBoundary(t *testing.T) {
+	var holdout = hoVerdictHoldout(105, 0, 999999, 0.01, 0.99)
+	hoExpectHeldOut(t, hoVerdictContext(t, "pct1_unit_188", holdout), holdout)
+	hoExpectNotHeldOut(t, hoVerdictContext(t, "pct1_unit_0", holdout), holdout)
+}
+
+func TestHoldout_VerdictTenPercentBoundary(t *testing.T) {
+	var holdout = hoVerdictHoldout(107, 0, 42, 0.1, 0.9)
+	hoExpectHeldOut(t, hoVerdictContext(t, "boundary_unit_175653", holdout), holdout)
+	hoExpectNotHeldOut(t, hoVerdictContext(t, "boundary_unit_75792", holdout), holdout)
+}
+
+func TestHoldout_VerdictHeldOutByTwoHoldouts(t *testing.T) {
+	var a, b = hoVerdictHoldout(107, 0, 42, 0.1, 0.9), hoVerdictHoldout(108, 0, 55, 0.1, 0.9)
+	var h = hoVerdictContext(t, "dual_holdout_unit_5", a, b)
+	expectInt(t, 0, h.treatment("verdict_vectors_experiment"))
+	h.expectPublished(hoExposure(hoVerdictUnitType, 107, "holdout_107", 0), hoExposure(hoVerdictUnitType, 108, "holdout_108", 0))
+}
+
+func TestHoldout_VariableReadFiresTheHoldoutForBothArms(t *testing.T) {
+	for _, c := range []struct {
+		uid     string
+		pending int
+	}{{hoUID, 1}, {hoUIDNotHeldOut, 2}} {
+		var experiment = hoExperiment(1, "exp_var", hoUnitType, 0, 11)
+		experiment.Variants[1].Config = `{"var_a":"value_a"}`
+		var h = hoCreateFor(t, c.uid, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+		expectValue(t, "default", h.variable("var_a"))
+		h.expectPending(c.pending)
+	}
+}
+
+func TestHoldout_SharedKeySkipsTheSuppressedExperimentForAnAssignedOne(t *testing.T) {
+	var suppressed = hoExperiment(1, "exp_var_key_suppressed", hoUnitType, 0, 11)
+	suppressed.Variants[1].Config = `{"shared":"from_suppressed"}`
+	var assigned = hoExperiment(2, "exp_var_key_assigned", hoUnitType, 0)
+	assigned.Variants[1].Config = `{"shared":"from_assigned"}`
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, suppressed, assigned))
+	expectValue(t, "from_assigned", h.variable("shared"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0), hoOwn(hoUnitType, 2, "exp_var_key_assigned", hoNormalVariant))
+}
+
+func TestHoldout_PeekVariableFiresNothing(t *testing.T) {
+	var suppressed = hoExperiment(1, "exp_suppressed", hoUnitType, 0, 11)
+	suppressed.Variants[1].Config = `{"shared_peek":"from_suppressed"}`
+	var assigned = hoExperiment(2, "exp_assigned", hoUnitType, 0)
+	assigned.Variants[1].Config = `{"shared_peek":"from_assigned"}`
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, suppressed, assigned))
+	expectValue(t, "from_assigned", h.peekVariable("shared_peek"))
+	h.expectPending(0)
+}
+
+// A panicking logger is contained, and the sibling holdout still publishes.
+func TestHoldout_PanickingLoggerDoesNotLoseASiblingHoldoutExposure(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA(),
+		hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_throwing_logger", hoUnitType, 0, 11, 12)))
+	h.logger.onEvent = func(event EventType, data interface{}) {
+		if exposure, ok := data.(jsonmodels.Exposure); ok && exposure.Id == 11 {
+			panic("boom")
+		}
+	}
+	expectInt(t, 0, h.treatment("exp_throwing_logger"))
+	h.expectPending(2)
+}
+
+func TestHoldout_PanickingLoggerDoesNotMakeExposuresRetryable(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_terminal", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_terminal", hoUnitType, 0, 11)))
+	h.logger.onEvent = func(event EventType, data interface{}) {
+		if exposure, ok := data.(jsonmodels.Exposure); ok && exposure.Id == 1 {
+			panic("boom")
+		}
+	}
+	h.treatment("exp_terminal")
+	h.logger.onEvent = nil
+	expectInt(t, hoNormalVariant, h.treatment("exp_terminal"))
+	h.expectPublished(hoOwn(hoUnitType, 1, "exp_terminal", hoNormalVariant), hoExposure(hoUnitType, 11, "holdout_terminal", 1))
+}
+
+func (h *hoContext) flushScheduled() bool {
+	h.ctx.TimeoutLock_.Lock()
+	defer h.ctx.TimeoutLock_.Unlock()
+	return h.ctx.Timeout_ != nil
+}
+
+// The suppressed experiment queues nothing of its own, so the holdout
+// exposure alone must schedule the flush, even when the logger panics.
+func TestHoldout_HoldoutOnlyExposureSchedulesTheFlush(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+		hoExperiment(1, "exp_stranded_flush", hoUnitType, 0, 11)), hoPublishDelay(3_600_000))
+	h.logger.onEvent = func(event EventType, data interface{}) {
+		if event == Exposure {
+			panic("boom")
+		}
+	}
+	expectInt(t, 0, h.treatment("exp_stranded_flush"))
+	h.expectPending(1)
+	if !h.flushScheduled() {
+		t.Fatal("no flush scheduled")
+	}
+}
+
+func TestHoldout_MalformedHoldoutEntriesAreIgnored(t *testing.T) {
+	for _, holdouts := range []string{`[null]`, `[{"id":11,"name":"holdout_null_split","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":null}]`,
+		`[{"id":11,"name":"holdout_empty_split","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":[]}]`,
+		`[{"id":11,"name":"holdout_no_split","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111}]`,
+		`[5, "x", [1], {"id":"11","split":[0.1,0.9]}]`, `{"id":11}`, `"x"`, `null`} {
+		var payload = `{"experiments":[{"id":1,"name":"exp_malformed","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
+			"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"fullOnVariant":0,
+			"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],"holdouts":` + holdouts + `}`
+		var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
+		if err != nil {
+			t.Fatalf("%s: %v", holdouts, err)
+		}
+		var h = hoCreateFor(t, hoUID, data)
+		expectInt(t, hoNormalVariant, h.treatment("exp_malformed"))
+		h.expectPublished(hoOwn(hoUnitType, 1, "exp_malformed", hoNormalVariant))
+	}
+}
+
+func TestHoldout_EmptyOrMissingSplitIsIgnored(t *testing.T) {
+	for _, split := range [][]float64{nil, {}} {
+		var holdout = hoHoldoutA()
+		holdout.Split = split
+		var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{holdout}, hoExperiment(1, "exp_split", hoUnitType, 0, 11)))
+		expectInt(t, hoNormalVariant, h.treatment("exp_split"))
+		h.expectPublished(hoOwn(hoUnitType, 1, "exp_split", hoNormalVariant))
+	}
+}
+
+// A holdout definition from before a refresh never replaces the arm drawn
+// from the installed, newer one.
+func TestHoldout_StaleHoldoutNeverReplacesANewerArm(t *testing.T) {
+	var it1 = hoHoldout(11, "holdout_h", hoUnitType, hoSeedAHi, hoSeedALo)
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{it1}, hoExperiment(1, "exp_f", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp_f"))
+	h.expectPending(1)
+	var it2 = hoHoldout(11, "holdout_h", hoUnitType, hoSeedBHi, hoSeedBLo)
+	it2.Iteration = 2
+	h.refresh(hoData([]jsonmodels.Holdout{it2}, hoExperiment(1, "exp_f", hoUnitType, 0, 11), hoExperiment(2, "exp_g", hoUnitType, 0, 11)))
+	expectInt(t, hoNormalVariant, h.treatment("exp_g"))
+	h.expectPending(3)
+
+	h.ctx.ContextLock_.Lock()
+	var arm = h.ctx.holdoutArm(&it1, hoUnitType)
+	h.ctx.ContextLock_.Unlock()
+	if arm.assignment.Iteration != 2 || arm.assignment.Variant != 1 || !arm.assignment.Exposed.Load().(bool) {
+		t.Fatalf("stale holdout gave arm %+v", arm.assignment)
+	}
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_h", 0), hoOwn(hoUnitType, 2, "exp_g", hoNormalVariant),
+		hoExposure(hoUnitType, 11, "holdout_h", 1))
+}
+
+// Scenario 225: coverage added by a refresh re-resolves an exposed
+// override, so the new holdout fires (and, as for any re-resolved
+// assignment, the override's exposure too).
+func TestHoldout_CoverageAddedByRefreshFiresForAnOverriddenExperiment(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp_override_late_holdout", hoUnitType, 0)),
+		hoOverride("exp_override_late_holdout", 3))
+	expectInt(t, 3, h.treatment("exp_override_late_holdout"))
+	h.expectPending(1)
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_late", hoUnitType, hoSeedAHi, hoSeedALo)},
+		hoExperiment(1, "exp_override_late_holdout", hoUnitType, 0, 11)))
+	expectInt(t, 3, h.treatment("exp_override_late_holdout"))
+	h.expectPending(3)
+	var own = hoOwn(hoUnitType, 1, "exp_override_late_holdout", 3)
+	own.Assigned = false
+	own.Overridden = true
+	h.expectPublished(own, own, hoExposure(hoUnitType, 11, "holdout_late", 0))
+}
+
+func TestHoldout_CoverageRemovedByRefreshReResolves(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp_uncovered", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp_uncovered"))
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp_uncovered", hoUnitType, 0)))
+	expectInt(t, hoNormalVariant, h.treatment("exp_uncovered"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0), hoOwn(hoUnitType, 1, "exp_uncovered", hoNormalVariant))
+}
+
+func TestHoldout_VariablePathHoldoutExposureSchedulesTheFlush(t *testing.T) {
+	var suppressed = hoExperiment(1, "exp_var_flush_suppressed", hoUnitType, 0, 11)
+	suppressed.Variants[1].Config = `{"flush_key":"from_suppressed"}`
+	var assigned = hoExperiment(2, "exp_var_flush_assigned", hoUnitType, 0)
+	assigned.Variants[1].Config = `{"flush_key":"from_assigned"}`
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, suppressed, assigned), hoPublishDelay(3_600_000))
+	h.treatment("exp_var_flush_assigned")
+	h.ctx.ClearTimeout()
+	expectValue(t, "from_assigned", h.variable("flush_key"))
+	h.expectPending(2)
+	if !h.flushScheduled() {
+		t.Fatal("no flush scheduled")
+	}
+}
+
+func TestHoldout_SetDataDoesNotModifyTheCallersData(t *testing.T) {
+	var ids = []int{12, 11}
+	var holdouts = []jsonmodels.Holdout{hoHoldoutA()}
+	var covered = hoExperiment(1, "exp_no_mutate_in", hoUnitType, 0)
+	covered.HoldoutIds = ids
+	var h = hoCreateFor(t, hoUID, hoData(holdouts, covered, hoExperiment(2, "exp_no_mutate_not_covered", hoUnitType, 0)))
+	expectInt(t, 0, h.treatment("exp_no_mutate_in"))
+	expectInt(t, hoNormalVariant, h.treatment("exp_no_mutate_not_covered"))
+	expectValue(t, []int{12, 11}, ids)
+	// Reusing the slice after it was installed does not move the pinned arm.
+	holdouts[0].Iteration = 5
+	holdouts[0].Id = 99
+	expectInt(t, 0, h.treatment("exp_no_mutate_in"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0), hoOwn(hoUnitType, 2, "exp_no_mutate_not_covered", hoNormalVariant))
+}
+
+const hoUSRule = `{"rules":[{"name":"US Internal Users","type":"assign","conditions":{"and":[{"eq":[{"var":"country"},{"value":"US"}]}]},"environments":[],"variant":1}]}`
+
+// Scenario 305: a matching assignment rule wins over holdout suppression, and
+// the holdout still publishes.
+func TestHoldout_MatchingAssignRuleWinsOverSuppression(t *testing.T) {
+	var experiment = hoExperiment(1, "exp_holdout_rules", hoUnitType, 0, 11)
+	experiment.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_rules", hoUnitType, hoSeedAHi, hoSeedALo)}, experiment))
+	h.setAttribute("country", "US")
+	expectInt(t, 1, h.treatment("exp_holdout_rules"))
+	var own = hoOwn(hoUnitType, 1, "exp_holdout_rules", 1)
+	own.Assigned = false
+	own.RuleOverride = true
+	var event = h.expectPublished(own, hoExposure(hoUnitType, 11, "holdout_rules", 0))
+	expectValue(t, []jsonmodels.Attribute{{Name: "country", Value: "US", SetAt: hoMillis}}, event.Attributes)
+}
+
+func TestHoldout_MatchingSplitRuleWinsOverSuppression(t *testing.T) {
+	var experiment = hoExperiment(1, "exp_holdout_split_rule", hoUnitType, 0, 11)
+	experiment.AssignmentRules = `{"rules":[{"name":"Everyone","type":"split","conditions":null,"environments":[],"percentages":"0/100"}]}`
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+	expectInt(t, 1, h.peek("exp_holdout_split_rule"))
+	expectInt(t, 1, h.treatment("exp_holdout_split_rule"))
+	h.expectPending(2)
+}
+
+func TestHoldout_HeldOutUnitIsSuppressedUntilTheRuleMatches(t *testing.T) {
+	var experiment = hoExperiment(1, "exp_holdout_rules", hoUnitType, 0, 11)
+	experiment.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+	h.setAttribute("country", "GB")
+	expectInt(t, 0, h.treatment("exp_holdout_rules"))
+	h.expectPending(1)
+	h.setAttribute("country", "US")
+	expectInt(t, 1, h.treatment("exp_holdout_rules"))
+	h.expectPending(2)
+}
+
+func TestHoldout_HeldOutUnitIsSuppressedAgainWhenTheRuleStopsMatching(t *testing.T) {
+	var experiment = hoExperiment(1, "exp_holdout_rules", hoUnitType, 0, 11)
+	experiment.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+	h.setAttribute("country", "US")
+	expectInt(t, 1, h.treatment("exp_holdout_rules"))
+	h.expectPending(2)
+	h.setAttribute("country", "GB")
+	expectInt(t, 0, h.treatment("exp_holdout_rules"))
+	expectInt(t, 0, h.peek("exp_holdout_rules"))
+	h.expectPending(2)
+}
+
+func hoWithVariables(experiment jsonmodels.Experiment, key string) jsonmodels.Experiment {
+	experiment.Variants = []jsonmodels.ExperimentVariant{
+		{Name: "A", Config: `{"` + key + `":"control"}`}, {Name: "B", Config: `{"` + key + `":"treatment"}`}}
+	return experiment
+}
+
+func TestHoldout_VariableOfARuleWonHeldOutExperiment(t *testing.T) {
+	var experiment = hoWithVariables(hoExperiment(1, "exp_holdout_rules", hoUnitType, 0, 11), "color")
+	experiment.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_rules", hoUnitType, hoSeedAHi, hoSeedALo)}, experiment))
+	h.setAttribute("country", "US")
+	expectValue(t, "treatment", h.variable("color"))
+	var own = hoOwn(hoUnitType, 1, "exp_holdout_rules", 1)
+	own.Assigned = false
+	own.RuleOverride = true
+	h.expectPublished(own, hoExposure(hoUnitType, 11, "holdout_rules", 0))
+}
+
+func TestHoldout_SharedKeyPrefersARuleWinOverASuppressedExperiment(t *testing.T) {
+	var heldOut = hoWithVariables(hoExperiment(1, "exp_held_out", hoUnitType, 0, 11), "color")
+	var ruleWon = hoWithVariables(hoExperiment(2, "exp_rule_won", hoUnitType, 0, 11), "color")
+	ruleWon.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, heldOut, ruleWon))
+	h.setAttribute("country", "GB")
+	expectValue(t, "control", h.peekVariable("color"))
+	h.setAttribute("country", "US")
+	expectValue(t, "treatment", h.peekVariable("color"))
+}
+
+func TestHoldout_SharedKeyPrefersAnEarlierAssignedOverALaterRuleWin(t *testing.T) {
+	var assigned = hoWithVariables(hoExperiment(1, "exp_assigned", hoUnitType, 0), "color")
+	assigned.Split = []float64{1, 0}
+	var ruleWon = hoWithVariables(hoExperiment(2, "exp_rule_won", hoUnitType, 0), "color")
+	ruleWon.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{}, assigned, ruleWon))
+	h.setAttribute("country", "US")
+	expectValue(t, "control", h.peekVariable("color"))
+	expectInt(t, 1, h.peek("exp_rule_won"))
+}
+
+// Scenario 226: with no other winner, a suppressed experiment gives its
+// control value, not the caller's default.
+func TestHoldout_SuppressedVariableReturnsTheControlValue(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+		hoWithVariables(hoExperiment(1, "exp_suppressed", hoUnitType, 0, 11), "color")))
+	expectValue(t, "control", h.peekVariable("color"))
+	expectValue(t, "control", h.variable("color"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
+// The first suppressed candidate is the fallback even if it lacks the key, so
+// a later suppressed one cannot supply it (JS _resolveVariableValue).
+func TestHoldout_SuppressedFallbackIsTheFirstSuppressedCandidate(t *testing.T) {
+	var first = hoExperiment(1, "exp_first", hoUnitType, 0, 11)
+	first.Variants[0].Config = `{"other":"x"}`
+	first.Variants[1].Config = `{"color":"first"}`
+	var second = hoWithVariables(hoExperiment(2, "exp_second", hoUnitType, 0, 11), "color")
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, first, second))
+	expectValue(t, "default", h.peekVariable("color"))
+}
+
+// Scenario 223: publishing keeps the exposed state.
+func TestHoldout_ExposureStateSurvivesPublish(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.treatment("exp")
+	h.expectPublished(hoOwn(hoUnitType, 1, "exp", 0), hoExposure(hoUnitType, 11, "holdout_a", 1))
+	h.treatment("exp")
+	h.expectPending(0)
+}
+
+// H1: a holdout id listed twice is one holdout with one exposure.
+func TestHoldout_DuplicateHoldoutIdsPublishOnce(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA(),
+		hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp_dup", hoUnitType, 0, 12, 11, 12, 11)))
+	h.treatment("exp_dup")
+	h.expectPublished(hoOwn(hoUnitType, 1, "exp_dup", 0), hoExposure(hoUnitType, 11, "holdout_a", 1),
+		hoExposure(hoUnitType, 12, "holdout_b", 1))
+}
+
+// H4: peek on a covered experiment queues nothing.
+func TestHoldout_PeekQueuesNoHoldoutExposure(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.peek("exp"))
+	h.expectPending(0)
+}
+
+// H7: a strict audience mismatch on a covered experiment that is not held out
+// still fires the holdout.
+func TestHoldout_StrictAudienceMismatchStillFiresTheHoldout(t *testing.T) {
+	var experiment = hoExperiment(1, "exp_strict", hoUnitType, 0, 11)
+	experiment.AudienceStrict = true
+	experiment.Audience = hoAgeAudience
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+	h.setAttribute("age", 5)
+	expectInt(t, 0, h.treatment("exp_strict"))
+	var own = hoOwn(hoUnitType, 1, "exp_strict", 0)
+	own.Assigned = false
+	own.AudienceMismatch = true
+	h.expectPublished(own, hoExposure(hoUnitType, 11, "holdout_a", 1))
+}
+
+// H8: the first candidate is suppressed and the second assigned: the
+// assigned one wins and both holdouts fire.
+func TestHoldout_SharedKeyFiresTheHoldoutsOfEveryCandidate(t *testing.T) {
+	var suppressed = hoWithVariables(hoExperiment(1, "exp_suppressed", hoUnitType, 0, 11), "color")
+	var assigned = hoWithVariables(hoExperiment(2, "exp_assigned", hoUnitType, 0, 12), "color")
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA(),
+		hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)}, suppressed, assigned))
+	expectValue(t, "treatment", h.variable("color"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0), hoOwn(hoUnitType, 2, "exp_assigned", hoNormalVariant),
+		hoExposure(hoUnitType, 12, "holdout_b", 1))
+}
+
+// isHeldOutBy truth table: arm 0 always holds out; arm 1 holds out only in a
+// three-arm holdout and only experiments that are not full-on.
+func TestHoldout_IsHeldOutBy(t *testing.T) {
+	for _, c := range []struct {
+		variant, arms, fullOn int
+		want                  bool
+	}{
+		{0, 2, 0, true}, {0, 2, 3, true}, {0, 3, 0, true}, {0, 3, 2, true},
+		{1, 2, 0, false}, {1, 2, 2, false}, {1, 3, 0, true}, {1, 3, 2, false},
+		{2, 3, 0, false}, {2, 3, 2, false}, {1, 4, 0, false}, {1, 1, 0, false}, {3, 4, 0, false},
+	} {
+		if got := isHeldOutBy(c.variant, c.arms, c.fullOn); got != c.want {
+			t.Errorf("isHeldOutBy(%d, %d, %d) = %v, want %v", c.variant, c.arms, c.fullOn, got, c.want)
+		}
+	}
+}
+
+// The arity comes from the split, never from holdoutType (scenario 222): a
+// three-value split with holdoutType "full", or none, is three-arm.
+func TestHoldout_ArityComesFromTheSplitNotTheHoldoutType(t *testing.T) {
+	for _, holdoutType := range []string{"", "full", "all_full_on", "future"} {
+		var holdout = hoThreeArm(21, "holdout_three_arm", hoThreeArm1Lo)
+		holdout.HoldoutType = holdoutType
+		var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{holdout},
+			hoExperiment(1, "exp_non_fullon", hoUnitType, 0, 21), hoExperiment(2, "exp_fullon", hoUnitType, 2, 21)))
+		expectInt(t, 0, h.treatment("exp_non_fullon"))
+		expectInt(t, 2, h.treatment("exp_fullon"))
+	}
+	// A two-value split labelled all_full_on is still two-arm: arm 1 assigns.
+	var two = hoHoldout(21, "holdout_two_arm", hoUnitType, hoSeedBHi, hoSeedBLo)
+	two.HoldoutType = "all_full_on"
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{two}, hoExperiment(1, "exp_non_fullon", hoUnitType, 0, 21)))
+	expectInt(t, hoNormalVariant, h.treatment("exp_non_fullon"))
+}
+
+// H5 / contracts §5: unknown keys inside holdout entries, and unknown
+// holdout-related fields elsewhere, are ignored by the default decoder, with
+// no error event.
+func TestHoldout_DefaultDecoderIgnoresUnknownHoldoutFields(t *testing.T) {
+	var payload = `{
+		"experiments":[
+			{"id":1,"name":"covered","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,"split":[0.5,0.5],
+			 "trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"fullOnVariant":0,
+			 "variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11,"12",null,{"id":13},1.5],"holdoutFuture":{"x":[1]}},
+			{"id":2,"name":"other","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,"split":[0.5,0.5],
+			 "trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"fullOnVariant":0,
+			 "variants":[{"name":"A"},{"name":"B"}],"holdoutIds":"11"}
+		],
+		"holdouts":[
+			{"id":11,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":[0.1,0.9],
+			 "holdoutType":"full","futureScalar":1,"futureObject":{"a":[1,{"b":2}]},"futureArray":[{"x":1}],
+			 "trafficSplit":[0,1],"variants":[{"name":"A","futureField":1}],"switchbackClusters":{"a":"b"}},
+			{"id":12,"name":"holdout_unknown_type","iteration":1,"seedHi":1,"seedLo":222,"split":[0.1,0.9],"holdoutType":"future_kind"}
+		],
+		"futureHoldoutRoot":{"nested":[1]}
+	}`
+	var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectValue(t, []int{11}, data.Experiments[0].HoldoutIds)
+	expectValue(t, []int(nil), data.Experiments[1].HoldoutIds)
+	expectInt(t, 2, len(data.Holdouts))
+	var errors []interface{}
+	var h = hoCreateFor(t, hoUID, data)
+	h.logger.onEvent = func(event EventType, data interface{}) {
+		if event == Error {
+			errors = append(errors, data)
+		}
+	}
+	expectInt(t, 0, h.treatment("covered"))
+	expectInt(t, hoNormalVariant, h.treatment("other"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0), hoOwn(hoUnitType, 2, "other", hoNormalVariant))
+	expectInt(t, 0, len(errors))
+}
+
+// Holdout models round-trip with encoding/json, and a ContextData without
+// holdouts marshals exactly as before (no new keys).
+func TestHoldout_ModelJSON(t *testing.T) {
+	var raw, _ = json.Marshal(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{}})
+	expectValue(t, `{"experiments":[]}`, string(raw))
+	raw, _ = json.Marshal(jsonmodels.Experiment{Id: 1})
+	var fields map[string]interface{}
+	_ = json.Unmarshal(raw, &fields)
+	if _, found := fields["holdoutIds"]; found {
+		t.Fatalf("holdoutIds marshalled when empty: %s", raw)
+	}
+	var data jsonmodels.ContextData
+	if err := json.Unmarshal([]byte(`{"holdouts":[{"id":3,"name":"h","unitType":"u","iteration":2,"seedHi":1,"seedLo":2,"split":[0.5,0.5],"holdoutType":"full","x":1}],"experiments":[{"id":1,"holdoutIds":[3]}]}`), &data); err != nil {
+		t.Fatal(err)
+	}
+	expectValue(t, []jsonmodels.Holdout{{Id: 3, Name: "h", UnitType: "u", Iteration: 2, SeedHi: 1, SeedLo: 2,
+		Split: []float64{0.5, 0.5}, HoldoutType: "full"}}, data.Holdouts)
+	expectValue(t, []int{3}, data.Experiments[0].HoldoutIds)
+}

@@ -209,6 +209,11 @@ type cachedAssignment struct {
 	// experiment's unit was not set, so the variant is the experiment's
 	// no-unit result rather than a hash of the unit.
 	ruleMissingUnit bool
+	// holdouts are the holdout decisions the assignment was resolved with,
+	// nil when no holdout covers the experiment. Never modified once the
+	// entry is installed. It lives here rather than on the public
+	// Assignment, so that struct keeps its layout.
+	holdouts *assignmentHoldouts
 }
 
 type loggerGoroutines struct {
@@ -271,16 +276,14 @@ type Assignment struct {
 	Variables    map[string]interface{}
 	Exposed      *atomic.Value
 	AttrsSeq     int32
-
-	holdouts *assignmentHoldouts
 }
 
 // suppressed reports whether a holdout holds the unit out of the experiment
 // and neither an override nor an assignment rule chose the variant. A
 // suppressed assignment gets control, is not assigned, and publishes no
 // exposure of its own; its holdouts' exposures still fire.
-func (a *Assignment) suppressed() bool {
-	return a.holdouts != nil && a.holdouts.suppressed
+func (h *assignmentHoldouts) isSuppressed() bool {
+	return h != nil && h.suppressed
 }
 
 // isHeldOutBy reports whether a holdout arm holds a covered experiment out:
@@ -724,8 +727,8 @@ func (c *Context) evictAssignmentsMissingUnit(unitType string) {
 			continue
 		}
 		var missing = assignment.RuleOverride && entry.ruleMissingUnit
-		if !missing && assignment.holdouts != nil {
-			for _, arm := range assignment.holdouts.arms {
+		if !missing && entry.holdouts != nil {
+			for _, arm := range entry.holdouts.arms {
 				if arm == nil {
 					missing = true
 					break
@@ -892,12 +895,12 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	var assignment = c.GetAssignment(experimentName)
-	if !assignment.Exposed.Load().(bool) {
-		c.QueueExposure(assignment)
+	var entry = c.getAssignment(experimentName)
+	if !entry.assignment.Exposed.Load().(bool) {
+		c.queueExposure(entry.assignment, entry.holdouts)
 	}
 
-	return assignment.Variant, nil
+	return entry.assignment.Variant, nil
 }
 
 // QueueExposure queues the assignment's exposure once, then the exposures of
@@ -905,11 +908,22 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 // suppressed assignment queues only its holdouts' exposures.
 func (c *Context) QueueExposure(assignment *Assignment) {
 	c = c.live()
+	var holdouts *assignmentHoldouts
+	c.ContextLock_.RLock()
+	if entry, found := c.assignmentCache_[assignment.Name]; found && entry.assignment == assignment {
+		holdouts = entry.holdouts
+	}
+	c.ContextLock_.RUnlock()
+	c.queueExposure(assignment, holdouts)
+}
+
+func (c *Context) queueExposure(assignment *Assignment, holdouts *assignmentHoldouts) {
+	c = c.live()
 	if assignment.Exposed.CompareAndSwap(false, true) {
-		if !assignment.suppressed() && !c.enqueueExposure(assignment) {
+		if !holdouts.isSuppressed() && !c.enqueueExposure(assignment) {
 			return
 		}
-		if assignment.holdouts != nil && !c.queueHoldoutExposures(assignment.holdouts) && assignment.suppressed() {
+		if holdouts != nil && !c.queueHoldoutExposures(holdouts) && holdouts.isSuppressed() {
 			// Nothing was queued for it, so the next read has to try again.
 			assignment.Exposed.Store(false)
 		}
@@ -1128,19 +1142,20 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 
 	var suppressedFallback map[string]interface{}
 	for _, experiment := range experiments {
-		var assignment = c.GetAssignment(experiment.Data.Name)
+		var entry = c.getAssignment(experiment.Data.Name)
+		var assignment = entry.assignment
 		if assignment.Variables == nil {
 			continue
 		}
 
 		if expose && !assignment.Exposed.Load().(bool) {
-			c.QueueExposure(assignment)
+			c.queueExposure(assignment, entry.holdouts)
 		}
 
 		if value, exist := assignment.Variables[key]; exist && (assignment.Assigned || assignment.Overridden || assignment.RuleOverride) {
 			return value, nil
 		}
-		if suppressedFallback == nil && assignment.suppressed() {
+		if suppressedFallback == nil && entry.holdouts.isSuppressed() {
 			suppressedFallback = assignment.Variables
 		}
 	}
@@ -1503,7 +1518,7 @@ func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignmen
 	}
 
 	if ofound {
-		if assignment.Overridden && assignment.Variant == override.(int) && holdoutSetMatches(holdouts, assignment.holdouts) {
+		if assignment.Overridden && assignment.Variant == override.(int) && holdoutSetMatches(holdouts, entry.holdouts) {
 			return entry, rules, assignmentValid
 		}
 	} else if !efound {
@@ -1513,17 +1528,17 @@ func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignmen
 		if !assignment.Assigned && !assignment.RuleOverride {
 			return entry, rules, assignmentValid
 		}
-	} else if assignment.RuleOverride || assignment.suppressed() || !cfound || custom.(int) == assignment.Variant {
+	} else if assignment.RuleOverride || entry.holdouts.isSuppressed() || !cfound || custom.(int) == assignment.Variant {
 		// A matching rule wins over a custom assignment, and a holdout
 		// suppression forces control, so a custom assignment that differs
 		// from either variant is not staleness.
-		if !c.ExperimentMatches(experiment.Data, *assignment) || !holdoutSetMatches(holdouts, assignment.holdouts) {
+		if !c.ExperimentMatches(experiment.Data, *assignment) || !holdoutSetMatches(holdouts, entry.holdouts) {
 			return entry, rules, assignmentStale
 		}
 		if rules == entry.rules && atomic.LoadInt32(&c.AttrsSeq_) <= entry.attrsSeq {
 			return entry, rules, assignmentValid
 		}
-		if c.ruleMatches(experiment.Data, rules, entry) && c.audienceMatches(experiment.Data, assignment) {
+		if c.ruleMatches(experiment.Data, rules, entry) && c.audienceMatches(experiment.Data, entry) {
 			return entry, rules, assignmentRevalidated
 		}
 	}
@@ -1555,8 +1570,9 @@ func (c *Context) ruleMatches(data jsonmodels.Experiment, rules *experimentRules
 // audienceMatches reports whether the audience still gives the cached
 // assignment's audienceMismatch. A rule-won or holdout-suppressed assignment
 // never evaluated the audience, as in the JS SDK, so it skips it.
-func (c *Context) audienceMatches(data jsonmodels.Experiment, assignment *Assignment) bool {
-	if assignment.RuleOverride || assignment.suppressed() || len(data.Audience) == 0 {
+func (c *Context) audienceMatches(data jsonmodels.Experiment, entry *cachedAssignment) bool {
+	var assignment = entry.assignment
+	if assignment.RuleOverride || entry.holdouts.isSuppressed() || len(data.Audience) == 0 {
 		return true
 	}
 	var match, err = c.AudienceMatcher_.Evaluate(data.Audience, c.evaluationAttributes())
@@ -1645,12 +1661,16 @@ func (c *Context) keepExposedRuleAssignment(data jsonmodels.Experiment, previous
 }
 
 func (c *Context) GetAssignment(experimentName string) *Assignment {
+	return c.getAssignment(experimentName).assignment
+}
+
+func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 	// A valid cached assignment only needs the read lock, so concurrent reads
 	// of a shared context do not serialise.
 	c.ContextLock_.RLock()
 	if entry, _, state := c.validCachedAssignment(experimentName); state == assignmentValid {
 		c.ContextLock_.RUnlock()
-		return entry.assignment
+		return entry
 	}
 	c.ContextLock_.RUnlock()
 
@@ -1661,7 +1681,7 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 	var previous, validated, state = c.validCachedAssignment(experimentName)
 	if state == assignmentValid {
 		c.ContextLock_.Unlock()
-		return previous.assignment
+		return previous
 	}
 	if state == assignmentRevalidated {
 		// Still the same outcome: acknowledge the rules and attributes it was
@@ -1673,7 +1693,7 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 		previous.rules = validated
 		previous.attrsSeq = atomic.LoadInt32(&c.AttrsSeq_)
 		c.ContextLock_.Unlock()
-		return previous.assignment
+		return previous
 	}
 
 	var custom, cfound = c.Cassignments_[experimentName]
@@ -1696,7 +1716,7 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 	// Resolved for overrides and rule wins too: the holdouts' exposures fire
 	// whatever chose the variant.
 	if efound && len(indexed.holdouts) > 0 {
-		assignment.holdouts = c.resolveHoldouts(indexed.holdouts, experiment.Data)
+		entry.holdouts = c.resolveHoldouts(indexed.holdouts, experiment.Data)
 	}
 
 	if ofound {
@@ -1718,13 +1738,13 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 				assignment.Variant = rule.variant
 				assignment.RuleOverride = true
 				entry.ruleMissingUnit = rule.missingUnit
-			} else if assignment.holdouts != nil && assignment.holdouts.held {
+			} else if entry.holdouts != nil && entry.holdouts.held {
 				// Held out: control, not assigned, and the audience, traffic,
 				// full-on and custom assignments are skipped.
-				assignment.holdouts.suppressed = true
+				entry.holdouts.suppressed = true
 			}
 
-			if !assignment.RuleOverride && !assignment.suppressed() && len(experiment.Data.Audience) > 0 {
+			if !assignment.RuleOverride && !entry.holdouts.isSuppressed() && len(experiment.Data.Audience) > 0 {
 				var attrs = c.evaluationAttributes()
 
 				var match, err = c.AudienceMatcher_.Evaluate(experiment.Data.Audience, attrs)
@@ -1733,7 +1753,7 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 				}
 			}
 
-			if !assignment.RuleOverride && !assignment.suppressed() {
+			if !assignment.RuleOverride && !entry.holdouts.isSuppressed() {
 				var assignBuf [12]int8
 				if experiment.Data.AudienceStrict && assignment.AudienceMismatch {
 					assignment.Variant = 0
@@ -1786,7 +1806,7 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 	c.assignmentCache_[experimentName] = entry
 	c.AssignmentCache[experimentName] = *assignment
 	c.ContextLock_.Unlock()
-	return assignment
+	return entry
 }
 
 // resolveHoldouts draws, or reuses, the unit's arm in each holdout covering
@@ -2010,11 +2030,14 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	var rules = map[string]*experimentRules{}
 	var holdoutsById map[int]*jsonmodels.Holdout
 	if len(data.Holdouts) > 0 {
-		holdoutsById = make(map[int]*jsonmodels.Holdout, len(data.Holdouts))
-		for i := range data.Holdouts {
+		// A copy, so assignments pin the holdouts as installed even if the
+		// caller reuses its slice.
+		var installed = append([]jsonmodels.Holdout(nil), data.Holdouts...)
+		holdoutsById = make(map[int]*jsonmodels.Holdout, len(installed))
+		for i := range installed {
 			// A holdout with no split cannot draw an arm, so it covers nothing.
-			if len(data.Holdouts[i].Split) > 0 {
-				holdoutsById[data.Holdouts[i].Id] = &data.Holdouts[i]
+			if len(installed[i].Split) > 0 {
+				holdoutsById[installed[i].Id] = &installed[i]
 			}
 		}
 	}
