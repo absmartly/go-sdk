@@ -112,6 +112,16 @@ func TestCompareObjects(t *testing.T) {
 	assert(nil, eval.Compare(reflect.ValueOf([]interface{}{1, 2}), reflect.ValueOf([]interface{}{3, 4})), t)
 }
 
+type uncomparable struct{ s []int }
+
+// Values of a struct type that holds a slice cannot be compared with ==;
+// Compare must say whether they are deeply equal, without panicking.
+func TestCompareUncomparableStructs(t *testing.T) {
+	var eval = eval.Evaluator{}
+	assert(nil, eval.Compare(reflect.ValueOf(uncomparable{[]int{1}}), reflect.ValueOf(uncomparable{[]int{2}})), t)
+	assert(0, eval.Compare(reflect.ValueOf(uncomparable{[]int{1}}), reflect.ValueOf(uncomparable{[]int{1}})), t)
+}
+
 func TestCompareNull(t *testing.T) {
 	var eval = eval.Evaluator{}
 	assert(0, eval.Compare(reflect.ValueOf(nil), reflect.ValueOf(nil)), t)

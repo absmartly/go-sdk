@@ -10,9 +10,8 @@ type VariableParser interface {
 // object, array, string, number, boolean or null.
 //
 // When the configured VariableParser implements this interface, Context uses it
-// for "json" custom fields and reports a returned error through the event
-// logger only when the field is read with GetCustomFieldValue. Other parsers use
-// Parse and store its map result.
+// for "json" custom fields and stores the value it returns. Other parsers use
+// Parse and store its map result, as in v1.1.1.
 type CustomFieldValueParser interface {
 	ParseCustomFieldValue(context Context, experimentName string, fieldName string, value string) (interface{}, error)
 }
