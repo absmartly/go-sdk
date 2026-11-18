@@ -73,7 +73,8 @@ func holdoutIds(raw json.RawMessage) []int {
 	return ids
 }
 
-// holdoutId decodes an integral JSON number that fits a holdout id.
+// holdoutId decodes an integral JSON number that fits an int: 10, 10.0 and
+// 1e1 are the same number, as in JavaScript.
 func holdoutId(raw json.RawMessage) (int, bool) {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || raw[0] == '"' {
@@ -94,17 +95,20 @@ func holdoutId(raw json.RawMessage) (int, bool) {
 	return int(value), true
 }
 
-// wireHoldout decodes a holdout with an id written as any integral number.
+// wireHoldout decodes a holdout with its integer fields written as any
+// integral JSON number, so a producer re-encoding 1 as 1.0 keeps the same
+// epoch and seeds. holdoutType and unitType are informational (the arity
+// comes from the split, the arm from the covered experiment's unit), so a
+// value of the wrong type drops only that field rather than the holdout, as
+// an unknown field would.
 type wireHoldout struct {
 	jsonmodels.Holdout
-	Id json.RawMessage `json:"id"`
-	// holdoutType and unitType are informational (the arity comes from the
-	// split, the arm from the covered experiment's unit), and iteration may
-	// be absent, so a value of the wrong type drops only that field rather
-	// than the holdout, as an unknown field would.
+	Id          json.RawMessage `json:"id"`
+	Iteration   json.RawMessage `json:"iteration"`
+	SeedHi      json.RawMessage `json:"seedHi"`
+	SeedLo      json.RawMessage `json:"seedLo"`
 	HoldoutType json.RawMessage `json:"holdoutType"`
 	UnitType    json.RawMessage `json:"unitType"`
-	Iteration   json.RawMessage `json:"iteration"`
 }
 
 // holdouts decodes the payload's holdouts, skipping entries that are not
@@ -125,9 +129,11 @@ func holdouts(raw json.RawMessage) []jsonmodels.Holdout {
 		}
 		if id, ok := holdoutId(holdout.Id); ok {
 			holdout.Holdout.Id = id
+			holdout.Holdout.Iteration, _ = holdoutId(holdout.Iteration)
+			holdout.Holdout.SeedHi, _ = holdoutId(holdout.SeedHi)
+			holdout.Holdout.SeedLo, _ = holdoutId(holdout.SeedLo)
 			_ = json.Unmarshal(holdout.HoldoutType, &holdout.Holdout.HoldoutType)
 			_ = json.Unmarshal(holdout.UnitType, &holdout.Holdout.UnitType)
-			_ = json.Unmarshal(holdout.Iteration, &holdout.Holdout.Iteration)
 			result = append(result, holdout.Holdout)
 		}
 	}

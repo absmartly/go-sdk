@@ -143,12 +143,12 @@ type Context struct {
 	// ContextLock_.
 	holdoutArms_ map[holdoutKey]*holdoutArm
 
-	// retiredExposures_ holds, per experiment, the exposure flags of the
-	// last replaced assignments that had holdouts or whose replacement has
-	// them, so a rejected exposure never reopens them. It keeps at most
-	// retiredExposureLimit per experiment. Created on first use; guarded by
-	// ContextLock_.
-	retiredExposures_ map[string][]*atomic.Value
+	// exposuresInFlight_ holds the exposure flags of the exposures being
+	// admitted right now, mapped to whether a replacement retired the
+	// assignment meanwhile, so a close rejecting the admission does not
+	// reopen it. Entries live only for the call; created on first use.
+	// Guarded by ContextLock_.
+	exposuresInFlight_ map[*atomic.Value]bool
 
 	// holdoutsSeen_ is set once any installed payload had holdouts and is
 	// never cleared: an assignment resolved then can still carry holdout
@@ -738,16 +738,7 @@ func (c *Context) evictAssignmentsMissingUnit(unitType string) {
 		if assignment.UnitType != unitType {
 			continue
 		}
-		var missing = assignment.RuleOverride && entry.ruleMissingUnit
-		if !missing && entry.holdouts != nil {
-			for _, arm := range entry.holdouts.arms {
-				if arm == nil {
-					missing = true
-					break
-				}
-			}
-		}
-		if missing && assignment.Exposed.CompareAndSwap(false, true) {
+		if entry.missingUnit() && assignment.Exposed.CompareAndSwap(false, true) {
 			delete(c.assignmentCache_, name)
 			delete(c.AssignmentCache, name)
 		}
@@ -935,14 +926,48 @@ func (c *Context) QueueExposure(assignment *Assignment) {
 
 func (c *Context) queueExposure(assignment *Assignment, holdouts *assignmentHoldouts) {
 	c = c.live()
-	if !assignment.Exposed.CompareAndSwap(false, true) {
-		return
+	if c.beginExposure(assignment) {
+		c.admitExposure(assignment, holdouts)
 	}
-	if holdouts == nil {
-		if !c.enqueueExposure(assignment) {
+}
+
+// beginExposure claims the assignment's exposure. Once the context has had
+// holdouts, the claim is registered as in flight, so a replacement landing
+// before admission can retire it.
+func (c *Context) beginExposure(assignment *Assignment) bool {
+	if !assignment.Exposed.CompareAndSwap(false, true) {
+		return false
+	}
+	if c.holdoutsSeen_ != nil && c.holdoutsSeen_.Load() {
+		c.ContextLock_.Lock()
+		if c.exposuresInFlight_ == nil {
+			c.exposuresInFlight_ = map[*atomic.Value]bool{}
+		}
+		c.exposuresInFlight_[assignment.Exposed] = false
+		c.ContextLock_.Unlock()
+	}
+	return true
+}
+
+// admitExposure queues an exposure claimed by beginExposure, or rolls the
+// claim back when a close rejects it, then ends the in-flight registration.
+func (c *Context) admitExposure(assignment *Assignment, holdouts *assignmentHoldouts) {
+	var admitted = c.admit(assignment, holdouts)
+	if !admitted || c.holdoutsSeen_ != nil && c.holdoutsSeen_.Load() {
+		c.ContextLock_.Lock()
+		if !admitted {
 			c.reopenExposure(assignment)
 		}
-		return
+		delete(c.exposuresInFlight_, assignment.Exposed)
+		c.ContextLock_.Unlock()
+	}
+}
+
+// admit queues the claimed exposures and reports false when a close
+// rejected them.
+func (c *Context) admit(assignment *Assignment, holdouts *assignmentHoldouts) bool {
+	if holdouts == nil {
+		return c.enqueueExposure(assignment)
 	}
 
 	// Admit the entire decision before any logger can close the context. Arm
@@ -951,8 +976,7 @@ func (c *Context) queueExposure(assignment *Assignment, holdouts *assignmentHold
 	c.EventLock_.Lock()
 	if c.CheckNotClosed() != nil {
 		c.EventLock_.Unlock()
-		c.reopenExposure(assignment)
-		return
+		return false
 	}
 	var exposures []jsonmodels.Exposure
 	if !holdouts.isSuppressed() {
@@ -972,41 +996,41 @@ func (c *Context) queueExposure(assignment *Assignment, holdouts *assignmentHold
 	if len(exposures) != 0 {
 		c.SetTimeout()
 	}
+	return true
 }
 
-// retiredExposureLimit bounds the retired exposure identities kept per
-// experiment. Only an assignment replaced while its exposure is in flight,
-// or still held by a caller, needs its identity; a handful covers several
-// refreshes landing during one exposure.
-const retiredExposureLimit = 8
-
-// reopenExposure rolls back a rejected admission unless that exact identity
-// was retired. A missing-unit decision must be recomputed if the unit arrived
-// while its admission was in flight.
+// reopenExposure rolls back a rejected admission unless a replacement
+// retired the assignment while it was in flight. A decision resolved without
+// its unit is resolved again instead if the unit arrived meanwhile. The
+// caller holds ContextLock_ for writing.
 func (c *Context) reopenExposure(assignment *Assignment) {
-	c.ContextLock_.Lock()
-	defer c.ContextLock_.Unlock()
-	for _, retired := range c.retiredExposures_[assignment.Name] {
-		if retired == assignment.Exposed {
+	if c.exposuresInFlight_[assignment.Exposed] {
+		return
+	}
+	if entry := c.assignmentCache_[assignment.Name]; entry != nil && entry.assignment.Exposed == assignment.Exposed {
+		if _, unitSet := c.Units_[assignment.UnitType]; unitSet && entry.missingUnit() {
+			delete(c.assignmentCache_, assignment.Name)
+			delete(c.AssignmentCache, assignment.Name)
 			return
 		}
 	}
-	if entry := c.assignmentCache_[assignment.Name]; entry != nil && entry.assignment.Exposed == assignment.Exposed {
-		if _, unitSet := c.Units_[assignment.UnitType]; unitSet {
-			missing := assignment.RuleOverride && entry.ruleMissingUnit
-			if entry.holdouts != nil {
-				for _, arm := range entry.holdouts.arms {
-					missing = missing || arm == nil
-				}
-			}
-			if missing {
-				delete(c.assignmentCache_, assignment.Name)
-				delete(c.AssignmentCache, assignment.Name)
-				return
+	assignment.Exposed.Store(false)
+}
+
+// missingUnit reports whether the assignment was resolved without its unit:
+// a split rule that matched without it, or a holdout arm it could not draw.
+func (e *cachedAssignment) missingUnit() bool {
+	if e.assignment.RuleOverride && e.ruleMissingUnit {
+		return true
+	}
+	if e.holdouts != nil {
+		for _, arm := range e.holdouts.arms {
+			if arm == nil {
+				return true
 			}
 		}
 	}
-	assignment.Exposed.Store(false)
+	return false
 }
 
 func (c *Context) exposureFor(assignment *Assignment) jsonmodels.Exposure {
@@ -1887,17 +1911,12 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 		c.keepExposedRuleAssignment(experiment.Data, previous, entry)
 	}
 	if previous != nil && (previous.holdouts != nil || entry.holdouts != nil) && previous.assignment.Exposed != assignment.Exposed {
-		if c.retiredExposures_ == nil {
-			c.retiredExposures_ = map[string][]*atomic.Value{}
-		}
-		var retired = append(c.retiredExposures_[experimentName], previous.assignment.Exposed)
-		if len(retired) > retiredExposureLimit {
-			retired = retired[len(retired)-retiredExposureLimit:]
-		}
-		c.retiredExposures_[experimentName] = retired
 		// Retire the replaced assignment, as eviction does: a caller still
 		// holding it must not publish a decision, or holdout arms, that the
-		// replacement has superseded.
+		// replacement has superseded, also when its admission is in flight.
+		if _, inFlight := c.exposuresInFlight_[previous.assignment.Exposed]; inFlight {
+			c.exposuresInFlight_[previous.assignment.Exposed] = true
+		}
 		previous.assignment.Exposed.CompareAndSwap(false, true)
 	}
 

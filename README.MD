@@ -563,7 +563,7 @@ them as the JavaScript SDK does.
 
 A unit keeps its arm until the holdout's iteration changes. Payloads without
 holdouts are served and published exactly as before, with no extra
-allocations.
+allocations on reads and exposures.
 
 `ContextData` gained a `Holdouts` field and `Experiment` a `HoldoutIds` field,
 so unkeyed (positional) literals of `jsonmodels.ContextData` must become keyed
