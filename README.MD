@@ -569,6 +569,52 @@ allocations.
 so unkeyed (positional) literals of `jsonmodels.ContextData` must become keyed
 (`jsonmodels.ContextData{Experiments: experiments}`), as for `Experiment`.
 
+### Switchback Experiments
+
+A switchback experiment randomizes over *clusters* and time rather than over
+units: every unit in the same cluster (for example a store's city) gets the
+same variant within a period, and the variant changes on a fixed time grid.
+The context payload marks it with `Experiment.RandomizationType ==
+"switchback"`; nothing needs to be configured. The SDK serves it as the
+collector and the other ABsmartly SDKs do (see the Java SDK's
+[`SWITCHBACK.md`](https://github.com/absmartly/java-sdk/blob/main/SWITCHBACK.md)
+for the full rules):
+
+- `Experiment.SwitchbackClusters` lists, in order, the unit types linked to
+  the experiment and the attribute path holding each one's cluster value
+  (`"city"`, `"geo/city"`, `"items/0/city"`). For each linked type in that
+  order, the context's unit of that type reads the attribute at its path. The
+  first unit that yields a value serves the experiment and the value is the
+  cluster. Set the cluster attributes with `SetAttribute` before reading the
+  treatment.
+- A cluster value is a non-empty string, used as-is, or a whole-number
+  integer, used as its decimal text. Every floating-point number (`3.0`
+  included), boolean, map, slice, empty string and `nil` gives no value. Go
+  keeps `3` and `3.0` apart: an `int` attribute is the integer `3`, a
+  `float64` is a float even when whole. Values from a JSON document should be
+  decoded with `json.Decoder.UseNumber`, so `json.Number("3")` keys a cluster
+  and `json.Number("3.0")` does not; plain `encoding/json` decodes every
+  number as a `float64`, which gives no value.
+- With no unit of a linked type set, the experiment does not apply. When no
+  unit yields a value, linked units disagree, or the value is not in
+  `Experiment.SwitchbackClusterValues`, the unit gets variant `0` and no
+  exposure is published; only an override (`SetOverride`) still applies.
+- Otherwise overrides, assignment rules, strict audiences, full-on, traffic
+  (on the serving unit) and custom assignments apply as for a unit
+  experiment, and the variant is drawn from the cluster value and the period
+  `floor((now - SwitchbackStartAt) / SwitchbackPeriodMs)`. Before the start,
+  or when the start is not hour aligned, the draw gives variant `0` with no
+  exposure. Holdouts never apply to a switchback experiment.
+- The exposure is published under the serving unit, once per period, and is
+  stamped with the time that chose its period. Its fields are the same as a
+  unit experiment's; the cluster attributes are published with their
+  timestamps as before.
+
+The cluster of a period is read once: a `SetAttribute` later in the same
+period takes effect from the next period. Payloads without switchback
+experiments are served and published exactly as before, with no extra
+allocations.
+
 ### Custom Assignments
 
 Sometimes it may be necessary to override the automatic selection of a
