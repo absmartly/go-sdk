@@ -167,10 +167,21 @@ func newContextState() *contextState {
 // protected by ContextLock_, and must be resolved before taking other locks.
 // It does not replace the caller's Clock_ or require process-lifetime storage.
 func (c *Context) state() *contextState {
-	if clock, ok := c.Clock_.(*contextClock); ok {
+	if clock := c.ownClock(); clock != nil {
 		return clock.state
 	}
 	return c.literalState()
+}
+
+// ownClock returns the context's state carrier, or nil when Clock_ holds none
+// or holds another context's (a caller assigned b.Clock_ = a.Clock_, which in
+// v1.1.1 only shared the clock). Copies and snapshots of a context share its
+// ContextLock_, so the lock tells the two apart.
+func (c *Context) ownClock() *contextClock {
+	if clock, ok := c.Clock_.(*contextClock); ok && clock.root != nil && clock.root.ContextLock_ == c.ContextLock_ {
+		return clock
+	}
+	return nil
 }
 
 // Keep the cold literal fallback out of state so the carrier lookup in the
@@ -213,8 +224,8 @@ func (c *Context) literalState() *contextState {
 }
 
 func (c *Context) isSnapshot() bool {
-	clock, ok := c.Clock_.(*contextClock)
-	return ok && clock.snapshot
+	var clock = c.ownClock()
+	return clock != nil && clock.snapshot
 }
 
 // ruleAssignmentIdentities remembers the rule flag of assignments handed to
@@ -603,11 +614,8 @@ func (c *Context) snapshot() Context {
 }
 
 func (c *Context) live() *Context {
-	if clock, ok := c.Clock_.(*contextClock); ok {
-		if clock.root != nil {
-			return clock.root
-		}
-		return c
+	if clock := c.ownClock(); clock != nil {
+		return clock.root
 	}
 	if c.ContextLock_ != nil {
 		return c.state().manualRoot
