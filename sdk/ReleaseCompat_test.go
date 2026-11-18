@@ -1,7 +1,6 @@
 package sdk
 
 import (
-	"encoding/json"
 	"testing"
 
 	"github.com/absmartly/go-sdk/sdk/future"
@@ -92,17 +91,43 @@ func TestFetchPathCreateContextInjectsSystemAttributes(t *testing.T) {
 	assertAny(true, expectExposures(t, ctx, 1)[0].RuleOverride, t)
 }
 
-// A payload that fails to decode returns what v1.1.1 returned: the partial
-// data and error of decoding it straight into jsonmodels.ContextData, even
-// when an experiment also has a non-string assignmentRules.
+// A payload that fails to decode returns what v1.1.1 returned: v1.1.1 had no
+// assignmentRules field, so it ignored a malformed one and reported the
+// first other invalid field. The expected texts and partial data were
+// measured against the published v1.1.1.
 func TestDeserializeErrorMatchesV111(t *testing.T) {
-	var payload = []byte(`{"experiments":[{"id":1,"name":"a","assignmentRules":5},{"id":"x","name":"b"}]}`)
-	var want jsonmodels.ContextData
-	var wantErr = json.Unmarshal(payload, &want)
-	if wantErr == nil {
-		t.Fatal("payload decoded without error")
+	var cases = []struct {
+		payload string
+		err     string
+		want    []jsonmodels.Experiment
+	}{
+		{`{"experiments":[{"id":1,"name":"a","assignmentRules":5},{"id":"x","name":"b"}]}`,
+			"json: cannot unmarshal string into Go struct field Experiment.experiments.id of type int",
+			[]jsonmodels.Experiment{{Id: 1, Name: "a"}, {Name: "b"}}},
+		{`{"experiments":[{"assignmentRules":5,"name":1,"id":"x"}]}`,
+			"json: cannot unmarshal number into Go struct field Experiment.experiments.name of type string",
+			[]jsonmodels.Experiment{{}}},
+		{`{"experiments":[{"id":1,"assignmentRules":{"a":1}},{"unitType":2}]}`,
+			"json: cannot unmarshal number into Go struct field Experiment.experiments.unitType of type string",
+			[]jsonmodels.Experiment{{Id: 1}, {}}},
 	}
-	var got, err = DefaultContextDataDeserializer{}.Deserialize(payload)
-	assertAny(wantErr.Error(), err.Error(), t)
-	assertAny(want, got, t)
+	for _, tc := range cases {
+		var got, err = DefaultContextDataDeserializer{}.Deserialize([]byte(tc.payload))
+		if err == nil {
+			t.Fatalf("%s decoded without error", tc.payload)
+		}
+		assertAny(tc.err, err.Error(), t)
+		assertAny(tc.want, got.Experiments, t)
+	}
+}
+
+// A payload whose only problem is a malformed assignmentRules decodes, with
+// that experiment's rules dropped.
+func TestDeserializeToleratesMalformedAssignmentRulesOnly(t *testing.T) {
+	var got, err = DefaultContextDataDeserializer{}.Deserialize(
+		[]byte(`{"experiments":[{"id":1,"name":"a","assignmentRules":{"a":1}},{"id":2,"name":"b","assignmentRules":"{\"rules\":[]}"}]}`))
+	assertAny(nil, err, t)
+	assertAny(2, len(got.Experiments), t)
+	assertAny("", got.Experiments[0].AssignmentRules, t)
+	assertAny(`{"rules":[]}`, got.Experiments[1].AssignmentRules, t)
 }

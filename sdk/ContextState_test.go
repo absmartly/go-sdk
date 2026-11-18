@@ -1,12 +1,14 @@
 package sdk
 
 import (
+	"errors"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/absmartly/go-sdk/sdk/future"
 	"github.com/absmartly/go-sdk/sdk/internal"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
@@ -232,4 +234,154 @@ func TestContextLiteralHonoursAssignmentCacheAndIndexVariables(t *testing.T) {
 	value, err := manual.PeekVariableValue("color", "none")
 	assertAny(nil, err, t)
 	assertAny("blue", value, t)
+}
+
+// reentrantDeserializer calls back into the context from inside an audience
+// evaluation, which runs while ContextLock_ is held.
+type reentrantDeserializer struct {
+	ctx *Context
+}
+
+func (d *reentrantDeserializer) Deserialize(bytes []byte, offset int, length int) (map[string]interface{}, error) {
+	if d.ctx != nil {
+		d.ctx.GetExperiment("exp_app")
+		_, _ = d.ctx.GetVariableExperiment("banner")
+	}
+	return DefaultAudienceDeserializer{}.Deserialize(bytes, offset, length)
+}
+
+// A deserializer that reads the context during an evaluation must not
+// deadlock after Clock_ is replaced, as it does not with the original clock.
+func TestReentrantDeserializerAfterClockReplacementDoesNotDeadlock(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		var deserializer = &reentrantDeserializer{}
+		var client = &systemAttrClient{application: "website", environment: "production"}
+		var abs = Create(ABsmartlyConfig{
+			Client_:               client,
+			ContextDataProvider_:  DefaultContextDataProvider{client_: client},
+			ContextEventHandler_:  DefaultContextEventHandler{client_: client},
+			AudienceDeserializer_: deserializer,
+		})
+		var config = CreateDefaultContextConfig()
+		config.Units_ = withUnit()
+		config.PublishDelay_ = -1
+		config.RefreshInterval_ = -1
+		var ctx = abs.CreateContextWith(config, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+			audienceExperiment("exp_app", appFilter, true)}})
+		ctx.WaitUntilReady()
+		if replace {
+			ctx.Clock_ = internal.FixedClock{Millis_: 1}
+		}
+		deserializer.ctx = ctx
+		var done = make(chan int, 1)
+		go func() {
+			var variant, _ = ctx.PeekTreatment("exp_app")
+			done <- variant
+		}()
+		select {
+		case variant := <-done:
+			assertAny(1, variant, t)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("PeekTreatment deadlocked (Clock_ replaced: %v)", replace)
+		}
+	}
+}
+
+// A literal context reads Index_ and IndexVariables_ as v1.1.1 did, including
+// entries replaced after the first read, with or without ContextLock_.
+func TestContextLiteralReadsCurrentLegacyIndexes(t *testing.T) {
+	var five = ExperimentVariables{Data: jsonmodels.Experiment{Id: 5, Name: "exp"}}
+	var six = ExperimentVariables{Data: jsonmodels.Experiment{Id: 6, Name: "exp"}}
+	for _, lock := range []*sync.RWMutex{nil, {}} {
+		var manual = Context{DataLock: &sync.RWMutex{}, ContextLock_: lock,
+			Index_:          map[string]ExperimentVariables{"exp": five},
+			IndexVariables_: map[interface{}]interface{}{"color": five}}
+		var got, found = manual.GetExperiment("exp")
+		assertAny(true, found, t)
+		assertAny(5, got.Data.Id, t)
+		var variable, err = manual.GetVariableExperiment("color")
+		assertAny(nil, err, t)
+		assertAny(5, variable.Data.Id, t)
+
+		manual.Index_["exp"] = six
+		manual.IndexVariables_["color"] = six
+		got, _ = manual.GetExperiment("exp")
+		assertAny(6, got.Data.Id, t)
+		variable, _ = manual.GetVariableExperiment("color")
+		assertAny(6, variable.Data.Id, t)
+	}
+}
+
+// A literal that has an event queue but no ContextLock_ can queue an
+// exposure, as in v1.1.1.
+func TestContextLiteralWithoutContextLockQueuesExposure(t *testing.T) {
+	var boolValue = func(value bool) *atomic.Value {
+		var result = &atomic.Value{}
+		result.Store(value)
+		return result
+	}
+	var count = &atomic.Value{}
+	count.Store(int32(0))
+	var manual = Context{PublishDelay_: -1, EventLock_: &sync.Mutex{}, PendingCount_: count,
+		Ready_: boolValue(true), Closing_: boolValue(false), Closed_: boolValue(false),
+		TimeoutLock_: &sync.Mutex{}, Clock_: internal.FixedClock{Millis_: 7}}
+	manual.QueueExposure(&Assignment{Id: 1, Name: "exp", Variant: 1, Exposed: boolValue(false)})
+	assertAny(int32(1), manual.GetPendingCount(), t)
+	assertAny(1, len(manual.Exposures_), t)
+	assertAny(int64(7), manual.Exposures_[0].ExposedAt, t)
+}
+
+// A value copy evaluates and installs data on the live context, so the
+// cache stamps, attributes, Data_ and indexes stay consistent.
+func TestContextCopyActsOnLiveContextForAssignmentsAndData(t *testing.T) {
+	var ctx, _ = newRuleContext(t, "production", withUnit(),
+		ruleExperiment("exp", rulesJSON(`{"type":"assign","variant":2,"conditions":{"eq":[{"var":"country"},{"value":"US"}]}}`)))
+	assertAny(0, treatmentPeek(t, ctx, "exp"), t)
+
+	var copied = *ctx
+	assertAny(nil, ctx.SetAttribute("country", "US"), t)
+	var variant, err = copied.PeekTreatment("exp")
+	assertAny(nil, err, t)
+	assertAny(2, variant, t)
+	assertAny(2, treatment(t, ctx, "exp"), t)
+	assertAny(true, expectExposures(t, ctx, 1)[0].RuleOverride, t)
+
+	copied.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{ruleExperiment("other", "")}})
+	var names, _ = ctx.GetExperiments()
+	assertAny([]string{"other"}, names, t)
+	var _, found = ctx.GetExperiment("other")
+	assertAny(true, found, t)
+
+	copied.SetDataFailed(errors.New("failed"))
+	names, _ = ctx.GetExperiments()
+	assertAny(0, len(names), t)
+	assertAny(true, ctx.IsFailed(), t)
+}
+
+func treatmentPeek(t *testing.T, ctx *Context, name string) int {
+	t.Helper()
+	var variant, err = ctx.PeekTreatment(name)
+	if err != nil {
+		t.Fatalf("PeekTreatment(%s): %v", name, err)
+	}
+	return variant
+}
+
+// Replacing Clock_ as soon as WaitUntilReady returns must not race the ready
+// callback, which finishes its work before releasing waiters.
+func TestReplacingClockAfterAsyncReadyDoesNotRace(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		setUp()
+		var config = CreateDefaultContextConfig()
+		config.Units_ = units
+		config.PublishDelay_ = -1
+		config.RefreshInterval_ = 0
+		var pending, settle = future.New()
+		var ctx = createTrackedContext(clock, config, pending, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
+		go settle(data, nil)
+		ctx.WaitUntilReady()
+		ctx.Clock_ = internal.FixedClock{Millis_: 1}
+		var _, err = ctx.PeekTreatment("exp_test_ab")
+		assertAny(nil, err, t)
+	}
 }

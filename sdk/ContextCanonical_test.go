@@ -111,6 +111,8 @@ func TestRefreshFailedContextInstallsData(t *testing.T) {
 	var logger = &MockEventLogger{}
 	var client = &CapturingPublishClient{contextData: data}
 	var ctx = createCanonicalContext(t, client, dataFutureReady, logger)
+	// No refresh timer, so only the explicit refresh logs a Refresh event.
+	ctx.ClearRefreshTimer()
 	ctx.SetDataFailed(errors.New("initial load failed"))
 	logger.Reset()
 

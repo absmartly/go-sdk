@@ -482,16 +482,16 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 		var tempFuture, readyFutureDone = future.New()
 		cntx.setReadyFuture(tempFuture)
 		dataFuture.Listen(func(val future.Value, err error) {
-			atomic.StoreUint64(tmp.state().readyDeliverer_, goroutineID())
-			defer atomic.StoreUint64(tmp.state().readyDeliverer_, 0)
+			atomic.StoreUint64(state.readyDeliverer_, goroutineID())
+			defer atomic.StoreUint64(state.readyDeliverer_, 0)
 			if err == nil {
 				result, ok := val.(jsonmodels.ContextData)
 				if !ok {
 					err = &TypeError{Expected: "jsonmodels.ContextData", Actual: val}
 					tmp.SetDataFailed(err)
 					tmp.LogError(err)
+					cntx.setReadyFutureWith(state, nil)
 					readyFutureDone(nil, err)
-					cntx.setReadyFuture(nil)
 					return
 				}
 				var diagnostics, panicErr = tmp.applyRefreshedData(result)
@@ -499,25 +499,26 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 					tmp.SetDataFailed(panicErr)
 					tmp.dispatchDiagnostics(diagnostics)
 					tmp.LogError(panicErr)
+					cntx.setReadyFutureWith(state, nil)
 					readyFutureDone(nil, panicErr)
-					cntx.setReadyFuture(nil)
 					return
 				}
 				// Log before settling, so WaitUntilReady returns after the
 				// logger has seen the ready event.
 				tmp.dispatchDiagnostics(diagnostics)
 				tmp.LogEvent(Ready, result)
-				readyFutureDone(result, nil)
-				cntx.setReadyFuture(nil)
-
+				// Finish everything that reads the context before settling:
+				// once WaitUntilReady returns, the caller may replace Clock_.
+				cntx.setReadyFutureWith(state, nil)
 				if tmp.GetPendingCount() > 0 {
 					tmp.SetTimeout()
 				}
+				readyFutureDone(result, nil)
 			} else {
 				tmp.SetDataFailed(err)
 				tmp.LogError(err)
+				cntx.setReadyFutureWith(state, nil)
 				readyFutureDone(nil, err)
-				cntx.setReadyFuture(nil)
 			}
 
 		})
@@ -578,7 +579,13 @@ func (c *Context) getReadyFuture() *future.Future {
 }
 
 func (c *Context) setReadyFuture(f *future.Future) {
-	var st = c.state()
+	c.setReadyFutureWith(c.state(), f)
+}
+
+// setReadyFutureWith is setReadyFuture with the state already resolved, for
+// the ready callback: it runs after WaitUntilReady has returned, when the
+// caller may be replacing Clock_, so it must not read Clock_ again.
+func (c *Context) setReadyFutureWith(st *contextState, f *future.Future) {
 	st.stateLock_.Lock()
 	c.ReadyFuture_ = f
 	st.stateLock_.Unlock()
@@ -964,11 +971,14 @@ func (c *Context) QueueExposure(assignment *Assignment) {
 	// A copy returned by GetAssignment shares the cached assignment's
 	// exposed flag, which identifies the cache entry its rule flag is on.
 	var ruleOverride = st.ruleIdentities.contains(assignment.Exposed)
-	c.ContextLock_.RLock()
-	if entry, found := st.assignmentCache_[assignment.Name]; found && entry.assignment.Exposed == assignment.Exposed {
-		ruleOverride = entry.ruleOverride
+	// A literal without ContextLock_ has no assignment cache to consult.
+	if c.ContextLock_ != nil {
+		c.ContextLock_.RLock()
+		if entry, found := st.assignmentCache_[assignment.Name]; found && entry.assignment.Exposed == assignment.Exposed {
+			ruleOverride = entry.ruleOverride
+		}
+		c.ContextLock_.RUnlock()
 	}
-	c.ContextLock_.RUnlock()
 	c.queueExposure(assignment, ruleOverride)
 }
 
@@ -1681,7 +1691,17 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 // it first when it is missing or out of date. The entry's assignment is
 // shared and never mutated once cached.
 func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
-	var st = c.state()
+	// Evaluate against the live context, whose attributes the cache stamps
+	// track; a copy's own Attributes_ may be older.
+	var st *contextState
+	if clock := c.ownClock(); clock != nil {
+		c, st = clock.root, clock.state
+	} else {
+		st = c.literalState()
+		if st.manualRoot != nil {
+			c = st.manualRoot
+		}
+	}
 	// A valid cached assignment only needs the read lock, so concurrent reads
 	// of a shared context do not serialise.
 	c.ContextLock_.RLock()
@@ -1826,13 +1846,21 @@ func (c *Context) ClearRefreshTimer() {
 // GetExperiment returns the experiment from the installed context data. It
 // reads the index setData published atomically, so a refresh installing new
 // data cannot race it, and it takes no lock.
+//
+// A context with no state carrier of its own (a literal, or one whose Clock_
+// was replaced) reads Index_, as v1.1.1 did. That path takes no ContextLock_,
+// so an AudienceDeserializer that calls GetExperiment during an evaluation,
+// which holds ContextLock_, does not deadlock; setData keeps Index_ current.
 func (c *Context) GetExperiment(experimentName string) (ExperimentVariables, bool) {
-	if c.ContextLock_ == nil {
+	if c.ownClock() == nil {
+		if c.DataLock != nil {
+			c.DataLock.RLock()
+			defer c.DataLock.RUnlock()
+		}
 		result, found := c.Index_[experimentName]
 		return result, found
 	}
-	var st = c.state()
-	var result, _, found = st.experimentAndRules(experimentName)
+	var result, _, found = c.state().experimentAndRules(experimentName)
 	return result, found
 }
 
@@ -1965,6 +1993,8 @@ func (c *Context) dispatchDiagnostics(events []bufferedEvent) {
 }
 
 func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer) {
+	// Install data and indexes on the same receiver: the live context.
+	c = c.live()
 	var st = c.state()
 	var self = c.snapshot()
 	self.EventLogger_ = buffer
@@ -2128,6 +2158,7 @@ func panicToError(r interface{}) error {
 }
 
 func (c *Context) SetDataFailed(err error) {
+	c = c.live()
 	var st = c.state()
 	c.DataLock.Lock()
 	c.Index_ = map[string]ExperimentVariables{}
@@ -2483,6 +2514,18 @@ func legacyIndexVariables(index map[string][]ExperimentVariables) map[interface{
 }
 
 func (c *Context) GetVariableExperiment(key string) (ExperimentVariables, error) {
+	if c.ownClock() == nil {
+		// As GetExperiment: read the v1.1.1 field, which setData keeps
+		// current, without ContextLock_.
+		if c.DataLock != nil {
+			c.DataLock.RLock()
+			defer c.DataLock.RUnlock()
+		}
+		if experiment, ok := c.IndexVariables_[key].(ExperimentVariables); ok {
+			return experiment, nil
+		}
+		return ExperimentVariables{}, errors.New("result is nil")
+	}
 	var st = c.state()
 	c.DataLock.RLock()
 	var experiments = st.indexVariables_[key]
