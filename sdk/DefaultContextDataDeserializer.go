@@ -95,9 +95,9 @@ func holdoutId(raw json.RawMessage) (int, bool) {
 	return int(value), true
 }
 
-// holdoutSeed decodes a seed the way the JS SDK's assigner uses it,
-// DataView.setUint32: any finite JSON number, truncated and taken modulo
-// 2^32. Anything else is 0, as JS's ToUint32 gives for NaN and infinities.
+// holdoutSeed decodes numeric JSON seeds as the JS SDK's DataView.setUint32:
+// truncated and taken modulo 2^32. Non-numeric values default to 0 rather than
+// applying JavaScript's broader coercions; non-finite numbers also give 0.
 func holdoutSeed(raw json.RawMessage) int {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || raw[0] == '"' {
