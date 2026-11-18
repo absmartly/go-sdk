@@ -1795,6 +1795,80 @@ func TestHoldout_AbsentHoldoutFieldsAllocateNothing(t *testing.T) {
 	}
 }
 
+func TestHoldout_ReadySnapshotSharesArms(t *testing.T) {
+	h := hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "a", hoUnitType, 0, 11), hoExperiment(2, "b", hoUnitType, 0, 11)))
+	snapshot := h.ctx.WaitUntilReady()
+	if _, err := snapshot.GetTreatment("a"); err != nil {
+		t.Fatal(err)
+	}
+	h.treatment("b")
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
+func TestHoldout_QueueExposureCopies(t *testing.T) {
+	for _, uid := range []string{hoUID, hoUIDNotHeldOut} {
+		t.Run(uid, func(t *testing.T) {
+			h := hoCreateFor(t, uid, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+			h.ctx.GetAssignment("exp")
+			copy := h.ctx.AssignmentCache["exp"]
+			h.ctx.QueueExposure(&copy)
+			if uid == hoUID {
+				h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+			} else {
+				h.expectPublished(hoOwn(hoUnitType, 1, "exp", 0), hoExposure(hoUnitType, 11, "holdout_a", 1))
+			}
+		})
+	}
+}
+
+func TestHoldout_SupersededCopyDoesNotExpose(t *testing.T) {
+	h := hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.ctx.GetAssignment("exp")
+	stale := h.ctx.AssignmentCache["exp"]
+	next := hoHoldoutA()
+	next.Iteration++
+	h.refresh(hoData([]jsonmodels.Holdout{next}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.ctx.GetAssignment("exp")
+	h.ctx.QueueExposure(&stale)
+	h.expectPending(0)
+}
+
+func TestHoldout_PartialCloseRetriesOnlyHoldout(t *testing.T) {
+	h := hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.logger.onEvent = func(event EventType, _ interface{}) {
+		if event == Exposure {
+			h.ctx.Closing_.Store(true)
+		}
+	}
+	h.ctx.QueueExposure(h.ctx.GetAssignment("exp"))
+	h.expectPending(1)
+	h.logger.onEvent = nil
+	h.ctx.Closing_.Store(false)
+	h.treatment("exp")
+	h.expectPublished(hoOwn(hoUnitType, 1, "exp", 0), hoExposure(hoUnitType, 11, "holdout_a", 1))
+}
+
+func TestHoldout_OverrideUnitTypeRefresh(t *testing.T) {
+	exp := hoExperiment(1, "exp", hoUnitType, 0, 11)
+	h := hoCreate(t, map[string]string{hoUnitType: hoUID, "user_id": hoUIDNotHeldOut}, hoData([]jsonmodels.Holdout{hoHoldoutA()}, exp), hoOverride("exp", 1))
+	h.treatment("exp")
+	exp.UnitType = "user_id"
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldoutA()}, exp))
+	h.treatment("exp")
+	exposures := queuedExposures(h.ctx)
+	if len(exposures) != 4 || exposures[3].Id != 11 || exposures[3].Unit != "user_id" {
+		t.Fatalf("exposures: %+v", exposures)
+	}
+}
+
+func TestHoldout_InstalledSplitIsCopied(t *testing.T) {
+	data := hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11))
+	h := hoCreateFor(t, hoUID, data)
+	data.Holdouts[0].Split[0], data.Holdouts[0].Split[1] = 0, 1
+	h.treatment("exp")
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
 // hoLeastAllocs is the fewest allocations of f over a few AllocsPerRun
 // samples. AllocsPerRun counts the whole process, so goroutines other tests
 // left running (timers, publishers) can only add to a sample.

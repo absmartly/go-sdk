@@ -149,8 +149,7 @@ type Context struct {
 // modified once published in index_.
 type contextIndex struct {
 	experiments map[string]*indexedExperiment
-	// holdouts are the installed holdouts with a non-empty split, by id.
-	holdouts map[int]*jsonmodels.Holdout
+	holdouts    map[int]*jsonmodels.Holdout
 }
 
 // indexedExperiment is an installed experiment with its parsed assignment
@@ -181,8 +180,10 @@ type holdoutArm struct {
 // iteration) for cache validation; arms has one entry per holdout, nil when
 // the experiment's unit was not set.
 type assignmentHoldouts struct {
-	holdouts []*jsonmodels.Holdout
-	arms     []*holdoutArm
+	holdouts  []*jsonmodels.Holdout
+	arms      []*holdoutArm
+	unitType  string
+	ownQueued atomic.Bool
 	// held is set when any arm holds the experiment out; suppressed when,
 	// in addition, no override or assignment rule chose the variant.
 	held       bool
@@ -911,7 +912,7 @@ func (c *Context) QueueExposure(assignment *Assignment) {
 	c = c.live()
 	var holdouts *assignmentHoldouts
 	c.ContextLock_.RLock()
-	if entry, found := c.assignmentCache_[assignment.Name]; found && entry.assignment == assignment {
+	if entry, found := c.assignmentCache_[assignment.Name]; found && entry.assignment.Exposed == assignment.Exposed {
 		holdouts = entry.holdouts
 	}
 	c.ContextLock_.RUnlock()
@@ -921,11 +922,16 @@ func (c *Context) QueueExposure(assignment *Assignment) {
 func (c *Context) queueExposure(assignment *Assignment, holdouts *assignmentHoldouts) {
 	c = c.live()
 	if assignment.Exposed.CompareAndSwap(false, true) {
-		if !holdouts.isSuppressed() && !c.enqueueExposure(assignment) {
-			return
+		if !holdouts.isSuppressed() && (holdouts == nil || !holdouts.ownQueued.Load()) {
+			if !c.enqueueExposure(assignment) {
+				return
+			}
+			if holdouts != nil {
+				holdouts.ownQueued.Store(true)
+			}
 		}
-		if holdouts != nil && !c.queueHoldoutExposures(holdouts) && holdouts.isSuppressed() {
-			// Nothing was queued for it, so the next read has to try again.
+		if holdouts != nil && !c.queueHoldoutExposures(holdouts) {
+			// Retry the remaining arms on the next exposing read.
 			assignment.Exposed.Store(false)
 		}
 	}
@@ -1519,7 +1525,8 @@ func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignmen
 	}
 
 	if ofound {
-		if assignment.Overridden && assignment.Variant == override.(int) && holdoutSetMatches(holdouts, entry.holdouts) {
+		if assignment.Overridden && assignment.Variant == override.(int) && holdoutSetMatches(holdouts, entry.holdouts) &&
+			(entry.holdouts == nil || entry.holdouts.unitType == experiment.Data.UnitType) {
 			return entry, rules, assignmentValid
 		}
 	} else if !efound {
@@ -1683,6 +1690,8 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 	}
 	c.ContextLock_.RUnlock()
 
+	// Mutable lazy state belongs to the live root, not a readiness snapshot.
+	c = c.live()
 	// Cache miss, out of date, or revalidated. Check again under the write
 	// lock: another goroutine may have rebuilt the assignment meanwhile, and
 	// replacing it would lose its exposed flag and queue a second exposure.
@@ -1830,7 +1839,7 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 // when the experiment's unit is not set. The caller holds ContextLock_ for
 // writing.
 func (c *Context) resolveHoldouts(holdouts []*jsonmodels.Holdout, data jsonmodels.Experiment) *assignmentHoldouts {
-	var resolved = &assignmentHoldouts{holdouts: holdouts, arms: make([]*holdoutArm, len(holdouts))}
+	var resolved = &assignmentHoldouts{holdouts: holdouts, arms: make([]*holdoutArm, len(holdouts)), unitType: data.UnitType}
 	for i, holdout := range holdouts {
 		var arm = c.holdoutArm(holdout, data.UnitType)
 		resolved.arms[i] = arm
@@ -1844,8 +1853,8 @@ func (c *Context) resolveHoldouts(holdouts []*jsonmodels.Holdout, data jsonmodel
 // holdoutArm returns the unit's arm in a holdout for unitType, drawing it on
 // first use. The arm is kept while the installed holdout's iteration is
 // unchanged, so a same-iteration seed or split edit neither moves the unit
-// nor re-exposes it. holdout may predate a refresh; the installed definition
-// with its id wins. The caller holds ContextLock_ for writing.
+// nor re-exposes it. The definition comes from the same index as coverage.
+// The caller holds ContextLock_ for writing.
 func (c *Context) holdoutArm(holdout *jsonmodels.Holdout, unitType string) *holdoutArm {
 	if index := c.index_.Load(); index != nil {
 		if live, found := index.holdouts[holdout.Id]; found {
@@ -2039,6 +2048,7 @@ func (c *Context) dispatchDiagnostics(events []bufferedEvent) {
 }
 
 func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer) {
+	c = c.live()
 	var self = c.snapshot()
 	self.EventLogger_ = buffer
 	var index = map[string]ExperimentVariables{}
@@ -2055,6 +2065,7 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		for i := range installed {
 			// A holdout with no split cannot draw an arm, so it covers nothing.
 			if len(installed[i].Split) > 0 {
+				installed[i].Split = append([]float64(nil), installed[i].Split...)
 				holdoutsById[installed[i].Id] = &installed[i]
 			}
 		}
@@ -2169,6 +2180,8 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		})
 	}
 
+	// Serialize publication with resolution to keep coverage and arms in one generation.
+	c.ContextLock_.Lock()
 	c.DataLock.Lock()
 
 	c.Index_ = index
@@ -2186,6 +2199,7 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 
 	c.SetRefreshTimer()
 	c.DataLock.Unlock()
+	c.ContextLock_.Unlock()
 }
 
 // coveringHoldouts resolves an experiment's holdoutIds to the installed
@@ -2265,6 +2279,9 @@ func panicToError(r interface{}) error {
 }
 
 func (c *Context) SetDataFailed(err error) {
+	c = c.live()
+	c.ContextLock_.Lock()
+	defer c.ContextLock_.Unlock()
 	c.DataLock.Lock()
 	c.Index_ = map[string]ExperimentVariables{}
 	c.index_.Store(&contextIndex{})
