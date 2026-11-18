@@ -2213,6 +2213,9 @@ func coveringHoldouts(ids []int, holdoutsById map[int]*jsonmodels.Holdout) []*js
 			covering = append(covering, holdout)
 		}
 	}
+	if len(covering) < 2 {
+		return covering
+	}
 	sort.Slice(covering, func(i, j int) bool { return covering[i].Id < covering[j].Id })
 	var unique = covering[:0]
 	for _, holdout := range covering {
