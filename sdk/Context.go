@@ -927,10 +927,11 @@ func (c *Context) QueueExposure(assignment *Assignment) {
 
 func (c *Context) queueExposure(assignment *Assignment, holdouts *assignmentHoldouts) {
 	c = c.live()
-	if !c.beginExposure(assignment) {
+	var claimed, registered = c.beginExposure(assignment)
+	if !claimed {
 		return
 	}
-	if holdouts == nil && (c.holdoutsSeen_ == nil || !c.holdoutsSeen_.Load()) {
+	if holdouts == nil && !registered {
 		// Never had holdouts and unregistered: no lock unless a close
 		// rejects the exposure.
 		if !c.enqueueExposure(assignment) {
@@ -943,25 +944,27 @@ func (c *Context) queueExposure(assignment *Assignment, holdouts *assignmentHold
 	c.admitExposure(assignment, holdouts)
 }
 
-// beginExposure claims the assignment's exposure. Once the context has had
-// holdouts, the CAS and the in-flight registration happen under
-// ContextLock_, which replacements hold, so a replacement landing before
-// admission always finds the claim and can retire it. A context that never
-// had holdouts claims with the bare CAS, as before holdouts.
-func (c *Context) beginExposure(assignment *Assignment) bool {
+// beginExposure claims the assignment's exposure and reports whether the
+// claim was registered as in flight. Once a context has had holdouts, the
+// CAS and the registration happen under ContextLock_, which replacements and
+// the first holdout install hold, so a replacement landing before admission
+// always finds the claim and can retire it. A context that never had
+// holdouts claims with the bare CAS, as before holdouts, after one atomic
+// load.
+func (c *Context) beginExposure(assignment *Assignment) (claimed bool, registered bool) {
 	if c.holdoutsSeen_ == nil || !c.holdoutsSeen_.Load() {
-		return assignment.Exposed.CompareAndSwap(false, true)
+		return assignment.Exposed.CompareAndSwap(false, true), false
 	}
 	c.ContextLock_.Lock()
 	defer c.ContextLock_.Unlock()
 	if !assignment.Exposed.CompareAndSwap(false, true) {
-		return false
+		return false, false
 	}
 	if c.exposuresInFlight_ == nil {
 		c.exposuresInFlight_ = map[*atomic.Value]bool{}
 	}
 	c.exposuresInFlight_[assignment.Exposed] = false
-	return true
+	return true, true
 }
 
 // admitExposure queues an exposure claimed by beginExposure, or rolls the
@@ -1025,7 +1028,8 @@ func (c *Context) reopenExposure(assignment *Assignment) {
 		return
 	}
 	var entry = c.assignmentCache_[assignment.Name]
-	if !registered && entry != nil && entry.assignment.Exposed != assignment.Exposed && entry.holdouts != nil {
+	if !registered && entry != nil && entry.assignment.Exposed != assignment.Exposed &&
+		(entry.holdouts != nil || c.holdoutsSeen_ != nil && c.holdoutsSeen_.Load()) {
 		return
 	}
 	if entry != nil && entry.assignment.Exposed == assignment.Exposed {

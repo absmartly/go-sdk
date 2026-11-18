@@ -95,6 +95,26 @@ func holdoutId(raw json.RawMessage) (int, bool) {
 	return int(value), true
 }
 
+// holdoutSeed decodes a seed the way the JS SDK's assigner uses it,
+// DataView.setUint32: any finite JSON number, truncated and taken modulo
+// 2^32. Anything else is 0, as JS's ToUint32 gives for NaN and infinities.
+func holdoutSeed(raw json.RawMessage) int {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] == '"' {
+		return 0
+	}
+	var number json.Number
+	if json.Unmarshal(raw, &number) != nil || len(number) == 0 {
+		return 0
+	}
+	// Through float64, as JavaScript parses every JSON number.
+	var value, err = number.Float64()
+	if err != nil || math.IsInf(value, 0) || math.IsNaN(value) {
+		return 0
+	}
+	return int(uint32(int64(math.Mod(math.Trunc(value), 1<<32))))
+}
+
 // wireHoldout decodes a holdout with its integer fields written as any
 // integral JSON number, so a producer re-encoding 1 as 1.0 keeps the same
 // epoch and seeds. holdoutType and unitType are informational (the arity
@@ -130,8 +150,8 @@ func holdouts(raw json.RawMessage) []jsonmodels.Holdout {
 		if id, ok := holdoutId(holdout.Id); ok {
 			holdout.Holdout.Id = id
 			holdout.Holdout.Iteration, _ = holdoutId(holdout.Iteration)
-			holdout.Holdout.SeedHi, _ = holdoutId(holdout.SeedHi)
-			holdout.Holdout.SeedLo, _ = holdoutId(holdout.SeedLo)
+			holdout.Holdout.SeedHi = holdoutSeed(holdout.SeedHi)
+			holdout.Holdout.SeedLo = holdoutSeed(holdout.SeedLo)
 			_ = json.Unmarshal(holdout.HoldoutType, &holdout.Holdout.HoldoutType)
 			_ = json.Unmarshal(holdout.UnitType, &holdout.Holdout.UnitType)
 			result = append(result, holdout.Holdout)

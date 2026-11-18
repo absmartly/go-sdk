@@ -2013,7 +2013,7 @@ func TestHoldout_RemovedExposedExperimentPublishesNothingMore(t *testing.T) {
 func TestHoldout_ReplacedUncoveredAssignmentStaysRetiredAfterRejection(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0)))
 	var stale = h.ctx.GetAssignment("exp")
-	if !h.ctx.beginExposure(stale) {
+	if !hoClaim(h, stale) {
 		t.Fatal("the exposure was not claimed")
 	}
 	h.refresh(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
@@ -2044,7 +2044,7 @@ func TestHoldout_RemovedOverriddenExperimentIsNotReExposed(t *testing.T) {
 func TestHoldout_ReplacedCoveredAssignmentWhoseOwnExposureIsRejectedStaysRetired(t *testing.T) {
 	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 	var entry = h.ctx.getAssignment("exp")
-	if !h.ctx.beginExposure(entry.assignment) {
+	if !hoClaim(h, entry.assignment) {
 		t.Fatal("the exposure was not claimed")
 	}
 	h.refresh(hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
@@ -2161,7 +2161,7 @@ func TestHoldout_RetirementSurvivesASecondReplacement(t *testing.T) {
 	for _, replacements := range []int{2, 12} {
 		var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0)))
 		var stale = h.ctx.GetAssignment("exp")
-		if !h.ctx.beginExposure(stale) {
+		if !hoClaim(h, stale) {
 			t.Fatal("the exposure was not claimed")
 		}
 		for i := 0; i < replacements; i++ {
@@ -2190,7 +2190,7 @@ func TestHoldout_RetirementSurvivesASecondReplacement(t *testing.T) {
 func TestHoldout_UnretiredRejectedClaimIsReopened(t *testing.T) {
 	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 	var entry = h.ctx.getAssignment("exp")
-	if !h.ctx.beginExposure(entry.assignment) {
+	if !hoClaim(h, entry.assignment) {
 		t.Fatal("the exposure was not claimed")
 	}
 	h.ctx.Closing_.Store(true)
@@ -2410,7 +2410,7 @@ func TestHoldout_EquivalentJSONNumbersKeepTheEpoch(t *testing.T) {
 func TestHoldout_ClaimMadeBeforeHoldoutsArrivedStaysRetired(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
 	var stale = h.ctx.GetAssignment("exp")
-	if !h.ctx.beginExposure(stale) {
+	if !hoClaim(h, stale) {
 		t.Fatal("the exposure was not claimed")
 	}
 	h.refresh(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
@@ -2448,7 +2448,7 @@ func TestHoldout_ClaimAndReplacementNeverInterleave(t *testing.T) {
 		var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0)))
 		var stale = h.ctx.GetAssignment("exp")
 		var claimed = make(chan bool)
-		go func() { claimed <- h.ctx.beginExposure(stale) }()
+		go func() { claimed <- hoClaim(h, stale) }()
 		h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 		h.ctx.GetAssignment("exp")
 		if !<-claimed {
@@ -2460,4 +2460,91 @@ func TestHoldout_ClaimAndReplacementNeverInterleave(t *testing.T) {
 		h.ctx.QueueExposure(stale)
 		h.expectPending(0)
 	}
+}
+
+// hoClaim claims an assignment's exposure as an exposing read does.
+func hoClaim(h *hoContext, assignment *Assignment) bool {
+	var claimed, _ = h.ctx.beginExposure(assignment)
+	return claimed
+}
+
+// Holdout seeds decode as the JS SDK's assigner uses them (JSON.parse, then
+// DataView.setUint32): truncated and wrapped to 32 bits. The expected values
+// were computed with node v22.
+func TestHoldout_SeedsWrapLikeJavaScript(t *testing.T) {
+	for _, c := range []struct {
+		raw  string
+		want uint32
+	}{
+		{"1", 1}, {"1.0", 1}, {"1e0", 1}, {"-1", 4294967295}, {"-0", 0}, {"2147483648", 2147483648},
+		{"4294967295", 4294967295}, {"4294967297", 1}, {"9007199254740993", 0}, {"1e19", 2313682944},
+		{"1e21", 3735027712}, {"1.5", 1}, {"-1.5", 4294967295}, {"1e400", 0}, {`"5"`, 0}, {"true", 0}, {"null", 0},
+	} {
+		if got := uint32(holdoutSeed(json.RawMessage(c.raw))); got != c.want {
+			t.Errorf("seed %s: got %d, want %d", c.raw, got, c.want)
+		}
+	}
+	// A wrapped seed draws the same arm as JS does from its 32-bit value.
+	var wrapped = hoHoldoutA()
+	wrapped.SeedHi = holdoutSeed(json.RawMessage("-4294967283")) // 13 after wrapping
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{wrapped}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp"))
+}
+
+// A claim made before the context had holdouts, whose assignment a refresh
+// replaces with a covered one and then with an uncovered one, stays retired
+// when a close rejects it.
+func TestHoldout_UnregisteredClaimStaysRetiredAfterCoverageComesAndGoes(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
+	var stale = h.ctx.GetAssignment("exp")
+	if !hoClaim(h, stale) {
+		t.Fatal("the exposure was not claimed")
+	}
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.ctx.GetAssignment("exp")
+	var uncovered = hoExperiment(1, "exp", hoUnitType, 0)
+	uncovered.Iteration = 2
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldoutA()}, uncovered))
+	h.ctx.GetAssignment("exp")
+	h.ctx.Closing_.Store(true)
+	h.ctx.admitExposure(stale, nil)
+	h.ctx.Closing_.Store(false)
+	h.ctx.QueueExposure(stale)
+	h.expectPending(0)
+	h.treatment("exp")
+	h.expectPending(1)
+}
+
+// A rejected exposure on a context without holdouts reopens under
+// ContextLock_: racing cache writers under -race stay clean.
+func TestHoldout_RejectedExposureWithoutHoldoutsReopensUnderTheLock(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp", hoUnitType, 0), hoExperiment(2, "other", hoUnitType, 0)))
+	h.ctx.Closing_.Store(true)
+	var done = make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			_ = h.ctx.SetOverride("other", i%2)
+			h.ctx.GetAssignment("other")
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		h.ctx.QueueExposure(h.ctx.GetAssignment("exp"))
+	}
+	<-done
+	h.ctx.Closing_.Store(false)
+	h.expectPending(0)
+}
+
+// An exposure no holdout covers, in a context that has had holdouts, is
+// registered and its registration ends with the call.
+func TestHoldout_UncoveredExposureInAHoldoutContextLeavesNoRegistration(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()},
+		hoExperiment(1, "exp", hoUnitType, 0), hoExperiment(2, "covered", hoUnitType, 0, 11)))
+	h.treatment("exp")
+	h.ctx.ContextLock_.RLock()
+	var left = len(h.ctx.exposuresInFlight_)
+	h.ctx.ContextLock_.RUnlock()
+	expectInt(t, 0, left)
+	h.expectPending(1)
 }
