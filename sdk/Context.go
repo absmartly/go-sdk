@@ -149,6 +149,11 @@ type Context struct {
 	// retiredExposureLimit per experiment. Created on first use; guarded by
 	// ContextLock_.
 	retiredExposures_ map[string][]*atomic.Value
+
+	// holdoutsSeen_ is set once any installed payload had holdouts and is
+	// never cleared: an assignment resolved then can still carry holdout
+	// decisions after a refresh removes them all.
+	holdoutsSeen_ *atomic.Bool
 }
 
 // contextIndex is an installed experiment index and, by experiment name, the
@@ -373,6 +378,7 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	cntx.AssignmentCache = map[string]Assignment{}
 	cntx.assignmentCache_ = map[string]*cachedAssignment{}
 	cntx.index_ = &atomic.Pointer[contextIndex]{}
+	cntx.holdoutsSeen_ = &atomic.Bool{}
 	cntx.unitValues_ = map[string]interface{}{}
 	cntx.readyDeliverer_ = &atomic.Uint64{}
 	cntx.loggers_ = &loggerGoroutines{ids: map[uint64]int{}}
@@ -915,9 +921,9 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 func (c *Context) QueueExposure(assignment *Assignment) {
 	c = c.live()
 	var holdouts *assignmentHoldouts
-	// Without installed holdouts no cached entry has any: skip the lookup,
-	// so this stays the released path.
-	if index := c.index_.Load(); index != nil && len(index.holdouts) > 0 {
+	// A context that never installed holdouts has no holdout decisions:
+	// skip the lookup, so this stays the released path.
+	if c.holdoutsSeen_.Load() {
 		c.ContextLock_.RLock()
 		if entry, found := c.assignmentCache_[assignment.Name]; found && entry.assignment.Exposed == assignment.Exposed {
 			holdouts = entry.holdouts
@@ -2131,6 +2137,7 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		// caller reuses its slice.
 		var installed = append([]jsonmodels.Holdout(nil), data.Holdouts...)
 		holdoutsById = make(map[int]*jsonmodels.Holdout, len(installed))
+		c.holdoutsSeen_.Store(true)
 		for i := range installed {
 			if len(installed[i].Split) > 0 {
 				installed[i].Split = append([]float64(nil), installed[i].Split...)

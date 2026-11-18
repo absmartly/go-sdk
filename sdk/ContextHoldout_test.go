@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/absmartly/go-sdk/sdk/future"
 	"github.com/absmartly/go-sdk/sdk/internal"
@@ -2321,12 +2322,18 @@ func TestHoldout_RetiredIdentitiesKeepTheNewest(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 	h.ctx.GetAssignment("exp")
 	var held = hoGenerations(h, 2, 11)
-	for _, assignment := range []*Assignment{held[7], held[8]} {
+	// Generations 2..10 were replaced; the newest eight (3..10) are kept.
+	for _, assignment := range []*Assignment{held[1], held[7], held[8]} {
 		assignment.Exposed.Store(true)
 		h.ctx.reopenExposure(assignment)
 		if !assignment.Exposed.Load().(bool) {
 			t.Fatal("a recently replaced assignment was reopened")
 		}
+	}
+	held[0].Exposed.Store(true)
+	h.ctx.reopenExposure(held[0])
+	if held[0].Exposed.Load().(bool) {
+		t.Fatal("an identity beyond the bound was kept")
 	}
 }
 
@@ -2340,4 +2347,37 @@ func TestHoldout_RetiredIdentityKeptAcrossTwoReplacements(t *testing.T) {
 	if !stale.Exposed.Load().(bool) {
 		t.Fatal("an assignment replaced twice was reopened")
 	}
+}
+
+// A held-out decision taken before a refresh removed every holdout still
+// publishes only its holdout exposure through QueueExposure.
+func TestHoldout_HeldAssignmentQueuedAfterHoldoutsRemoved(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	var stale = h.ctx.GetAssignment("exp")
+	h.ctx.SetData(hoData(nil, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.ctx.QueueExposure(stale)
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
+// A context that never installed holdouts takes no lock to look for holdout
+// decisions in QueueExposure.
+func TestHoldout_QueueExposureWithoutHoldoutsTakesNoLookup(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
+	// No logger, so nothing but the holdout lookup could take ContextLock_.
+	h.ctx.EventLogger_ = nil
+	var assignment = h.ctx.GetAssignment("exp")
+	h.ctx.ContextLock_.Lock()
+	var done = make(chan struct{})
+	go func() {
+		h.ctx.QueueExposure(assignment)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		h.ctx.ContextLock_.Unlock()
+		t.Fatal("QueueExposure waited on ContextLock_ without holdouts")
+	}
+	h.ctx.ContextLock_.Unlock()
+	h.expectPending(1)
 }
