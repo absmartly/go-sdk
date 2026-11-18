@@ -178,9 +178,12 @@ func switchbackSlotMatches(indexed *indexedExperiment, entry *cachedAssignment) 
 // under the unit its clusters select, so its unit identity is the cluster
 // map, compared through the generation.
 func (c *Context) entryMatches(indexed *indexedExperiment, entry *cachedAssignment) bool {
-	var data, assignment = indexed.experiment.Data, entry.assignment
+	// Through a pointer: the experiment is too large to copy on every read.
+	var data, assignment = &indexed.experiment.Data, entry.assignment
 	if entry.switchback == nil {
-		return indexed.switchback == nil && c.ExperimentMatches(data, *assignment)
+		return indexed.switchback == nil && data.Id == assignment.Id && data.UnitType == assignment.UnitType &&
+			data.Iteration == assignment.Iteration && data.FullOnVariant == assignment.FullOnVariant &&
+			reflect.DeepEqual(data.TrafficSplit, assignment.TrafficSplit)
 	}
 	return switchbackSlotMatches(indexed, entry) && data.Id == assignment.Id && data.Iteration == assignment.Iteration &&
 		data.FullOnVariant == assignment.FullOnVariant && reflect.DeepEqual(data.TrafficSplit, assignment.TrafficSplit)
@@ -209,6 +212,10 @@ type switchbackEpoch struct {
 // slots belong to another definition: the installed one is absent, not a
 // switchback, or of another generation. The caller holds ContextLock_.
 func (c *Context) switchbackEpochStale(experimentName string, indexed *indexedExperiment) bool {
+	if c.switchbackEpochs_ == nil {
+		// No switchback slot was ever cached.
+		return false
+	}
 	var epoch = c.switchbackEpochs_[experimentName]
 	return epoch != nil && (indexed == nil || indexed.switchback == nil || epoch.generation != indexed.switchback.generation)
 }

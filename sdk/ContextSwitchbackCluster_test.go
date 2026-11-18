@@ -518,3 +518,30 @@ func TestSwitchbackCluster_UnitExperimentsIgnoreClusterFields(t *testing.T) {
 		expectValue(t, published[1], published[0])
 	}
 }
+
+// An ineligible or absent switchback slot never evaluates its audience, also
+// when a SetAttribute makes it revalidate, and is not resolved again within
+// the period.
+func TestSwitchbackCluster_IneligibleSlotNeverEvaluatesTheAudience(t *testing.T) {
+	var ineligible = sbExperiment(1, "exp_ineligible", 2, sbHour)
+	ineligible.Audience = sbStrictGoldAudience
+	ineligible.SwitchbackClusterValues = []string{"other-store"}
+	var absent = sbExperiment(2, "exp_absent", 2, sbHour)
+	absent.Audience = sbStrictGoldAudience
+	absent.SwitchbackClusters = sbClusters("device_id", sbClusterPath)
+	var h = sbCreate(t, sbData(ineligible, absent))
+	var counter = &hoCountingDeserializer{}
+	h.ctx.AudienceMatcher_ = AudienceMatcher{counter}
+	h.at(sbAnchor + 10)
+	for _, name := range []string{"exp_ineligible", "exp_absent"} {
+		expectInt(t, 0, h.treatment(name))
+		var first = h.ctx.GetAssignment(name)
+		h.setAttribute("tier", "gold")
+		expectInt(t, 0, h.treatment(name))
+		if h.ctx.GetAssignment(name) != first {
+			t.Fatalf("%s was resolved again", name)
+		}
+	}
+	expectInt(t, 0, counter.count)
+	h.expectPending(0)
+}
