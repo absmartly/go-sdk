@@ -1792,3 +1792,21 @@ func TestSwitchback_QueueExposureOfASlotDroppedBySetUnitPublishesNothing(t *test
 	expectInt(t, sbExpected2Arms[0], h.treatment("exp_sb"))
 	h.expectPending(1)
 }
+
+// Once metadata leaves the bounded retired-slot window, QueueExposure fails
+// closed: it cannot publish a silent assignment or stamp an old draw now.
+func TestSwitchback_ExpiredRetiredSlotsFailClosed(t *testing.T) {
+	var silent = sbExperiment(2, "exp_silent", 2, sbHour)
+	silent.SwitchbackClusters = sbClusters(sbUnitType, "missing")
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour), silent))
+	var eligible = h.ctx.GetAssignment("exp_sb")
+	var ineligible = h.ctx.GetAssignment("exp_silent")
+	for i := int64(1); i < 20; i++ {
+		h.at(sbAnchor + i*sbHour)
+		h.ctx.GetAssignment("exp_sb")
+		h.ctx.GetAssignment("exp_silent")
+	}
+	h.ctx.QueueExposure(eligible)
+	h.ctx.QueueExposure(ineligible)
+	h.expectPending(0)
+}

@@ -256,6 +256,12 @@ func (c *Context) retireSwitchbackSlot(experimentName string, key string) {
 	}
 	var retired = append(c.retiredSwitchbackSlots_[experimentName], entry)
 	if len(retired) > retiredExposureLimit {
+		// Metadata is no longer available outside this bounded window.
+		// Fail closed rather than publishing a silent resolution, or an
+		// old variant stamped in the current period, as a unit exposure.
+		for _, expired := range retired[:len(retired)-retiredExposureLimit] {
+			expired.assignment.Exposed.CompareAndSwap(false, true)
+		}
 		retired = retired[len(retired)-retiredExposureLimit:]
 	}
 	c.retiredSwitchbackSlots_[experimentName] = retired
