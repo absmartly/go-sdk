@@ -1731,10 +1731,10 @@ func TestSwitchback_QueueExposureWithoutHoldoutsUsesTheSlot(t *testing.T) {
 	h.expectPublished(sbExposure(1, "exp_sb", sbExpected2Arms[0], sbAnchor+5, true, true))
 }
 
-// A switchback assignment whose slot was evicted or dropped never publishes
-// through QueueExposure: a silent one stays silent, and an eligible one does
-// not publish beside the slot that replaced it.
-func TestSwitchback_QueueExposureOfAnEvictedOrDroppedSlotPublishesNothing(t *testing.T) {
+// QueueExposure on a switchback assignment whose slot was evicted or dropped
+// still finds the slot: a silent one publishes nothing, and an eligible one
+// is published once, stamped inside its own period.
+func TestSwitchback_QueueExposureOfAnEvictedOrDroppedSlot(t *testing.T) {
 	var silent = sbExperiment(2, "exp_silent", 2, sbHour)
 	silent.SwitchbackClusters = sbClusters(sbUnitType, "unset_zone")
 	var h = sbCreate(t, sbData(sbDefault(2, sbHour), silent))
@@ -1747,20 +1747,40 @@ func TestSwitchback_QueueExposureOfAnEvictedOrDroppedSlotPublishesNothing(t *tes
 	}
 	h.ctx.QueueExposure(held["exp_sb"])
 	h.ctx.QueueExposure(held["exp_silent"])
-	h.expectPending(0)
+	h.ctx.QueueExposure(held["exp_sb"])
+	h.expectPending(1)
 
-	// A new epoch drops every slot of the old one.
+	// A new epoch drops every slot of the old one, the slot without a
+	// period included.
+	var preStart = silent
+	preStart.SwitchbackStartAt = sbInt64(sbAnchor + 10*sbHour)
+	h.refresh(sbDefault(2, sbHour), preStart)
 	var dropped = h.ctx.GetAssignment("exp_silent")
-	var regridded = silent
+	var regridded = preStart
 	regridded.SwitchbackDesignType = "other"
 	h.refresh(sbDefault(2, sbHour), regridded)
 	h.ctx.GetAssignment("exp_silent")
 	h.ctx.QueueExposure(dropped)
-	h.expectPending(0)
+	h.expectPublished(sbExposure(1, "exp_sb", sbExpected2Arms[0], sbAnchor+5, true, true))
 }
 
-// A slot resolved without a linked unit and dropped by SetUnit never
-// publishes through QueueExposure.
+// A read that resolved a slot exposes it even when the slot is dropped
+// before the exposure is queued.
+func TestSwitchback_ExposureOfASlotDroppedAfterItsResolutionIsKept(t *testing.T) {
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+	h.at(sbAnchor + 5)
+	var at = clockReading{clock: h.ctx.Clock_}
+	var entry = h.ctx.getAssignmentAt("exp_sb", &at)
+	var regridded = sbDefault(2, sbHour)
+	regridded.SwitchbackDesignType = "other"
+	h.refresh(regridded)
+	h.ctx.GetAssignment("exp_sb")
+	h.ctx.queueExposure(entry.assignment, entry.holdouts, entry.switchback, &at)
+	h.expectPublished(sbExposure(1, "exp_sb", sbExpected2Arms[0], sbAnchor+5, true, true))
+}
+
+// A slot resolved without a linked unit and dropped by SetUnit is silent: it
+// never publishes through QueueExposure.
 func TestSwitchback_QueueExposureOfASlotDroppedBySetUnitPublishesNothing(t *testing.T) {
 	var h = sbCreateAt(t, sbAnchor+5, nil, sbData(sbDefault(2, sbHour)))
 	var held = h.ctx.GetAssignment("exp_sb")

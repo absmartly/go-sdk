@@ -234,21 +234,31 @@ func (c *Context) dropSwitchbackEpoch(experimentName string) {
 	}
 	delete(c.switchbackEpochs_, experimentName)
 	for _, period := range epoch.periods {
-		c.retireSwitchbackSlot(switchbackSlotKey(experimentName, period))
+		c.retireSwitchbackSlot(experimentName, switchbackSlotKey(experimentName, period))
 	}
-	c.retireSwitchbackSlot(experimentName)
+	c.retireSwitchbackSlot(experimentName, experimentName)
 }
 
-// retireSwitchbackSlot removes a cached switchback slot and marks its
-// assignment exposed, as eviction does elsewhere: a caller still holding it
-// must not publish it through QueueExposure, where its slot, and with it its
-// silence and its period, can no longer be found. The caller holds
-// ContextLock_ for writing.
-func (c *Context) retireSwitchbackSlot(key string) {
-	if entry, found := c.assignmentCache_[key]; found {
-		entry.assignment.Exposed.CompareAndSwap(false, true)
-		delete(c.assignmentCache_, key)
+// retireSwitchbackSlot removes a cached switchback slot and remembers it in
+// a small window per experiment, so QueueExposure on an assignment a caller
+// still holds finds its slot: a silent resolution stays silent, and an
+// exposure is stamped within the slot's period. The exposed flag is left
+// alone, so a read that resolved the slot just before it was removed still
+// exposes it. The caller holds ContextLock_ for writing.
+func (c *Context) retireSwitchbackSlot(experimentName string, key string) {
+	var entry, found = c.assignmentCache_[key]
+	if !found {
+		return
 	}
+	delete(c.assignmentCache_, key)
+	if c.retiredSwitchbackSlots_ == nil {
+		c.retiredSwitchbackSlots_ = map[string][]*cachedAssignment{}
+	}
+	var retired = append(c.retiredSwitchbackSlots_[experimentName], entry)
+	if len(retired) > retiredExposureLimit {
+		retired = retired[len(retired)-retiredExposureLimit:]
+	}
+	c.retiredSwitchbackSlots_[experimentName] = retired
 }
 
 // retainSwitchbackSlot records a switchback slot under the current epoch.
@@ -285,7 +295,7 @@ func (c *Context) retainSwitchbackSlot(experimentName string, indexed *indexedEx
 		if epoch.periods[0] == slot.period {
 			evict = 1
 		}
-		c.retireSwitchbackSlot(switchbackSlotKey(experimentName, epoch.periods[evict]))
+		c.retireSwitchbackSlot(experimentName, switchbackSlotKey(experimentName, epoch.periods[evict]))
 		epoch.periods = append(epoch.periods[:evict], epoch.periods[evict+1:]...)
 	}
 }

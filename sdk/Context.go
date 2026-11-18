@@ -165,6 +165,12 @@ type Context struct {
 	// switchback definition. Guarded by ContextLock_ held for writing.
 	switchbackGeneration_ uint64
 
+	// retiredSwitchbackSlots_ holds, per experiment, the last switchback
+	// slots removed from the cache (at most retiredExposureLimit), so
+	// QueueExposure still finds the slot of an assignment a caller holds.
+	// Guarded by ContextLock_.
+	retiredSwitchbackSlots_ map[string][]*cachedAssignment
+
 	// switchbackSlotsSeen_ is set once a switchback slot was cached, so
 	// QueueExposure only looks one up after that. Nil on a Context literal.
 	switchbackSlotsSeen_ *atomic.Bool
@@ -759,10 +765,9 @@ func (c *Context) evictAssignmentsMissingUnit(unitType string) {
 		if entry.switchback != nil && entry.switchback.serving.status == switchbackAbsent {
 			// A switchback resolved before any linked unit was set is
 			// resolved again now that one may be. One that is not overridden
-			// never published anything, so it is dropped even if exposed,
-			// and retired so a caller holding it cannot publish it.
-			if retired := assignment.Exposed.CompareAndSwap(false, true); retired || !assignment.Overridden {
-				delete(c.assignmentCache_, name)
+			// never published anything, so it is dropped even if exposed.
+			if !assignment.Overridden || assignment.Exposed.CompareAndSwap(false, true) {
+				c.retireSwitchbackSlot(assignment.Name, name)
 				delete(c.AssignmentCache, assignment.Name)
 			}
 			continue
@@ -985,6 +990,11 @@ func (c *Context) cachedEntryFor(assignment *Assignment) *cachedAssignment {
 			if entry != nil && entry.assignment.Exposed == assignment.Exposed {
 				return entry
 			}
+		}
+	}
+	for _, entry := range c.retiredSwitchbackSlots_[assignment.Name] {
+		if entry.assignment.Exposed == assignment.Exposed {
+			return entry
 		}
 	}
 	return nil
