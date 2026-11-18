@@ -2344,21 +2344,69 @@ func TestHoldout_QueueExposureOnALiteralContext(t *testing.T) {
 
 // The uncovered path builds its exposure inline (sharing exposureFor costs
 // about 5% on the first exposure without holdouts); both mappings must
-// produce the same exposure for every field.
+// produce the same exposure for every field, with every flag set and with
+// every flag clear, so neither dropping nor hardcoding a field passes.
 func TestHoldout_CoveredAndUncoveredExposureMappingsAgree(t *testing.T) {
-	var assignment = &Assignment{Id: 7, Name: "exp", UnitType: "u", Variant: 2, Assigned: true, Eligible: true,
-		Overridden: true, FullOn: true, Custom: true, AudienceMismatch: true, RuleOverride: true}
-	var exposed = &atomic.Value{}
-	exposed.Store(true)
-	assignment.Exposed = exposed
-	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "other", hoUnitType, 0)))
-	if !h.ctx.enqueueExposure(assignment) {
-		t.Fatal("not queued")
+	for _, flag := range []bool{false, true} {
+		var assignment = &Assignment{Id: 7, Name: "exp", UnitType: "u", Variant: 2, Assigned: flag, Eligible: flag,
+			Overridden: flag, FullOn: flag, Custom: flag, AudienceMismatch: flag, RuleOverride: flag}
+		var exposed = &atomic.Value{}
+		exposed.Store(true)
+		assignment.Exposed = exposed
+		var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "other", hoUnitType, 0)))
+		if !h.ctx.enqueueExposure(assignment) {
+			t.Fatal("not queued")
+		}
+		var queued = queuedExposures(h.ctx)
+		expectValue(t, []jsonmodels.Exposure{h.ctx.exposureFor(assignment, hoMillis)}, queued)
+		expectValue(t, jsonmodels.Exposure{Id: 7, Name: "exp", Unit: "u", Variant: 2, ExposedAt: hoMillis, Assigned: flag,
+			Eligible: flag, Overridden: flag, FullOn: flag, Custom: flag, AudienceMismatch: flag, RuleOverride: flag}, queued[0])
 	}
-	var queued = queuedExposures(h.ctx)
-	expectValue(t, []jsonmodels.Exposure{h.ctx.exposureFor(assignment, hoMillis)}, queued)
-	expectValue(t, jsonmodels.Exposure{Id: 7, Name: "exp", Unit: "u", Variant: 2, ExposedAt: hoMillis, Assigned: true,
-		Eligible: true, Overridden: true, FullOn: true, Custom: true, AudienceMismatch: true, RuleOverride: true}, queued[0])
+}
+
+// Holdout ids, iterations and seeds accept integers in any JSON notation up
+// to the native int range, and reject anything beyond it.
+func TestHoldout_HoldoutIdRange(t *testing.T) {
+	var ids = holdoutIds([]byte(`[1e18, -9.223372036854775808e18, 9.223372036854775807e18, -1e19, 1e19]`))
+	expectValue(t, []int{1000000000000000000, -9223372036854775808}, ids)
+}
+
+// hoLockProbingClock fails the test if the context's EventLock_ is held while
+// the clock is read, so a custom clock can never block on its own context.
+type hoLockProbingClock struct {
+	t   *testing.T
+	ctx **Context
+}
+
+func (c hoLockProbingClock) Millis() int64 {
+	if ctx := *c.ctx; ctx != nil {
+		if !ctx.EventLock_.TryLock() {
+			c.t.Error("the clock was read with EventLock_ held")
+		} else {
+			ctx.EventLock_.Unlock()
+		}
+	}
+	return hoMillis
+}
+
+// A covered decision reads the clock before taking EventLock_, as the
+// uncovered path does.
+func TestHoldout_CoveredAdmissionReadsTheClockOutsideEventLock(t *testing.T) {
+	var ctx *Context
+	var config = CreateDefaultContextConfig()
+	config.Units_ = map[string]string{hoUnitType: hoUIDNotHeldOut}
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = -1
+	var ft, done = future.New()
+	done(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)), nil)
+	ctx = CreateContext(hoLockProbingClock{t: t, ctx: &ctx}, config, ft, &hoProvider{}, &hoPublisher{}, nil,
+		DefaultVariableParser{}, AudienceMatcher{DefaultAudienceDeserializer{}})
+	ctx.WaitUntilReady()
+	t.Cleanup(func() { ctx.ClearRefreshTimer() })
+	if _, err := ctx.GetTreatment("exp"); err != nil {
+		t.Fatal(err)
+	}
+	expectInt(t, 2, int(ctx.GetPendingCount()))
 }
 
 // A refresh that re-encodes a holdout's integers in another JSON notation

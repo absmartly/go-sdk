@@ -561,9 +561,11 @@ them as the JavaScript SDK does.
   over one the unit is assigned to; if none is, the held-out experiment's
   control value is returned rather than the default.
 
-A unit keeps its arm until the holdout's iteration changes. Payloads without
-holdouts are served and published exactly as before, with no extra
-allocations on warmed cached reads and exposures. Assignment rebuilds allocate a small retirement token.
+A unit keeps its arm until the holdout's iteration changes. Holdouts add
+nothing to the publish payload of experiments without holdouts (the
+`ruleOverride` flag every exposure now carries comes with assignment rules),
+and warmed cached reads and exposures allocate nothing more. Assignment
+rebuilds allocate a small retirement token.
 
 `ContextData` gained a `Holdouts` field and `Experiment` a `HoldoutIds` field,
 so unkeyed (positional) literals of `jsonmodels.ContextData` must become keyed
