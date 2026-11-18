@@ -5,6 +5,9 @@ package sdk_test
 // configuration and model type whose layout v1.1.1 published, extension
 // points implemented by customer types, and the v1.1.1 error texts. If it
 // stops compiling or passing, v1.2.0 broke a v1.1.1 caller.
+//
+// The unkeyed literals are the point of the file, so `go vet ./...` reports
+// them by design; run vet with -composites=false.
 
 import (
 	"errors"
