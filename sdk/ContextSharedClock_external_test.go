@@ -64,3 +64,61 @@ func TestSharingClockBetweenContextsKeepsThemSeparate(t *testing.T) {
 		t.Errorf("b's goal was published under a's unit hash %q", publisherB.events[0].Units[0].Uid)
 	}
 }
+
+// firstContextLogger keeps the first Context value an event logger receives,
+// which is a snapshot of the context that logged it.
+type firstContextLogger struct {
+	saved *sdk.Context
+}
+
+func (l *firstContextLogger) HandleEvent(context sdk.Context, event sdk.EventType, data interface{}) {
+	if l.saved == nil {
+		l.saved = &context
+	}
+}
+
+// The Context a logger receives is a snapshot; copying its Clock_ into
+// another context must also only share the clock.
+func TestSharingSnapshotClockBetweenContextsKeepsThemSeparate(t *testing.T) {
+	var publisherA, publisherB = &recordingPublisher{}, &recordingPublisher{}
+	var logger = &firstContextLogger{}
+	var abs = sdk.Create(sdk.ABSmartlyConfig{
+		ContextDataProvider_: v111Provider{jsonmodels.ContextData{}},
+		ContextEventHandler_: publisherA,
+		ContextEventLogger_:  logger,
+	})
+	var a = abs.CreateContext(sdk.ContextConfig{Units_: map[string]string{"session_id": "alice"}, PublishDelay_: -1})
+	a.WaitUntilReady()
+	if logger.saved == nil {
+		t.Fatal("the logger received no context")
+	}
+	var b = sharedClockContext(t, "bob", publisherB)
+	b.Clock_ = logger.saved.Clock_
+
+	if err := b.Track("goal", nil); err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
+
+	if len(publisherA.events) != 0 {
+		t.Fatalf("b's goal was published through a: %+v", publisherA.events)
+	}
+	if len(publisherB.events) != 1 || len(publisherB.events[0].Goals) != 1 {
+		t.Fatalf("b published %+v, want one event with b's goal", publisherB.events)
+	}
+	if !b.IsClosed() || a.IsClosed() {
+		t.Errorf("closed: a=%v b=%v, want only b", a.IsClosed(), b.IsClosed())
+	}
+	if err := a.Track("goal", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Publish(); err != nil {
+		t.Fatal(err)
+	}
+	if len(publisherA.events) != 1 {
+		t.Fatalf("a published %d events, want 1", len(publisherA.events))
+	}
+	if publisherA.events[0].Units[0].Uid == publisherB.events[0].Units[0].Uid {
+		t.Errorf("b's goal was published under a's unit hash %q", publisherB.events[0].Units[0].Uid)
+	}
+}

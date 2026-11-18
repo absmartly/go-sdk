@@ -184,8 +184,9 @@ func (c *Context) ownClock() *contextClock {
 	return nil
 }
 
-// Keep the cold literal fallback out of state so the carrier lookup in the
-// assignment fast path can inline.
+// literalState is the cold fallback for a context with no carrier of its own
+// (a literal, or one whose Clock_ was replaced), kept out of state so the
+// carrier lookup stays a short call.
 func (c *Context) literalState() *contextState {
 	if c.ContextLock_ == nil {
 		return newContextState()
