@@ -915,11 +915,15 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 func (c *Context) QueueExposure(assignment *Assignment) {
 	c = c.live()
 	var holdouts *assignmentHoldouts
-	c.ContextLock_.RLock()
-	if entry, found := c.assignmentCache_[assignment.Name]; found && entry.assignment.Exposed == assignment.Exposed {
-		holdouts = entry.holdouts
+	// Without installed holdouts no cached entry has any: skip the lookup,
+	// so this stays the released path.
+	if index := c.index_.Load(); index != nil && len(index.holdouts) > 0 {
+		c.ContextLock_.RLock()
+		if entry, found := c.assignmentCache_[assignment.Name]; found && entry.assignment.Exposed == assignment.Exposed {
+			holdouts = entry.holdouts
+		}
+		c.ContextLock_.RUnlock()
 	}
-	c.ContextLock_.RUnlock()
 	c.queueExposure(assignment, holdouts)
 }
 

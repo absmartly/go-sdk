@@ -2300,3 +2300,44 @@ func TestHoldout_RetiredExposureIdentitiesAreBounded(t *testing.T) {
 	h.ctx.QueueExposure(first)
 	h.expectPending(0)
 }
+
+// hoGenerations installs payloads whose holdout iteration is 1..n and
+// returns each generation's assignment, so each replaces the one before.
+func hoGenerations(h *hoContext, from int, to int) []*Assignment {
+	var held []*Assignment
+	for i := from; i <= to; i++ {
+		var holdout = hoHoldoutA()
+		holdout.Iteration = i
+		h.ctx.SetData(hoData([]jsonmodels.Holdout{holdout}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+		held = append(held, h.ctx.GetAssignment("exp"))
+	}
+	return held
+}
+
+// The bound keeps the newest retired identities: after ten replacements the
+// recently replaced generations are still retired, and a rejected exposure
+// never reopens them.
+func TestHoldout_RetiredIdentitiesKeepTheNewest(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.ctx.GetAssignment("exp")
+	var held = hoGenerations(h, 2, 11)
+	for _, assignment := range []*Assignment{held[7], held[8]} {
+		assignment.Exposed.Store(true)
+		h.ctx.reopenExposure(assignment)
+		if !assignment.Exposed.Load().(bool) {
+			t.Fatal("a recently replaced assignment was reopened")
+		}
+	}
+}
+
+// An identity replaced twice is still retired.
+func TestHoldout_RetiredIdentityKeptAcrossTwoReplacements(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	var stale = h.ctx.GetAssignment("exp")
+	hoGenerations(h, 2, 3)
+	stale.Exposed.Store(true)
+	h.ctx.reopenExposure(stale)
+	if !stale.Exposed.Load().(bool) {
+		t.Fatal("an assignment replaced twice was reopened")
+	}
+}
