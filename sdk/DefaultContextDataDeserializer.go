@@ -74,8 +74,10 @@ func holdoutIds(raw json.RawMessage) []int {
 	return ids
 }
 
-// holdoutId decodes an integral JSON number that fits an int: 10, 10.0 and
-// 1e1 are the same number, as in JavaScript.
+// holdoutId decodes an integral JSON number that fits an int. It goes
+// through float64, as JavaScript's JSON.parse does, so 10, 10.0 and 1e1 are
+// the same id, and any two spellings of one number decode alike (above 2^53
+// they round together, as in JavaScript).
 func holdoutId(raw json.RawMessage) (int, bool) {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || raw[0] == '"' {
@@ -85,9 +87,6 @@ func holdoutId(raw json.RawMessage) (int, bool) {
 	var number json.Number
 	if json.Unmarshal(raw, &number) != nil || len(number) == 0 {
 		return 0, false
-	}
-	if id, err := number.Int64(); err == nil {
-		return int(id), id == int64(int(id))
 	}
 	var value, err = number.Float64()
 	if err != nil || value != math.Trunc(value) || value < -math.Exp2(float64(strconv.IntSize-1)) || value >= math.Exp2(float64(strconv.IntSize-1)) {

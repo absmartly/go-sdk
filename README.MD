@@ -564,8 +564,8 @@ them as the JavaScript SDK does.
 A unit keeps its arm until the holdout's iteration changes. Holdouts add
 nothing to the publish payload of experiments without holdouts (the
 `ruleOverride` flag every exposure now carries comes with assignment rules),
-and warmed cached reads and exposures allocate nothing more. Assignment
-rebuilds allocate a small retirement token.
+and warmed cached reads and exposures allocate nothing more. Creating a
+context and rebuilding an assignment each allocate one small extra object.
 
 `ContextData` gained a `Holdouts` field and `Experiment` a `HoldoutIds` field,
 so unkeyed (positional) literals of `jsonmodels.ContextData` must become keyed

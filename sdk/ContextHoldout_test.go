@@ -2637,3 +2637,32 @@ func TestHoldout_RuleRebuildCarriesRetirementIdentity(t *testing.T) {
 	h.ctx.QueueExposure(before.assignment)
 	h.expectPending(0)
 }
+
+// An uncovered exposure also reads the clock before taking EventLock_.
+func TestHoldout_UncoveredExposureReadsTheClockOutsideEventLock(t *testing.T) {
+	var ctx *Context
+	var config = CreateDefaultContextConfig()
+	config.Units_ = map[string]string{hoUnitType: hoUID}
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = -1
+	var ft, done = future.New()
+	done(hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)), nil)
+	ctx = CreateContext(hoLockProbingClock{t: t, ctx: &ctx}, config, ft, &hoProvider{}, &hoPublisher{}, nil,
+		DefaultVariableParser{}, AudienceMatcher{DefaultAudienceDeserializer{}})
+	ctx.WaitUntilReady()
+	t.Cleanup(func() { ctx.ClearRefreshTimer() })
+	if _, err := ctx.GetTreatment("exp"); err != nil {
+		t.Fatal(err)
+	}
+	expectInt(t, 1, int(ctx.GetPendingCount()))
+}
+
+// Holdout ids decode through float64 as JavaScript's JSON.parse does, so any
+// two spellings of one number give the same id, also above 2^53. Expected
+// values computed with node v22.
+func TestHoldout_HoldoutIdSpellingsDecodeAlike(t *testing.T) {
+	expectValue(t, []int{9007199254740992, 9007199254740992, 9007199254740992},
+		holdoutIds([]byte(`[9007199254740993, 9.007199254740993e15, 9007199254740992]`)))
+	expectValue(t, []int{1000000000000000000, 1000000000000000000},
+		holdoutIds([]byte(`[1000000000000000001, 1.000000000000000001e18]`)))
+}
