@@ -24,8 +24,7 @@ The finalization event is still `sdk.Close` with the value `"Close"`; `sdk.Final
 ### Install the SDK
 
 ```bash
-go get github.com/absmartly/go-sdk/sdk
-```
+go get github.com/absmartly/go-sdk/sdk@v1.2.0```
 
 ### Dependencies
 ```

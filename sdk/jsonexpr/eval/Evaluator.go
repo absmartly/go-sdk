@@ -75,9 +75,6 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 	}
 
 	if lhs.IsValid() && rhs.IsValid() && lhs.Kind() == rhs.Kind() {
-		if valueEquals(lhs, rhs) {
-			return 0
-		}
 		if reflect.DeepEqual(lhs.Interface(), rhs.Interface()) {
 			return 0
 		}
@@ -265,19 +262,5 @@ func deepEquals(lhs reflect.Value, rhs reflect.Value) bool {
 	if lhs.Kind() != rhs.Kind() {
 		return false
 	}
-	if valueEquals(lhs, rhs) {
-		return true
-	}
 	return reflect.DeepEqual(lhs.Interface(), rhs.Interface())
-}
-
-// valueEquals reports whether lhs == rhs, without panicking on values whose
-// dynamic type is not comparable (reflect.Value.Comparable needs Go 1.20).
-func valueEquals(lhs reflect.Value, rhs reflect.Value) (equal bool) {
-	defer func() {
-		if recover() != nil {
-			equal = false
-		}
-	}()
-	return lhs.Interface() == rhs.Interface()
 }

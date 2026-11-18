@@ -300,9 +300,9 @@ func TestFailedCloseDoesNotRestartRefreshTimer(t *testing.T) {
 
 	ctx.Refresh()
 	assertAny(before+1, atomic.LoadInt32(&provider.calls), t)
-	ctx.stateLock_.Lock()
+	ctx.state().stateLock_.Lock()
 	var timer = ctx.RefreshTimer_
-	ctx.stateLock_.Unlock()
+	ctx.state().stateLock_.Unlock()
 	if timer != nil {
 		t.Fatal("refresh timer re-armed after a failed close")
 	}

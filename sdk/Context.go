@@ -44,50 +44,46 @@ type Context struct {
 	Data_                jsonmodels.ContextData
 	Index_               map[string]ExperimentVariables
 	ContextCustomFields_ map[string]map[string]ContextCustomFieldValue
-	// Deprecated: IndexVariables_ keeps its v1.1.1 type; each key maps to the
-	// first ExperimentVariables that defines it. Use GetVariableKeysAll for
-	// every experiment per key.
-	IndexVariables_ map[interface{}]interface{}
-	ContextLock_    *sync.RWMutex
-	HashedUnits_    map[interface{}]interface{}
-	Assigners_      map[interface{}]interface{}
-	// Deprecated: AssignmentCache keeps its v1.1.1 type and is a read-only
-	// copy of the internal cache, written under ContextLock_.
-	AssignmentCache map[string]Assignment
-	EventLock_      *sync.Mutex
-	Exposures_      []jsonmodels.Exposure
-	Achievements_   []jsonmodels.GoalAchievement
-	Attributes_     []interface{}
-	Overrides_      map[interface{}]interface{}
-	Cassignments_   map[interface{}]interface{}
-	PendingCount_   *atomic.Value
-	Closing_        *atomic.Value
-	Closed_         *atomic.Value
-	Refreshing_     *atomic.Value
-	ReadyFuture_    *future.Future
-	ClosingFuture_  *future.Future
+	IndexVariables_      map[interface{}]interface{}
+	ContextLock_         *sync.RWMutex
+	HashedUnits_         map[interface{}]interface{}
+	Assigners_           map[interface{}]interface{}
+	AssignmentCache      map[string]Assignment
+	EventLock_           *sync.Mutex
+	Exposures_           []jsonmodels.Exposure
+	Achievements_        []jsonmodels.GoalAchievement
+	Attributes_          []interface{}
+	Overrides_           map[interface{}]interface{}
+	Cassignments_        map[interface{}]interface{}
+	PendingCount_        *atomic.Value
+	Closing_             *atomic.Value
+	Closed_              *atomic.Value
+	Refreshing_          *atomic.Value
+	ReadyFuture_         *future.Future
+	ClosingFuture_       *future.Future
+	RefreshFuture_       *future.Future
+	TimeoutLock_         *sync.Mutex
+	Timeout_             *time.Timer
+	RefreshTimer_        *time.Timer
+	Clock_               internal.Clock
+}
+
+// contextState is owned by a context, never by a process-wide registry.
+// Context keeps its v1.1.1 layout so external unkeyed literals remain valid.
+type contextState struct {
+	// manualRoot is set only by the literal fallback; its copies share this
+	// owner through Assigners_, just as constructed copies share a carrier.
+	manualRoot *Context
 	// finalizedFuture_ includes logger delivery; ClosingFuture_ only includes
 	// transport/sealing, allowing loggers to re-enter Close safely.
 	finalizedFuture_ *future.Future
 	publishLogs_     []*future.Future
-	RefreshFuture_   *future.Future
-	TimeoutLock_     *sync.Mutex
 	// stateLock_ guards ReadyFuture_, RefreshFuture_, ClosingFuture_, RefreshTimer_ and closeStarted_.
 	stateLock_ *sync.Mutex
 	// inflight_ holds the publishes that have been sent and not yet settled. Guarded by stateLock_.
 	inflight_ []*future.Future
 
-	// root_ is set on the copies of the Context that callbacks receive. It
-	// points at the live context, which owns the lifecycle state (the
-	// closing/refresh futures, timers, in-flight publishes and event queue).
-	// The lifecycle methods run on the live context, so calling Close, Publish
-	// or Refresh on the copy a logger was given acts on the real context, not
-	// on stale copied fields.
-	root_         *Context
-	Timeout_      *time.Timer
-	RefreshTimer_ *time.Timer
-	Clock_        internal.Clock
-	attrsSeq_     int32
+	attrsSeq_ int32
 
 	// application_ and environment_ are the application and environment names
 	// from the client config. They are injected into the attribute map that
@@ -133,6 +129,128 @@ type Context struct {
 	// assignmentCache_ holds the assignments by experiment name. Guarded by
 	// ContextLock_: entries are only written under the write lock.
 	assignmentCache_ map[string]*cachedAssignment
+	ruleIdentities   *ruleAssignmentIdentities
+}
+
+// contextClock carries private state in an existing interface field without
+// changing Context's public layout. Millis still delegates to the supplied
+// clock. Ordinary value copies share state; callback snapshots additionally
+// point at the live context. All references are GC-owned, including cycles:
+// neither abandoned open contexts nor retained snapshots need a global map or
+// finalizer. The carrier is installed before a constructed context escapes.
+type contextClock struct {
+	internal.Clock
+	state    *contextState
+	root     *Context
+	snapshot bool
+}
+
+type contextStateKey struct{}
+
+func newContextState() *contextState {
+	var state = &contextState{
+		stateLock_:       &sync.Mutex{},
+		unitValues_:      map[string]interface{}{},
+		readyDeliverer_:  new(uint64),
+		loggers_:         &loggerGoroutines{ids: map[uint64]int{}},
+		index_:           &atomic.Value{},
+		assignmentCache_: map[string]*cachedAssignment{},
+		ruleIdentities:   &ruleAssignmentIdentities{ids: map[uintptr]struct{}{}},
+	}
+	state.index_.Store((*contextIndex)(nil))
+	return state
+}
+
+// state takes no lock on constructor-created contexts, including assignment
+// cache hits. A manually initialized v1.1.1 literal has no carrier; its existing
+// assigner map owns the state under a private, non-string key. That fallback is
+// protected by ContextLock_, and must be resolved before taking other locks.
+// It does not replace the caller's Clock_ or require process-lifetime storage.
+func (c *Context) state() *contextState {
+	if clock, ok := c.Clock_.(*contextClock); ok {
+		return clock.state
+	}
+	return c.literalState()
+}
+
+// Keep the cold literal fallback out of state so the carrier lookup in the
+// assignment fast path can inline.
+func (c *Context) literalState() *contextState {
+	if c.ContextLock_ == nil {
+		return newContextState()
+	}
+	c.ContextLock_.Lock()
+	defer c.ContextLock_.Unlock()
+	if state, ok := c.Assigners_[contextStateKey{}].(*contextState); ok {
+		return state
+	}
+	var state = newContextState()
+	state.manualRoot = c
+	var indexed = make(map[string]*indexedExperiment, len(c.Index_))
+	for name, experiment := range c.Index_ {
+		// Manually supplied v1.1.1 indexes have no parsed-rule metadata.
+		// SetData installs it; don't call a user deserializer under this lock.
+		indexed[name] = &indexedExperiment{experiment: experiment}
+	}
+	state.index_.Store(&contextIndex{experiments: indexed})
+	state.indexVariables_ = map[string][]ExperimentVariables{}
+	for key, value := range c.IndexVariables_ {
+		if key, ok := key.(string); ok {
+			if experiment, ok := value.(ExperimentVariables); ok {
+				state.indexVariables_[key] = []ExperimentVariables{experiment}
+			}
+		}
+	}
+	for name, assignment := range c.AssignmentCache {
+		var assignment = assignment
+		state.assignmentCache_[name] = &cachedAssignment{assignment: &assignment}
+	}
+	if c.Assigners_ == nil {
+		c.Assigners_ = map[interface{}]interface{}{}
+	}
+	c.Assigners_[contextStateKey{}] = state
+	return state
+}
+
+func (c *Context) isSnapshot() bool {
+	clock, ok := c.Clock_.(*contextClock)
+	return ok && clock.snapshot
+}
+
+// ruleAssignmentIdentities remembers the rule flag of assignments handed to
+// callers even after their cache entries are replaced. Keys are numeric, not
+// pointers: the registry must not keep an abandoned assignment alive. Each
+// flag's finalizer removes its key and captures only this standalone registry,
+// never the context or its cache (which would create a retention cycle).
+// A retained Assignment copy keeps Exposed alive, so its rule flag remains
+// available for as long as QueueExposure can use it. No global table is used.
+type ruleAssignmentIdentities struct {
+	mu  sync.Mutex
+	ids map[uintptr]struct{}
+}
+
+func (r *ruleAssignmentIdentities) remember(flag *atomic.Value) {
+	var id = reflect.ValueOf(flag).Pointer()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, found := r.ids[id]; found {
+		return
+	}
+	r.ids[id] = struct{}{}
+	runtime.SetFinalizer(flag, func(*atomic.Value) {
+		r.mu.Lock()
+		delete(r.ids, id)
+		r.mu.Unlock()
+	})
+}
+
+func (r *ruleAssignmentIdentities) contains(flag *atomic.Value) bool {
+	var id = reflect.ValueOf(flag).Pointer()
+	r.mu.Lock()
+	_, found := r.ids[id]
+	r.mu.Unlock()
+	runtime.KeepAlive(flag)
+	return found
 }
 
 // contextIndex is an installed experiment index and, by experiment name, the
@@ -251,8 +369,10 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	audienceMatcher AudienceMatcher, application string, environment string) *Context {
 	var cntx = Context{Clock_: clock, PublishDelay_: config.PublishDelay_, RefreshInterval_: config.RefreshInterval_,
 		EventHandler_: eventHandler, DataProvider_: dataProvider, VariableParser_: variableParser,
-		AudienceMatcher_: audienceMatcher, Units_: map[string]string{},
-		application_: application, environment_: environment}
+		AudienceMatcher_: audienceMatcher, Units_: map[string]string{}}
+	var state = newContextState()
+	state.application_, state.environment_ = application, environment
+	cntx.Clock_ = &contextClock{Clock: clock, state: state, root: &cntx}
 
 	if config.EventLogger_ != nil {
 		cntx.EventLogger_ = config.EventLogger_
@@ -276,15 +396,7 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	cntx.ContextLock_ = &sync.RWMutex{}
 	cntx.EventLock_ = &sync.Mutex{}
 	cntx.TimeoutLock_ = &sync.Mutex{}
-	cntx.stateLock_ = &sync.Mutex{}
-
 	cntx.AssignmentCache = map[string]Assignment{}
-	cntx.assignmentCache_ = map[string]*cachedAssignment{}
-	cntx.index_ = &atomic.Value{}
-	cntx.index_.Store((*contextIndex)(nil))
-	cntx.unitValues_ = map[string]interface{}{}
-	cntx.readyDeliverer_ = new(uint64)
-	cntx.loggers_ = &loggerGoroutines{ids: map[uint64]int{}}
 	cntx.Achievements_ = make([]jsonmodels.GoalAchievement, 0)
 	cntx.Exposures_ = make([]jsonmodels.Exposure, 0)
 	cntx.Attributes_ = make([]interface{}, 0)
@@ -353,8 +465,8 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 		var tempFuture, readyFutureDone = future.New()
 		cntx.setReadyFuture(tempFuture)
 		dataFuture.Listen(func(val future.Value, err error) {
-			atomic.StoreUint64(tmp.readyDeliverer_, goroutineID())
-			defer atomic.StoreUint64(tmp.readyDeliverer_, 0)
+			atomic.StoreUint64(tmp.state().readyDeliverer_, goroutineID())
+			defer atomic.StoreUint64(tmp.state().readyDeliverer_, 0)
 			if err == nil {
 				result, ok := val.(jsonmodels.ContextData)
 				if !ok {
@@ -435,22 +547,24 @@ func (c *Context) WaitUntilReady() Context {
 }
 
 func (c *Context) pendingReadyFuture() *future.Future {
-	if c.Ready_.Load().(bool) && (c.root_ != nil || atomic.LoadUint64(c.live().readyDeliverer_) == goroutineID()) {
+	if c.Ready_.Load().(bool) && (c.isSnapshot() || atomic.LoadUint64(c.live().state().readyDeliverer_) == goroutineID()) {
 		return nil
 	}
 	return c.live().getReadyFuture()
 }
 
 func (c *Context) getReadyFuture() *future.Future {
-	c.stateLock_.Lock()
-	defer c.stateLock_.Unlock()
+	var st = c.state()
+	st.stateLock_.Lock()
+	defer st.stateLock_.Unlock()
 	return c.ReadyFuture_
 }
 
 func (c *Context) setReadyFuture(f *future.Future) {
-	c.stateLock_.Lock()
+	var st = c.state()
+	st.stateLock_.Lock()
 	c.ReadyFuture_ = f
-	c.stateLock_.Unlock()
+	st.stateLock_.Unlock()
 }
 
 // snapshot returns a copy of the context taken while holding every lock that
@@ -459,24 +573,39 @@ func (c *Context) setReadyFuture(f *future.Future) {
 // stateLock_. It must not be called while holding any of them.
 func (c *Context) snapshot() Context {
 	c = c.live()
-	c.ContextLock_.RLock()
-	defer c.ContextLock_.RUnlock()
-	c.DataLock.RLock()
-	defer c.DataLock.RUnlock()
-	c.EventLock_.Lock()
-	defer c.EventLock_.Unlock()
-	c.TimeoutLock_.Lock()
-	defer c.TimeoutLock_.Unlock()
-	c.stateLock_.Lock()
-	defer c.stateLock_.Unlock()
+	var st = c.state()
+	if c.ContextLock_ != nil {
+		c.ContextLock_.RLock()
+		defer c.ContextLock_.RUnlock()
+	}
+	if c.DataLock != nil {
+		c.DataLock.RLock()
+		defer c.DataLock.RUnlock()
+	}
+	if c.EventLock_ != nil {
+		c.EventLock_.Lock()
+		defer c.EventLock_.Unlock()
+	}
+	if c.TimeoutLock_ != nil {
+		c.TimeoutLock_.Lock()
+		defer c.TimeoutLock_.Unlock()
+	}
+	st.stateLock_.Lock()
+	defer st.stateLock_.Unlock()
 	var cp = *c
-	cp.root_ = c
+	cp.Clock_ = &contextClock{Clock: c.Clock_, state: st, root: c, snapshot: true}
 	return cp
 }
 
 func (c *Context) live() *Context {
-	if c.root_ != nil {
-		return c.root_
+	if clock, ok := c.Clock_.(*contextClock); ok {
+		if clock.root != nil {
+			return clock.root
+		}
+		return c
+	}
+	if c.ContextLock_ != nil {
+		return c.state().manualRoot
 	}
 	return c
 }
@@ -590,6 +719,7 @@ func (c *Context) SetUnitValue(unitType string, uid interface{}) error {
 
 func (c *Context) setUnit(unitType string, uid interface{}) error {
 	c = c.live()
+	var st = c.state()
 	var err = c.CheckNotClosed()
 	if err != nil {
 		return err
@@ -608,7 +738,7 @@ func (c *Context) setUnit(unitType string, uid interface{}) error {
 
 	c.ContextLock_.Lock()
 	defer c.ContextLock_.Unlock()
-	var previous, exist = c.unitValues_[unitType]
+	var previous, exist = st.unitValues_[unitType]
 	if !exist {
 		if s, found := c.Units_[unitType]; found {
 			previous, exist = s, true
@@ -623,8 +753,8 @@ func (c *Context) setUnit(unitType string, uid interface{}) error {
 	}
 
 	c.Units_[unitType] = uidString
-	c.unitValues_[unitType] = value
-	c.evictRuleAssignmentsMissingUnit(unitType)
+	st.unitValues_[unitType] = value
+	c.evictRuleAssignmentsMissingUnit(st, unitType)
 	return nil
 }
 
@@ -635,12 +765,12 @@ func (c *Context) setUnit(unitType string, uid interface{}) error {
 // variant and queue a second, conflicting exposure. An evicted assignment is
 // marked exposed so a caller still holding it cannot queue it. The caller
 // holds ContextLock_ for writing.
-func (c *Context) evictRuleAssignmentsMissingUnit(unitType string) {
-	for name, entry := range c.assignmentCache_ {
+func (c *Context) evictRuleAssignmentsMissingUnit(st *contextState, unitType string) {
+	for name, entry := range st.assignmentCache_ {
 		var assignment = entry.assignment
 		if entry.ruleOverride && entry.ruleMissingUnit && assignment.UnitType == unitType &&
 			assignment.Exposed.CompareAndSwap(false, true) {
-			delete(c.assignmentCache_, name)
+			delete(st.assignmentCache_, name)
 			delete(c.AssignmentCache, name)
 		}
 	}
@@ -685,9 +815,10 @@ func toFloat64(v interface{}) float64 {
 // GetUnit returns the UID of a unit type, or nil when it is not set.
 func (c *Context) GetUnit(unitType string) interface{} {
 	c = c.live()
+	var st = c.state()
 	c.ContextLock_.RLock()
 	defer c.ContextLock_.RUnlock()
-	if v, ok := c.unitValues_[unitType]; ok {
+	if v, ok := st.unitValues_[unitType]; ok {
 		return v
 	}
 	if s, ok := c.Units_[unitType]; ok {
@@ -699,11 +830,12 @@ func (c *Context) GetUnit(unitType string) interface{} {
 // GetUnits returns a copy of all units, each as it was set.
 func (c *Context) GetUnits() map[string]interface{} {
 	c = c.live()
+	var st = c.state()
 	c.ContextLock_.RLock()
 	defer c.ContextLock_.RUnlock()
 	var result = make(map[string]interface{}, len(c.Units_))
 	for k, s := range c.Units_ {
-		if v, ok := c.unitValues_[k]; ok {
+		if v, ok := st.unitValues_[k]; ok {
 			result[k] = v
 		} else {
 			result[k] = s
@@ -723,6 +855,7 @@ func (c *Context) SetUnits(units map[string]string) error {
 }
 
 func (c *Context) SetAttribute(name string, value interface{}) error {
+	var st = c.state()
 	var err = c.CheckNotClosed()
 	if err != nil {
 		return err
@@ -731,7 +864,7 @@ func (c *Context) SetAttribute(name string, value interface{}) error {
 	var attribute = jsonmodels.Attribute{Name: name, Value: value, SetAt: c.Clock_.Millis()}
 	c.ContextLock_.Lock()
 	c.Attributes_ = append(c.Attributes_, attribute)
-	atomic.AddInt32(&c.attrsSeq_, 1)
+	atomic.AddInt32(&st.attrsSeq_, 1)
 	c.ContextLock_.Unlock()
 	return nil
 }
@@ -770,12 +903,16 @@ func (c *Context) GetAttributes() map[string]interface{} {
 // These values are never published as attributes; the collector adds them to
 // exposures server-side. The caller must hold ContextLock_.
 func (c *Context) evaluationAttributes() map[string]interface{} {
+	return c.evaluationAttributesWithState(c.state())
+}
+
+func (c *Context) evaluationAttributesWithState(st *contextState) map[string]interface{} {
 	var attrs = map[string]interface{}{}
-	if len(c.application_) > 0 {
-		attrs["application"] = c.application_
+	if len(st.application_) > 0 {
+		attrs["application"] = st.application_
 	}
-	if len(c.environment_) > 0 {
-		attrs["environment"] = c.environment_
+	if len(st.environment_) > 0 {
+		attrs["environment"] = st.environment_
 	}
 	for _, v := range c.Attributes_ {
 		var attribute = v.(jsonmodels.Attribute)
@@ -809,11 +946,12 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 
 func (c *Context) QueueExposure(assignment *Assignment) {
 	c = c.live()
+	var st = c.state()
 	// A copy returned by GetAssignment shares the cached assignment's
 	// exposed flag, which identifies the cache entry its rule flag is on.
-	var ruleOverride = false
+	var ruleOverride = st.ruleIdentities.contains(assignment.Exposed)
 	c.ContextLock_.RLock()
-	if entry, found := c.assignmentCache_[assignment.Name]; found && entry.assignment.Exposed == assignment.Exposed {
+	if entry, found := st.assignmentCache_[assignment.Name]; found && entry.assignment.Exposed == assignment.Exposed {
 		ruleOverride = entry.ruleOverride
 	}
 	c.ContextLock_.RUnlock()
@@ -862,6 +1000,7 @@ func (c *Context) PeekTreatment(experimentName string) (int, error) {
 // GetVariableKeys returns, for each variable key, the name of the first
 // experiment that defines it. Use GetVariableKeysAll to get every experiment.
 func (c *Context) GetVariableKeys() (map[string]string, error) {
+	var st = c.state()
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
@@ -870,7 +1009,7 @@ func (c *Context) GetVariableKeys() (map[string]string, error) {
 	var variableKeys = map[string]string{}
 
 	c.DataLock.RLock()
-	for key, experiments := range c.indexVariables_ {
+	for key, experiments := range st.indexVariables_ {
 		if len(experiments) > 0 {
 			variableKeys[key] = experiments[0].Data.Name
 		}
@@ -882,6 +1021,7 @@ func (c *Context) GetVariableKeys() (map[string]string, error) {
 // GetVariableKeysAll returns, for each variable key, the names of all
 // experiments that define it.
 func (c *Context) GetVariableKeysAll() (map[string][]string, error) {
+	var st = c.state()
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
@@ -890,7 +1030,7 @@ func (c *Context) GetVariableKeysAll() (map[string][]string, error) {
 	var variableKeys = map[string][]string{}
 
 	c.DataLock.RLock()
-	for key, experiments := range c.indexVariables_ {
+	for key, experiments := range st.indexVariables_ {
 		var names = make([]string, 0, len(experiments))
 		for _, value := range experiments {
 			names = append(names, value.Data.Name)
@@ -1000,13 +1140,14 @@ func (c *Context) PeekVariableValue(key string, defaultValue interface{}) (inter
 // experiment. When no experiment along the way assigns the key, the caller's
 // default is returned. v1.1.1 read only the last experiment in the payload.
 func (c *Context) resolveVariableValue(key string, defaultValue interface{}, expose bool) (interface{}, error) {
+	var st = c.state()
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
 	}
 
 	c.DataLock.RLock()
-	var experiments = c.indexVariables_[key]
+	var experiments = st.indexVariables_[key]
 	c.DataLock.RUnlock()
 
 	for _, experiment := range experiments {
@@ -1087,6 +1228,7 @@ func (c *Context) GetPendingCount() int32 {
 
 func (c *Context) RefreshAsync() *future.Future {
 	c = c.live()
+	var st = c.state()
 	var err = c.CheckNotClosed()
 	if err != nil {
 		var tempfuture, donefun = future.New()
@@ -1096,10 +1238,10 @@ func (c *Context) RefreshAsync() *future.Future {
 
 	// Decide and publish under one lock so a concurrent caller that sees the
 	// refresh as running also sees its future.
-	c.stateLock_.Lock()
+	st.stateLock_.Lock()
 	if c.Refreshing_.Load().(bool) {
 		var active = c.RefreshFuture_
-		c.stateLock_.Unlock()
+		st.stateLock_.Unlock()
 		if active != nil {
 			return active
 		}
@@ -1110,7 +1252,7 @@ func (c *Context) RefreshAsync() *future.Future {
 	c.Refreshing_.Store(true)
 	var tempfuture, donefun = future.New()
 	c.RefreshFuture_ = tempfuture
-	c.stateLock_.Unlock()
+	st.stateLock_.Unlock()
 
 	c.callDataProvider().Listen(func(value future.Value, err error) {
 		// Whatever happens below, the refresh ends: Refreshing_ is cleared and
@@ -1171,14 +1313,15 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 // closeAttempt starts or joins a close and returns that attempt's close and
 // finalization futures together, so a later retry cannot replace them.
 func (c *Context) closeAttempt() (*future.Future, *future.Future) {
+	var st = c.state()
 	// Claim the close and publish its future in one critical section, so a
 	// concurrent caller that sees the context closing also gets the future of
 	// the close that is running.
-	c.stateLock_.Lock()
+	st.stateLock_.Lock()
 	if c.Closed_.Load().(bool) || c.Closing_.Load().(bool) {
 		var existing = c.ClosingFuture_
-		var existingFinalized = c.finalizedFuture_
-		c.stateLock_.Unlock()
+		var existingFinalized = st.finalizedFuture_
+		st.stateLock_.Unlock()
 		if existingFinalized == nil {
 			var resolved, resolve = future.New()
 			resolve(nil, nil)
@@ -1187,7 +1330,7 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 		// A logger that re-enters a close that has already succeeded gets a
 		// settled future, as in v1.1.1: the close future may only settle once
 		// that logger returns.
-		if existing == nil || (c.Closed_.Load().(bool) && c.loggers_ != nil && c.loggers_.current()) {
+		if existing == nil || (c.Closed_.Load().(bool) && st.loggers_ != nil && st.loggers_.current()) {
 			var resolved, resolve = future.New()
 			resolve(nil, nil)
 			existing = resolved
@@ -1195,12 +1338,12 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 		return existing, existingFinalized
 	}
 	c.Closing_.Store(true)
-	c.closeStarted_ = true
+	st.closeStarted_ = true
 	var tempFuture, done = future.New()
 	c.ClosingFuture_ = tempFuture
 	var finalized, finalizeDone = future.New()
-	c.finalizedFuture_ = finalized
-	c.stateLock_.Unlock()
+	st.finalizedFuture_ = finalized
+	st.stateLock_.Unlock()
 
 	c.ClearRefreshTimer()
 
@@ -1229,7 +1372,7 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 	var settle func(synchronous bool)
 	settle = func(synchronous bool) {
 		c.EventLock_.Lock()
-		var waitFor = c.inflightSnapshot()
+		var waitFor = st.inflightSnapshot()
 		if len(waitFor) > 0 {
 			c.EventLock_.Unlock()
 			var remaining = int32(len(waitFor))
@@ -1259,10 +1402,10 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 			// The failed batch is back in the queue. Leave the context open so
 			// Publish or Close can retry it. The refresh timer stays stopped:
 			// Close returns nothing, so the caller cannot know it must stop it.
-			c.stateLock_.Lock()
+			st.stateLock_.Lock()
 			c.ClosingFuture_ = nil
 			c.Closing_.Store(false)
-			c.stateLock_.Unlock()
+			st.stateLock_.Unlock()
 			// Start delivery before notifying Close listeners, which run
 			// synchronously and may wait for finalization.
 			go func() {
@@ -1280,7 +1423,7 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 		// So is a close that would have to wait for an earlier publish logger.
 		// Each future's listeners run synchronously and may wait for the
 		// other future, so finalization settles on its own goroutine.
-		if synchronous && c.publishLogsDone() && (c.loggers_ == nil || !c.loggers_.current()) {
+		if synchronous && c.publishLogsDone() && (st.loggers_ == nil || !st.loggers_.current()) {
 			c.LogEvent(Finalize, nil)
 			go finalizeDone(nil, nil)
 			done(nil, nil)
@@ -1307,9 +1450,10 @@ func (c *Context) FinalizeAsync() (*future.Future, error) {
 }
 
 func (c *Context) publishLogsDone() bool {
-	c.stateLock_.Lock()
-	defer c.stateLock_.Unlock()
-	for _, f := range c.publishLogs_ {
+	var st = c.state()
+	st.stateLock_.Lock()
+	defer st.stateLock_.Unlock()
+	for _, f := range st.publishLogs_ {
 		if !f.Ready() {
 			return false
 		}
@@ -1318,9 +1462,10 @@ func (c *Context) publishLogsDone() bool {
 }
 
 func (c *Context) waitPublishLogs() {
-	c.stateLock_.Lock()
-	logs := append([]*future.Future(nil), c.publishLogs_...)
-	c.stateLock_.Unlock()
+	var st = c.state()
+	st.stateLock_.Lock()
+	logs := append([]*future.Future(nil), st.publishLogs_...)
+	st.stateLock_.Unlock()
 	for _, f := range logs {
 		f.Join(context.Background())
 	}
@@ -1332,8 +1477,9 @@ func (c *Context) waitPublishLogs() {
 // logger returns.
 func (c *Context) Close() {
 	c = c.live()
+	var st = c.state()
 	closing, finalized := c.closeAttempt()
-	if c.loggers_ != nil && c.loggers_.current() {
+	if st.loggers_ != nil && st.loggers_.current() {
 		closing.Join(context.Background())
 		return
 	}
@@ -1356,15 +1502,15 @@ const (
 // validCachedAssignment returns the cached assignment for experimentName and
 // whether it is still valid, with the rule set it was validated against. It
 // only reads, so it may run under ContextLock_ held for reading or writing.
-func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignment, *experimentRules, assignmentState) {
-	var entry, found = c.assignmentCache_[experimentName]
+func (c *Context) validCachedAssignment(st *contextState, experimentName string) (*cachedAssignment, *experimentRules, assignmentState) {
+	var entry, found = st.assignmentCache_[experimentName]
 	if !found {
 		return nil, nil, assignmentStale
 	}
 	var assignment = entry.assignment
 	var custom, cfound = c.Cassignments_[experimentName]
 	var override, ofound = c.Overrides_[experimentName]
-	var experiment, rules, efound = c.experimentAndRules(experimentName)
+	var experiment, rules, efound = st.experimentAndRules(experimentName)
 
 	if ofound {
 		if assignment.Overridden && assignment.Variant == override.(int) {
@@ -1383,10 +1529,10 @@ func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignmen
 		if !c.ExperimentMatches(experiment.Data, *assignment) {
 			return entry, rules, assignmentStale
 		}
-		if rules == entry.rules && atomic.LoadInt32(&c.attrsSeq_) <= entry.attrsSeq {
+		if rules == entry.rules && atomic.LoadInt32(&st.attrsSeq_) <= entry.attrsSeq {
 			return entry, rules, assignmentValid
 		}
-		if c.ruleMatches(experiment.Data, rules, entry) && c.audienceMatches(experiment.Data, entry) {
+		if c.ruleMatches(st, experiment.Data, rules, entry) && c.audienceMatches(st, experiment.Data, entry) {
 			return entry, rules, assignmentRevalidated
 		}
 	}
@@ -1396,13 +1542,13 @@ func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignmen
 // ruleMatches reports whether the experiment's assignment rules still give the
 // cached assignment's outcome. It never updates the entry; a changed outcome
 // is reported as stale for GetAssignment to rebuild under the write lock.
-func (c *Context) ruleMatches(data jsonmodels.Experiment, rules *experimentRules, entry *cachedAssignment) bool {
+func (c *Context) ruleMatches(st *contextState, data jsonmodels.Experiment, rules *experimentRules, entry *cachedAssignment) bool {
 	var assignment = entry.assignment
 	// An exposed split resolved without its unit keeps resolving as if the
 	// unit were still missing, so a unit set afterwards cannot switch the
 	// variant the user already saw.
 	var pinnedMissing = entry.ruleMissingUnit && assignment.Exposed.Load().(bool)
-	var rule = c.resolveRule(data, rules, pinnedMissing, false)
+	var rule = c.resolveRule(st, data, rules, pinnedMissing, false)
 	if (rule != nil) != entry.ruleOverride {
 		return false
 	}
@@ -1418,12 +1564,12 @@ func (c *Context) ruleMatches(data jsonmodels.Experiment, rules *experimentRules
 // audienceMatches reports whether the audience still gives the cached
 // assignment's audienceMismatch. A rule-won assignment skips the audience, as
 // in the JS SDK.
-func (c *Context) audienceMatches(data jsonmodels.Experiment, entry *cachedAssignment) bool {
+func (c *Context) audienceMatches(st *contextState, data jsonmodels.Experiment, entry *cachedAssignment) bool {
 	var assignment = entry.assignment
 	if entry.ruleOverride || len(data.Audience) == 0 {
 		return true
 	}
-	var match, err = c.AudienceMatcher_.Evaluate(data.Audience, c.evaluationAttributes())
+	var match, err = c.AudienceMatcher_.Evaluate(data.Audience, c.evaluationAttributesWithState(st))
 	var newAudienceMismatch = false
 	if err == nil {
 		newAudienceMismatch = !match.Get()
@@ -1448,12 +1594,12 @@ type ruleResolution struct {
 //
 // The caller holds ContextLock_. cache is false on the read path, where the
 // hashed-unit and assigner caches must not be written.
-func (c *Context) resolveRule(data jsonmodels.Experiment, rules *experimentRules, unitPinnedMissing bool, cache bool) *ruleResolution {
+func (c *Context) resolveRule(st *contextState, data jsonmodels.Experiment, rules *experimentRules, unitPinnedMissing bool, cache bool) *ruleResolution {
 	if rules == nil || rules.parsed == nil {
 		return nil
 	}
 
-	var action = c.AudienceMatcher_.evaluateRules(rules.parsed, c.environment_, c.evaluationAttributes())
+	var action = c.AudienceMatcher_.evaluateRules(rules.parsed, st.environment_, c.evaluationAttributesWithState(st))
 	if action == nil {
 		return nil
 	}
@@ -1521,10 +1667,11 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 // it first when it is missing or out of date. The entry's assignment is
 // shared and never mutated once cached.
 func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
+	var st = c.state()
 	// A valid cached assignment only needs the read lock, so concurrent reads
 	// of a shared context do not serialise.
 	c.ContextLock_.RLock()
-	if entry, _, state := c.validCachedAssignment(experimentName); state == assignmentValid {
+	if entry, _, state := c.validCachedAssignment(st, experimentName); state == assignmentValid {
 		c.ContextLock_.RUnlock()
 		return entry
 	}
@@ -1534,7 +1681,7 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 	// lock: another goroutine may have rebuilt the assignment meanwhile, and
 	// replacing it would lose its exposed flag and queue a second exposure.
 	c.ContextLock_.Lock()
-	var previous, validated, state = c.validCachedAssignment(experimentName)
+	var previous, validated, state = c.validCachedAssignment(st, experimentName)
 	if state == assignmentValid {
 		c.ContextLock_.Unlock()
 		return previous
@@ -1547,21 +1694,21 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 		// validated; a refresh racing this records the old rule set, which
 		// only makes the next read revalidate.
 		previous.rules = validated
-		previous.attrsSeq = atomic.LoadInt32(&c.attrsSeq_)
+		previous.attrsSeq = atomic.LoadInt32(&st.attrsSeq_)
 		c.ContextLock_.Unlock()
 		return previous
 	}
 
 	var custom, cfound = c.Cassignments_[experimentName]
 	var override, ofound = c.Overrides_[experimentName]
-	var experiment, rules, efound = c.experimentAndRules(experimentName)
+	var experiment, rules, efound = st.experimentAndRules(experimentName)
 
 	var exposed = &atomic.Value{}
 	exposed.Store(false)
 	var assignment = &Assignment{Exposed: exposed}
 	assignment.Name = experimentName
 	assignment.Eligible = true
-	var entry = &cachedAssignment{assignment: assignment, rules: rules, attrsSeq: atomic.LoadInt32(&c.attrsSeq_)}
+	var entry = &cachedAssignment{assignment: assignment, rules: rules, attrsSeq: atomic.LoadInt32(&st.attrsSeq_)}
 
 	if ofound {
 		if efound {
@@ -1578,14 +1725,14 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 			// A matching rule is an explicit assignment, like an override: it
 			// wins over the audience, audienceStrict, traffic eligibility,
 			// full-on and custom assignments.
-			if rule := c.resolveRule(experiment.Data, rules, false, true); rule != nil {
+			if rule := c.resolveRule(st, experiment.Data, rules, false, true); rule != nil {
 				assignment.Variant = rule.variant
 				entry.ruleOverride = true
 				entry.ruleMissingUnit = rule.missingUnit
 			}
 
 			if !entry.ruleOverride && len(experiment.Data.Audience) > 0 {
-				var attrs = c.evaluationAttributes()
+				var attrs = c.evaluationAttributesWithState(st)
 
 				var match, err = c.AudienceMatcher_.Evaluate(experiment.Data.Audience, attrs)
 				if err == nil {
@@ -1642,7 +1789,10 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 		c.keepExposedRuleAssignment(experiment.Data, previous, entry)
 	}
 
-	c.assignmentCache_[experimentName] = entry
+	if entry.ruleOverride {
+		st.ruleIdentities.remember(assignment.Exposed)
+	}
+	st.assignmentCache_[experimentName] = entry
 	c.AssignmentCache[experimentName] = *assignment
 	c.ContextLock_.Unlock()
 	return entry
@@ -1650,8 +1800,9 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 
 func (c *Context) ClearRefreshTimer() {
 	c = c.live()
-	c.stateLock_.Lock()
-	defer c.stateLock_.Unlock()
+	var st = c.state()
+	st.stateLock_.Lock()
+	defer st.stateLock_.Unlock()
 	if c.RefreshTimer_ != nil {
 		c.RefreshTimer_.Stop()
 		c.RefreshTimer_ = nil
@@ -1662,19 +1813,24 @@ func (c *Context) ClearRefreshTimer() {
 // reads the index setData published atomically, so a refresh installing new
 // data cannot race it, and it takes no lock.
 func (c *Context) GetExperiment(experimentName string) (ExperimentVariables, bool) {
-	var result, _, found = c.experimentAndRules(experimentName)
+	if c.ContextLock_ == nil {
+		result, found := c.Index_[experimentName]
+		return result, found
+	}
+	var st = c.state()
+	var result, _, found = st.experimentAndRules(experimentName)
 	return result, found
 }
 
 // loadIndex returns the installed index, or nil before any data is set.
-func (c *Context) loadIndex() *contextIndex {
-	return c.index_.Load().(*contextIndex)
+func (st *contextState) loadIndex() *contextIndex {
+	return st.index_.Load().(*contextIndex)
 }
 
 // experimentAndRules is GetExperiment plus the experiment's parsed assignment
 // rules, read from the same installed index.
-func (c *Context) experimentAndRules(experimentName string) (ExperimentVariables, *experimentRules, bool) {
-	var index = c.loadIndex()
+func (st *contextState) experimentAndRules(experimentName string) (ExperimentVariables, *experimentRules, bool) {
+	var index = st.loadIndex()
 	if index == nil {
 		return ExperimentVariables{}, nil, false
 	}
@@ -1795,13 +1951,14 @@ func (c *Context) dispatchDiagnostics(events []bufferedEvent) {
 }
 
 func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer) {
+	var st = c.state()
 	var self = c.snapshot()
 	self.EventLogger_ = buffer
 	var index = map[string]ExperimentVariables{}
 	var indexVariables = map[string][]ExperimentVariables{}
 	var contextCustomFields = map[string]map[string]ContextCustomFieldValue{}
 	var rules = map[string]*experimentRules{}
-	var previous = c.loadIndex()
+	var previous = st.loadIndex()
 	var previousRules = func(name string) *experimentRules {
 		if previous != nil {
 			if entry, found := previous.experiments[name]; found {
@@ -1890,14 +2047,14 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	for name, experiment := range index {
 		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name]}
 	}
-	c.index_.Store(&contextIndex{experiments: indexed})
+	st.index_.Store(&contextIndex{experiments: indexed})
 	c.ContextCustomFields_ = contextCustomFields
-	c.indexVariables_ = indexVariables
+	st.indexVariables_ = indexVariables
 	c.IndexVariables_ = legacyIndexVariables(indexVariables)
 	c.Data_ = data
 	c.Ready_.Store(true)
 
-	c.SetRefreshTimer()
+	c.setRefreshTimer(st)
 	c.DataLock.Unlock()
 }
 
@@ -1929,7 +2086,7 @@ func (c *Context) LogError(err error) {
 func (c *Context) logEvent(event EventType, data interface{}) {
 	if c.EventLogger_ != nil {
 		var snapshot = c.snapshot()
-		if loggers := c.live().loggers_; loggers != nil {
+		if loggers := c.live().state().loggers_; loggers != nil {
 			var id = loggers.enter()
 			defer loggers.exit(id)
 		}
@@ -1957,10 +2114,11 @@ func panicToError(r interface{}) error {
 }
 
 func (c *Context) SetDataFailed(err error) {
+	var st = c.state()
 	c.DataLock.Lock()
 	c.Index_ = map[string]ExperimentVariables{}
-	c.index_.Store(&contextIndex{})
-	c.indexVariables_ = map[string][]ExperimentVariables{}
+	st.index_.Store(&contextIndex{})
+	st.indexVariables_ = map[string][]ExperimentVariables{}
 	c.IndexVariables_ = map[interface{}]interface{}{}
 	c.Data_ = jsonmodels.ContextData{}
 	c.Ready_.Store(true)
@@ -1970,6 +2128,7 @@ func (c *Context) SetDataFailed(err error) {
 
 func (c *Context) Flush() *future.Future {
 	c = c.live()
+	var st = c.state()
 	c.ClearTimeout()
 
 	if !c.Failed_.Load().(bool) {
@@ -2001,16 +2160,16 @@ func (c *Context) Flush() *future.Future {
 			c.PendingCount_.Store(int32(0))
 			// Register the publish in the same critical section that drains
 			// the queue, so CloseAsync cannot miss it.
-			c.addInflight(settled)
-			c.stateLock_.Lock()
+			st.addInflight(settled)
+			st.stateLock_.Lock()
 			var activeLogs []*future.Future
-			for _, f := range c.publishLogs_ {
+			for _, f := range st.publishLogs_ {
 				if !f.Ready() {
 					activeLogs = append(activeLogs, f)
 				}
 			}
-			c.publishLogs_ = append(activeLogs, result)
-			c.stateLock_.Unlock()
+			st.publishLogs_ = append(activeLogs, result)
+			st.stateLock_.Unlock()
 		}
 		c.EventLock_.Unlock()
 
@@ -2078,33 +2237,35 @@ func (c *Context) Flush() *future.Future {
 	return result
 }
 
-func (c *Context) addInflight(f *future.Future) {
-	c.stateLock_.Lock()
-	c.inflight_ = append(c.inflight_, f)
-	c.stateLock_.Unlock()
+func (st *contextState) addInflight(f *future.Future) {
+	st.stateLock_.Lock()
+	st.inflight_ = append(st.inflight_, f)
+	st.stateLock_.Unlock()
 }
 
 func (c *Context) removeInflight(f *future.Future) {
-	c.stateLock_.Lock()
-	for i, g := range c.inflight_ {
+	var st = c.state()
+	st.stateLock_.Lock()
+	for i, g := range st.inflight_ {
 		if g == f {
-			c.inflight_ = append(c.inflight_[:i:i], c.inflight_[i+1:]...)
+			st.inflight_ = append(st.inflight_[:i:i], st.inflight_[i+1:]...)
 			break
 		}
 	}
-	c.stateLock_.Unlock()
+	st.stateLock_.Unlock()
 }
 
 func (c *Context) inflightCount() int {
-	c.stateLock_.Lock()
-	defer c.stateLock_.Unlock()
-	return len(c.inflight_)
+	var st = c.state()
+	st.stateLock_.Lock()
+	defer st.stateLock_.Unlock()
+	return len(st.inflight_)
 }
 
-func (c *Context) inflightSnapshot() []*future.Future {
-	c.stateLock_.Lock()
-	defer c.stateLock_.Unlock()
-	return append([]*future.Future(nil), c.inflight_...)
+func (st *contextState) inflightSnapshot() []*future.Future {
+	st.stateLock_.Lock()
+	defer st.stateLock_.Unlock()
+	return append([]*future.Future(nil), st.inflight_...)
 }
 
 // runLogger runs an observer on its own goroutine so lifecycle re-entry cannot
@@ -2204,10 +2365,6 @@ func flushUnit(cntx *Context, value interface{}) interface{} {
 	return jsonmodels.Unit{Type: value.(Pair).a, Uid: res}
 }
 
-func (f FlushMapper) forceASCII(s string) string {
-	return asciiOnly(s)
-}
-
 func asciiOnly(s string) string {
 	rs := make([]rune, 0, len(s))
 	for _, r := range s {
@@ -2248,23 +2405,27 @@ func (c *Context) SetTimeout() {
 
 func (c *Context) SetRefreshTimer() {
 	c = c.live()
-	c.stateLock_.Lock()
-	defer c.stateLock_.Unlock()
+	c.setRefreshTimer(c.state())
+}
+
+func (c *Context) setRefreshTimer(st *contextState) {
+	st.stateLock_.Lock()
+	defer st.stateLock_.Unlock()
 	// A refresh that finishes after Close began calls SetData, which gets here.
 	// Installing the timer then would leave a timer on a closed context.
-	if c.Closed_.Load().(bool) || c.Closing_.Load().(bool) || c.closeStarted_ {
+	if c.Closed_.Load().(bool) || c.Closing_.Load().(bool) || st.closeStarted_ {
 		return
 	}
 	if c.RefreshInterval_ > 0 && c.RefreshTimer_ == nil {
 		var rate = time.Duration(uint64(c.RefreshInterval_ * int64(time.Millisecond)))
 
 		c.RefreshTimer_ = time.AfterFunc(rate, func() {
-			c.stateLock_.Lock()
+			st.stateLock_.Lock()
 			var timer = c.RefreshTimer_
 			if timer != nil {
 				timer.Reset(rate)
 			}
-			c.stateLock_.Unlock()
+			st.stateLock_.Unlock()
 			if timer != nil {
 				c.RefreshAsync()
 			}
@@ -2308,8 +2469,9 @@ func legacyIndexVariables(index map[string][]ExperimentVariables) map[interface{
 }
 
 func (c *Context) GetVariableExperiment(key string) (ExperimentVariables, error) {
+	var st = c.state()
 	c.DataLock.RLock()
-	var experiments = c.indexVariables_[key]
+	var experiments = st.indexVariables_[key]
 	c.DataLock.RUnlock()
 	if len(experiments) == 0 {
 		return ExperimentVariables{}, errors.New("result is nil")

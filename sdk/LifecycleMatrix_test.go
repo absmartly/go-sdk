@@ -346,15 +346,15 @@ func runLifecycleCase(t *testing.T, mode, fault string, failing bool, loggerBeha
 				}
 			}
 			mu.Unlock()
-			ctx.stateLock_.Lock()
+			ctx.state().stateLock_.Lock()
 			var logsDelivered = true
-			for _, f := range ctx.publishLogs_ {
+			for _, f := range ctx.state().publishLogs_ {
 				if !f.Ready() {
 					logsDelivered = false
 				}
 			}
-			var finalized = ctx.finalizedFuture_
-			ctx.stateLock_.Unlock()
+			var finalized = ctx.state().finalizedFuture_
+			ctx.state().stateLock_.Unlock()
 			if finalized != nil && !finalized.Ready() {
 				logsDelivered = false
 			}
@@ -452,9 +452,9 @@ func runLifecycleCase(t *testing.T, mode, fault string, failing bool, loggerBeha
 			}
 		}
 		if act.refresh && ctx.IsClosed() {
-			ctx.stateLock_.Lock()
+			ctx.state().stateLock_.Lock()
 			var leaked = ctx.RefreshTimer_ != nil
-			ctx.stateLock_.Unlock()
+			ctx.state().stateLock_.Unlock()
 			if leaked {
 				t.Fatalf("closed context still has a refresh timer: %s", state())
 			}

@@ -1997,11 +1997,12 @@ func TestUnknownExperimentExposureUnitIsNull(t *testing.T) {
 	setUp()
 	var config = CreateDefaultContextConfig()
 	config.Units_ = units
+	config.PublishDelay_ = -1
 	var context = CreateTestContext(config, dataFutureReady)
 
 	_, err := context.GetTreatment("not_found")
 	assertAny(nil, err, t)
-	var out, merr = json.Marshal(context.Exposures_[0])
+	var out, merr = json.Marshal(queuedExposures(context)[0])
 	assertAny(nil, merr, t)
 	var decoded map[string]interface{}
 	_ = json.Unmarshal(out, &decoded)

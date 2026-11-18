@@ -39,6 +39,25 @@ func TestQueueExposureOfStaleCopyDoesNotTakeNewRuleFlag(t *testing.T) {
 	assertAny(false, exposure.RuleOverride, t)
 }
 
+// A rule-selected copy also keeps its flag after a later peek has replaced
+// the cache with a normal assignment. Its identity outlives that cache entry.
+func TestQueueExposureOfRetainedRuleCopyKeepsRuleOverride(t *testing.T) {
+	var ctx, _ = newRuleContext(t, "production", withUnit(),
+		ruleExperiment("exp", rulesJSON(`{"type":"assign","variant":2,"conditions":{"eq":[{"var":"country"},{"value":"US"}]}}`)))
+	assertAny(nil, ctx.SetAttribute("country", "US"), t)
+	var retained = ctx.GetAssignment("exp")
+	assertAny(2, retained.Variant, t)
+	assertAny(nil, ctx.SetAttribute("country", "CA"), t)
+	var variant, err = ctx.PeekTreatment("exp")
+	assertAny(nil, err, t)
+	assertAny(0, variant, t)
+
+	ctx.QueueExposure(retained)
+	var exposure = expectExposures(t, ctx, 1)[0]
+	assertAny(2, exposure.Variant, t)
+	assertAny(true, exposure.RuleOverride, t)
+}
+
 // fetchClient serves the context data on GET, so the context is created
 // through ABSmartly.CreateContext (the fetch path), not CreateContextWith.
 type fetchClient struct {
