@@ -234,9 +234,21 @@ func (c *Context) dropSwitchbackEpoch(experimentName string) {
 	}
 	delete(c.switchbackEpochs_, experimentName)
 	for _, period := range epoch.periods {
-		delete(c.assignmentCache_, switchbackSlotKey(experimentName, period))
+		c.retireSwitchbackSlot(switchbackSlotKey(experimentName, period))
 	}
-	delete(c.assignmentCache_, experimentName)
+	c.retireSwitchbackSlot(experimentName)
+}
+
+// retireSwitchbackSlot removes a cached switchback slot and marks its
+// assignment exposed, as eviction does elsewhere: a caller still holding it
+// must not publish it through QueueExposure, where its slot, and with it its
+// silence and its period, can no longer be found. The caller holds
+// ContextLock_ for writing.
+func (c *Context) retireSwitchbackSlot(key string) {
+	if entry, found := c.assignmentCache_[key]; found {
+		entry.assignment.Exposed.CompareAndSwap(false, true)
+		delete(c.assignmentCache_, key)
+	}
 }
 
 // retainSwitchbackSlot records a switchback slot under the current epoch.
@@ -273,7 +285,7 @@ func (c *Context) retainSwitchbackSlot(experimentName string, indexed *indexedEx
 		if epoch.periods[0] == slot.period {
 			evict = 1
 		}
-		delete(c.assignmentCache_, switchbackSlotKey(experimentName, epoch.periods[evict]))
+		c.retireSwitchbackSlot(switchbackSlotKey(experimentName, epoch.periods[evict]))
 		epoch.periods = append(epoch.periods[:evict], epoch.periods[evict+1:]...)
 	}
 }

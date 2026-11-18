@@ -759,8 +759,9 @@ func (c *Context) evictAssignmentsMissingUnit(unitType string) {
 		if entry.switchback != nil && entry.switchback.serving.status == switchbackAbsent {
 			// A switchback resolved before any linked unit was set is
 			// resolved again now that one may be. One that is not overridden
-			// never published anything, so it is dropped even if exposed.
-			if !assignment.Overridden || assignment.Exposed.CompareAndSwap(false, true) {
+			// never published anything, so it is dropped even if exposed,
+			// and retired so a caller holding it cannot publish it.
+			if retired := assignment.Exposed.CompareAndSwap(false, true); retired || !assignment.Overridden {
 				delete(c.assignmentCache_, name)
 				delete(c.AssignmentCache, assignment.Name)
 			}
