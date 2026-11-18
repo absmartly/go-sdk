@@ -952,6 +952,7 @@ func (c *Context) admit(assignment *Assignment, holdouts *assignmentHoldouts) bo
 		return c.enqueueExposure(assignment)
 	}
 
+	var exposedAt = c.Clock_.Millis()
 	// Admit the entire decision before any logger can close the context. Arm
 	// marks are made under the same lock as their append, so another decision
 	// can never confuse an in-flight arm with an accepted exposure.
@@ -962,11 +963,11 @@ func (c *Context) admit(assignment *Assignment, holdouts *assignmentHoldouts) bo
 	}
 	var exposures []jsonmodels.Exposure
 	if !holdouts.isSuppressed() {
-		exposures = append(exposures, c.exposureFor(assignment))
+		exposures = append(exposures, c.exposureFor(assignment, exposedAt))
 	}
 	for _, arm := range holdouts.arms {
 		if arm != nil && arm.assignment.Exposed.CompareAndSwap(false, true) {
-			exposures = append(exposures, c.exposureFor(arm.assignment))
+			exposures = append(exposures, c.exposureFor(arm.assignment, exposedAt))
 		}
 	}
 	c.PendingCount_.Store(c.PendingCount_.Load().(int32) + int32(len(exposures)))
@@ -1016,9 +1017,9 @@ func (e *cachedAssignment) missingUnit() bool {
 	return false
 }
 
-func (c *Context) exposureFor(assignment *Assignment) jsonmodels.Exposure {
+func (c *Context) exposureFor(assignment *Assignment, exposedAt int64) jsonmodels.Exposure {
 	return jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
-		Variant: assignment.Variant, ExposedAt: c.Clock_.Millis(), Assigned: assignment.Assigned,
+		Variant: assignment.Variant, ExposedAt: exposedAt, Assigned: assignment.Assigned,
 		Eligible: assignment.Eligible, Overridden: assignment.Overridden, FullOn: assignment.FullOn,
 		Custom: assignment.Custom, AudienceMismatch: assignment.AudienceMismatch, RuleOverride: assignment.RuleOverride}
 }

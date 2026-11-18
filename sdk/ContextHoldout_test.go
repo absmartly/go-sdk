@@ -2251,7 +2251,10 @@ func TestHoldout_PopulatedModelRoundTrip(t *testing.T) {
 	}
 	expectValue(t, data.Holdouts, decoded.Holdouts)
 	expectValue(t, data.Experiments[0].HoldoutIds, decoded.Experiments[0].HoldoutIds)
-	var viaSDK, _ = DefaultContextDataDeserializer{}.Deserialize(raw)
+	var viaSDK, sdkErr = DefaultContextDataDeserializer{}.Deserialize(raw)
+	if sdkErr != nil {
+		t.Fatal(sdkErr)
+	}
 	expectValue(t, data.Holdouts, viaSDK.Holdouts)
 }
 
@@ -2343,7 +2346,7 @@ func TestHoldout_QueueExposureOnALiteralContext(t *testing.T) {
 // about 5% on the first exposure without holdouts); both mappings must
 // produce the same exposure for every field.
 func TestHoldout_CoveredAndUncoveredExposureMappingsAgree(t *testing.T) {
-	var assignment = &Assignment{Id: 7, Name: "exp", UnitType: "u", Variant: 2, Assigned: true, Eligible: false,
+	var assignment = &Assignment{Id: 7, Name: "exp", UnitType: "u", Variant: 2, Assigned: true, Eligible: true,
 		Overridden: true, FullOn: true, Custom: true, AudienceMismatch: true, RuleOverride: true}
 	var exposed = &atomic.Value{}
 	exposed.Store(true)
@@ -2353,9 +2356,9 @@ func TestHoldout_CoveredAndUncoveredExposureMappingsAgree(t *testing.T) {
 		t.Fatal("not queued")
 	}
 	var queued = queuedExposures(h.ctx)
-	expectValue(t, []jsonmodels.Exposure{h.ctx.exposureFor(assignment)}, queued)
+	expectValue(t, []jsonmodels.Exposure{h.ctx.exposureFor(assignment, hoMillis)}, queued)
 	expectValue(t, jsonmodels.Exposure{Id: 7, Name: "exp", Unit: "u", Variant: 2, ExposedAt: hoMillis, Assigned: true,
-		Eligible: false, Overridden: true, FullOn: true, Custom: true, AudienceMismatch: true, RuleOverride: true}, queued[0])
+		Eligible: true, Overridden: true, FullOn: true, Custom: true, AudienceMismatch: true, RuleOverride: true}, queued[0])
 }
 
 // A refresh that re-encodes a holdout's integers in another JSON notation

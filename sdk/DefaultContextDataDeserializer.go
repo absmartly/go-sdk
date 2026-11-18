@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"math"
+	"strconv"
 
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
@@ -89,7 +90,7 @@ func holdoutId(raw json.RawMessage) (int, bool) {
 		return int(id), id == int64(int(id))
 	}
 	var value, err = number.Float64()
-	if err != nil || value != math.Trunc(value) || math.Abs(value) > 1<<53 {
+	if err != nil || value != math.Trunc(value) || value < -math.Exp2(float64(strconv.IntSize-1)) || value >= math.Exp2(float64(strconv.IntSize-1)) {
 		return 0, false
 	}
 	return int(value), true
