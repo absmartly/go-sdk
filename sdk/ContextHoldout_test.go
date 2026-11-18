@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/absmartly/go-sdk/sdk/future"
@@ -2136,4 +2137,34 @@ func TestHoldout_ReplacedCoveredAssignmentWhoseOwnExposureIsRejectedStaysRetired
 	}
 	h.ctx.QueueExposure(stale)
 	h.expectPending(0)
+}
+
+// An assignment that is not in the cache (built by hand, or evicted) whose
+// exposure a close rejected is queued by a later QueueExposure, as before
+// holdouts.
+func TestHoldout_RejectedExposureOfAnUncachedAssignmentIsRetried(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
+	var exposed = &atomic.Value{}
+	exposed.Store(false)
+	var assignment = &Assignment{Name: "other", Exposed: exposed}
+	h.ctx.Closing_.Store(true)
+	h.ctx.QueueExposure(assignment)
+	h.ctx.Closing_.Store(false)
+	if assignment.Exposed.Load().(bool) {
+		t.Fatal("a rejected exposure stayed marked exposed")
+	}
+	h.ctx.QueueExposure(assignment)
+	h.expectPending(1)
+}
+
+// QueueExposure takes the pinned holdouts only from the cached assignment it
+// was given (or a copy of it): an assignment that merely shares the name
+// publishes its own exposure, not the cached one's holdouts.
+func TestHoldout_QueueExposureOfAnUnrelatedAssignmentWithTheSameName(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.ctx.GetAssignment("exp")
+	var exposed = &atomic.Value{}
+	exposed.Store(false)
+	h.ctx.QueueExposure(&Assignment{Id: 1, Name: "exp", UnitType: hoUnitType, Assigned: true, Eligible: true, Exposed: exposed})
+	h.expectPublished(hoOwn(hoUnitType, 1, "exp", 0))
 }
