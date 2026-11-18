@@ -248,7 +248,12 @@ type evaluatingEntry struct {
 	n  int
 }
 
+var evaluationsActive int32
+
 func evaluatingState(lock *sync.RWMutex) *contextState {
+	if atomic.LoadInt32(&evaluationsActive) == 0 {
+		return nil
+	}
 	evaluatingStates.RLock()
 	defer evaluatingStates.RUnlock()
 	if entry, ok := evaluatingStates.m[lock]; ok {
@@ -278,12 +283,14 @@ func beginEvaluating(lock *sync.RWMutex, st *contextState) func() {
 		evaluatingStates.m[lock] = entry
 	}
 	entry.n++
+	atomic.AddInt32(&evaluationsActive, 1)
 	evaluatingStates.Unlock()
 	return func() {
 		evaluatingStates.Lock()
 		if entry.n--; entry.n == 0 {
 			delete(evaluatingStates.m, lock)
 		}
+		atomic.AddInt32(&evaluationsActive, -1)
 		evaluatingStates.Unlock()
 	}
 }
@@ -1098,6 +1105,18 @@ func (c *Context) GetVariableKeys() (map[string]string, error) {
 	}
 
 	var variableKeys = map[string]string{}
+	if c.ownClock() == nil && evaluatingState(c.ContextLock_) == nil && (c.ContextLock_ == nil || c.state().manualRoot == nil) {
+		c.DataLock.RLock()
+		for key, value := range c.IndexVariables_ {
+			if key, ok := key.(string); ok {
+				if experiment, ok := value.(ExperimentVariables); ok {
+					variableKeys[key] = experiment.Data.Name
+				}
+			}
+		}
+		c.DataLock.RUnlock()
+		return variableKeys, nil
+	}
 	var st = c.state()
 
 	c.DataLock.RLock()
@@ -1119,6 +1138,18 @@ func (c *Context) GetVariableKeysAll() (map[string][]string, error) {
 	}
 
 	var variableKeys = map[string][]string{}
+	if c.ownClock() == nil && evaluatingState(c.ContextLock_) == nil && (c.ContextLock_ == nil || c.state().manualRoot == nil) {
+		c.DataLock.RLock()
+		for key, value := range c.IndexVariables_ {
+			if key, ok := key.(string); ok {
+				if experiment, ok := value.(ExperimentVariables); ok {
+					variableKeys[key] = []string{experiment.Data.Name}
+				}
+			}
+		}
+		c.DataLock.RUnlock()
+		return variableKeys, nil
+	}
 	var st = c.state()
 
 	c.DataLock.RLock()

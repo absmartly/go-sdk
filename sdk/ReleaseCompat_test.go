@@ -161,3 +161,15 @@ func TestPartialDecodePreservesAllReleasedFieldsAndDropsRules(t *testing.T) {
 		CustomFieldValues: []jsonmodels.CustomFieldValue{{Name: "field", Type: "string", Value: "kept"}},
 		Audience:          "{}", AudienceStrict: true}, {}}, got.Experiments, t)
 }
+
+func TestDeserializeTopLevelErrorsNamePublicModels(t *testing.T) {
+	for _, payload := range []string{`[]`, `5`, `{"experiments":"nope"}`} {
+		var want jsonmodels.ContextData
+		var wantErr = json.Unmarshal([]byte(payload), &want)
+		var _, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
+		if wantErr == nil || err == nil {
+			t.Fatalf("%s: want error %v, got %v", payload, wantErr, err)
+		}
+		assertAny(wantErr.Error(), err.Error(), t)
+	}
+}

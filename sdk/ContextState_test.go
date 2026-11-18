@@ -657,3 +657,31 @@ func TestEvaluationRegistryConcurrentScopesAreRemoved(t *testing.T) {
 		t.Fatal("last evaluation scope retained state")
 	}
 }
+
+func TestContextLiteralVariableKeysReadCurrentLegacyIndex(t *testing.T) {
+	var ready = &atomic.Value{}
+	ready.Store(true)
+	var closing = &atomic.Value{}
+	closing.Store(false)
+	var closed = &atomic.Value{}
+	closed.Store(false)
+	var five = ExperimentVariables{Data: jsonmodels.Experiment{Id: 5, Name: "five"}}
+	var six = ExperimentVariables{Data: jsonmodels.Experiment{Id: 6, Name: "six"}}
+	for _, lock := range []*sync.RWMutex{nil, {}} {
+		var manual = Context{Ready_: ready, Closing_: closing, Closed_: closed, DataLock: &sync.RWMutex{},
+			ContextLock_: lock, IndexVariables_: map[interface{}]interface{}{"color": five}}
+		var keys, err = manual.GetVariableKeys()
+		assertAny(nil, err, t)
+		assertAny(map[string]string{"color": "five"}, keys, t)
+		var all, allErr = manual.GetVariableKeysAll()
+		assertAny(nil, allErr, t)
+		assertAny(map[string][]string{"color": {"five"}}, all, t)
+
+		manual.IndexVariables_["color"] = six
+		manual.IndexVariables_["size"] = five
+		keys, _ = manual.GetVariableKeys()
+		assertAny(map[string]string{"color": "six", "size": "five"}, keys, t)
+		all, _ = manual.GetVariableKeysAll()
+		assertAny(map[string][]string{"color": {"six"}, "size": {"five"}}, all, t)
+	}
+}
