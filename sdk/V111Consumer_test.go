@@ -101,7 +101,6 @@ func v111Data(t *testing.T) jsonmodels.ContextData {
 }
 
 func TestV111ConsumerCompiles(t *testing.T) {
-	// Unkeyed literals of every v1.1.1 configuration struct.
 	var clientConfig = sdk.ClientConfig{"https://acme.absmartly.io/v1", "key", "prod", "website", nil, nil}
 	var client = sdk.CreateDefaultClient(clientConfig)
 	var _ = sdk.ABSmartlyConfig{nil, nil, nil, nil, nil, client}
@@ -122,13 +121,11 @@ func TestV111ConsumerCompiles(t *testing.T) {
 	var _ = jsonmodels.ExperimentApplication{"website"}
 	var _ = jsonmodels.ContextData{nil}
 
-	// v1.1.1 exported fields keep their types.
 	var ctx sdk.Context
 	var _ map[string]sdk.ExperimentVariables = ctx.Index_
 	var _ map[interface{}]interface{} = ctx.IndexVariables_
 	var _ map[string]sdk.Assignment = ctx.AssignmentCache
 
-	// Customer types still satisfy the v1.1.1 extension interfaces.
 	var _ sdk.ContextEventLogger = &v111Logger{}
 	var _ sdk.ContextEventHandler = &v111Publisher{}
 	var _ sdk.ContextDataProvider = v111Provider{}
@@ -156,7 +153,6 @@ func TestV111ConsumerBehaviour(t *testing.T) {
 		t.Error("the customer's VariableParser was not used")
 	}
 
-	// The variants v1.1.1's own tests pin for these units.
 	for name, want := range map[string]int{"exp_test_ab": 1, "exp_test_abc": 2, "exp_test_not_eligible": 0, "exp_test_fullon": 2} {
 		got, err := ctx.GetTreatment(name)
 		if err != nil || got != want {
@@ -164,7 +160,6 @@ func TestV111ConsumerBehaviour(t *testing.T) {
 		}
 	}
 
-	// GetAssignment returns a copy: changing it does not change the context.
 	var assignment = ctx.GetAssignment("exp_test_ab")
 	assignment.Variant = 7
 	if got, _ := ctx.PeekTreatment("exp_test_ab"); got != 1 {

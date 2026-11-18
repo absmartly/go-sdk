@@ -65,8 +65,7 @@ func TestSharingClockBetweenContextsKeepsThemSeparate(t *testing.T) {
 	}
 }
 
-// firstContextLogger keeps the first Context value an event logger receives,
-// which is a snapshot of the context that logged it.
+// An event logger receives a snapshot of the context that logged it.
 type firstContextLogger struct {
 	saved *sdk.Context
 }

@@ -1687,9 +1687,8 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 	return &assignment
 }
 
-// assignmentEntry returns the experiment's cached assignment entry, resolving
-// it first when it is missing or out of date. The entry's assignment is
-// shared and never mutated once cached.
+// assignmentEntry's assignment is shared with callers, so it is never mutated
+// once cached.
 func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 	// Evaluate against the live context, whose attributes the cache stamps
 	// track; a copy's own Attributes_ may be older.
