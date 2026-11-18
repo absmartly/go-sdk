@@ -2381,3 +2381,39 @@ func TestHoldout_QueueExposureWithoutHoldoutsTakesNoLookup(t *testing.T) {
 	h.ctx.ContextLock_.Unlock()
 	h.expectPending(1)
 }
+
+// With more replacements than the window, the oldest retired identity is
+// dropped and the next one is still kept.
+func TestHoldout_RetiredIdentityWindowDropsOnlyTheOldest(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.ctx.GetAssignment("exp")
+	var held = hoGenerations(h, 2, 12)
+	held[2].Exposed.Store(true)
+	h.ctx.reopenExposure(held[2])
+	if !held[2].Exposed.Load().(bool) {
+		t.Fatal("a kept identity was reopened")
+	}
+	held[1].Exposed.Store(true)
+	h.ctx.reopenExposure(held[1])
+	if held[1].Exposed.Load().(bool) {
+		t.Fatal("an identity beyond the window was kept")
+	}
+}
+
+// A failed load does not clear that holdouts were installed.
+func TestHoldout_SetDataFailedKeepsHoldoutsSeen(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.ctx.SetDataFailed(errors.New("load failed"))
+	if !h.ctx.holdoutsSeen_.Load() {
+		t.Fatal("SetDataFailed cleared holdoutsSeen_")
+	}
+}
+
+// QueueExposure on a Context built as a literal returns, as in v1.1.1, for
+// an assignment already exposed.
+func TestHoldout_QueueExposureOnALiteralContext(t *testing.T) {
+	var exposed = &atomic.Value{}
+	exposed.Store(true)
+	var ctx = &Context{}
+	ctx.QueueExposure(&Assignment{Name: "exp", Exposed: exposed})
+}

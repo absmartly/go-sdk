@@ -923,7 +923,7 @@ func (c *Context) QueueExposure(assignment *Assignment) {
 	var holdouts *assignmentHoldouts
 	// A context that never installed holdouts has no holdout decisions:
 	// skip the lookup, so this stays the released path.
-	if c.holdoutsSeen_.Load() {
+	if c.holdoutsSeen_ != nil && c.holdoutsSeen_.Load() {
 		c.ContextLock_.RLock()
 		if entry, found := c.assignmentCache_[assignment.Name]; found && entry.assignment.Exposed == assignment.Exposed {
 			holdouts = entry.holdouts
