@@ -617,7 +617,7 @@ for the full rules):
 The cluster of a period is read once: a `SetAttribute` later in the same
 period takes effect from the next period. Payloads without switchback
 experiments are served and published exactly as before, with no extra
-allocations.
+allocations (the decoded experiment structs are a little wider).
 
 ### Custom Assignments
 

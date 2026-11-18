@@ -1664,3 +1664,40 @@ func TestSwitchback_ExposureRejectedByACloseIsRetried(t *testing.T) {
 	h.treatment("exp_sb")
 	h.expectPublished(sbExposure(1, "exp_sb", sbExpected2Arms[0], sbAnchor+5, true, true))
 }
+
+// An overridden unit experiment refreshed into a switchback is resolved
+// again under the switchback's serving unit, and exposed again.
+func TestSwitchback_OverriddenUnitExperimentRefreshedIntoASwitchback(t *testing.T) {
+	var unit = sbUnit(sbDefault(2, sbHour))
+	unit.UnitType = "user_id"
+	var h = sbCreateAt(t, sbAnchor+5, map[string]string{sbUnitType: sbUID, "user_id": "u1"}, sbData(unit), sbOverride("exp_sb", 1))
+	expectInt(t, 1, h.treatment("exp_sb"))
+	// In its grid and before its start: the switchback resolves in the
+	// period slot and in the slot without a period, which is the unit
+	// experiment's.
+	for _, startAt := range []int64{sbAnchor, sbAnchor + sbHour} {
+		var switchback = sbDefault(2, sbHour)
+		switchback.UnitType = "user_id"
+		switchback.SwitchbackStartAt = sbInt64(startAt)
+		h.refresh(switchback)
+		expectInt(t, 1, h.treatment("exp_sb"))
+		h.refresh(unit)
+		expectInt(t, 1, h.treatment("exp_sb"))
+	}
+	var exposures = h.publishExposures()
+	var units []string
+	for _, exposure := range exposures {
+		units = append(units, exposure.Unit)
+	}
+	expectValue(t, []string{"user_id", sbUnitType, "user_id", sbUnitType, "user_id"}, units)
+}
+
+// A traffic miss wins over a custom assignment: control, recorded with
+// eligible=false and custom=false.
+func TestSwitchback_TrafficMissWinsOverACustomAssignment(t *testing.T) {
+	var experiment = sbDefault(3, sbHour)
+	experiment.TrafficSplit = []float64{1, 0}
+	var h = sbCreate(t, sbData(experiment), sbCustom("exp_sb", 2))
+	expectInt(t, 0, h.at(sbAnchor+5).treatment("exp_sb"))
+	h.expectPublished(sbExposure(1, "exp_sb", 0, sbAnchor+5, true, false))
+}

@@ -433,3 +433,13 @@ func TestSwitchbackClusterRule_ContextMatchesTheWireRuleParityGrid(t *testing.T)
 	}
 	h.expectPending(0)
 }
+
+// A later linked unit with no value is skipped, never a disagreement.
+func TestSwitchbackClusterRule_ALaterUnitWithoutAValueIsSkipped(t *testing.T) {
+	var key = "s-17"
+	var assignment = crSbc(t, crDefault(), map[string]interface{}{"session_store": key}, map[string]string{crSession: "x1", crUser: "u1"})
+	if !assignment.eligible || assignment.unit != crSession || assignment.variant != crScheduled(key) ||
+		len(assignment.exposures) != 1 || assignment.exposures[0].Unit != crSession {
+		t.Fatalf("%+v", assignment)
+	}
+}
