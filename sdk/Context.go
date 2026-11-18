@@ -184,9 +184,8 @@ type assignmentHoldouts struct {
 	arms      []*holdoutArm
 	unitType  string
 	ownQueued atomic.Bool
-	// held is set when any arm holds the experiment out; suppressed when,
-	// in addition, no override or assignment rule chose the variant.
-	held       bool
+	// suppressed is set when an arm holds the experiment out and no
+	// override or assignment rule chose the variant.
 	suppressed bool
 }
 
@@ -1733,8 +1732,9 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 
 	// Resolved for overrides and rule wins too: the holdouts' exposures fire
 	// whatever chose the variant.
+	var held = false
 	if efound && len(indexed.holdouts) > 0 {
-		entry.holdouts = c.resolveHoldouts(indexed.holdouts, experiment.Data)
+		entry.holdouts, held = c.resolveHoldouts(indexed.holdouts, experiment.Data)
 	}
 
 	if ofound {
@@ -1756,7 +1756,7 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 				assignment.Variant = rule.variant
 				assignment.RuleOverride = true
 				entry.ruleMissingUnit = rule.missingUnit
-			} else if entry.holdouts != nil && entry.holdouts.held {
+			} else if held {
 				// Held out: control, not assigned, and the audience, traffic,
 				// full-on and custom assignments are skipped.
 				entry.holdouts.suppressed = true
@@ -1835,19 +1835,20 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 
 // resolveHoldouts draws, or reuses, the unit's arm in each holdout covering
 // the experiment, hashing the experiment's unit type (never the holdout's
-// own), and records whether any arm holds the experiment out. An arm is nil
+// own), and reports whether any arm holds the experiment out. An arm is nil
 // when the experiment's unit is not set. The caller holds ContextLock_ for
 // writing.
-func (c *Context) resolveHoldouts(holdouts []*jsonmodels.Holdout, data jsonmodels.Experiment) *assignmentHoldouts {
+func (c *Context) resolveHoldouts(holdouts []*jsonmodels.Holdout, data jsonmodels.Experiment) (*assignmentHoldouts, bool) {
 	var resolved = &assignmentHoldouts{holdouts: holdouts, arms: make([]*holdoutArm, len(holdouts)), unitType: data.UnitType}
+	var held = false
 	for i, holdout := range holdouts {
 		var arm = c.holdoutArm(holdout, data.UnitType)
 		resolved.arms[i] = arm
 		if arm != nil && isHeldOutBy(arm.assignment.Variant, arm.armCount, data.FullOnVariant) {
-			resolved.held = true
+			held = true
 		}
 	}
-	return resolved
+	return resolved, held
 }
 
 // holdoutArm returns the unit's arm in a holdout for unitType, drawing it on
@@ -2208,19 +2209,18 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 func coveringHoldouts(ids []int, holdoutsById map[int]*jsonmodels.Holdout) []*jsonmodels.Holdout {
 	var covering []*jsonmodels.Holdout
 	for _, id := range ids {
-		var holdout, found = holdoutsById[id]
-		if !found {
-			continue
+		if holdout, found := holdoutsById[id]; found {
+			covering = append(covering, holdout)
 		}
-		var at = sort.Search(len(covering), func(i int) bool { return covering[i].Id >= id })
-		if at < len(covering) && covering[at].Id == id {
-			continue
-		}
-		covering = append(covering, nil)
-		copy(covering[at+1:], covering[at:])
-		covering[at] = holdout
 	}
-	return covering
+	sort.Slice(covering, func(i, j int) bool { return covering[i].Id < covering[j].Id })
+	var unique = covering[:0]
+	for _, holdout := range covering {
+		if len(unique) == 0 || unique[len(unique)-1].Id != holdout.Id {
+			unique = append(unique, holdout)
+		}
+	}
+	return unique
 }
 
 // experimentRulesFor parses an experiment's assignmentRules text, or returns

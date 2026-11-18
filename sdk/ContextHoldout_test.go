@@ -15,6 +15,7 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -1912,6 +1913,9 @@ func TestHoldout_RefreshAndResolutionUseOneGeneration(t *testing.T) {
 		holdout.Iteration = iteration
 		return hoData([]jsonmodels.Holdout{holdout}, experiment)
 	}
+	// The race this pins needs the refresh and the reads on different
+	// threads.
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(2))
 	var h = hoCreateFor(t, hoUID, payload(1))
 	var done = make(chan struct{})
 	go func() {
