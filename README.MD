@@ -562,7 +562,8 @@ them as the other ABsmartly SDKs do.
   control value is returned rather than the default.
 
 A unit keeps its arm until the holdout's iteration changes. Payloads without
-holdouts are served and published exactly as before.
+holdouts are served and published exactly as before, with no extra
+allocations.
 
 `ContextData` gained a `Holdouts` field and `Experiment` a `HoldoutIds` field,
 so unkeyed (positional) literals of `jsonmodels.ContextData` must become keyed

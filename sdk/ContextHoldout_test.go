@@ -1728,23 +1728,18 @@ func TestHoldout_IntegralHoldoutIdsInAnyNotation(t *testing.T) {
 func TestHoldout_NoHoldoutPayloadCostsNothingExtra(t *testing.T) {
 	var raw, _ = os.ReadFile("testAssets/context.json")
 	var withHoldouts = []byte(strings.Replace(string(raw), `"experiments"`, `"holdouts":[{"id":1,"split":[1]}],"experiments"`, 1))
-	var decode = testing.AllocsPerRun(50, func() { _, _ = DefaultContextDataDeserializer{}.Deserialize(raw) })
-	var decodeWith = testing.AllocsPerRun(50, func() { _, _ = DefaultContextDataDeserializer{}.Deserialize(withHoldouts) })
+	var decode = hoLeastAllocs(func() { _, _ = DefaultContextDataDeserializer{}.Deserialize(raw) })
+	var decodeWith = hoLeastAllocs(func() { _, _ = DefaultContextDataDeserializer{}.Deserialize(withHoldouts) })
 	if decodeWith <= decode {
 		t.Fatalf("probe is not sensitive: %.0f allocations with a holdout, %.0f without", decodeWith, decode)
 	}
 	var data, _ = DefaultContextDataDeserializer{}.Deserialize(raw)
+	// setData alone, on a context with no publish or refresh timer, so no
+	// SDK goroutine allocates during the measurement; the minimum of a few
+	// samples drops allocations by goroutines other tests left behind.
+	var h = hoCreateFor(t, hoUID, data)
 	var install = func(data jsonmodels.ContextData) float64 {
-		var config = CreateDefaultContextConfig()
-		config.Units_ = map[string]string{hoUnitType: hoUID}
-		config.PublishDelay_ = -1
-		config.RefreshInterval_ = -1
-		return testing.AllocsPerRun(50, func() {
-			var ft, done = future.New()
-			done(data, nil)
-			CreateContext(internal.FixedClock{Millis_: 1}, config, ft, DefaultContextDataProvider{}, DefaultContextEventHandler{}, nil,
-				DefaultVariableParser{}, AudienceMatcher{DefaultAudienceDeserializer{}})
-		})
+		return hoLeastAllocs(func() { h.ctx.SetData(data) })
 	}
 	// An experiment-only payload costs the same whether ContextData carries
 	// an empty holdouts list or none.
@@ -1761,7 +1756,7 @@ func TestHoldout_NoHoldoutPayloadCostsNothingExtra(t *testing.T) {
 // holdouts costs.
 func TestHoldout_UncoveredFirstResolutionAllocatesNothingForHoldouts(t *testing.T) {
 	var first = func(h *hoContext) float64 {
-		return testing.AllocsPerRun(50, func() {
+		return hoLeastAllocs(func() {
 			h.ctx.ContextLock_.Lock()
 			delete(h.ctx.assignmentCache_, "exp")
 			h.ctx.ContextLock_.Unlock()
@@ -1828,7 +1823,7 @@ func TestHoldout_WronglyTypedHoldoutTypeIsIgnored(t *testing.T) {
 // context without holdouts never creates the holdout arm map.
 func TestHoldout_AbsentHoldoutFieldsAllocateNothing(t *testing.T) {
 	for _, raw := range []json.RawMessage{nil, json.RawMessage(`null`), json.RawMessage(`"x"`), json.RawMessage(`{}`)} {
-		if n := testing.AllocsPerRun(20, func() { holdouts(raw); holdoutIds(raw) }); n != 0 {
+		if n := hoLeastAllocs(func() { holdouts(raw); holdoutIds(raw) }); n != 0 {
 			t.Errorf("decoding %q: %.0f allocations", raw, n)
 		}
 	}
@@ -1838,5 +1833,37 @@ func TestHoldout_AbsentHoldoutFieldsAllocateNothing(t *testing.T) {
 	defer h.ctx.ContextLock_.RUnlock()
 	if h.ctx.holdoutArms_ != nil {
 		t.Fatal("holdout arm map created without holdouts")
+	}
+}
+
+// hoLeastAllocs is the fewest allocations of f over a few AllocsPerRun
+// samples. AllocsPerRun counts the whole process, so goroutines other tests
+// left running (timers, publishers) can only add to a sample.
+func hoLeastAllocs(f func()) float64 {
+	var least = -1.0
+	for i := 0; i < 7; i++ {
+		if n := testing.AllocsPerRun(20, f); least < 0 || n < least {
+			least = n
+		}
+	}
+	return least
+}
+
+// unitType and iteration of the wrong JSON type drop only that field, as an
+// unknown key would: the arm uses the covered experiment's unit type, and a
+// missing iteration is iteration 0.
+func TestHoldout_WronglyTypedUnitTypeOrIterationIsIgnored(t *testing.T) {
+	for _, fields := range []string{`"unitType":5,"iteration":1`, `"unitType":{"a":1},"iteration":1`, `"unitType":"session_id","iteration":"2"`,
+		`"unitType":null,"iteration":null`} {
+		var payload = `{"experiments":[{"id":1,"name":"exp","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
+			"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
+			"holdouts":[{"id":11,"name":"holdout_a",` + fields + `,"seedHi":13,"seedLo":111,"split":[0.1,0.9]}]}`
+		var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var h = hoCreateFor(t, hoUID, data)
+		expectInt(t, 0, h.treatment("exp"))
+		h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
 	}
 }
