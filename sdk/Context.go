@@ -998,7 +998,6 @@ func (c *Context) reopenExposure(assignment *Assignment, hadHoldouts bool) {
 	c.ContextLock_.RLock()
 	defer c.ContextLock_.RUnlock()
 	var entry, found = c.assignmentCache_[assignment.Name]
-	// A switchback slot is cached under its period; it never has holdouts.
 	var current = found && entry.assignment.Exposed == assignment.Exposed
 	if current || (!hadHoldouts && (!found || entry.holdouts == nil)) {
 		assignment.Exposed.Store(false)
