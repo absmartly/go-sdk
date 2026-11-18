@@ -543,7 +543,7 @@ A holdout keeps a share of units out of a group of experiments, so their
 combined effect can be measured. The context payload lists the holdouts
 (`ContextData.Holdouts`) and each experiment names the holdouts covering it
 (`Experiment.HoldoutIds`). Nothing needs to be configured: the SDK applies
-them as the other ABsmartly SDKs do.
+them as the JavaScript SDK does.
 
 - Each holdout puts the unit in an arm, drawn with the covered experiment's
   unit. Arm 0 holds the unit out. In a three-arm holdout (three values in its

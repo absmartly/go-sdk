@@ -17,8 +17,8 @@ import (
 	"reflect"
 	"runtime"
 	"sort"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/absmartly/go-sdk/sdk/future"
@@ -1308,7 +1308,7 @@ func TestHoldout_DuplicateHoldoutIdsPublishOnce(t *testing.T) {
 		hoExposure(hoUnitType, 12, "holdout_b", 1))
 }
 
-// H4: peek on a covered experiment queues nothing.
+// H4: peek publishes no holdout exposure.
 func TestHoldout_PeekQueuesNoHoldoutExposure(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 	expectInt(t, 0, h.peek("exp"))
@@ -1592,20 +1592,25 @@ func TestHoldout_IterationBumpReExposesARuleWonAssignment(t *testing.T) {
 	h.expectPublished(own, arm1, own, arm0)
 }
 
-// An unchanged holdout set keeps an exposed rule win exposed across a
-// refresh that rebuilds it (here: unrelated rule text).
+// A rule win rebuilt with an unchanged holdout set keeps its exposed state:
+// nothing is published again. The rebuild is real: the assign rule gives
+// variant 2 without the unit, then a split rule that starts matching gives
+// the same full-on variant 2 but as a missing-unit split, so the cached
+// assignment is replaced.
 func TestHoldout_UnchangedCoverageKeepsAnExposedRuleWin(t *testing.T) {
-	var experiment = hoExperiment(1, "exp_rule", hoUnitType, 0, 11)
-	experiment.AssignmentRules = hoUSRule
-	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
-	h.setAttribute("country", "US")
-	expectInt(t, 1, h.treatment("exp_rule"))
-	h.expectPending(2)
-	var refreshed = experiment
-	refreshed.AssignmentRules = strings.Replace(hoUSRule, "US Internal Users", "Renamed", 1)
-	h.refresh(hoData([]jsonmodels.Holdout{hoHoldoutA()}, refreshed))
-	expectInt(t, 1, h.treatment("exp_rule"))
-	h.expectPending(2)
+	var experiment = hoExperiment(1, "exp_rule", hoUnitType, 2, 11)
+	experiment.AssignmentRules = `{"rules":[{"type":"split","percentages":"100/0/0","environments":[],` +
+		`"conditions":{"eq":[{"var":"split"},{"value":true}]}},{"type":"assign","variant":2,"environments":[]}]}`
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+	expectInt(t, 2, h.treatment("exp_rule"))
+	h.expectPending(1)
+	var before = h.ctx.GetAssignment("exp_rule")
+	h.setAttribute("split", true)
+	expectInt(t, 2, h.treatment("exp_rule"))
+	if h.ctx.GetAssignment("exp_rule") == before {
+		t.Fatal("the assignment was not rebuilt")
+	}
+	h.expectPending(1)
 }
 
 // A suppressed assignment superseded by a refresh cannot publish through the
@@ -1955,8 +1960,230 @@ func TestHoldout_SetDataThroughACopyActsOnTheLiveContext(t *testing.T) {
 	expectValue(t, []string{"exp", "exp2"}, names)
 
 	snapshot.SetDataFailed(errors.New("load failed"))
-	names, _ = h.ctx.GetExperiments()
-	expectInt(t, 0, len(names))
+	if !h.ctx.IsFailed() {
+		t.Fatal("the live context is not failed")
+	}
+	var data, err = h.ctx.GetData()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectInt(t, 0, len(data.Experiments))
+	h.ctx.DataLock.RLock()
+	expectInt(t, 0, len(h.ctx.Index_))
+	h.ctx.DataLock.RUnlock()
+}
+
+// A held-out experiment that a refresh removes keeps its cached decision, as
+// in the JS SDK (_assign keeps a not-assigned assignment when the experiment
+// is gone): a later read fires the pinned holdout exposure and nothing else.
+func TestHoldout_RemovedExperimentKeepsItsPinnedDecision(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.peek("exp"))
+	h.refresh(hoData(nil))
+	expectInt(t, 0, h.treatment("exp"))
+	expectInt(t, 0, h.treatment("exp"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
+// An assignment that a refresh replaces with a held-out one cannot publish
+// beside its replacement, also when it had no holdouts itself.
+func TestHoldout_AssignmentSupersededByNewCoverageIsRetired(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0)))
+	var retained = h.ctx.GetAssignment("exp")
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.peek("exp"))
+	h.ctx.QueueExposure(retained)
+	h.expectPending(0)
+	expectInt(t, 0, h.treatment("exp"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
+// A replaced held-out assignment whose holdout exposure a close rejected
+// stays retired: once the context reopens, it publishes nothing, while the
+// current assignment still retries the rejected arm.
+func TestHoldout_SupersededAssignmentIsNotReopenedByARejectedArm(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA(), hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp", hoUnitType, 0, 11, 12)))
+	var stale = h.ctx.GetAssignment("exp")
+	var next = hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)
+	next.Iteration = 2
+	var replaced = false
+	h.logger.onEvent = func(event EventType, data interface{}) {
+		if exposure, ok := data.(jsonmodels.Exposure); ok && exposure.Id == 11 && !replaced {
+			replaced = true
+			// Replace the assignment while its exposure call is running, then
+			// make the close reject the second arm.
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA(), next}, hoExperiment(1, "exp", hoUnitType, 0, 11, 12)))
+			h.ctx.GetAssignment("exp")
+			h.ctx.Closing_.Store(true)
+		}
+	}
+	h.ctx.QueueExposure(stale)
+	h.logger.onEvent = nil
+	h.ctx.Closing_.Store(false)
+	h.ctx.QueueExposure(stale)
+	h.expectPending(1)
+	expectInt(t, 0, h.treatment("exp"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0), hoExposure(hoUnitType, 12, "holdout_b", 1))
+}
+
+// Without holdouts, a replaced assignment whose exposure a close rejected
+// stays retryable through QueueExposure, as before holdouts.
+func TestHoldout_RejectedExposureWithoutHoldoutsStaysRetryableAfterReplacement(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
+	var assignment = h.ctx.GetAssignment("exp")
+	var refreshed = hoExperiment(1, "exp", hoUnitType, 0)
+	refreshed.Iteration = 2
+	h.refresh(hoData(nil, refreshed))
+	h.ctx.GetAssignment("exp")
+	h.ctx.Closing_.Store(true)
+	h.ctx.QueueExposure(assignment)
+	h.ctx.Closing_.Store(false)
+	h.ctx.QueueExposure(assignment)
+	h.expectPending(1)
+}
+
+// An exposed held-out experiment that a refresh removes keeps its
+// assignment, as in the JS SDK: nothing more is published for it.
+func TestHoldout_RemovedExposedExperimentPublishesNothingMore(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp"))
+	h.refresh(hoData(nil))
+	expectInt(t, 0, h.treatment("exp"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
+// An assignment without holdouts replaced by one with holdouts stays retired
+// when a close rejects its exposure: it never publishes beside the
+// held-out replacement.
+func TestHoldout_ReplacedUncoveredAssignmentStaysRetiredAfterRejection(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0)))
+	var stale = h.ctx.GetAssignment("exp")
+	stale.Exposed.Store(true)
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.peek("exp"))
+	stale.Exposed.Store(false)
+	h.ctx.Closing_.Store(true)
+	h.ctx.QueueExposure(stale)
+	h.ctx.Closing_.Store(false)
+	h.ctx.QueueExposure(stale)
+	h.expectPending(0)
+}
+
+// An exposed override whose experiment a refresh removes keeps its cached
+// assignment, as in the JS SDK: nothing is published again.
+func TestHoldout_RemovedOverriddenExperimentIsNotReExposed(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)),
+		hoOverride("exp", 1))
+	expectInt(t, 1, h.treatment("exp"))
+	h.refresh(hoData(nil))
+	expectInt(t, 1, h.treatment("exp"))
+	var own = hoOwn(hoUnitType, 1, "exp", 1)
+	own.Assigned = false
+	own.Overridden = true
+	h.expectPublished(own, hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
+// A held-out assignment replaced by an uncovered one stays retired when a
+// close rejects its holdout exposure: it never publishes beside the
+// replacement.
+func TestHoldout_ReplacedHeldOutAssignmentStaysRetiredAfterRejection(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA(), hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp", hoUnitType, 0, 11, 12)))
+	var stale = h.ctx.GetAssignment("exp")
+	var replaced = false
+	h.logger.onEvent = func(event EventType, data interface{}) {
+		if exposure, ok := data.(jsonmodels.Exposure); ok && exposure.Id == 11 && !replaced {
+			replaced = true
+			h.ctx.SetData(hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
+			h.ctx.GetAssignment("exp")
+			h.ctx.Closing_.Store(true)
+		}
+	}
+	h.ctx.QueueExposure(stale)
+	h.logger.onEvent = nil
+	h.ctx.Closing_.Store(false)
+	h.ctx.QueueExposure(stale)
+	h.expectPending(1)
+}
+
+// reopenExposure leaves a replaced holdout assignment retired, whatever its
+// replacement is.
+func TestHoldout_ReopenExposureKeepsAReplacedHoldoutAssignmentRetired(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	var stale = h.ctx.GetAssignment("exp")
+	h.refresh(hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
+	h.ctx.GetAssignment("exp")
+	stale.Exposed.Store(true)
+	h.ctx.reopenExposure(stale, true)
+	if !stale.Exposed.Load().(bool) {
+		t.Fatal("a replaced holdout assignment was reopened")
+	}
+}
+
+// A covered assignment whose own exposure a close rejected stays retired
+// when it was replaced, also by an uncovered assignment: queueExposure
+// passes reopenExposure whether the assignment had holdouts.
+func TestHoldout_ReplacedCoveredAssignmentWhoseOwnExposureIsRejectedStaysRetired(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	var stale = h.ctx.GetAssignment("exp")
+	var holdouts = h.ctx.getAssignment("exp").holdouts
+	h.refresh(hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
+	h.ctx.GetAssignment("exp")
+	// The replacement retired it; replay the exposure call that was already
+	// running when it was replaced, with a close rejecting its exposure.
+	stale.Exposed.Store(false)
+	h.ctx.Closing_.Store(true)
+	h.ctx.queueExposure(stale, holdouts, nil, nil)
+	h.ctx.Closing_.Store(false)
+	if !stale.Exposed.Load().(bool) {
+		t.Fatal("a replaced covered assignment was reopened")
+	}
+	h.ctx.QueueExposure(stale)
+	h.expectPending(0)
+}
+
+// An assignment that is not in the cache (built by hand, or evicted) whose
+// exposure a close rejected is queued by a later QueueExposure, as before
+// holdouts.
+func TestHoldout_RejectedExposureOfAnUncachedAssignmentIsRetried(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
+	var exposed = &atomic.Value{}
+	exposed.Store(false)
+	var assignment = &Assignment{Name: "other", Exposed: exposed}
+	h.ctx.Closing_.Store(true)
+	h.ctx.QueueExposure(assignment)
+	h.ctx.Closing_.Store(false)
+	if assignment.Exposed.Load().(bool) {
+		t.Fatal("a rejected exposure stayed marked exposed")
+	}
+	h.ctx.QueueExposure(assignment)
+	h.expectPending(1)
+}
+
+// QueueExposure takes the pinned holdouts only from the cached assignment it
+// was given (or a copy of it): an assignment that merely shares the name
+// publishes its own exposure, not the cached one's holdouts.
+func TestHoldout_QueueExposureOfAnUnrelatedAssignmentWithTheSameName(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.ctx.GetAssignment("exp")
+	var exposed = &atomic.Value{}
+	exposed.Store(false)
+	h.ctx.QueueExposure(&Assignment{Id: 1, Name: "exp", UnitType: hoUnitType, Assigned: true, Eligible: true, Exposed: exposed})
+	h.expectPublished(hoOwn(hoUnitType, 1, "exp", 0))
+}
+
+// Swapping one covering holdout for another of the same iteration is a
+// coverage change: the experiment is resolved again and the new holdout
+// publishes (JS holdoutSetMatches compares ids).
+func TestHoldout_HoldoutIdSwapIsACoverageChange(t *testing.T) {
+	var b = hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA(), b}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp"))
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldoutA(), b}, hoExperiment(1, "exp", hoUnitType, 0, 12)))
+	expectInt(t, 0, h.treatment("exp"))
+	var own = hoOwn(hoUnitType, 1, "exp", 0)
+	h.expectPublished(own, hoExposure(hoUnitType, 11, "holdout_a", 1), own, hoExposure(hoUnitType, 12, "holdout_b", 1))
 }
 
 // An overridden experiment a holdout covers stays cached: it is resolved

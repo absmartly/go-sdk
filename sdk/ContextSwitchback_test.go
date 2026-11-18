@@ -1635,3 +1635,32 @@ func TestSwitchback_ExposureIsStampedWithTheResolvingReadingWithinThePeriod(t *t
 		expectValue(t, sbAnchor+100, exposures[0].ExposedAt)
 	}
 }
+
+// An overridden switchback removed by a refresh is resolved again, as an
+// experiment that is no longer there: the override still applies, under no
+// unit, and it is exposed again once.
+func TestSwitchback_OverriddenSwitchbackRemovedByARefresh(t *testing.T) {
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour)), sbOverride("exp_sb", 1))
+	h.at(sbAnchor + 5)
+	expectInt(t, 1, h.treatment("exp_sb"))
+	h.refresh()
+	expectInt(t, 1, h.treatment("exp_sb"))
+	expectInt(t, 1, h.treatment("exp_sb"))
+	var exposures = h.publishExposures()
+	expectInt(t, 2, len(exposures))
+	expectValue(t, jsonmodels.Exposure{Name: "exp_sb", Variant: 1, ExposedAt: sbAnchor + 5, Eligible: true, Overridden: true}, exposures[1])
+}
+
+// A switchback exposure rejected by a close is queued by the next read once
+// the context is open again.
+func TestSwitchback_ExposureRejectedByACloseIsRetried(t *testing.T) {
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+	h.at(sbAnchor + 5)
+	h.ctx.Closing_.Store(true)
+	_ = h.ctx.GetAssignment("exp_sb")
+	h.ctx.QueueExposure(h.ctx.GetAssignment("exp_sb"))
+	h.expectPending(0)
+	h.ctx.Closing_.Store(false)
+	h.treatment("exp_sb")
+	h.expectPublished(sbExposure(1, "exp_sb", sbExpected2Arms[0], sbAnchor+5, true, true))
+}

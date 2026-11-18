@@ -191,14 +191,13 @@ type holdoutArm struct {
 // with, so its exposures fire the arms that decided it even if a refresh
 // lands in between. holdouts identifies the covering set (by id and
 // iteration) for cache validation; arms has one entry per holdout, nil when
-// the experiment's unit was not set.
+// the experiment's unit was not set. suppressed is set when an arm holds the
+// experiment out and no override or assignment rule chose the variant.
 type assignmentHoldouts struct {
-	holdouts  []*jsonmodels.Holdout
-	arms      []*holdoutArm
-	unitType  string
-	ownQueued atomic.Bool
-	// suppressed is set when an arm holds the experiment out and no
-	// override or assignment rule chose the variant.
+	holdouts   []*jsonmodels.Holdout
+	arms       []*holdoutArm
+	unitType   string
+	ownQueued  atomic.Bool
 	suppressed bool
 }
 
@@ -977,6 +976,7 @@ func (c *Context) queueExposure(assignment *Assignment, holdouts *assignmentHold
 	if assignment.Exposed.CompareAndSwap(false, true) {
 		if !holdouts.isSuppressed() && !slot.isSilent() && (holdouts == nil || !holdouts.ownQueued.Load()) {
 			if !c.enqueueExposure(assignment, c.exposedAt(slot, at)) {
+				c.reopenExposure(assignment, holdouts != nil)
 				return
 			}
 			if holdouts != nil {
@@ -984,9 +984,24 @@ func (c *Context) queueExposure(assignment *Assignment, holdouts *assignmentHold
 			}
 		}
 		if holdouts != nil && !c.queueHoldoutExposures(holdouts) {
-			// Retry the remaining arms on the next exposing read.
-			assignment.Exposed.Store(false)
+			c.reopenExposure(assignment, true)
 		}
+	}
+}
+
+// reopenExposure clears the exposed mark of an assignment whose exposure a
+// close rejected, so the next exposing read queues it. A replaced assignment
+// that had holdouts, or whose replacement has them, stays retired: it must
+// not publish beside its replacement. Without holdouts on either side the
+// mark is cleared as before holdouts.
+func (c *Context) reopenExposure(assignment *Assignment, hadHoldouts bool) {
+	c.ContextLock_.RLock()
+	defer c.ContextLock_.RUnlock()
+	var entry, found = c.assignmentCache_[assignment.Name]
+	// A switchback slot is cached under its period; it never has holdouts.
+	var current = found && entry.assignment.Exposed == assignment.Exposed
+	if current || (!hadHoldouts && (!found || entry.holdouts == nil)) {
+		assignment.Exposed.Store(false)
 	}
 }
 
@@ -996,6 +1011,7 @@ func (c *Context) queueHoldoutExposures(holdouts *assignmentHoldouts) bool {
 	var queued = true
 	for _, arm := range holdouts.arms {
 		if arm != nil && arm.assignment.Exposed.CompareAndSwap(false, true) && !c.enqueueExposure(arm.assignment, c.Clock_.Millis()) {
+			arm.assignment.Exposed.Store(false)
 			queued = false
 		}
 	}
@@ -1018,7 +1034,8 @@ func (c *Context) exposedAt(slot *switchbackSlot, at *clockReading) int64 {
 }
 
 // enqueueExposure queues an exposure for an assignment already marked
-// exposed. When the context is closed it clears the mark and reports false.
+// exposed. When the context is closed it reports false, and the caller
+// clears the mark so a later read can retry.
 func (c *Context) enqueueExposure(assignment *Assignment, exposedAt int64) bool {
 	var exposure = jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
 		Variant: assignment.Variant, ExposedAt: exposedAt, Assigned: assignment.Assigned,
@@ -1031,10 +1048,6 @@ func (c *Context) enqueueExposure(assignment *Assignment, exposedAt int64) bool 
 	// or rejected after it, never stranded behind it.
 	if c.CheckNotClosed() != nil {
 		c.EventLock_.Unlock()
-		// The exposure was not queued, so it must not stay marked as
-		// exposed: a failed close reopens the context, and the next
-		// GetTreatment has to queue it.
-		assignment.Exposed.Store(false)
 		return false
 	}
 	c.PendingCount_.Store(c.PendingCount_.Load().(int32) + 1)
@@ -1600,10 +1613,13 @@ func (c *Context) validCachedAssignment(experimentName string, indexed *indexedE
 	}
 
 	if ofound {
-		// The switchback identity is checked too, so a grid change resolves
-		// an overridden slot again like any other.
-		if assignment.Overridden && assignment.Variant == override.(int) && holdoutSetMatches(holdouts, entry.holdouts) &&
-			(entry.holdouts == nil || entry.holdouts.unitType == unitTypeOf(experiment)) && switchbackSlotMatches(indexed, entry) {
+		// A removed experiment keeps its override, as in the JS SDK
+		// (experiment == null || holdoutSetMatches). The switchback identity
+		// is checked too, so a grid change, or the removal of a switchback,
+		// resolves an overridden slot again like any other.
+		if assignment.Overridden && assignment.Variant == override.(int) && (!efound ||
+			holdoutSetMatches(holdouts, entry.holdouts) && (entry.holdouts == nil || entry.holdouts.unitType == unitTypeOf(experiment))) &&
+			switchbackSlotMatches(indexed, entry) {
 			return entry, rules, assignmentValid
 		}
 	} else if !efound {
@@ -1765,10 +1781,11 @@ func (c *Context) keepExposedRuleAssignment(indexed *indexedExperiment, previous
 	}
 	// Changed holdout coverage is a new decision, whose holdout exposures
 	// must fire: it is exposed again, as in the JS SDK.
-	if entry.holdouts != nil && !holdoutSetMatches(entry.holdouts.holdouts, previous.holdouts) {
-		return
+	var covering []*jsonmodels.Holdout
+	if entry.holdouts != nil {
+		covering = entry.holdouts.holdouts
 	}
-	if entry.holdouts == nil && previous.holdouts != nil {
+	if !holdoutSetMatches(covering, previous.holdouts) {
 		return
 	}
 	fresh.Exposed = previous.assignment.Exposed
@@ -1884,8 +1901,6 @@ func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cach
 				assignment.RuleOverride = true
 				entry.ruleMissingUnit = rule.missingUnit
 			} else if held {
-				// Held out: control, not assigned, and the audience, traffic,
-				// full-on and custom assignments are skipped.
 				entry.holdouts.suppressed = true
 			}
 
@@ -1947,7 +1962,7 @@ func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cach
 	if efound {
 		c.keepExposedRuleAssignment(indexed, previous, entry)
 	}
-	if previous != nil && previous.holdouts != nil && previous.assignment.Exposed != assignment.Exposed {
+	if previous != nil && (previous.holdouts != nil || entry.holdouts != nil) && previous.assignment.Exposed != assignment.Exposed {
 		// Retire the replaced assignment, as eviction does: a caller still
 		// holding it must not publish a decision, or holdout arms, that the
 		// replacement has superseded.
@@ -2194,7 +2209,6 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		var installed = append([]jsonmodels.Holdout(nil), data.Holdouts...)
 		holdoutsById = make(map[int]*jsonmodels.Holdout, len(installed))
 		for i := range installed {
-			// A holdout with no split cannot draw an arm, so it covers nothing.
 			if len(installed[i].Split) > 0 {
 				installed[i].Split = append([]float64(nil), installed[i].Split...)
 				holdoutsById[installed[i].Id] = &installed[i]
