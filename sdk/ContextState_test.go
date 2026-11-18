@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"context"
 	"errors"
 	"runtime"
 	"sync"
@@ -367,21 +368,92 @@ func treatmentPeek(t *testing.T, ctx *Context, name string) int {
 	return variant
 }
 
-// Replacing Clock_ as soon as WaitUntilReady returns must not race the ready
-// callback, which finishes its work before releasing waiters.
-func TestReplacingClockAfterAsyncReadyDoesNotRace(t *testing.T) {
-	for i := 0; i < 20; i++ {
-		setUp()
-		var config = CreateDefaultContextConfig()
-		config.Units_ = units
-		config.PublishDelay_ = -1
-		config.RefreshInterval_ = 0
-		var pending, settle = future.New()
-		var ctx = createTrackedContext(clock, config, pending, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
-		go settle(data, nil)
-		ctx.WaitUntilReady()
-		ctx.Clock_ = internal.FixedClock{Millis_: 1}
-		var _, err = ctx.PeekTreatment("exp_test_ab")
-		assertAny(nil, err, t)
+// readyGateLogger hands TimeoutLock_ to the test from inside the Ready event,
+// which the ready callback logs after installing the data.
+type readyGateLogger struct {
+	ctx    *Context
+	locked chan struct{}
+}
+
+func (l *readyGateLogger) HandleEvent(_ Context, event EventType, _ interface{}) {
+	if event == Ready {
+		l.ctx.TimeoutLock_.Lock()
+		close(l.locked)
 	}
+}
+
+// The ready callback finishes everything that reads the context (clearing
+// ReadyFuture_, arming the publish timeout) before it releases waiters, so a
+// caller may replace Clock_ as soon as WaitUntilReady returns. The logger
+// holds TimeoutLock_, which SetTimeout needs: the waiters must stay blocked
+// until it is released, whatever the scheduling.
+func TestReadyReleasesWaitersOnlyAfterItsLastContextRead(t *testing.T) {
+	setUp()
+	var logger = &readyGateLogger{locked: make(chan struct{})}
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = 0
+	config.EventLogger_ = logger
+	var pending, settle = future.New()
+	var ctx = createTrackedContext(clock, config, pending, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
+	logger.ctx = ctx
+	assertAny(nil, ctx.Track("goal", nil), t)
+	var ready = ctx.WaitUntilReadyAsync()
+
+	go settle(data, nil)
+	<-logger.locked
+	select {
+	case <-readyChannel(ready):
+		ctx.TimeoutLock_.Unlock()
+		t.Fatal("waiters were released before the ready callback armed the publish timeout")
+	case <-time.After(200 * time.Millisecond):
+	}
+	ctx.TimeoutLock_.Unlock()
+	assertAny(nil, getWithTimeout(t, ready), t)
+	ctx.Clock_ = internal.FixedClock{Millis_: 1}
+	var _, err = ctx.PeekTreatment("exp_test_ab")
+	assertAny(nil, err, t)
+}
+
+func readyChannel(f *future.Future) <-chan struct{} {
+	var done = make(chan struct{})
+	go func() {
+		_, _ = f.Get(context.Background())
+		close(done)
+	}()
+	return done
+}
+
+// After Clock_ is replaced, GetExperiment reads Index_ under DataLock, so it
+// does not race SetData installing new data (run with -race).
+func TestReplacedClockGetExperimentDoesNotRaceSetData(t *testing.T) {
+	var ctx, _ = newRuleContext(t, "production", withUnit(), ruleExperiment("exp", ""))
+	ctx.Clock_ = internal.FixedClock{Millis_: 1}
+	var done = make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{ruleExperiment("exp", "")}})
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		ctx.GetExperiment("exp")
+	}
+	<-done
+}
+
+// The same holds for a copy of a context whose Clock_ was replaced: it acts on
+// the live context.
+func TestContextCopyAfterClockReplacementActsOnLiveContext(t *testing.T) {
+	var ctx, _ = newRuleContext(t, "production", withUnit(),
+		ruleExperiment("exp", rulesJSON(`{"type":"assign","variant":2,"conditions":{"eq":[{"var":"country"},{"value":"US"}]}}`)))
+	ctx.Clock_ = internal.FixedClock{Millis_: 1}
+	assertAny(0, treatmentPeek(t, ctx, "exp"), t)
+
+	var copied = *ctx
+	assertAny(nil, ctx.SetAttribute("country", "US"), t)
+	assertAny(2, treatmentPeek(t, &copied, "exp"), t)
+	assertAny(2, treatment(t, ctx, "exp"), t)
+	assertAny(true, expectExposures(t, ctx, 1)[0].RuleOverride, t)
 }

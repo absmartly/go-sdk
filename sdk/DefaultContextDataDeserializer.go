@@ -30,6 +30,12 @@ func (d DefaultContextDataDeserializer) Deserialize(bytes []byte) (jsonmodels.Co
 // object with an experiments array is returned as it is; its decode error is
 // the same either way.
 func withoutAssignmentRules(payload []byte) []byte {
+	// Re-encoding would repair a truncated payload or drop trailing data, so
+	// only a well-formed payload is rewritten; anything else must fail to
+	// decode exactly as it did in v1.1.1.
+	if !json.Valid(payload) {
+		return payload
+	}
 	return rewriteObject(payload, func(key string, value json.RawMessage) (json.RawMessage, bool) {
 		if key != "experiments" {
 			return value, true

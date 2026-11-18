@@ -110,6 +110,14 @@ func TestDeserializeErrorMatchesV111(t *testing.T) {
 		{`{"experiments":[{"id":1,"assignmentRules":{"a":1}},{"unitType":2}]}`,
 			"json: cannot unmarshal number into Go struct field Experiment.experiments.unitType of type string",
 			[]jsonmodels.Experiment{{Id: 1}, {}}},
+		// Malformed JSON stays malformed: no repair of a truncated body, no
+		// dropping trailing data.
+		{`{"experiments":[{"id":1,"name":"a"}]`, "unexpected end of JSON input", nil},
+		{`{"experiments":[{"id":1,"name":"a","assignmentRules":5}]`, "unexpected end of JSON input", nil},
+		{`{"experiments":[{"id":1,"name":"a"}]}x`, "invalid character 'x' after top-level value", nil},
+		{`{"experiments":[{"id":1,"name":"a","assignmentRules":5}]}x`, "invalid character 'x' after top-level value", nil},
+		{`{"experiments":[{"id":1,"name":"a"}]}{}`, "invalid character '{' after top-level value", nil},
+		{`{"experiments":[{"id":1,"name":"a",}]}`, "invalid character '}' looking for beginning of object key string", nil},
 	}
 	for _, tc := range cases {
 		var got, err = DefaultContextDataDeserializer{}.Deserialize([]byte(tc.payload))

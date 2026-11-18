@@ -633,7 +633,7 @@ import (
     "log"
 )
 
-var absmartlySDK *sdk.ABsmartly
+var absmartlySDK sdk.ABsmartly
 
 func main() {
     // Initialize SDK once at app startup
@@ -697,7 +697,7 @@ import (
     "log"
 )
 
-var absmartlySDK *sdk.ABsmartly
+var absmartlySDK sdk.ABsmartly
 
 func main() {
     // Initialize SDK once at app startup
@@ -760,7 +760,7 @@ import (
     "log"
 )
 
-var absmartlySDK *sdk.ABsmartly
+var absmartlySDK sdk.ABsmartly
 
 func main() {
     // Initialize SDK once at app startup
