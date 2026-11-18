@@ -1968,9 +1968,10 @@ func TestHoldout_SetDataThroughACopyActsOnTheLiveContext(t *testing.T) {
 	h.ctx.DataLock.RUnlock()
 }
 
-// A held-out experiment that a refresh removes is resolved again: its
-// removed holdout is not exposed. JS: the experiment is gone, so _assign
-// rebuilds the assignment with no holdouts.
+// A held-out experiment that a refresh removes before it was exposed is
+// resolved again, as an unknown experiment: its removed holdout is never
+// newly exposed. (JS keeps the cached assignment and fires the pinned
+// holdout here; this SDK does not publish coverage the payload withdrew.)
 func TestHoldout_RemovedExperimentDoesNotExposeItsRemovedHoldout(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 	expectInt(t, 0, h.peek("exp"))
@@ -2036,4 +2037,45 @@ func TestHoldout_RejectedExposureWithoutHoldoutsStaysRetryableAfterReplacement(t
 	h.ctx.Closing_.Store(false)
 	h.ctx.QueueExposure(assignment)
 	h.expectPending(1)
+}
+
+// An exposed held-out experiment that a refresh removes keeps its
+// assignment, as in the JS SDK: nothing more is published for it.
+func TestHoldout_RemovedExposedExperimentPublishesNothingMore(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp"))
+	h.refresh(hoData(nil))
+	expectInt(t, 0, h.treatment("exp"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
+// An assignment without holdouts replaced by one with holdouts stays retired
+// when a close rejects its exposure: it never publishes beside the
+// held-out replacement.
+func TestHoldout_ReplacedUncoveredAssignmentStaysRetiredAfterRejection(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0)))
+	var stale = h.ctx.GetAssignment("exp")
+	stale.Exposed.Store(true)
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.peek("exp"))
+	stale.Exposed.Store(false)
+	h.ctx.Closing_.Store(true)
+	h.ctx.QueueExposure(stale)
+	h.ctx.Closing_.Store(false)
+	h.ctx.QueueExposure(stale)
+	h.expectPending(0)
+}
+
+// An exposed override whose experiment a refresh removes keeps its cached
+// assignment, as in the JS SDK: nothing is published again.
+func TestHoldout_RemovedOverriddenExperimentIsNotReExposed(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)),
+		hoOverride("exp", 1))
+	expectInt(t, 1, h.treatment("exp"))
+	h.refresh(hoData(nil))
+	expectInt(t, 1, h.treatment("exp"))
+	var own = hoOwn(hoUnitType, 1, "exp", 1)
+	own.Assigned = false
+	own.Overridden = true
+	h.expectPublished(own, hoExposure(hoUnitType, 11, "holdout_a", 0))
 }

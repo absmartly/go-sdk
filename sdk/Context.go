@@ -1538,17 +1538,20 @@ func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignmen
 	}
 
 	if ofound {
-		if assignment.Overridden && assignment.Variant == override.(int) && holdoutSetMatches(holdouts, entry.holdouts) &&
-			(entry.holdouts == nil || entry.holdouts.unitType == experiment.Data.UnitType) {
+		// A removed experiment keeps its override, as in the JS SDK
+		// (experiment == null || holdoutSetMatches).
+		if assignment.Overridden && assignment.Variant == override.(int) && (!efound ||
+			holdoutSetMatches(holdouts, entry.holdouts) && (entry.holdouts == nil || entry.holdouts.unitType == experiment.Data.UnitType)) {
 			return entry, rules, assignmentValid
 		}
 	} else if !efound {
 		// A rule-won assignment is not assigned either, but its variant came
 		// from the experiment's rules, so it is rebuilt once the experiment
 		// is gone.
-		// A held-out one is rebuilt too, so the removed coverage is not
-		// exposed.
-		if !assignment.Assigned && !assignment.RuleOverride && entry.holdouts == nil {
+		// A held-out one not yet exposed is rebuilt too, so the removed
+		// coverage is never newly exposed; once exposed it is kept, as in
+		// the JS SDK, so nothing is published twice.
+		if !assignment.Assigned && !assignment.RuleOverride && (entry.holdouts == nil || assignment.Exposed.Load().(bool)) {
 			return entry, rules, assignmentValid
 		}
 	} else if assignment.RuleOverride || entry.holdouts.isSuppressed() || !cfound || custom.(int) == assignment.Variant {
