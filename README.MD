@@ -594,7 +594,9 @@ for the full rules):
   `float64` is a float even when whole. Values from a JSON document should be
   decoded with `json.Decoder.UseNumber`, so `json.Number("3")` keys a cluster
   and `json.Number("3.0")` does not; plain `encoding/json` decodes every
-  number as a `float64`, which gives no value.
+  number as a `float64`, which gives no value. Prefer integer or string
+  attributes: a whole `float64` is published as `3`, which the collector
+  reads back as an integer when it re-resolves the cluster.
 - With no unit of a linked type set, the experiment does not apply. When no
   unit yields a value, linked units disagree, or the value is not in
   `Experiment.SwitchbackClusterValues`, the unit gets variant `0` and no
@@ -603,8 +605,10 @@ for the full rules):
   (on the serving unit) and custom assignments apply as for a unit
   experiment, and the variant is drawn from the cluster value and the period
   `floor((now - SwitchbackStartAt) / SwitchbackPeriodMs)`. Before the start,
-  or when the start is not hour aligned, the draw gives variant `0` with no
-  exposure. Holdouts never apply to a switchback experiment.
+  and when the schedule cannot be served (no start, a start that is not hour
+  aligned or outside `[0, 10000-01-01)`, a period of 0 or less, fewer than
+  two arms), the draw gives variant `0` with no exposure. Holdouts never
+  apply to a switchback experiment.
 - The exposure is published under the serving unit, once per period, and is
   stamped with the time that chose its period. Its fields are the same as a
   unit experiment's; the cluster attributes are published with their

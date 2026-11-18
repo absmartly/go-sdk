@@ -1591,18 +1591,19 @@ func (c *Context) validCachedAssignment(experimentName string, indexed *indexedE
 	var custom, cfound = c.Cassignments_[experimentName]
 	var override, ofound = c.Overrides_[experimentName]
 	var efound = indexed != nil
-	var experiment ExperimentVariables
+	// A pointer: the experiment is too large to copy on every cached read.
+	var experiment *ExperimentVariables
 	var rules *experimentRules
 	var holdouts []*jsonmodels.Holdout
 	if efound {
-		experiment, rules, holdouts = indexed.experiment, indexed.rules, indexed.holdouts
+		experiment, rules, holdouts = &indexed.experiment, indexed.rules, indexed.holdouts
 	}
 
 	if ofound {
 		// The switchback identity is checked too, so a grid change resolves
 		// an overridden slot again like any other.
 		if assignment.Overridden && assignment.Variant == override.(int) && holdoutSetMatches(holdouts, entry.holdouts) &&
-			(entry.holdouts == nil || entry.holdouts.unitType == experiment.Data.UnitType) && switchbackSlotMatches(indexed, entry) {
+			(entry.holdouts == nil || entry.holdouts.unitType == unitTypeOf(experiment)) && switchbackSlotMatches(indexed, entry) {
 			return entry, rules, assignmentValid
 		}
 	} else if !efound {
@@ -1627,6 +1628,14 @@ func (c *Context) validCachedAssignment(experimentName string, indexed *indexedE
 		}
 	}
 	return entry, rules, assignmentStale
+}
+
+// unitTypeOf is an installed experiment's unit type, or "" without one.
+func unitTypeOf(experiment *ExperimentVariables) string {
+	if experiment == nil {
+		return ""
+	}
+	return experiment.Data.UnitType
 }
 
 // ruleMatches reports whether the experiment's assignment rules still give the

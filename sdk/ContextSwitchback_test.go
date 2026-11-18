@@ -1542,3 +1542,47 @@ func TestSwitchback_BurnAndCarryoverWindowsDoNotChangeServing(t *testing.T) {
 		late.expectPublished(want...)
 	}
 }
+
+// A split-rule switchback revalidates its rule against the serving unit, not
+// the declared unitType: an unrelated SetAttribute keeps the cached slot.
+func TestSwitchback_SplitRuleRevalidatesAgainstTheServingUnit(t *testing.T) {
+	var experiment = sbDefault(2, sbHour)
+	experiment.UnitType = "user_id"
+	experiment.AssignmentRules = `{"rules":[{"type":"split","environments":[],"percentages":"50/50"}]}`
+	for u := 0; u < 16; u++ {
+		var h = sbCreateAt(t, sbAnchor+5, map[string]string{sbUnitType: "store-" + strconv.Itoa(u), "user_id": "fixed-user"}, sbData(experiment))
+		h.peek("exp_sb")
+		var first = h.ctx.GetAssignment("exp_sb")
+		h.setAttribute("unrelated", u)
+		h.peek("exp_sb")
+		if h.ctx.GetAssignment("exp_sb") != first {
+			t.Fatalf("store-%d: the slot was resolved again", u)
+		}
+	}
+}
+
+// A switchback slot stays current while the custom assignment is the one it
+// was resolved with, even when it serves another variant (full-on here).
+func TestSwitchback_UnchangedCustomAssignmentKeepsAFullOnSlot(t *testing.T) {
+	var experiment = sbDefault(3, sbHour)
+	experiment.FullOnVariant = 1
+	var h = sbCreate(t, sbData(experiment), sbCustom("exp_sb", 2))
+	h.at(sbAnchor + 5)
+	expectInt(t, 1, h.treatment("exp_sb"))
+	expectInt(t, 1, h.treatment("exp_sb"))
+	h.expectPending(1)
+}
+
+// A unit experiment refreshed to another unitType is resolved again and
+// exposed under the new unit.
+func TestSwitchback_UnitExperimentUnitTypeRefreshReresolves(t *testing.T) {
+	var unit = sbUnit(sbDefault(2, sbHour))
+	var h = sbCreateAt(t, sbAnchor, map[string]string{sbUnitType: sbUID, "user_id": "u1"}, sbData(unit))
+	h.treatment("exp_sb")
+	unit.UnitType = "user_id"
+	h.refresh(unit)
+	h.treatment("exp_sb")
+	var exposures = h.publishExposures()
+	expectInt(t, 2, len(exposures))
+	expectValue(t, "user_id", exposures[1].Unit)
+}
