@@ -178,7 +178,8 @@ type holdoutArm struct {
 // with, so its exposures fire the arms that decided it even if a refresh
 // lands in between. holdouts identifies the covering set (by id and
 // iteration) for cache validation; arms has one entry per holdout, nil when
-// the experiment's unit was not set.
+// the experiment's unit was not set. suppressed is set when an arm holds the
+// experiment out and no override or assignment rule chose the variant.
 type assignmentHoldouts struct {
 	holdouts   []*jsonmodels.Holdout
 	arms       []*holdoutArm

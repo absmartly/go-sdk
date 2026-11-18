@@ -1308,7 +1308,7 @@ func TestHoldout_DuplicateHoldoutIdsPublishOnce(t *testing.T) {
 		hoExposure(hoUnitType, 12, "holdout_b", 1))
 }
 
-// H4.
+// H4: peek publishes no holdout exposure.
 func TestHoldout_PeekQueuesNoHoldoutExposure(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 	expectInt(t, 0, h.peek("exp"))
@@ -2171,4 +2171,17 @@ func TestHoldout_QueueExposureOfAnUnrelatedAssignmentWithTheSameName(t *testing.
 	exposed.Store(false)
 	h.ctx.QueueExposure(&Assignment{Id: 1, Name: "exp", UnitType: hoUnitType, Assigned: true, Eligible: true, Exposed: exposed})
 	h.expectPublished(hoOwn(hoUnitType, 1, "exp", 0))
+}
+
+// Swapping one covering holdout for another of the same iteration is a
+// coverage change: the experiment is resolved again and the new holdout
+// publishes (JS holdoutSetMatches compares ids).
+func TestHoldout_HoldoutIdSwapIsACoverageChange(t *testing.T) {
+	var b = hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA(), b}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp"))
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldoutA(), b}, hoExperiment(1, "exp", hoUnitType, 0, 12)))
+	expectInt(t, 0, h.treatment("exp"))
+	var own = hoOwn(hoUnitType, 1, "exp", 0)
+	h.expectPublished(own, hoExposure(hoUnitType, 11, "holdout_a", 1), own, hoExposure(hoUnitType, 12, "holdout_b", 1))
 }
