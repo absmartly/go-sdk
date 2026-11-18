@@ -16,6 +16,7 @@ package sdk_test
 import (
 	"errors"
 	"os"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -58,7 +59,12 @@ type v111Publisher struct {
 }
 
 func (p *v111Publisher) Publish(context sdk.Context, event jsonmodels.PublishEvent) *future.Future {
-	p.attempts = append(p.attempts, event)
+	// Snapshot the batch at the handler boundary, so a later change to the
+	// SDK's slices cannot alter what an attempt recorded.
+	var snapshot = event
+	snapshot.Exposures = append([]jsonmodels.Exposure(nil), event.Exposures...)
+	snapshot.Goals = append([]jsonmodels.GoalAchievement(nil), event.Goals...)
+	p.attempts = append(p.attempts, snapshot)
 	return future.Call(func() (future.Value, error) {
 		if p.fail {
 			return nil, errCollectorDown
@@ -162,8 +168,8 @@ func TestV111ConsumerBehaviour(t *testing.T) {
 
 	var assignment = ctx.GetAssignment("exp_test_ab")
 	assignment.Variant = 7
-	if got, _ := ctx.PeekTreatment("exp_test_ab"); got != 1 {
-		t.Errorf("mutating GetAssignment's result changed the treatment to %d", got)
+	if got, err := ctx.PeekTreatment("exp_test_ab"); err != nil || got != 1 {
+		t.Errorf("after mutating GetAssignment's result, PeekTreatment = %d, %v; want 1, nil", got, err)
 	}
 
 	if err := ctx.SetUnit("session_id", "other"); err == nil || err.Error() != "unit already set" {
@@ -186,10 +192,14 @@ func TestV111ConsumerBehaviour(t *testing.T) {
 	if len(publisher.attempts) != 2 {
 		t.Fatalf("publisher called %d times, want 2", len(publisher.attempts))
 	}
-	for i, attempt := range publisher.attempts {
-		if len(attempt.Exposures) != 4 || len(attempt.Goals) != 1 {
-			t.Errorf("attempt %d sent %d exposures and %d goals, want 4 and 1", i, len(attempt.Exposures), len(attempt.Goals))
-		}
+	var first = publisher.attempts[0]
+	if len(first.Exposures) != 4 || len(first.Goals) != 1 || first.Goals[0].Name != "payment" ||
+		!reflect.DeepEqual(first.Goals[0].Properties, map[string]interface{}{"amount": 1}) {
+		t.Fatalf("first attempt sent %+v, want the 4 exposures and the payment goal", first)
+	}
+	var second = publisher.attempts[1]
+	if !sameExposures(first.Exposures, second.Exposures) || !reflect.DeepEqual(first.Goals, second.Goals) {
+		t.Errorf("the retry sent %+v, want the rejected batch %+v", second, first)
 	}
 	if len(publisher.published) != 1 {
 		t.Errorf("published %d batches, want 1", len(publisher.published))
@@ -205,4 +215,22 @@ func TestV111ConsumerBehaviour(t *testing.T) {
 	if err := ctx.Track("payment", nil); err == nil || err.Error() != "ABSmartly Context is closed" {
 		t.Errorf("Track after close: %v", err)
 	}
+}
+
+// sameExposures compares two exposure batches regardless of order.
+func sameExposures(a, b []jsonmodels.Exposure) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var counts = map[jsonmodels.Exposure]int{}
+	for _, e := range a {
+		counts[e]++
+	}
+	for _, e := range b {
+		counts[e]--
+		if counts[e] < 0 {
+			return false
+		}
+	}
+	return true
 }

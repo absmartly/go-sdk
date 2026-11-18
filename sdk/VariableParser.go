@@ -12,7 +12,10 @@ type VariableParser interface {
 // Which parser reads a "json" custom field:
 //   - DefaultVariableParser (value or pointer): the SDK's own JSON parser,
 //     which returns any JSON value (map, slice, string, float64 or bool); JSON
-//     null and invalid JSON give a nil map[string]interface{}.
+//     null and non-empty invalid JSON give a nil map[string]interface{}.
+//
+// For every parser, a field whose value is empty is treated as absent and
+// never parsed: GetCustomFieldValue returns an untyped nil for it.
 //   - A parser that implements this interface: its ParseCustomFieldValue.
 //   - Any other parser, including one that embeds DefaultVariableParser:
 //     its Parse, storing the map it returns, as in v1.1.1.

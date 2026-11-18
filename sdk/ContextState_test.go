@@ -71,9 +71,11 @@ func TestContextManualLiteralState(t *testing.T) {
 	assertAny(true, expectExposures(t, &manual, 1)[0].RuleOverride, t)
 	assertAny(nil, manual.SetAttribute("country", "CA"), t)
 	assertAny("CA", manual.GetAttribute("country"), t)
+	// As in v1.1.1, a value copy of a literal acts on its own fields; it
+	// shares the state found through their shared maps and locks.
 	var copied = manual
-	if copied.live() != &manual {
-		t.Error("a copy of a literal context does not act on the original")
+	if copied.live() != &copied {
+		t.Error("a copy of a literal context redirects to another context")
 	}
 	if copied.state() != manual.state() {
 		t.Error("a copy of a literal context does not share its state")
@@ -403,14 +405,20 @@ func TestReadyReleasesWaitersOnlyAfterItsLastContextRead(t *testing.T) {
 
 	go settle(data, nil)
 	<-logger.locked
-	select {
-	case <-readyChannel(ready):
-		ctx.TimeoutLock_.Unlock()
-		t.Fatal("waiters were released before the ready callback armed the publish timeout")
-	case <-time.After(200 * time.Millisecond):
+	// A waiter that arrives after the data is installed, while the callback
+	// is still arming the timeout, must wait too.
+	var late = ctx.WaitUntilReadyAsync()
+	for name, waiter := range map[string]*future.Future{"early": ready, "late": late} {
+		select {
+		case <-readyChannel(waiter):
+			ctx.TimeoutLock_.Unlock()
+			t.Fatalf("%s waiter was released before the ready callback armed the publish timeout", name)
+		case <-time.After(200 * time.Millisecond):
+		}
 	}
 	ctx.TimeoutLock_.Unlock()
 	assertAny(nil, getWithTimeout(t, ready), t)
+	assertAny(nil, getWithTimeout(t, late), t)
 	ctx.Clock_ = internal.FixedClock{Millis_: 1}
 	var _, err = ctx.PeekTreatment("exp_test_ab")
 	assertAny(nil, err, t)
@@ -475,4 +483,80 @@ func TestReplacedClockGetVariableExperimentDoesNotRaceSetData(t *testing.T) {
 		_, _ = ctx.GetVariableExperiment("color")
 	}
 	<-done
+}
+
+// A publish in flight when Clock_ is replaced is removed from the state that
+// registered it, so a later Close does not wait for it for ever.
+func TestReplacingClockWithPublishInFlightKeepsCloseFinishing(t *testing.T) {
+	var publisher = &heldPublisher{}
+	var ctx = createHeldPublisherContext(t, publisher, nil)
+	assertAny(nil, ctx.Track("goal1", nil), t)
+	var published, err = ctx.PublishAsync()
+	assertAny(nil, err, t)
+	// Replace Clock_ while the publish settles on another goroutine; with
+	// -race this catches the settle path reading Clock_ again.
+	var settled = make(chan struct{})
+	go func() {
+		publisher.settle(t, 0, nil)
+		close(settled)
+	}()
+	ctx.Clock_ = internal.FixedClock{Millis_: 42}
+	<-settled
+	assertAny(nil, getWithTimeout(t, published), t)
+	assertAny(0, ctx.inflightCount(), t)
+
+	var closing, closeErr = ctx.CloseAsync()
+	assertAny(nil, closeErr, t)
+	assertAny(nil, getWithTimeout(t, closing), t)
+	assertAny(true, ctx.IsClosed(), t)
+}
+
+// v1.1.1: when a copy of a literal makes the first SDK call, a later SetData
+// on the original is still visible through the original.
+func TestCopiedLiteralDoesNotCaptureTheOriginal(t *testing.T) {
+	var boolValue = func(value bool) *atomic.Value {
+		var result = &atomic.Value{}
+		result.Store(value)
+		return result
+	}
+	var count = &atomic.Value{}
+	count.Store(int32(0))
+	var original = Context{
+		PublishDelay_: -1, RefreshInterval_: -1, VariableParser_: DefaultVariableParser{},
+		Units_: map[string]string{}, Failed_: boolValue(false), Ready_: boolValue(false),
+		DataLock: &sync.RWMutex{}, ContextLock_: &sync.RWMutex{},
+		Index_: map[string]ExperimentVariables{}, IndexVariables_: map[interface{}]interface{}{},
+		HashedUnits_: map[interface{}]interface{}{}, Assigners_: map[interface{}]interface{}{},
+		AssignmentCache: map[string]Assignment{}, EventLock_: &sync.Mutex{},
+		Overrides_: map[interface{}]interface{}{}, Cassignments_: map[interface{}]interface{}{},
+		PendingCount_: count, Closing_: boolValue(false), Closed_: boolValue(false),
+		Refreshing_: boolValue(false), TimeoutLock_: &sync.Mutex{},
+		Clock_: internal.FixedClock{Millis_: 1},
+	}
+	var copied = original
+	_ = copied.GetAssignment("missing")
+	original.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{ruleExperiment("new", "")}})
+
+	var _, found = original.GetExperiment("new")
+	assertAny(true, found, t)
+	var names, err = original.GetExperiments()
+	assertAny(nil, err, t)
+	assertAny([]string{"new"}, names, t)
+}
+
+// GetVariableAssignment through a copy of a context whose Clock_ was
+// replaced resolves the key and the assignment against the same data.
+func TestGetVariableAssignmentThroughStaleCopyUsesLiveData(t *testing.T) {
+	var a = ruleExperiment("a", "")
+	var ctx, _ = newRuleContext(t, "production", withUnit(), a)
+	ctx.Clock_ = internal.FixedClock{Millis_: 1}
+	var copied = *ctx
+	var b = ruleExperiment("b", "")
+	b.Id = 8
+	ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{b}})
+
+	var assignment, err = copied.GetVariableAssignment("color")
+	assertAny(nil, err, t)
+	assertAny("b", assignment.Name, t)
+	assertAny(8, assignment.Id, t)
 }

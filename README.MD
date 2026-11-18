@@ -4,7 +4,7 @@ Go SDK for [ABsmartly](https://www.absmartly.com/) A/B testing platform.
 
 ## Compatibility
 
-The A/B Smartly Go SDK is compatible with Go versions 1.17 and later, as v1.1.1 was. CI builds and tests on Go 1.17, 1.20, 1.23 and the latest stable Go. The module requires `resty` v2.16.5; it builds with Go 1.17, which CI checks. Upgrading `resty` to v2.17+ in your own module raises your Go floor to 1.23.
+The A/B Smartly Go SDK is compatible with Go versions 1.17 and later. (v1.1.1's go.mod said 1.15, but it used `atomic.Value.CompareAndSwap` and so needed Go 1.17 to build.) CI builds and tests on Go 1.17, 1.20, 1.23 and the latest stable Go. The module requires `resty` v2.16.5; it builds with Go 1.17, which CI checks. Upgrading `resty` to v2.17+ in your own module raises your Go floor to 1.23.
 It provides both a blocking and an asynchronous interfaces.
 
 `Context.GetVariableKeys()` keeps its v1.1 signature (`map[string]string`), returning, for each key, the first experiment that defines it by experiment id. Use the new `Context.GetVariableKeysAll()` to get every experiment per key (`map[string][]string`, in experiment-id order), as the other ABsmartly SDKs return. When several experiments share a variable key, `GetVariableValue`/`PeekVariableValue` read from the first experiment, by id, that the unit is assigned to or overridden in; `GetVariableValue` exposes each experiment visited along the way and `PeekVariableValue` exposes none (v1.1.1 used the last experiment in the payload); this matches the JS SDK.

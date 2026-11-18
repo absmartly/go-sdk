@@ -71,8 +71,9 @@ type Context struct {
 // contextState is owned by a context, never by a process-wide registry.
 // Context keeps its v1.1.1 layout so external unkeyed literals remain valid.
 type contextState struct {
-	// manualRoot is set only by the literal fallback; its copies share this
-	// owner through Assigners_, just as constructed copies share a carrier.
+	// manualRoot is the context createContext built. A copy of it whose
+	// Clock_ was replaced finds this state through Assigners_ and redirects to
+	// manualRoot, as a copy with the carrier does. It is nil for literals.
 	manualRoot *Context
 	// finalizedFuture_ includes logger delivery; ClosingFuture_ only includes
 	// transport/sealing, allowing loggers to re-enter Close safely.
@@ -196,8 +197,11 @@ func (c *Context) literalState() *contextState {
 	if state, ok := c.Assigners_[contextStateKey{}].(*contextState); ok {
 		return state
 	}
+	// A literal has no root: as in v1.1.1, each value copy acts on its own
+	// fields (sharing their maps and locks). Only a context the SDK created
+	// and whose Clock_ was replaced redirects to its root (createContext sets
+	// manualRoot for those).
 	var state = newContextState()
-	state.manualRoot = c
 	var indexed = make(map[string]*indexedExperiment, len(c.Index_))
 	for name, experiment := range c.Index_ {
 		// Manually supplied v1.1.1 indexes have no parsed-rule metadata.
@@ -507,12 +511,14 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 				// logger has seen the ready event.
 				tmp.dispatchDiagnostics(diagnostics)
 				tmp.LogEvent(Ready, result)
-				// Finish everything that reads the context before settling:
-				// once WaitUntilReady returns, the caller may replace Clock_.
-				cntx.setReadyFutureWith(state, nil)
+				// Finish everything that reads the context before releasing
+				// waiters: once WaitUntilReady returns, the caller may replace
+				// Clock_. ReadyFuture_ stays installed until then, so a waiter
+				// that arrives meanwhile waits on it too.
 				if tmp.GetPendingCount() > 0 {
-					tmp.SetTimeout()
+					tmp.armTimeout()
 				}
+				cntx.setReadyFutureWith(state, nil)
 				readyFutureDone(result, nil)
 			} else {
 				tmp.SetDataFailed(err)
@@ -626,7 +632,9 @@ func (c *Context) live() *Context {
 		return clock.root
 	}
 	if c.ContextLock_ != nil {
-		return c.state().manualRoot
+		if root := c.state().manualRoot; root != nil {
+			return root
+		}
 	}
 	return c
 }
@@ -1679,9 +1687,11 @@ func (c *Context) keepExposedRuleAssignment(data jsonmodels.Experiment, previous
 	fresh.Exposed = previous.assignment.Exposed
 }
 
-// GetAssignment returns a copy of the experiment's assignment, as in v1.1.1:
-// changing it does not change the context's cached assignment. The copy
-// shares the cached assignment's Exposed flag.
+// GetAssignment returns a shallow copy of the experiment's assignment, as in
+// v1.1.1: changing its fields does not change the context's cached
+// assignment. The copy shares the cached Exposed flag (QueueExposure relies
+// on it), the Variables map and the TrafficSplit slice; treat those as
+// read-only.
 func (c *Context) GetAssignment(experimentName string) *Assignment {
 	var assignment = *c.assignmentEntry(experimentName).assignment
 	return &assignment
@@ -2262,7 +2272,7 @@ func (c *Context) Flush() *future.Future {
 						c.requeueEvents(exposures, achievements, eventCount)
 						runLogger(done, err, func() { c.logEvent(Error, err) })
 					}
-					c.removeInflight(settled)
+					st.removeInflight(settled)
 					settledDone(nil, err)
 				})
 
@@ -2287,8 +2297,9 @@ func (st *contextState) addInflight(f *future.Future) {
 	st.stateLock_.Unlock()
 }
 
-func (c *Context) removeInflight(f *future.Future) {
-	var st = c.state()
+// removeInflight drops a settled publish from the state that registered it
+// (Flush captured it), without reading Clock_ again.
+func (st *contextState) removeInflight(f *future.Future) {
 	st.stateLock_.Lock()
 	for i, g := range st.inflight_ {
 		if g == f {
@@ -2430,7 +2441,13 @@ func (c *Context) ClearTimeout() {
 }
 
 func (c *Context) SetTimeout() {
-	c = c.live()
+	c.live().armTimeout()
+}
+
+// armTimeout arms the publish timeout on c, which must be the live context.
+// It does not read Clock_, so the ready callback can call it on the context it
+// created while a caller may be replacing Clock_.
+func (c *Context) armTimeout() {
 	if c.IsReady() {
 		c.TimeoutLock_.Lock()
 		if c.Timeout_ == nil && c.PublishDelay_ >= 0 {
@@ -2492,6 +2509,9 @@ func (c *Context) GetVariantAssigner(unitType string, hash []byte, needlock bool
 }
 
 func (c *Context) GetVariableAssignment(key string) (*Assignment, error) {
+	// Look the key up on the context whose index GetAssignment reads, so a
+	// stale copy cannot pair an old experiment with the live index.
+	c = c.live()
 	var experiment, err = c.GetVariableExperiment(key)
 
 	if err == nil {

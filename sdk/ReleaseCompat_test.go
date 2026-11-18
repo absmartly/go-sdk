@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/absmartly/go-sdk/sdk/future"
+	"github.com/absmartly/go-sdk/sdk/internal/v111"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
 
@@ -92,38 +93,12 @@ func TestFetchPathCreateContextInjectsSystemAttributes(t *testing.T) {
 	assertAny(true, expectExposures(t, ctx, 1)[0].RuleOverride, t)
 }
 
-// Experiment and ContextData are v1.1.1's jsonmodels declarations, copied
-// under the same names (encoding/json puts them in its error texts) so that
-// decoding into them shows what v1.1.1 returns on the Go toolchain running the
-// test. The wording differs between Go versions.
-type Experiment struct {
-	Id                int                                `json:"id"`
-	Name              string                             `json:"name"`
-	UnitType          string                             `json:"unitType"`
-	Iteration         int                                `json:"iteration"`
-	SeedHi            int                                `json:"seedHi"`
-	SeedLo            int                                `json:"seedLo"`
-	Split             []float64                          `json:"split"`
-	TrafficSeedHi     int                                `json:"trafficSeedHi"`
-	TrafficSeedLo     int                                `json:"trafficSeedLo"`
-	TrafficSplit      []float64                          `json:"trafficSplit"`
-	FullOnVariant     int                                `json:"fullOnVariant"`
-	Applications      []jsonmodels.ExperimentApplication `json:"applications"`
-	Variants          []jsonmodels.ExperimentVariant     `json:"variants"`
-	CustomFieldValues []jsonmodels.CustomFieldValue      `json:"customFieldValues"`
-	AudienceStrict    bool                               `json:"audienceStrict"`
-	Audience          string                             `json:"audience"`
-}
-
-type ContextData struct {
-	Experiments []Experiment `json:"experiments"`
-}
-
 // A payload that fails to decode returns what v1.1.1 returned: v1.1.1 had no
 // assignmentRules field, so it ignored a malformed one and reported the first
-// other invalid field, and malformed JSON stayed malformed. The oracle is
-// v1.1.1's model decoded on this toolchain; on Go 1.17-1.26 its first error
-// reads "Go struct field Experiment.experiments.id of type int".
+// other invalid field, and malformed JSON stayed malformed. The oracle is the
+// published v1.1.1 model (sdk/internal/v111, a byte-for-byte copy of its
+// declarations) decoded on this toolchain, because encoding/json words its
+// errors differently between Go versions.
 func TestDeserializeErrorMatchesV111(t *testing.T) {
 	var payloads = []string{
 		`{"experiments":[{"id":1,"name":"a","assignmentRules":5},{"id":"x","name":"b"}]}`,
@@ -136,9 +111,13 @@ func TestDeserializeErrorMatchesV111(t *testing.T) {
 		`{"experiments":[{"id":1,"name":"a","assignmentRules":5}]}x`,
 		`{"experiments":[{"id":1,"name":"a"}]}{}`,
 		`{"experiments":[{"id":1,"name":"a",}]}`,
+		// Whitespace before the bad value, a duplicate null experiments key.
+		`{"experiments": [ {"id": "bad"} ]}`,
+		`{"experiments":[{"id":"bad"}],"experiments":null}`,
+		`{"experiments": [ {"assignmentRules": 5, "id": "bad"} ]}`,
 	}
 	for _, payload := range payloads {
-		var legacy ContextData
+		var legacy v111.ContextData
 		var wantErr = json.Unmarshal([]byte(payload), &legacy)
 		if wantErr == nil {
 			t.Fatalf("%s decodes without error in v1.1.1's model", payload)
@@ -147,7 +126,8 @@ func TestDeserializeErrorMatchesV111(t *testing.T) {
 		if err == nil {
 			t.Fatalf("%s decoded without error", payload)
 		}
-		assertAny(wantErr.Error(), err.Error(), t)
+		assertAny(wantErr, err, t)
+		assertAny(legacy.Experiments == nil, got.Experiments == nil, t)
 		assertAny(len(legacy.Experiments), len(got.Experiments), t)
 		for i, want := range legacy.Experiments {
 			assertAny(want.Id, got.Experiments[i].Id, t)
