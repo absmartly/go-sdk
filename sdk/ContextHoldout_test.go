@@ -2216,6 +2216,9 @@ func TestHoldout_RejectedMissingUnitDecisionIsResolvedAgain(t *testing.T) {
 	h.ctx.Closing_.Store(true)
 	h.ctx.QueueExposure(assignment)
 	h.ctx.Closing_.Store(false)
+	// The evicted decision stays retired for a caller still holding it.
+	h.ctx.QueueExposure(assignment)
+	h.expectPending(0)
 	expectInt(t, 2, h.treatment("exp"))
 	var own = hoOwn("user_id", 1, "exp", 2)
 	own.FullOn = true
@@ -2237,4 +2240,63 @@ func TestHoldout_PopulatedModelRoundTrip(t *testing.T) {
 	expectValue(t, data.Experiments[0].HoldoutIds, decoded.Experiments[0].HoldoutIds)
 	var viaSDK, _ = DefaultContextDataDeserializer{}.Deserialize(raw)
 	expectValue(t, data.Holdouts, viaSDK.Holdouts)
+}
+
+// A decision rejected by a close while its unit is still missing is
+// reopened, not rebuilt.
+func TestHoldout_RejectedDecisionStillMissingItsUnitIsReopened(t *testing.T) {
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_user", "user_id", hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp", "user_id", 2, 11)))
+	var assignment = h.ctx.GetAssignment("exp")
+	h.ctx.Closing_.Store(true)
+	h.ctx.QueueExposure(assignment)
+	h.ctx.Closing_.Store(false)
+	if h.ctx.GetAssignment("exp") != assignment {
+		t.Fatal("a rejected decision without its unit was rebuilt")
+	}
+	if assignment.Exposed.Load().(bool) {
+		t.Fatal("a rejected decision stayed marked exposed")
+	}
+}
+
+// A rejected hand-built assignment sharing a covered experiment's name never
+// evicts the cached, already-exposed decision: nothing is published twice.
+func TestHoldout_RejectedSameNameAssignmentDoesNotEvictTheExposedEntry(t *testing.T) {
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_user", "user_id", hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp", "user_id", 2, 11)))
+	expectInt(t, 2, h.treatment("exp"))
+	h.setUnit("user_id", hoUID)
+	var exposed = &atomic.Value{}
+	exposed.Store(false)
+	var handBuilt = &Assignment{Id: 1, Name: "exp", UnitType: "user_id", Exposed: exposed}
+	h.ctx.Closing_.Store(true)
+	h.ctx.QueueExposure(handBuilt)
+	h.ctx.Closing_.Store(false)
+	expectInt(t, 2, h.treatment("exp"))
+	var own = hoOwn("user_id", 1, "exp", 2)
+	own.FullOn = true
+	h.expectPublished(own)
+}
+
+// Retired identities are kept per experiment and bounded, so a context
+// that is refreshed for its whole life does not grow them.
+func TestHoldout_RetiredExposureIdentitiesAreBounded(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	var first = h.ctx.GetAssignment("exp")
+	for i := 2; i < 200; i++ {
+		var holdout = hoHoldoutA()
+		holdout.Iteration = i
+		h.ctx.SetData(hoData([]jsonmodels.Holdout{holdout}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+		h.ctx.GetAssignment("exp")
+	}
+	h.ctx.ContextLock_.RLock()
+	var kept = len(h.ctx.retiredExposures_["exp"])
+	h.ctx.ContextLock_.RUnlock()
+	if kept > retiredExposureLimit {
+		t.Fatalf("%d retired identities kept, limit %d", kept, retiredExposureLimit)
+	}
+	// An assignment retired long ago is still marked exposed, so it cannot
+	// publish.
+	h.ctx.QueueExposure(first)
+	h.expectPending(0)
 }

@@ -143,11 +143,12 @@ type Context struct {
 	// ContextLock_.
 	holdoutArms_ map[holdoutKey]*holdoutArm
 
-	// retiredExposures_ holds the exposure flags of replaced assignments
-	// that had holdouts, or whose replacement has them, so a rejected
-	// exposure never reopens them. Created on first use; guarded by
+	// retiredExposures_ holds, per experiment, the exposure flags of the
+	// last replaced assignments that had holdouts or whose replacement has
+	// them, so a rejected exposure never reopens them. It keeps at most
+	// retiredExposureLimit per experiment. Created on first use; guarded by
 	// ContextLock_.
-	retiredExposures_ map[*atomic.Value]struct{}
+	retiredExposures_ map[string][]*atomic.Value
 }
 
 // contextIndex is an installed experiment index and, by experiment name, the
@@ -963,14 +964,22 @@ func (c *Context) queueExposure(assignment *Assignment, holdouts *assignmentHold
 	}
 }
 
+// retiredExposureLimit bounds the retired exposure identities kept per
+// experiment. Only an assignment replaced while its exposure is in flight,
+// or still held by a caller, needs its identity; a handful covers several
+// refreshes landing during one exposure.
+const retiredExposureLimit = 8
+
 // reopenExposure rolls back a rejected admission unless that exact identity
 // was retired. A missing-unit decision must be recomputed if the unit arrived
 // while its admission was in flight.
 func (c *Context) reopenExposure(assignment *Assignment) {
 	c.ContextLock_.Lock()
 	defer c.ContextLock_.Unlock()
-	if _, retired := c.retiredExposures_[assignment.Exposed]; retired {
-		return
+	for _, retired := range c.retiredExposures_[assignment.Name] {
+		if retired == assignment.Exposed {
+			return
+		}
 	}
 	if entry := c.assignmentCache_[assignment.Name]; entry != nil && entry.assignment.Exposed == assignment.Exposed {
 		if _, unitSet := c.Units_[assignment.UnitType]; unitSet {
@@ -1001,7 +1010,10 @@ func (c *Context) exposureFor(assignment *Assignment) jsonmodels.Exposure {
 // exposed. When the context is closed it reports false, and the caller
 // clears the mark so a later read can retry.
 func (c *Context) enqueueExposure(assignment *Assignment) bool {
-	var exposure = c.exposureFor(assignment)
+	var exposure = jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
+		Variant: assignment.Variant, ExposedAt: c.Clock_.Millis(), Assigned: assignment.Assigned,
+		Eligible: assignment.Eligible, Overridden: assignment.Overridden, FullOn: assignment.FullOn,
+		Custom: assignment.Custom, AudienceMismatch: assignment.AudienceMismatch, RuleOverride: assignment.RuleOverride}
 
 	c.EventLock_.Lock()
 	// Close seals the context under EventLock_, so this check and the
@@ -1866,9 +1878,13 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 	}
 	if previous != nil && (previous.holdouts != nil || entry.holdouts != nil) && previous.assignment.Exposed != assignment.Exposed {
 		if c.retiredExposures_ == nil {
-			c.retiredExposures_ = make(map[*atomic.Value]struct{})
+			c.retiredExposures_ = map[string][]*atomic.Value{}
 		}
-		c.retiredExposures_[previous.assignment.Exposed] = struct{}{}
+		var retired = append(c.retiredExposures_[experimentName], previous.assignment.Exposed)
+		if len(retired) > retiredExposureLimit {
+			retired = retired[len(retired)-retiredExposureLimit:]
+		}
+		c.retiredExposures_[experimentName] = retired
 		// Retire the replaced assignment, as eviction does: a caller still
 		// holding it must not publish a decision, or holdout arms, that the
 		// replacement has superseded.
