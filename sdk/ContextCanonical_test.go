@@ -636,7 +636,7 @@ func TestSetCustomAssignmentBeforeReady(t *testing.T) {
 	assertAny(2, res, t)
 }
 
-func TestSetCustomAssignmentAllowedAfterClose(t *testing.T) {
+func TestSetCustomAssignmentRejectedAfterClose(t *testing.T) {
 	setUp()
 	var config = CreateDefaultContextConfig()
 	config.Units_ = units
@@ -644,11 +644,11 @@ func TestSetCustomAssignmentAllowedAfterClose(t *testing.T) {
 
 	context.Close()
 
-	var err = context.SetCustomAssignment("exp_test", 2)
-	assertAny(nil, err, t)
-	var res, er = context.GetCustomAssignment("exp_test")
-	assertAny(nil, er, t)
-	assertAny(2, res, t)
+	assertAny("ABSmartly Context is closed", context.SetCustomAssignment("exp_test", 2).Error(), t)
+	assertAny("ABSmartly Context is closed", context.SetCustomAssignments(map[string]int{"exp_test": 2}).Error(), t)
+	var _, er = context.GetCustomAssignment("exp_test")
+	assertAny("customAssignment not found", er.Error(), t)
+	assertAny(nil, context.SetOverride("exp_test", 2), t)
 }
 
 func TestRefreshKeepsOverrides(t *testing.T) {

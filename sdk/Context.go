@@ -537,8 +537,12 @@ func (c *Context) SetOverrides(overrides map[string]int) error {
 	return nil
 }
 
-// SetCustomAssignment is allowed after the context is finalized, like SetOverride.
+// SetCustomAssignment returns the closed or closing error after Close, as in
+// v1.1.1 and the JS and Java SDKs. Unlike SetOverride, it is not allowed then.
 func (c *Context) SetCustomAssignment(experimentName string, variant int) error {
+	if err := c.CheckNotClosed(); err != nil {
+		return err
+	}
 	PutRW(c.ContextLock_, c.Cassignments_, experimentName, variant)
 	return nil
 }
