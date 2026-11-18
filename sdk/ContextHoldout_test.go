@@ -12,6 +12,7 @@ package sdk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"reflect"
 	"sort"
@@ -1899,4 +1900,57 @@ func TestHoldout_WronglyTypedUnitTypeOrIterationIsIgnored(t *testing.T) {
 		expectInt(t, 0, h.treatment("exp"))
 		h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
 	}
+}
+
+// A refresh publishes coverage and holdout definitions together with the
+// assignments resolved from them: an assignment never pins an arm from one
+// holdout iteration beside the coverage of another.
+func TestHoldout_RefreshAndResolutionUseOneGeneration(t *testing.T) {
+	var experiment = hoExperiment(1, "exp", hoUnitType, 0, 11)
+	var payload = func(iteration int) jsonmodels.ContextData {
+		var holdout = hoHoldoutA()
+		holdout.Iteration = iteration
+		return hoData([]jsonmodels.Holdout{holdout}, experiment)
+	}
+	var h = hoCreateFor(t, hoUID, payload(1))
+	var done = make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 2; i < 3000; i++ {
+			h.ctx.SetData(payload(i))
+		}
+	}()
+	var mixed = 0
+	for running := true; running; {
+		select {
+		case <-done:
+			running = false
+		default:
+		}
+		var entry = h.ctx.getAssignment("exp")
+		if entry.holdouts != nil {
+			for i, arm := range entry.holdouts.arms {
+				if arm != nil && arm.assignment.Iteration != entry.holdouts.holdouts[i].Iteration {
+					mixed++
+				}
+			}
+		}
+	}
+	expectInt(t, 0, mixed)
+}
+
+// SetData and SetDataFailed act on the live context, also when called on the
+// copy WaitUntilReady returns or a logger receives, as Close, Publish and
+// Refresh already do.
+func TestHoldout_SetDataThroughACopyActsOnTheLiveContext(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
+	var snapshot = h.ctx.WaitUntilReady()
+	snapshot.SetData(hoData(nil, hoExperiment(1, "exp", hoUnitType, 0), hoExperiment(2, "exp2", hoUnitType, 0)))
+	var names, _ = h.ctx.GetExperiments()
+	sort.Strings(names)
+	expectValue(t, []string{"exp", "exp2"}, names)
+
+	snapshot.SetDataFailed(errors.New("load failed"))
+	names, _ = h.ctx.GetExperiments()
+	expectInt(t, 0, len(names))
 }
