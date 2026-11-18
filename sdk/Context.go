@@ -407,6 +407,11 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	}
 
 	cntx.Assigners_ = map[interface{}]interface{}{}
+	// Also register the state where the literal fallback looks for it, so a
+	// caller that replaces the exported Clock_ (as v1.1.1 allowed) keeps the
+	// context's rules, caches, system attributes and lifecycle.
+	state.manualRoot = &cntx
+	cntx.Assigners_[contextStateKey{}] = state
 	cntx.HashedUnits_ = map[interface{}]interface{}{}
 
 	var attributes = config.Attributes_

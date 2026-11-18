@@ -69,8 +69,12 @@ func TestContextManualLiteralState(t *testing.T) {
 	assertAny(nil, manual.SetAttribute("country", "CA"), t)
 	assertAny("CA", manual.GetAttribute("country"), t)
 	var copied = manual
-	assertAny(&manual, copied.live(), t)
-	assertAny(manual.state(), copied.state(), t)
+	if copied.live() != &manual {
+		t.Error("a copy of a literal context does not act on the original")
+	}
+	if copied.state() != manual.state() {
+		t.Error("a copy of a literal context does not share its state")
+	}
 	manual.ClearRefreshTimer()
 	manual.ClearTimeout()
 }
@@ -153,4 +157,79 @@ func TestAbandonedContextAndSnapshotsAreCollectible(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+// v1.1.1 let callers replace the exported Clock_. A constructed context keeps
+// its rules, system attributes and lifecycle after the swap.
+func TestReplacingClockKeepsContextState(t *testing.T) {
+	var ctx, _ = newSystemAttrContext("website", "production",
+		ruleExperiment("exp_rule", rulesJSON(`{"type":"assign","variant":2}`)),
+		audienceExperiment("exp_app", appFilter, true))
+	assertAny(nil, ctx.SetUnit("session_id", ruleUnit), t)
+	ctx.Clock_ = internal.FixedClock{Millis_: 42}
+
+	assertAny(2, treatment(t, ctx, "exp_rule"), t)
+	assertAny(1, treatment(t, ctx, "exp_app"), t)
+	var exposures = expectExposures(t, ctx, 2)
+	assertAny(true, exposures[0].RuleOverride, t)
+	assertAny(false, exposures[1].AudienceMismatch, t)
+	assertAny(int64(42), exposures[0].ExposedAt, t)
+}
+
+// Close still waits for a publish already in flight after Clock_ is replaced.
+func TestReplacingClockKeepsCloseWaitingForInflightPublish(t *testing.T) {
+	var publisher = &heldPublisher{}
+	var ctx = createHeldPublisherContext(t, publisher, nil)
+	assertAny(nil, ctx.Track("goal1", nil), t)
+	var published, err = ctx.PublishAsync()
+	assertAny(nil, err, t)
+	ctx.Clock_ = internal.FixedClock{Millis_: 42}
+
+	var closing, closeErr = ctx.CloseAsync()
+	assertAny(nil, closeErr, t)
+	if closing.Ready() {
+		t.Fatal("close settled while a publish was still in flight")
+	}
+	publisher.settle(t, 0, nil)
+	assertAny(nil, getWithTimeout(t, published), t)
+	assertAny(nil, getWithTimeout(t, closing), t)
+	assertAny(true, ctx.IsClosed(), t)
+}
+
+// A literal context's pre-filled v1.1.1 caches are honoured, as in v1.1.1.
+func TestContextLiteralHonoursAssignmentCacheAndIndexVariables(t *testing.T) {
+	var boolValue = func(value bool) *atomic.Value {
+		var result = &atomic.Value{}
+		result.Store(value)
+		return result
+	}
+	var count = &atomic.Value{}
+	count.Store(int32(0))
+	var experiment = ExperimentVariables{
+		Data:      jsonmodels.Experiment{Id: 5, Name: "exp", UnitType: "session_id", Iteration: 1, TrafficSplit: []float64{0, 1}},
+		Variables: []map[string]interface{}{{"color": "red"}, {"color": "blue"}},
+	}
+	var exposed = boolValue(false)
+	var manual = Context{
+		PublishDelay_: -1, RefreshInterval_: -1,
+		Units_: map[string]string{}, Failed_: boolValue(false), Ready_: boolValue(true),
+		DataLock: &sync.RWMutex{}, ContextLock_: &sync.RWMutex{},
+		Index_:          map[string]ExperimentVariables{"exp": experiment},
+		IndexVariables_: map[interface{}]interface{}{"color": experiment},
+		HashedUnits_:    map[interface{}]interface{}{}, Assigners_: map[interface{}]interface{}{},
+		AssignmentCache: map[string]Assignment{"exp": {Id: 5, Name: "exp", UnitType: "session_id", Iteration: 1,
+			TrafficSplit: []float64{0, 1}, Variant: 1, Assigned: true, Eligible: true,
+			Variables: experiment.Variables[1], Exposed: exposed}},
+		EventLock_: &sync.Mutex{}, Overrides_: map[interface{}]interface{}{}, Cassignments_: map[interface{}]interface{}{},
+		PendingCount_: count, Closing_: boolValue(false), Closed_: boolValue(false),
+		Refreshing_: boolValue(false), TimeoutLock_: &sync.Mutex{},
+		Clock_: internal.FixedClock{Millis_: 123},
+	}
+
+	var variant, err = manual.PeekTreatment("exp")
+	assertAny(nil, err, t)
+	assertAny(1, variant, t)
+	value, err := manual.PeekVariableValue("color", "none")
+	assertAny(nil, err, t)
+	assertAny("blue", value, t)
 }
