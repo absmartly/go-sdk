@@ -220,6 +220,11 @@ func (c *Context) switchbackEpochStale(experimentName string, indexed *indexedEx
 	return epoch != nil && (indexed == nil || indexed.switchback == nil || epoch.generation != indexed.switchback.generation)
 }
 
+// hasSwitchbackSlots reports whether a switchback slot was ever cached.
+func (c *Context) hasSwitchbackSlots() bool {
+	return c.switchbackSlotsSeen_ != nil && c.switchbackSlotsSeen_.Load()
+}
+
 // dropSwitchbackEpoch drops every slot of an experiment's epoch, the one
 // without a period included. The caller holds ContextLock_ for writing.
 func (c *Context) dropSwitchbackEpoch(experimentName string) {
@@ -246,6 +251,9 @@ func (c *Context) retainSwitchbackSlot(experimentName string, indexed *indexedEx
 	if epoch == nil {
 		if c.switchbackEpochs_ == nil {
 			c.switchbackEpochs_ = map[string]*switchbackEpoch{}
+			if c.switchbackSlotsSeen_ != nil {
+				c.switchbackSlotsSeen_.Store(true)
+			}
 		}
 		epoch = &switchbackEpoch{generation: indexed.switchback.generation}
 		c.switchbackEpochs_[experimentName] = epoch

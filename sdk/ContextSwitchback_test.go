@@ -1701,3 +1701,32 @@ func TestSwitchback_TrafficMissWinsOverACustomAssignment(t *testing.T) {
 	expectInt(t, 0, h.at(sbAnchor+5).treatment("exp_sb"))
 	h.expectPublished(sbExposure(1, "exp_sb", 0, sbAnchor+5, true, false))
 }
+
+// randomizationType matches "switchback" exactly, as in the Java SDK: any
+// other spelling is a unit experiment.
+func TestSwitchback_RandomizationTypeMatchesExactly(t *testing.T) {
+	for _, randomization := range []string{"Switchback", "SWITCHBACK", " switchback", "switchback "} {
+		var experiment = sbDefault(2, sbHour)
+		experiment.RandomizationType = randomization
+		var h = sbCreate(t, sbData(experiment), sbNoClusterAttribute())
+		h.treatment("exp_sb")
+		var exposures = h.publishExposures()
+		if len(exposures) != 1 || !exposures[0].Assigned || !exposures[0].Eligible {
+			t.Fatalf("%q: %+v", randomization, exposures)
+		}
+	}
+}
+
+// QueueExposure finds a switchback slot without holdouts installed, and a
+// silent slot (no cluster value) publishes nothing through it.
+func TestSwitchback_QueueExposureWithoutHoldoutsUsesTheSlot(t *testing.T) {
+	var silent = sbExperiment(2, "exp_silent", 2, sbHour)
+	silent.SwitchbackClusters = sbClusters(sbUnitType, "unset_zone")
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour), silent))
+	h.at(sbAnchor + 5)
+	var assignment = h.ctx.GetAssignment("exp_sb")
+	h.ctx.QueueExposure(h.ctx.GetAssignment("exp_silent"))
+	h.at(sbAnchor + sbHour + 1)
+	h.ctx.QueueExposure(assignment)
+	h.expectPublished(sbExposure(1, "exp_sb", sbExpected2Arms[0], sbAnchor+5, true, true))
+}
