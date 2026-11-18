@@ -98,6 +98,9 @@ func holdoutId(raw json.RawMessage) (int, bool) {
 type wireHoldout struct {
 	jsonmodels.Holdout
 	Id json.RawMessage `json:"id"`
+	// HoldoutType is informational (the arity comes from the split), so a
+	// value that is not a string is ignored rather than dropping the holdout.
+	HoldoutType json.RawMessage `json:"holdoutType"`
 }
 
 // holdouts decodes the payload's holdouts, skipping entries that are not
@@ -118,6 +121,7 @@ func holdouts(raw json.RawMessage) []jsonmodels.Holdout {
 		}
 		if id, ok := holdoutId(holdout.Id); ok {
 			holdout.Holdout.Id = id
+			_ = json.Unmarshal(holdout.HoldoutType, &holdout.Holdout.HoldoutType)
 			result = append(result, holdout.Holdout)
 		}
 	}

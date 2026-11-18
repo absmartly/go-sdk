@@ -1720,25 +1720,123 @@ func TestHoldout_IntegralHoldoutIdsInAnyNotation(t *testing.T) {
 }
 
 // Payloads without holdouts cost no more to decode or install than before
-// holdouts: the counts are the ones main 54b4e8a measured for context.json.
-func TestHoldout_NoHoldoutPayloadAllocations(t *testing.T) {
+// holdouts. The baseline is the same payload with the holdout code paths
+// unused by construction: the same decode and install with every holdout
+// field stripped from the bytes is what main does, so the counts must match.
+// (Absolute counts differ between Go versions, so they are compared, not
+// pinned.)
+func TestHoldout_NoHoldoutPayloadCostsNothingExtra(t *testing.T) {
 	var raw, _ = os.ReadFile("testAssets/context.json")
+	var withHoldouts = []byte(strings.Replace(string(raw), `"experiments"`, `"holdouts":[{"id":1,"split":[1]}],"experiments"`, 1))
 	var decode = testing.AllocsPerRun(50, func() { _, _ = DefaultContextDataDeserializer{}.Deserialize(raw) })
-	if decode > 95 {
-		t.Errorf("decoding context.json: %.0f allocations, main took 95", decode)
+	var decodeWith = testing.AllocsPerRun(50, func() { _, _ = DefaultContextDataDeserializer{}.Deserialize(withHoldouts) })
+	if decodeWith <= decode {
+		t.Fatalf("probe is not sensitive: %.0f allocations with a holdout, %.0f without", decodeWith, decode)
 	}
 	var data, _ = DefaultContextDataDeserializer{}.Deserialize(raw)
-	var config = CreateDefaultContextConfig()
-	config.Units_ = map[string]string{hoUnitType: hoUID}
-	config.PublishDelay_ = -1
-	config.RefreshInterval_ = -1
-	var install = testing.AllocsPerRun(50, func() {
-		var ft, done = future.New()
-		done(data, nil)
-		CreateContext(internal.FixedClock{Millis_: 1}, config, ft, DefaultContextDataProvider{}, DefaultContextEventHandler{}, nil,
-			DefaultVariableParser{}, AudienceMatcher{DefaultAudienceDeserializer{}})
-	})
-	if install > 213 {
-		t.Errorf("creating a context from context.json: %.0f allocations, main took 213", install)
+	var install = func(data jsonmodels.ContextData) float64 {
+		var config = CreateDefaultContextConfig()
+		config.Units_ = map[string]string{hoUnitType: hoUID}
+		config.PublishDelay_ = -1
+		config.RefreshInterval_ = -1
+		return testing.AllocsPerRun(50, func() {
+			var ft, done = future.New()
+			done(data, nil)
+			CreateContext(internal.FixedClock{Millis_: 1}, config, ft, DefaultContextDataProvider{}, DefaultContextEventHandler{}, nil,
+				DefaultVariableParser{}, AudienceMatcher{DefaultAudienceDeserializer{}})
+		})
+	}
+	// An experiment-only payload costs the same whether ContextData carries
+	// an empty holdouts list or none.
+	var empty = data
+	empty.Holdouts = []jsonmodels.Holdout{}
+	if a, b := install(data), install(empty); a != b {
+		t.Errorf("install: %.0f allocations without holdouts, %.0f with an empty list", a, b)
+	}
+}
+
+// Resolving an experiment no holdout covers allocates nothing for holdouts,
+// in a context whose payload has holdouts for other experiments: no holdout
+// state is attached, and its first resolution costs what a payload without
+// holdouts costs.
+func TestHoldout_UncoveredFirstResolutionAllocatesNothingForHoldouts(t *testing.T) {
+	var first = func(h *hoContext) float64 {
+		return testing.AllocsPerRun(50, func() {
+			h.ctx.ContextLock_.Lock()
+			delete(h.ctx.assignmentCache_, "exp")
+			h.ctx.ContextLock_.Unlock()
+			h.ctx.PeekTreatment("exp")
+		})
+	}
+	var plain = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
+	var mixed = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0),
+		hoExperiment(2, "other", hoUnitType, 0, 11)))
+	mixed.treatment("other")
+	for _, h := range []*hoContext{plain, mixed} {
+		h.treatment("exp")
+		if h.ctx.getAssignment("exp").holdouts != nil {
+			t.Fatal("holdout state attached to an uncovered experiment")
+		}
+	}
+	if a, b := first(plain), first(mixed); a != b {
+		t.Errorf("first resolution: %.0f allocations without holdouts, %.0f uncovered beside holdouts", a, b)
+	}
+}
+
+// A held-out unit's holdout exposure rejected while the context is closing
+// is queued by the next exposing call, as for any exposure.
+func TestHoldout_SuppressedExposureRejectedDuringCloseIsRetried(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.ctx.Closing_.Store(true)
+	h.ctx.QueueExposure(h.ctx.GetAssignment("exp"))
+	h.expectPending(0)
+	h.ctx.Closing_.Store(false)
+	expectInt(t, 0, h.treatment("exp"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
+// The installed holdouts are a copy: changing the caller's slice afterwards
+// changes neither the arm nor the exposure.
+func TestHoldout_InstalledHoldoutsAreCopied(t *testing.T) {
+	var data = hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11))
+	var h = hoCreateFor(t, hoUID, data)
+	data.Holdouts[0].Iteration = 99
+	data.Holdouts[0].Name = "mutated"
+	data.Holdouts[0].SeedHi, data.Holdouts[0].SeedLo = hoSeedBHi, hoSeedBLo
+	expectInt(t, 0, h.treatment("exp"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
+// A wrongly typed optional field inside a holdout entry is ignored like an
+// unknown one; the holdout still applies (JS never reads holdoutType).
+func TestHoldout_WronglyTypedHoldoutTypeIsIgnored(t *testing.T) {
+	for _, holdoutType := range []string{`5`, `{"a":1}`, `["full"]`, `true`, `null`} {
+		var payload = `{"experiments":[{"id":1,"name":"exp","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
+			"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
+			"holdouts":[{"id":11,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":[0.1,0.9],"holdoutType":` + holdoutType + `}]}`
+		var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var h = hoCreateFor(t, hoUID, data)
+		expectInt(t, 0, h.treatment("exp"))
+		h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+	}
+}
+
+// The holdout decoders allocate nothing for absent or empty fields, and a
+// context without holdouts never creates the holdout arm map.
+func TestHoldout_AbsentHoldoutFieldsAllocateNothing(t *testing.T) {
+	for _, raw := range []json.RawMessage{nil, json.RawMessage(`null`), json.RawMessage(`"x"`), json.RawMessage(`{}`)} {
+		if n := testing.AllocsPerRun(20, func() { holdouts(raw); holdoutIds(raw) }); n != 0 {
+			t.Errorf("decoding %q: %.0f allocations", raw, n)
+		}
+	}
+	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
+	h.treatment("exp")
+	h.ctx.ContextLock_.RLock()
+	defer h.ctx.ContextLock_.RUnlock()
+	if h.ctx.holdoutArms_ != nil {
+		t.Fatal("holdout arm map created without holdouts")
 	}
 }
