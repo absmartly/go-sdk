@@ -923,6 +923,7 @@ func (c *Context) queueExposure(assignment *Assignment, holdouts *assignmentHold
 	if assignment.Exposed.CompareAndSwap(false, true) {
 		if !holdouts.isSuppressed() && (holdouts == nil || !holdouts.ownQueued.Load()) {
 			if !c.enqueueExposure(assignment) {
+				c.reopenExposure(assignment, holdouts != nil)
 				return
 			}
 			if holdouts != nil {
@@ -931,8 +932,23 @@ func (c *Context) queueExposure(assignment *Assignment, holdouts *assignmentHold
 		}
 		if holdouts != nil && !c.queueHoldoutExposures(holdouts) {
 			// Retry the remaining arms on the next exposing read.
-			assignment.Exposed.Store(false)
+			c.reopenExposure(assignment, true)
 		}
+	}
+}
+
+// reopenExposure clears the exposed mark of an assignment whose exposure a
+// close rejected, so the next exposing read queues it. A replaced assignment
+// that had holdouts, or whose replacement has them, stays retired: it must
+// not publish beside its replacement. Without holdouts on either side the
+// mark is cleared as before holdouts.
+func (c *Context) reopenExposure(assignment *Assignment, hadHoldouts bool) {
+	c.ContextLock_.RLock()
+	defer c.ContextLock_.RUnlock()
+	var entry, found = c.assignmentCache_[assignment.Name]
+	var current = found && entry.assignment.Exposed == assignment.Exposed
+	if current || (!hadHoldouts && (!found || entry.holdouts == nil)) {
+		assignment.Exposed.Store(false)
 	}
 }
 
@@ -942,6 +958,7 @@ func (c *Context) queueHoldoutExposures(holdouts *assignmentHoldouts) bool {
 	var queued = true
 	for _, arm := range holdouts.arms {
 		if arm != nil && arm.assignment.Exposed.CompareAndSwap(false, true) && !c.enqueueExposure(arm.assignment) {
+			arm.assignment.Exposed.Store(false)
 			queued = false
 		}
 	}
@@ -949,7 +966,8 @@ func (c *Context) queueHoldoutExposures(holdouts *assignmentHoldouts) bool {
 }
 
 // enqueueExposure queues an exposure for an assignment already marked
-// exposed. When the context is closed it clears the mark and reports false.
+// exposed. When the context is closed it reports false, and the caller
+// clears the mark so a later read can retry.
 func (c *Context) enqueueExposure(assignment *Assignment) bool {
 	var exposure = jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
 		Variant: assignment.Variant, ExposedAt: c.Clock_.Millis(), Assigned: assignment.Assigned,
@@ -962,10 +980,6 @@ func (c *Context) enqueueExposure(assignment *Assignment) bool {
 	// or rejected after it, never stranded behind it.
 	if c.CheckNotClosed() != nil {
 		c.EventLock_.Unlock()
-		// The exposure was not queued, so it must not stay marked as
-		// exposed: a failed close reopens the context, and the next
-		// GetTreatment has to queue it.
-		assignment.Exposed.Store(false)
 		return false
 	}
 	c.PendingCount_.Store(c.PendingCount_.Load().(int32) + 1)
@@ -1532,7 +1546,9 @@ func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignmen
 		// A rule-won assignment is not assigned either, but its variant came
 		// from the experiment's rules, so it is rebuilt once the experiment
 		// is gone.
-		if !assignment.Assigned && !assignment.RuleOverride {
+		// A held-out one is rebuilt too, so the removed coverage is not
+		// exposed.
+		if !assignment.Assigned && !assignment.RuleOverride && entry.holdouts == nil {
 			return entry, rules, assignmentValid
 		}
 	} else if assignment.RuleOverride || entry.holdouts.isSuppressed() || !cfound || custom.(int) == assignment.Variant {
@@ -1820,7 +1836,7 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 	if efound {
 		c.keepExposedRuleAssignment(experiment.Data, previous, entry)
 	}
-	if previous != nil && previous.holdouts != nil && previous.assignment.Exposed != assignment.Exposed {
+	if previous != nil && (previous.holdouts != nil || entry.holdouts != nil) && previous.assignment.Exposed != assignment.Exposed {
 		// Retire the replaced assignment, as eviction does: a caller still
 		// holding it must not publish a decision, or holdout arms, that the
 		// replacement has superseded.

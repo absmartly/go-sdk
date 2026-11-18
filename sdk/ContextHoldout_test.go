@@ -1955,6 +1955,85 @@ func TestHoldout_SetDataThroughACopyActsOnTheLiveContext(t *testing.T) {
 	expectValue(t, []string{"exp", "exp2"}, names)
 
 	snapshot.SetDataFailed(errors.New("load failed"))
-	names, _ = h.ctx.GetExperiments()
-	expectInt(t, 0, len(names))
+	if !h.ctx.IsFailed() {
+		t.Fatal("the live context is not failed")
+	}
+	var data, err = h.ctx.GetData()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectInt(t, 0, len(data.Experiments))
+	h.ctx.DataLock.RLock()
+	expectInt(t, 0, len(h.ctx.Index_))
+	h.ctx.DataLock.RUnlock()
+}
+
+// A held-out experiment that a refresh removes is resolved again: its
+// removed holdout is not exposed. JS: the experiment is gone, so _assign
+// rebuilds the assignment with no holdouts.
+func TestHoldout_RemovedExperimentDoesNotExposeItsRemovedHoldout(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.peek("exp"))
+	h.refresh(hoData(nil))
+	expectInt(t, 0, h.treatment("exp"))
+	var own = jsonmodels.Exposure{Id: 0, Name: "exp", Variant: 0, ExposedAt: hoMillis, Eligible: true}
+	h.expectPublished(own)
+}
+
+// An assignment that a refresh replaces with a held-out one cannot publish
+// beside its replacement, also when it had no holdouts itself.
+func TestHoldout_AssignmentSupersededByNewCoverageIsRetired(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0)))
+	var retained = h.ctx.GetAssignment("exp")
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.peek("exp"))
+	h.ctx.QueueExposure(retained)
+	h.expectPending(0)
+	expectInt(t, 0, h.treatment("exp"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
+// A replaced held-out assignment whose holdout exposure a close rejected
+// stays retired: once the context reopens, it publishes nothing, while the
+// current assignment still retries the rejected arm.
+func TestHoldout_SupersededAssignmentIsNotReopenedByARejectedArm(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA(), hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp", hoUnitType, 0, 11, 12)))
+	var stale = h.ctx.GetAssignment("exp")
+	var next = hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)
+	next.Iteration = 2
+	var replaced = false
+	h.logger.onEvent = func(event EventType, data interface{}) {
+		if exposure, ok := data.(jsonmodels.Exposure); ok && exposure.Id == 11 && !replaced {
+			replaced = true
+			// Replace the assignment while its exposure call is running, then
+			// make the close reject the second arm.
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA(), next}, hoExperiment(1, "exp", hoUnitType, 0, 11, 12)))
+			h.ctx.GetAssignment("exp")
+			h.ctx.Closing_.Store(true)
+		}
+	}
+	h.ctx.QueueExposure(stale)
+	h.logger.onEvent = nil
+	h.ctx.Closing_.Store(false)
+	h.ctx.QueueExposure(stale)
+	h.expectPending(1)
+	expectInt(t, 0, h.treatment("exp"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0), hoExposure(hoUnitType, 12, "holdout_b", 1))
+}
+
+// Without holdouts, a replaced assignment whose exposure a close rejected
+// stays retryable through QueueExposure, as before holdouts.
+func TestHoldout_RejectedExposureWithoutHoldoutsStaysRetryableAfterReplacement(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
+	var assignment = h.ctx.GetAssignment("exp")
+	var refreshed = hoExperiment(1, "exp", hoUnitType, 0)
+	refreshed.Iteration = 2
+	h.refresh(hoData(nil, refreshed))
+	h.ctx.GetAssignment("exp")
+	h.ctx.Closing_.Store(true)
+	h.ctx.QueueExposure(assignment)
+	h.ctx.Closing_.Store(false)
+	h.ctx.QueueExposure(assignment)
+	h.expectPending(1)
 }
