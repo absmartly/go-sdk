@@ -1968,17 +1968,16 @@ func TestHoldout_SetDataThroughACopyActsOnTheLiveContext(t *testing.T) {
 	h.ctx.DataLock.RUnlock()
 }
 
-// A held-out experiment that a refresh removes before it was exposed is
-// resolved again, as an unknown experiment: its removed holdout is never
-// newly exposed. (JS keeps the cached assignment and fires the pinned
-// holdout here; this SDK does not publish coverage the payload withdrew.)
-func TestHoldout_RemovedExperimentDoesNotExposeItsRemovedHoldout(t *testing.T) {
+// A held-out experiment that a refresh removes keeps its cached decision, as
+// in the JS SDK (_assign keeps a not-assigned assignment when the experiment
+// is gone): a later read fires the pinned holdout exposure and nothing else.
+func TestHoldout_RemovedExperimentKeepsItsPinnedDecision(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 	expectInt(t, 0, h.peek("exp"))
 	h.refresh(hoData(nil))
 	expectInt(t, 0, h.treatment("exp"))
-	var own = jsonmodels.Exposure{Id: 0, Name: "exp", Variant: 0, ExposedAt: hoMillis, Eligible: true}
-	h.expectPublished(own)
+	expectInt(t, 0, h.treatment("exp"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
 }
 
 // An assignment that a refresh replaces with a held-out one cannot publish
@@ -2078,4 +2077,63 @@ func TestHoldout_RemovedOverriddenExperimentIsNotReExposed(t *testing.T) {
 	own.Assigned = false
 	own.Overridden = true
 	h.expectPublished(own, hoExposure(hoUnitType, 11, "holdout_a", 0))
+}
+
+// A held-out assignment replaced by an uncovered one stays retired when a
+// close rejects its holdout exposure: it never publishes beside the
+// replacement.
+func TestHoldout_ReplacedHeldOutAssignmentStaysRetiredAfterRejection(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA(), hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp", hoUnitType, 0, 11, 12)))
+	var stale = h.ctx.GetAssignment("exp")
+	var replaced = false
+	h.logger.onEvent = func(event EventType, data interface{}) {
+		if exposure, ok := data.(jsonmodels.Exposure); ok && exposure.Id == 11 && !replaced {
+			replaced = true
+			h.ctx.SetData(hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
+			h.ctx.GetAssignment("exp")
+			h.ctx.Closing_.Store(true)
+		}
+	}
+	h.ctx.QueueExposure(stale)
+	h.logger.onEvent = nil
+	h.ctx.Closing_.Store(false)
+	h.ctx.QueueExposure(stale)
+	h.expectPending(1)
+}
+
+// reopenExposure leaves a replaced holdout assignment retired, whatever its
+// replacement is.
+func TestHoldout_ReopenExposureKeepsAReplacedHoldoutAssignmentRetired(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	var stale = h.ctx.GetAssignment("exp")
+	h.refresh(hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
+	h.ctx.GetAssignment("exp")
+	stale.Exposed.Store(true)
+	h.ctx.reopenExposure(stale, true)
+	if !stale.Exposed.Load().(bool) {
+		t.Fatal("a replaced holdout assignment was reopened")
+	}
+}
+
+// A covered assignment whose own exposure a close rejected stays retired
+// when it was replaced, also by an uncovered assignment: queueExposure
+// passes reopenExposure whether the assignment had holdouts.
+func TestHoldout_ReplacedCoveredAssignmentWhoseOwnExposureIsRejectedStaysRetired(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	var stale = h.ctx.GetAssignment("exp")
+	var holdouts = h.ctx.getAssignment("exp").holdouts
+	h.refresh(hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
+	h.ctx.GetAssignment("exp")
+	// The replacement retired it; replay the exposure call that was already
+	// running when it was replaced, with a close rejecting its exposure.
+	stale.Exposed.Store(false)
+	h.ctx.Closing_.Store(true)
+	h.ctx.queueExposure(stale, holdouts)
+	h.ctx.Closing_.Store(false)
+	if !stale.Exposed.Load().(bool) {
+		t.Fatal("a replaced covered assignment was reopened")
+	}
+	h.ctx.QueueExposure(stale)
+	h.expectPending(0)
 }

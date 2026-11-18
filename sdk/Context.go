@@ -1548,10 +1548,7 @@ func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignmen
 		// A rule-won assignment is not assigned either, but its variant came
 		// from the experiment's rules, so it is rebuilt once the experiment
 		// is gone.
-		// A held-out one not yet exposed is rebuilt too, so the removed
-		// coverage is never newly exposed; once exposed it is kept, as in
-		// the JS SDK, so nothing is published twice.
-		if !assignment.Assigned && !assignment.RuleOverride && (entry.holdouts == nil || assignment.Exposed.Load().(bool)) {
+		if !assignment.Assigned && !assignment.RuleOverride {
 			return entry, rules, assignmentValid
 		}
 	} else if assignment.RuleOverride || entry.holdouts.isSuppressed() || !cfound || custom.(int) == assignment.Variant {
