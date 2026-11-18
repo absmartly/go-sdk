@@ -142,6 +142,12 @@ type Context struct {
 	// so a context without holdouts never allocates it. Guarded by
 	// ContextLock_.
 	holdoutArms_ map[holdoutKey]*holdoutArm
+
+	// retiredExposures_ holds the exposure flags of replaced assignments
+	// that had holdouts, or whose replacement has them, so a rejected
+	// exposure never reopens them. Created on first use; guarded by
+	// ContextLock_.
+	retiredExposures_ map[*atomic.Value]struct{}
 }
 
 // contextIndex is an installed experiment index and, by experiment name, the
@@ -184,7 +190,6 @@ type assignmentHoldouts struct {
 	holdouts   []*jsonmodels.Holdout
 	arms       []*holdoutArm
 	unitType   string
-	ownQueued  atomic.Bool
 	suppressed bool
 }
 
@@ -919,58 +924,84 @@ func (c *Context) QueueExposure(assignment *Assignment) {
 
 func (c *Context) queueExposure(assignment *Assignment, holdouts *assignmentHoldouts) {
 	c = c.live()
-	if assignment.Exposed.CompareAndSwap(false, true) {
-		if !holdouts.isSuppressed() && (holdouts == nil || !holdouts.ownQueued.Load()) {
-			if !c.enqueueExposure(assignment) {
-				c.reopenExposure(assignment, holdouts != nil)
+	if !assignment.Exposed.CompareAndSwap(false, true) {
+		return
+	}
+	if holdouts == nil {
+		if !c.enqueueExposure(assignment) {
+			c.reopenExposure(assignment)
+		}
+		return
+	}
+
+	// Admit the entire decision before any logger can close the context. Arm
+	// marks are made under the same lock as their append, so another decision
+	// can never confuse an in-flight arm with an accepted exposure.
+	c.EventLock_.Lock()
+	if c.CheckNotClosed() != nil {
+		c.EventLock_.Unlock()
+		c.reopenExposure(assignment)
+		return
+	}
+	var exposures []jsonmodels.Exposure
+	if !holdouts.isSuppressed() {
+		exposures = append(exposures, c.exposureFor(assignment))
+	}
+	for _, arm := range holdouts.arms {
+		if arm != nil && arm.assignment.Exposed.CompareAndSwap(false, true) {
+			exposures = append(exposures, c.exposureFor(arm.assignment))
+		}
+	}
+	c.PendingCount_.Store(c.PendingCount_.Load().(int32) + int32(len(exposures)))
+	c.Exposures_ = append(c.Exposures_, exposures...)
+	c.EventLock_.Unlock()
+	for _, exposure := range exposures {
+		c.LogEvent(Exposure, exposure)
+	}
+	if len(exposures) != 0 {
+		c.SetTimeout()
+	}
+}
+
+// reopenExposure rolls back a rejected admission unless that exact identity
+// was retired. A missing-unit decision must be recomputed if the unit arrived
+// while its admission was in flight.
+func (c *Context) reopenExposure(assignment *Assignment) {
+	c.ContextLock_.Lock()
+	defer c.ContextLock_.Unlock()
+	if _, retired := c.retiredExposures_[assignment.Exposed]; retired {
+		return
+	}
+	if entry := c.assignmentCache_[assignment.Name]; entry != nil && entry.assignment.Exposed == assignment.Exposed {
+		if _, unitSet := c.Units_[assignment.UnitType]; unitSet {
+			missing := assignment.RuleOverride && entry.ruleMissingUnit
+			if entry.holdouts != nil {
+				for _, arm := range entry.holdouts.arms {
+					missing = missing || arm == nil
+				}
+			}
+			if missing {
+				delete(c.assignmentCache_, assignment.Name)
+				delete(c.AssignmentCache, assignment.Name)
 				return
 			}
-			if holdouts != nil {
-				holdouts.ownQueued.Store(true)
-			}
-		}
-		if holdouts != nil && !c.queueHoldoutExposures(holdouts) {
-			c.reopenExposure(assignment, true)
 		}
 	}
+	assignment.Exposed.Store(false)
 }
 
-// reopenExposure clears the exposed mark of an assignment whose exposure a
-// close rejected, so the next exposing read queues it. A replaced assignment
-// that had holdouts, or whose replacement has them, stays retired: it must
-// not publish beside its replacement. Without holdouts on either side the
-// mark is cleared as before holdouts.
-func (c *Context) reopenExposure(assignment *Assignment, hadHoldouts bool) {
-	c.ContextLock_.RLock()
-	defer c.ContextLock_.RUnlock()
-	var entry, found = c.assignmentCache_[assignment.Name]
-	var current = found && entry.assignment.Exposed == assignment.Exposed
-	if current || (!hadHoldouts && (!found || entry.holdouts == nil)) {
-		assignment.Exposed.Store(false)
-	}
-}
-
-// queueHoldoutExposures queues the exposure of each pinned holdout arm not
-// exposed yet. It reports false if the context was closed meanwhile.
-func (c *Context) queueHoldoutExposures(holdouts *assignmentHoldouts) bool {
-	var queued = true
-	for _, arm := range holdouts.arms {
-		if arm != nil && arm.assignment.Exposed.CompareAndSwap(false, true) && !c.enqueueExposure(arm.assignment) {
-			arm.assignment.Exposed.Store(false)
-			queued = false
-		}
-	}
-	return queued
+func (c *Context) exposureFor(assignment *Assignment) jsonmodels.Exposure {
+	return jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
+		Variant: assignment.Variant, ExposedAt: c.Clock_.Millis(), Assigned: assignment.Assigned,
+		Eligible: assignment.Eligible, Overridden: assignment.Overridden, FullOn: assignment.FullOn,
+		Custom: assignment.Custom, AudienceMismatch: assignment.AudienceMismatch, RuleOverride: assignment.RuleOverride}
 }
 
 // enqueueExposure queues an exposure for an assignment already marked
 // exposed. When the context is closed it reports false, and the caller
 // clears the mark so a later read can retry.
 func (c *Context) enqueueExposure(assignment *Assignment) bool {
-	var exposure = jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
-		Variant: assignment.Variant, ExposedAt: c.Clock_.Millis(), Assigned: assignment.Assigned,
-		Eligible: assignment.Eligible, Overridden: assignment.Overridden, FullOn: assignment.FullOn,
-		Custom: assignment.Custom, AudienceMismatch: assignment.AudienceMismatch, RuleOverride: assignment.RuleOverride}
+	var exposure = c.exposureFor(assignment)
 
 	c.EventLock_.Lock()
 	// Close seals the context under EventLock_, so this check and the
@@ -1834,6 +1865,10 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 		c.keepExposedRuleAssignment(experiment.Data, previous, entry)
 	}
 	if previous != nil && (previous.holdouts != nil || entry.holdouts != nil) && previous.assignment.Exposed != assignment.Exposed {
+		if c.retiredExposures_ == nil {
+			c.retiredExposures_ = make(map[*atomic.Value]struct{})
+		}
+		c.retiredExposures_[previous.assignment.Exposed] = struct{}{}
 		// Retire the replaced assignment, as eviction does: a caller still
 		// holding it must not publish a decision, or holdout arms, that the
 		// replacement has superseded.
