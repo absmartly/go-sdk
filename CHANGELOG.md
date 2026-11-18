@@ -2,7 +2,7 @@
 
 ## v1.2.0 (2026-11-17)
 
-Go versions are released as git tags only; this entry lists every change since v1.1.1. It is a non-breaking release: v1.1.1 code compiles unchanged, apart from unkeyed (positional) literals of `jsonmodels.Experiment`, `jsonmodels.Exposure` and `sdk.Context` (see Changed). Requires Go 1.17 or later, as v1.1.1 did.
+Go versions are released as git tags only; this entry lists every change since v1.1.1. It is a non-breaking release: v1.1.1 code compiles unchanged, apart from unkeyed (positional) literals of `jsonmodels.Experiment`, `jsonmodels.Exposure` and `sdk.Context`, and customer structs that embed `jsonmodels.Exposure` encode through its new `MarshalJSON` (see Changed). Requires Go 1.17 or later, as v1.1.1 did.
 
 ### Added
 - Assignment rules (`jsonmodels.Experiment.AssignmentRules`): ordered `assign` rules (a fixed variant) and `split` rules (percentages such as `20/30/50`, hashed with the experiment's own seed), limited by environment and by JSON-expression conditions. The first matching rule wins over the audience/`audienceStrict`, traffic, full-on and custom assignments; only `SetOverride` beats it. A `split` that matches before its unit is set gives the experiment's no-unit result and is re-resolved once the unit is set, unless already exposed. Malformed rules are skipped in favour of the next rule, except that an applicable `assign` rule with an out-of-range variant, or a `split` with a different number of values than the experiment has variants, stops rule evaluation and falls back to normal assignment (as in the JS SDK and the collector). A non-string or unparseable `assignmentRules` only drops that experiment's rules. Matches the JS (#66) and Java (#17) SDKs.

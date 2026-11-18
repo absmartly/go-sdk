@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/absmartly/go-sdk/sdk/future"
@@ -70,4 +71,19 @@ func TestFetchPathCreateContextInjectsSystemAttributes(t *testing.T) {
 
 	assertAny(1, treatment(t, ctx, "exp"), t)
 	assertAny(true, expectExposures(t, ctx, 1)[0].RuleOverride, t)
+}
+
+// A payload that fails to decode returns what v1.1.1 returned: the partial
+// data and error of decoding it straight into jsonmodels.ContextData, even
+// when an experiment also has a non-string assignmentRules.
+func TestDeserializeErrorMatchesV111(t *testing.T) {
+	var payload = []byte(`{"experiments":[{"id":1,"name":"a","assignmentRules":5},{"id":"x","name":"b"}]}`)
+	var want jsonmodels.ContextData
+	var wantErr = json.Unmarshal(payload, &want)
+	if wantErr == nil {
+		t.Fatal("payload decoded without error")
+	}
+	var got, err = DefaultContextDataDeserializer{}.Deserialize(payload)
+	assertAny(wantErr.Error(), err.Error(), t)
+	assertAny(want, got, t)
 }
