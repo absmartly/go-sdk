@@ -2048,6 +2048,11 @@ func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cach
 		previous.assignment.Exposed.CompareAndSwap(false, true)
 	}
 
+	if previous != nil && previous.switchback != nil {
+		// Same-period revalidation replaces a slot too. Preserve its metadata
+		// for QueueExposure on an Assignment the caller still holds.
+		c.retireSwitchbackSlot(experimentName, slot.key)
+	}
 	c.assignmentCache_[slot.key] = entry
 	if entry.switchback != nil {
 		c.retainSwitchbackSlot(experimentName, indexed, slot)

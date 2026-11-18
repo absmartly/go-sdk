@@ -1810,3 +1810,26 @@ func TestSwitchback_ExpiredRetiredSlotsFailClosed(t *testing.T) {
 	h.ctx.QueueExposure(ineligible)
 	h.expectPending(0)
 }
+
+// Replacing a slot in the same period preserves the old assignment's silent
+// status and timestamp for a later explicit QueueExposure call.
+func TestSwitchback_SamePeriodReplacementKeepsHeldSlotMetadata(t *testing.T) {
+	for _, silent := range []bool{false, true} {
+		var experiment = sbDefault(3, sbHour)
+		if silent {
+			experiment.SwitchbackClusters = sbClusters(sbUnitType, "missing")
+		}
+		var h = sbCreate(t, sbData(experiment))
+		h.at(sbAnchor + 5)
+		var held = h.ctx.GetAssignment("exp_sb")
+		_ = h.ctx.SetCustomAssignment("exp_sb", 2)
+		h.ctx.GetAssignment("exp_sb")
+		h.at(sbAnchor + sbHour + 1)
+		h.ctx.QueueExposure(held)
+		if silent {
+			h.expectPending(0)
+		} else {
+			h.expectPublished(sbExposure(1, "exp_sb", sbExpected3Arms[0], sbAnchor+5, true, true))
+		}
+	}
+}
