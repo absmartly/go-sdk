@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/absmartly/go-sdk/sdk/future"
-	"github.com/absmartly/go-sdk/sdk/internal/v111"
+	v111 "github.com/absmartly/go-sdk/sdk/internal/v111"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
 
@@ -115,6 +115,8 @@ func TestDeserializeErrorMatchesV111(t *testing.T) {
 		`{"experiments": [ {"id": "bad"} ]}`,
 		`{"experiments":[{"id":"bad"}],"experiments":null}`,
 		`{"experiments": [ {"assignmentRules": 5, "id": "bad"} ]}`,
+		`[]`, `5`, `{"experiments":"nope"}`,
+		`{"experiments":[{"id":1,"assignmentRules":"{\"rules\":[]}","iteration":2,"seedHi":3,"seedLo":4,"trafficSeedHi":5,"trafficSeedLo":6,"split":[0.4,0.6],"trafficSplit":[0,1],"fullOnVariant":1,"applications":[{"name":"app"}],"variants":[{"name":"A","config":"{}"}],"customFieldValues":[{"name":"field","type":"string","value":"kept"}],"audience":"{}","audienceStrict":true},{"assignmentRules":5,"id":"bad"}]}`,
 	}
 	for _, payload := range payloads {
 		var legacy v111.ContextData
@@ -127,12 +129,9 @@ func TestDeserializeErrorMatchesV111(t *testing.T) {
 			t.Fatalf("%s decoded without error", payload)
 		}
 		assertAny(wantErr, err, t)
-		assertAny(legacy.Experiments == nil, got.Experiments == nil, t)
-		assertAny(len(legacy.Experiments), len(got.Experiments), t)
-		for i, want := range legacy.Experiments {
-			assertAny(want.Id, got.Experiments[i].Id, t)
-			assertAny(want.Name, got.Experiments[i].Name, t)
-			assertAny(want.UnitType, got.Experiments[i].UnitType, t)
+		assertAny(legacy.Public(), got, t)
+		for _, experiment := range got.Experiments {
+			assertAny("", experiment.AssignmentRules, t)
 		}
 	}
 }
@@ -146,4 +145,19 @@ func TestDeserializeToleratesMalformedAssignmentRulesOnly(t *testing.T) {
 	assertAny(2, len(got.Experiments), t)
 	assertAny("", got.Experiments[0].AssignmentRules, t)
 	assertAny(`{"rules":[]}`, got.Experiments[1].AssignmentRules, t)
+}
+
+func TestPartialDecodePreservesAllReleasedFieldsAndDropsRules(t *testing.T) {
+	var payload = []byte(`{"experiments":[{"id":1,"name":"a","unitType":"session_id","iteration":2,"seedHi":3,"seedLo":4,"trafficSeedHi":5,"trafficSeedLo":6,"split":[0.4,0.6],"trafficSplit":[0,1],"fullOnVariant":1,"applications":[{"name":"app"}],"variants":[{"name":"A","config":"{}"}],"customFieldValues":[{"name":"field","type":"string","value":"kept"}],"audience":"{}","audienceStrict":true,"assignmentRules":"{\"rules\":[]}"},{"assignmentRules":5,"id":"bad"}]}`)
+	var got, err = DefaultContextDataDeserializer{}.Deserialize(payload)
+	if err == nil {
+		t.Fatal("expected invalid id error")
+	}
+	assertAny([]jsonmodels.Experiment{{Id: 1, Name: "a", UnitType: "session_id", Iteration: 2,
+		SeedHi: 3, SeedLo: 4, TrafficSeedHi: 5, TrafficSeedLo: 6,
+		Split: []float64{0.4, 0.6}, TrafficSplit: []float64{0, 1}, FullOnVariant: 1,
+		Applications:      []jsonmodels.ExperimentApplication{{Name: "app"}},
+		Variants:          []jsonmodels.ExperimentVariant{{Name: "A", Config: "{}"}},
+		CustomFieldValues: []jsonmodels.CustomFieldValue{{Name: "field", Type: "string", Value: "kept"}},
+		Audience:          "{}", AudienceStrict: true}, {}}, got.Experiments, t)
 }

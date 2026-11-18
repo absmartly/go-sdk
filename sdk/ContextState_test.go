@@ -574,3 +574,86 @@ func TestGetVariableAssignmentThroughStaleCopyUsesLiveData(t *testing.T) {
 	assertAny("b", assignment.Name, t)
 	assertAny(8, assignment.Id, t)
 }
+
+func TestSharedVariableKeysKeepAllExperimentsAfterClockReplacement(t *testing.T) {
+	var first, second = ruleExperiment("first", ""), ruleExperiment("second", "")
+	first.Id, second.Id = 1, 2
+	var ctx, _ = newRuleContext(t, "production", withUnit(), second, first)
+	ctx.Clock_ = internal.FixedClock{Millis_: 1}
+	var all, err = ctx.GetVariableKeysAll()
+	assertAny(nil, err, t)
+	assertAny([]string{"first", "second"}, all["color"], t)
+	var one, oneErr = ctx.GetVariableKeys()
+	assertAny(nil, oneErr, t)
+	assertAny("first", one["color"], t)
+}
+
+type registryCheckingDeserializer struct {
+	ctx            *Context
+	wantRegistered bool
+	calls          int
+	wrong          bool
+}
+
+func (d *registryCheckingDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	if d.ctx != nil {
+		d.calls++
+		if (evaluatingState(d.ctx.ContextLock_) != nil) != d.wantRegistered {
+			d.wrong = true
+		}
+	}
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+func TestEvaluationRegistryIsScopedAndOrdinaryContextsBypassIt(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		var d = &registryCheckingDeserializer{wantRegistered: replace}
+		var client = &systemAttrClient{application: "website", environment: "production"}
+		var abs = Create(ABSmartlyConfig{Client_: client, AudienceDeserializer_: d})
+		var config = CreateDefaultContextConfig()
+		config.Units_, config.PublishDelay_, config.RefreshInterval_ = withUnit(), -1, -1
+		var ctx = abs.CreateContextWith(config, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{audienceExperiment("exp", appFilter, true)}})
+		ctx.WaitUntilReady()
+		if replace {
+			ctx.Clock_ = internal.FixedClock{Millis_: 1}
+		}
+		d.ctx = ctx
+		assertAny(1, treatmentPeek(t, ctx, "exp"), t)
+		assertAny(nil, ctx.SetAttribute("other", 1), t)
+		assertAny(1, treatmentPeek(t, ctx, "exp"), t)
+		if d.calls < 2 || d.wrong {
+			t.Fatalf("replace=%v: calls=%d wrong registration=%v", replace, d.calls, d.wrong)
+		}
+		if evaluatingState(ctx.ContextLock_) != nil {
+			t.Fatal("evaluation state retained after build/revalidation")
+		}
+	}
+}
+
+func TestEvaluationRegistryConcurrentScopesAreRemoved(t *testing.T) {
+	var lock = &sync.RWMutex{}
+	var st = newContextState()
+	var ready sync.WaitGroup
+	ready.Add(8)
+	var release = make(chan struct{})
+	var done sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			var end = beginEvaluating(lock, st)
+			ready.Done()
+			<-release
+			end()
+		}()
+	}
+	ready.Wait()
+	if evaluatingState(lock) != st {
+		t.Fatal("active scopes did not publish their state")
+	}
+	close(release)
+	done.Wait()
+	if evaluatingState(lock) != nil {
+		t.Fatal("last evaluation scope retained state")
+	}
+}

@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 
-	"github.com/absmartly/go-sdk/sdk/internal/v111"
+	v111 "github.com/absmartly/go-sdk/sdk/internal/v111"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
 

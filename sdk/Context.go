@@ -239,7 +239,7 @@ func (c *Context) literalState() *contextState {
 // being evaluated, its state and the number of evaluations in progress.
 // Entries exist only during an evaluation, so the table keeps nothing alive.
 var evaluatingStates = struct {
-	sync.Mutex
+	sync.RWMutex
 	m map[*sync.RWMutex]*evaluatingEntry
 }{m: map[*sync.RWMutex]*evaluatingEntry{}}
 
@@ -249,8 +249,8 @@ type evaluatingEntry struct {
 }
 
 func evaluatingState(lock *sync.RWMutex) *contextState {
-	evaluatingStates.Lock()
-	defer evaluatingStates.Unlock()
+	evaluatingStates.RLock()
+	defer evaluatingStates.RUnlock()
 	if entry, ok := evaluatingStates.m[lock]; ok {
 		return entry.st
 	}
@@ -1098,9 +1098,10 @@ func (c *Context) GetVariableKeys() (map[string]string, error) {
 	}
 
 	var variableKeys = map[string]string{}
+	var st = c.state()
 
 	c.DataLock.RLock()
-	for key, experiments := range c.readIndexVariables() {
+	for key, experiments := range st.indexVariables_ {
 		if len(experiments) > 0 {
 			variableKeys[key] = experiments[0].Data.Name
 		}
@@ -1118,9 +1119,10 @@ func (c *Context) GetVariableKeysAll() (map[string][]string, error) {
 	}
 
 	var variableKeys = map[string][]string{}
+	var st = c.state()
 
 	c.DataLock.RLock()
-	for key, experiments := range c.readIndexVariables() {
+	for key, experiments := range st.indexVariables_ {
 		var names = make([]string, 0, len(experiments))
 		for _, value := range experiments {
 			names = append(names, value.Data.Name)
@@ -2580,27 +2582,6 @@ func (c *Context) GetVariableAssignment(key string) (*Assignment, error) {
 	var exposed = &atomic.Value{}
 	exposed.Store(false)
 	return &Assignment{Exposed: exposed}, err
-}
-
-// readIndexVariables returns, per variable key, the experiments that define
-// it. The caller holds DataLock. A context with no carrier of its own (a
-// literal, or one whose Clock_ was replaced) uses the v1.1.1 IndexVariables_
-// field, which setData keeps current, so the lookup never takes ContextLock_:
-// an AudienceDeserializer can call it from inside an evaluation, which holds
-// that lock.
-func (c *Context) readIndexVariables() map[string][]ExperimentVariables {
-	if clock := c.ownClock(); clock != nil {
-		return clock.state.indexVariables_
-	}
-	var index = make(map[string][]ExperimentVariables, len(c.IndexVariables_))
-	for key, value := range c.IndexVariables_ {
-		if key, ok := key.(string); ok {
-			if experiment, ok := value.(ExperimentVariables); ok {
-				index[key] = []ExperimentVariables{experiment}
-			}
-		}
-	}
-	return index
 }
 
 func legacyIndexVariables(index map[string][]ExperimentVariables) map[interface{}]interface{} {
