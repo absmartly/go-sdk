@@ -146,8 +146,9 @@ type Context struct {
 	// exposuresInFlight_ holds the exposure flags of the exposures being
 	// admitted right now, mapped to whether a replacement retired the
 	// assignment meanwhile, so a close rejecting the admission does not
-	// reopen it. Entries live only for the call; created on first use.
-	// Guarded by ContextLock_.
+	// reopen it. A claim is registered under ContextLock_ together with its
+	// CAS, so a replacement can never miss it, and the entry is removed when
+	// the call ends. Created on first use.
 	exposuresInFlight_ map[*atomic.Value]bool
 
 	// holdoutsSeen_ is set once any installed payload had holdouts and is
@@ -926,41 +927,54 @@ func (c *Context) QueueExposure(assignment *Assignment) {
 
 func (c *Context) queueExposure(assignment *Assignment, holdouts *assignmentHoldouts) {
 	c = c.live()
-	if c.beginExposure(assignment) {
-		c.admitExposure(assignment, holdouts)
+	if !c.beginExposure(assignment) {
+		return
 	}
+	if holdouts == nil && (c.holdoutsSeen_ == nil || !c.holdoutsSeen_.Load()) {
+		// Never had holdouts and unregistered: no lock unless a close
+		// rejects the exposure.
+		if !c.enqueueExposure(assignment) {
+			c.ContextLock_.Lock()
+			c.reopenExposure(assignment)
+			c.ContextLock_.Unlock()
+		}
+		return
+	}
+	c.admitExposure(assignment, holdouts)
 }
 
 // beginExposure claims the assignment's exposure. Once the context has had
-// holdouts, the claim is registered as in flight, so a replacement landing
-// before admission can retire it.
+// holdouts, the CAS and the in-flight registration happen under
+// ContextLock_, which replacements hold, so a replacement landing before
+// admission always finds the claim and can retire it. A context that never
+// had holdouts claims with the bare CAS, as before holdouts.
 func (c *Context) beginExposure(assignment *Assignment) bool {
+	if c.holdoutsSeen_ == nil || !c.holdoutsSeen_.Load() {
+		return assignment.Exposed.CompareAndSwap(false, true)
+	}
+	c.ContextLock_.Lock()
+	defer c.ContextLock_.Unlock()
 	if !assignment.Exposed.CompareAndSwap(false, true) {
 		return false
 	}
-	if c.holdoutsSeen_ != nil && c.holdoutsSeen_.Load() {
-		c.ContextLock_.Lock()
-		if c.exposuresInFlight_ == nil {
-			c.exposuresInFlight_ = map[*atomic.Value]bool{}
-		}
-		c.exposuresInFlight_[assignment.Exposed] = false
-		c.ContextLock_.Unlock()
+	if c.exposuresInFlight_ == nil {
+		c.exposuresInFlight_ = map[*atomic.Value]bool{}
 	}
+	c.exposuresInFlight_[assignment.Exposed] = false
 	return true
 }
 
 // admitExposure queues an exposure claimed by beginExposure, or rolls the
-// claim back when a close rejects it, then ends the in-flight registration.
+// claim back when a close rejects it, and ends the in-flight registration.
+// Logger panics are contained by notifyLogger, so it always returns here.
 func (c *Context) admitExposure(assignment *Assignment, holdouts *assignmentHoldouts) {
 	var admitted = c.admit(assignment, holdouts)
-	if !admitted || c.holdoutsSeen_ != nil && c.holdoutsSeen_.Load() {
-		c.ContextLock_.Lock()
-		if !admitted {
-			c.reopenExposure(assignment)
-		}
-		delete(c.exposuresInFlight_, assignment.Exposed)
-		c.ContextLock_.Unlock()
+	c.ContextLock_.Lock()
+	defer c.ContextLock_.Unlock()
+	if !admitted {
+		c.reopenExposure(assignment)
 	}
+	delete(c.exposuresInFlight_, assignment.Exposed)
 }
 
 // admit queues the claimed exposures and reports false when a close
@@ -1000,14 +1014,21 @@ func (c *Context) admit(assignment *Assignment, holdouts *assignmentHoldouts) bo
 }
 
 // reopenExposure rolls back a rejected admission unless a replacement
-// retired the assignment while it was in flight. A decision resolved without
+// retired the assignment while it was in flight, or the claim was made
+// before the context first had holdouts (unregistered) and the assignment
+// has been replaced since. A decision resolved without
 // its unit is resolved again instead if the unit arrived meanwhile. The
 // caller holds ContextLock_ for writing.
 func (c *Context) reopenExposure(assignment *Assignment) {
-	if c.exposuresInFlight_[assignment.Exposed] {
+	var retired, registered = c.exposuresInFlight_[assignment.Exposed]
+	if retired {
 		return
 	}
-	if entry := c.assignmentCache_[assignment.Name]; entry != nil && entry.assignment.Exposed == assignment.Exposed {
+	var entry = c.assignmentCache_[assignment.Name]
+	if !registered && entry != nil && entry.assignment.Exposed != assignment.Exposed && entry.holdouts != nil {
+		return
+	}
+	if entry != nil && entry.assignment.Exposed == assignment.Exposed {
 		if _, unitSet := c.Units_[assignment.UnitType]; unitSet && entry.missingUnit() {
 			delete(c.assignmentCache_, assignment.Name)
 			delete(c.AssignmentCache, assignment.Name)
@@ -2156,7 +2177,6 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		// caller reuses its slice.
 		var installed = append([]jsonmodels.Holdout(nil), data.Holdouts...)
 		holdoutsById = make(map[int]*jsonmodels.Holdout, len(installed))
-		c.holdoutsSeen_.Store(true)
 		for i := range installed {
 			if len(installed[i].Split) > 0 {
 				installed[i].Split = append([]float64(nil), installed[i].Split...)
@@ -2276,6 +2296,9 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 
 	// Serialize publication with resolution to keep coverage and arms in one generation.
 	c.ContextLock_.Lock()
+	if len(data.Holdouts) > 0 {
+		c.holdoutsSeen_.Store(true)
+	}
 	c.DataLock.Lock()
 
 	c.Index_ = index

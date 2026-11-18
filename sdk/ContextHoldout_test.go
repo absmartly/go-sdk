@@ -2403,3 +2403,61 @@ func TestHoldout_EquivalentJSONNumbersKeepTheEpoch(t *testing.T) {
 	expectInt(t, 0, h.treatment("exp"))
 	h.expectPending(2)
 }
+
+// A claim made before the context first had holdouts is not registered; if
+// a refresh then installs holdouts and replaces the assignment while it is
+// in flight, a close rejecting it leaves it retired.
+func TestHoldout_ClaimMadeBeforeHoldoutsArrivedStaysRetired(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
+	var stale = h.ctx.GetAssignment("exp")
+	if !h.ctx.beginExposure(stale) {
+		t.Fatal("the exposure was not claimed")
+	}
+	h.refresh(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.ctx.GetAssignment("exp")
+	h.ctx.Closing_.Store(true)
+	h.ctx.admitExposure(stale, nil)
+	h.ctx.Closing_.Store(false)
+	h.ctx.QueueExposure(stale)
+	h.expectPending(0)
+}
+
+// A logger that panics while a registered decision is admitted (contained
+// by the SDK) does not leave its in-flight registration behind.
+func TestHoldout_PanickingLoggerLeavesNoInFlightRegistration(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.logger.onEvent = func(event EventType, _ interface{}) {
+		if event == Exposure {
+			panic("boom")
+		}
+	}
+	h.treatment("exp")
+	h.ctx.ContextLock_.RLock()
+	var left = len(h.ctx.exposuresInFlight_)
+	h.ctx.ContextLock_.RUnlock()
+	expectInt(t, 0, left)
+	h.expectPending(2)
+}
+
+// The claim and its registration are atomic with respect to replacements:
+// a replacement racing a claim either finds the registration or the claim
+// has not happened yet, so a rejected claim is never reopened beside its
+// replacement.
+func TestHoldout_ClaimAndReplacementNeverInterleave(t *testing.T) {
+	for round := 0; round < 200; round++ {
+		var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0)))
+		var stale = h.ctx.GetAssignment("exp")
+		var claimed = make(chan bool)
+		go func() { claimed <- h.ctx.beginExposure(stale) }()
+		h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+		h.ctx.GetAssignment("exp")
+		if !<-claimed {
+			continue
+		}
+		h.ctx.Closing_.Store(true)
+		h.ctx.admitExposure(stale, nil)
+		h.ctx.Closing_.Store(false)
+		h.ctx.QueueExposure(stale)
+		h.expectPending(0)
+	}
+}
