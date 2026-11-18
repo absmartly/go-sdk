@@ -457,3 +457,22 @@ func TestContextCopyAfterClockReplacementActsOnLiveContext(t *testing.T) {
 	assertAny(2, treatment(t, ctx, "exp"), t)
 	assertAny(true, expectExposures(t, ctx, 1)[0].RuleOverride, t)
 }
+
+// GetVariableExperiment after Clock_ is replaced reads IndexVariables_ under
+// DataLock too (run with -race).
+func TestReplacedClockGetVariableExperimentDoesNotRaceSetData(t *testing.T) {
+	var experiment = ruleExperiment("exp", "")
+	var ctx, _ = newRuleContext(t, "production", withUnit(), experiment)
+	ctx.Clock_ = internal.FixedClock{Millis_: 1}
+	var done = make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{experiment}})
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		_, _ = ctx.GetVariableExperiment("color")
+	}
+	<-done
+}
