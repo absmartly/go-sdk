@@ -180,12 +180,10 @@ type holdoutArm struct {
 // iteration) for cache validation; arms has one entry per holdout, nil when
 // the experiment's unit was not set.
 type assignmentHoldouts struct {
-	holdouts  []*jsonmodels.Holdout
-	arms      []*holdoutArm
-	unitType  string
-	ownQueued atomic.Bool
-	// suppressed is set when an arm holds the experiment out and no
-	// override or assignment rule chose the variant.
+	holdouts   []*jsonmodels.Holdout
+	arms       []*holdoutArm
+	unitType   string
+	ownQueued  atomic.Bool
 	suppressed bool
 }
 
@@ -931,7 +929,6 @@ func (c *Context) queueExposure(assignment *Assignment, holdouts *assignmentHold
 			}
 		}
 		if holdouts != nil && !c.queueHoldoutExposures(holdouts) {
-			// Retry the remaining arms on the next exposing read.
 			c.reopenExposure(assignment, true)
 		}
 	}
@@ -1682,10 +1679,11 @@ func (c *Context) keepExposedRuleAssignment(data jsonmodels.Experiment, previous
 	}
 	// Changed holdout coverage is a new decision, whose holdout exposures
 	// must fire: it is exposed again, as in the JS SDK.
-	if entry.holdouts != nil && !holdoutSetMatches(entry.holdouts.holdouts, previous.holdouts) {
-		return
+	var covering []*jsonmodels.Holdout
+	if entry.holdouts != nil {
+		covering = entry.holdouts.holdouts
 	}
-	if entry.holdouts == nil && previous.holdouts != nil {
+	if !holdoutSetMatches(covering, previous.holdouts) {
 		return
 	}
 	fresh.Exposed = previous.assignment.Exposed
@@ -1773,8 +1771,6 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 				assignment.RuleOverride = true
 				entry.ruleMissingUnit = rule.missingUnit
 			} else if held {
-				// Held out: control, not assigned, and the audience, traffic,
-				// full-on and custom assignments are skipped.
 				entry.holdouts.suppressed = true
 			}
 
@@ -2080,7 +2076,6 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		var installed = append([]jsonmodels.Holdout(nil), data.Holdouts...)
 		holdoutsById = make(map[int]*jsonmodels.Holdout, len(installed))
 		for i := range installed {
-			// A holdout with no split cannot draw an arm, so it covers nothing.
 			if len(installed[i].Split) > 0 {
 				installed[i].Split = append([]float64(nil), installed[i].Split...)
 				holdoutsById[installed[i].Id] = &installed[i]

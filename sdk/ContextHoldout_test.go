@@ -17,7 +17,6 @@ import (
 	"reflect"
 	"runtime"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1309,7 +1308,7 @@ func TestHoldout_DuplicateHoldoutIdsPublishOnce(t *testing.T) {
 		hoExposure(hoUnitType, 12, "holdout_b", 1))
 }
 
-// H4: peek on a covered experiment queues nothing.
+// H4.
 func TestHoldout_PeekQueuesNoHoldoutExposure(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 	expectInt(t, 0, h.peek("exp"))
@@ -1593,20 +1592,25 @@ func TestHoldout_IterationBumpReExposesARuleWonAssignment(t *testing.T) {
 	h.expectPublished(own, arm1, own, arm0)
 }
 
-// An unchanged holdout set keeps an exposed rule win exposed across a
-// refresh that rebuilds it (here: unrelated rule text).
+// A rule win rebuilt with an unchanged holdout set keeps its exposed state:
+// nothing is published again. The rebuild is real: the assign rule gives
+// variant 2 without the unit, then a split rule that starts matching gives
+// the same full-on variant 2 but as a missing-unit split, so the cached
+// assignment is replaced.
 func TestHoldout_UnchangedCoverageKeepsAnExposedRuleWin(t *testing.T) {
-	var experiment = hoExperiment(1, "exp_rule", hoUnitType, 0, 11)
-	experiment.AssignmentRules = hoUSRule
-	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
-	h.setAttribute("country", "US")
-	expectInt(t, 1, h.treatment("exp_rule"))
-	h.expectPending(2)
-	var refreshed = experiment
-	refreshed.AssignmentRules = strings.Replace(hoUSRule, "US Internal Users", "Renamed", 1)
-	h.refresh(hoData([]jsonmodels.Holdout{hoHoldoutA()}, refreshed))
-	expectInt(t, 1, h.treatment("exp_rule"))
-	h.expectPending(2)
+	var experiment = hoExperiment(1, "exp_rule", hoUnitType, 2, 11)
+	experiment.AssignmentRules = `{"rules":[{"type":"split","percentages":"100/0/0","environments":[],` +
+		`"conditions":{"eq":[{"var":"split"},{"value":true}]}},{"type":"assign","variant":2,"environments":[]}]}`
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+	expectInt(t, 2, h.treatment("exp_rule"))
+	h.expectPending(1)
+	var before = h.ctx.GetAssignment("exp_rule")
+	h.setAttribute("split", true)
+	expectInt(t, 2, h.treatment("exp_rule"))
+	if h.ctx.GetAssignment("exp_rule") == before {
+		t.Fatal("the assignment was not rebuilt")
+	}
+	h.expectPending(1)
 }
 
 // A suppressed assignment superseded by a refresh cannot publish through the
