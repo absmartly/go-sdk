@@ -905,19 +905,21 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 // the holdouts covering it that are not exposed yet, in holdout id order. A
 // suppressed assignment queues only its holdouts' exposures.
 func (c *Context) QueueExposure(assignment *Assignment) {
+	if assignment.Exposed.Load().(bool) {
+		return
+	}
 	c = c.live()
 	var entry *cachedAssignment
-	// A context that never installed holdouts keeps the released no-lock path.
-	// Once holdouts exist, public Assignment copies use Exposed as their
-	// identity to recover the current entry and its pinned holdouts.
-	if c.holdoutsSeen_ != nil && c.holdoutsSeen_.Load() {
-		c.ContextLock_.RLock()
-		if candidate := c.assignmentCache_[assignment.Name]; candidate != nil &&
-			candidate.assignment.Exposed == assignment.Exposed {
-			entry = candidate
-		}
-		c.ContextLock_.RUnlock()
+	// Public Assignment copies use Exposed as their identity to recover the
+	// cached retirement token and pinned holdouts. This lookup is required even
+	// before the first holdout arrives: a refresh may add coverage while a
+	// caller-held exposure is in flight.
+	c.ContextLock_.RLock()
+	if candidate := c.assignmentCache_[assignment.Name]; candidate != nil &&
+		candidate.assignment.Exposed == assignment.Exposed {
+		entry = candidate
 	}
+	c.ContextLock_.RUnlock()
 	c.queueExposure(assignment, entry)
 }
 

@@ -20,7 +20,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/absmartly/go-sdk/sdk/future"
 	"github.com/absmartly/go-sdk/sdk/internal"
@@ -2315,26 +2314,11 @@ func TestHoldout_HeldAssignmentQueuedAfterHoldoutsRemoved(t *testing.T) {
 	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
 }
 
-// A context that never installed holdouts takes no lock to look for holdout
-// decisions in QueueExposure.
-func TestHoldout_QueueExposureWithoutHoldoutsTakesNoLookup(t *testing.T) {
+// A context without holdouts still leaves no in-flight registration after
+// its public QueueExposure path.
+func TestHoldout_QueueExposureWithoutHoldoutsLeavesNoRegistration(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
-	// No logger, so nothing but the holdout lookup could take ContextLock_.
-	h.ctx.EventLogger_ = nil
-	var assignment = h.ctx.GetAssignment("exp")
-	h.ctx.ContextLock_.Lock()
-	var done = make(chan struct{})
-	go func() {
-		h.ctx.QueueExposure(assignment)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		h.ctx.ContextLock_.Unlock()
-		t.Fatal("QueueExposure waited on ContextLock_ without holdouts")
-	}
-	h.ctx.ContextLock_.Unlock()
+	h.ctx.QueueExposure(h.ctx.GetAssignment("exp"))
 	h.expectPending(1)
 }
 
