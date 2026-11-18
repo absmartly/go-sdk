@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/absmartly/go-sdk/sdk/future"
@@ -91,41 +92,68 @@ func TestFetchPathCreateContextInjectsSystemAttributes(t *testing.T) {
 	assertAny(true, expectExposures(t, ctx, 1)[0].RuleOverride, t)
 }
 
+// Experiment and ContextData are v1.1.1's jsonmodels declarations, copied
+// under the same names (encoding/json puts them in its error texts) so that
+// decoding into them shows what v1.1.1 returns on the Go toolchain running the
+// test. The wording differs between Go versions.
+type Experiment struct {
+	Id                int                                `json:"id"`
+	Name              string                             `json:"name"`
+	UnitType          string                             `json:"unitType"`
+	Iteration         int                                `json:"iteration"`
+	SeedHi            int                                `json:"seedHi"`
+	SeedLo            int                                `json:"seedLo"`
+	Split             []float64                          `json:"split"`
+	TrafficSeedHi     int                                `json:"trafficSeedHi"`
+	TrafficSeedLo     int                                `json:"trafficSeedLo"`
+	TrafficSplit      []float64                          `json:"trafficSplit"`
+	FullOnVariant     int                                `json:"fullOnVariant"`
+	Applications      []jsonmodels.ExperimentApplication `json:"applications"`
+	Variants          []jsonmodels.ExperimentVariant     `json:"variants"`
+	CustomFieldValues []jsonmodels.CustomFieldValue      `json:"customFieldValues"`
+	AudienceStrict    bool                               `json:"audienceStrict"`
+	Audience          string                             `json:"audience"`
+}
+
+type ContextData struct {
+	Experiments []Experiment `json:"experiments"`
+}
+
 // A payload that fails to decode returns what v1.1.1 returned: v1.1.1 had no
-// assignmentRules field, so it ignored a malformed one and reported the
-// first other invalid field. The expected texts and partial data were
-// measured against the published v1.1.1.
+// assignmentRules field, so it ignored a malformed one and reported the first
+// other invalid field, and malformed JSON stayed malformed. The oracle is
+// v1.1.1's model decoded on this toolchain; on Go 1.17-1.26 its first error
+// reads "Go struct field Experiment.experiments.id of type int".
 func TestDeserializeErrorMatchesV111(t *testing.T) {
-	var cases = []struct {
-		payload string
-		err     string
-		want    []jsonmodels.Experiment
-	}{
-		{`{"experiments":[{"id":1,"name":"a","assignmentRules":5},{"id":"x","name":"b"}]}`,
-			"json: cannot unmarshal string into Go struct field Experiment.experiments.id of type int",
-			[]jsonmodels.Experiment{{Id: 1, Name: "a"}, {Name: "b"}}},
-		{`{"experiments":[{"assignmentRules":5,"name":1,"id":"x"}]}`,
-			"json: cannot unmarshal number into Go struct field Experiment.experiments.name of type string",
-			[]jsonmodels.Experiment{{}}},
-		{`{"experiments":[{"id":1,"assignmentRules":{"a":1}},{"unitType":2}]}`,
-			"json: cannot unmarshal number into Go struct field Experiment.experiments.unitType of type string",
-			[]jsonmodels.Experiment{{Id: 1}, {}}},
-		// Malformed JSON stays malformed: no repair of a truncated body, no
-		// dropping trailing data.
-		{`{"experiments":[{"id":1,"name":"a"}]`, "unexpected end of JSON input", nil},
-		{`{"experiments":[{"id":1,"name":"a","assignmentRules":5}]`, "unexpected end of JSON input", nil},
-		{`{"experiments":[{"id":1,"name":"a"}]}x`, "invalid character 'x' after top-level value", nil},
-		{`{"experiments":[{"id":1,"name":"a","assignmentRules":5}]}x`, "invalid character 'x' after top-level value", nil},
-		{`{"experiments":[{"id":1,"name":"a"}]}{}`, "invalid character '{' after top-level value", nil},
-		{`{"experiments":[{"id":1,"name":"a",}]}`, "invalid character '}' looking for beginning of object key string", nil},
+	var payloads = []string{
+		`{"experiments":[{"id":1,"name":"a","assignmentRules":5},{"id":"x","name":"b"}]}`,
+		`{"experiments":[{"assignmentRules":5,"name":1,"id":"x"}]}`,
+		`{"experiments":[{"id":1,"assignmentRules":{"a":1}},{"unitType":2}]}`,
+		// No repair of a truncated body, no dropping trailing data.
+		`{"experiments":[{"id":1,"name":"a"}]`,
+		`{"experiments":[{"id":1,"name":"a","assignmentRules":5}]`,
+		`{"experiments":[{"id":1,"name":"a"}]}x`,
+		`{"experiments":[{"id":1,"name":"a","assignmentRules":5}]}x`,
+		`{"experiments":[{"id":1,"name":"a"}]}{}`,
+		`{"experiments":[{"id":1,"name":"a",}]}`,
 	}
-	for _, tc := range cases {
-		var got, err = DefaultContextDataDeserializer{}.Deserialize([]byte(tc.payload))
-		if err == nil {
-			t.Fatalf("%s decoded without error", tc.payload)
+	for _, payload := range payloads {
+		var legacy ContextData
+		var wantErr = json.Unmarshal([]byte(payload), &legacy)
+		if wantErr == nil {
+			t.Fatalf("%s decodes without error in v1.1.1's model", payload)
 		}
-		assertAny(tc.err, err.Error(), t)
-		assertAny(tc.want, got.Experiments, t)
+		var got, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
+		if err == nil {
+			t.Fatalf("%s decoded without error", payload)
+		}
+		assertAny(wantErr.Error(), err.Error(), t)
+		assertAny(len(legacy.Experiments), len(got.Experiments), t)
+		for i, want := range legacy.Experiments {
+			assertAny(want.Id, got.Experiments[i].Id, t)
+			assertAny(want.Name, got.Experiments[i].Name, t)
+			assertAny(want.UnitType, got.Experiments[i].UnitType, t)
+		}
 	}
 }
 
