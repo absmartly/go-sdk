@@ -249,6 +249,9 @@ func (d *reentrantDeserializer) Deserialize(bytes []byte, offset int, length int
 	if d.ctx != nil {
 		d.ctx.GetExperiment("exp_app")
 		_, _ = d.ctx.GetVariableExperiment("banner")
+		_, _ = d.ctx.GetVariableKeys()
+		_, _ = d.ctx.GetVariableKeysAll()
+		_ = d.ctx.Track("evaluated", nil)
 	}
 	return DefaultAudienceDeserializer{}.Deserialize(bytes, offset, length)
 }
@@ -256,36 +259,47 @@ func (d *reentrantDeserializer) Deserialize(bytes []byte, offset int, length int
 // A deserializer that reads the context during an evaluation must not
 // deadlock after Clock_ is replaced, as it does not with the original clock.
 func TestReentrantDeserializerAfterClockReplacementDoesNotDeadlock(t *testing.T) {
-	for _, replace := range []bool{false, true} {
-		var deserializer = &reentrantDeserializer{}
-		var client = &systemAttrClient{application: "website", environment: "production"}
-		var abs = Create(ABsmartlyConfig{
-			Client_:               client,
-			ContextDataProvider_:  DefaultContextDataProvider{client_: client},
-			ContextEventHandler_:  DefaultContextEventHandler{client_: client},
-			AudienceDeserializer_: deserializer,
-		})
-		var config = CreateDefaultContextConfig()
-		config.Units_ = withUnit()
-		config.PublishDelay_ = -1
-		config.RefreshInterval_ = -1
-		var ctx = abs.CreateContextWith(config, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
-			audienceExperiment("exp_app", appFilter, true)}})
-		ctx.WaitUntilReady()
-		if replace {
-			ctx.Clock_ = internal.FixedClock{Millis_: 1}
-		}
-		deserializer.ctx = ctx
-		var done = make(chan int, 1)
-		go func() {
-			var variant, _ = ctx.PeekTreatment("exp_app")
-			done <- variant
-		}()
-		select {
-		case variant := <-done:
-			assertAny(1, variant, t)
-		case <-time.After(5 * time.Second):
-			t.Fatalf("PeekTreatment deadlocked (Clock_ replaced: %v)", replace)
+	// "build" reaches the deserializer while rebuilding the assignment under
+	// the write lock; "revalidate" while revalidating a cached one after an
+	// unrelated attribute change, under the read lock.
+	for _, path := range []string{"build", "revalidate"} {
+		for _, replace := range []bool{false, true} {
+			var deserializer = &reentrantDeserializer{}
+			var client = &systemAttrClient{application: "website", environment: "production"}
+			var abs = Create(ABsmartlyConfig{
+				Client_:               client,
+				ContextDataProvider_:  DefaultContextDataProvider{client_: client},
+				ContextEventHandler_:  DefaultContextEventHandler{client_: client},
+				AudienceDeserializer_: deserializer,
+			})
+			var config = CreateDefaultContextConfig()
+			config.Units_ = withUnit()
+			config.PublishDelay_ = -1
+			config.RefreshInterval_ = -1
+			var ctx = abs.CreateContextWith(config, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+				audienceExperiment("exp_app", appFilter, true)}})
+			ctx.WaitUntilReady()
+			if path == "revalidate" {
+				assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
+			}
+			if replace {
+				ctx.Clock_ = internal.FixedClock{Millis_: 1}
+			}
+			if path == "revalidate" {
+				assertAny(nil, ctx.SetAttribute("other", 1), t)
+			}
+			deserializer.ctx = ctx
+			var done = make(chan int, 1)
+			go func() {
+				var variant, _ = ctx.PeekTreatment("exp_app")
+				done <- variant
+			}()
+			select {
+			case variant := <-done:
+				assertAny(1, variant, t)
+			case <-time.After(5 * time.Second):
+				t.Fatalf("PeekTreatment deadlocked (%s, Clock_ replaced: %v)", path, replace)
+			}
 		}
 	}
 }

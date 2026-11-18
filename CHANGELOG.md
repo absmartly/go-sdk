@@ -36,7 +36,7 @@ These follow the cross-SDK contract agreed for all ABsmartly SDKs in 2026-11; ea
 - `json` custom fields with the default parser return any JSON value (array, string, number, boolean) instead of only objects (cross-SDK scenarios 53-58); JSON `null` and invalid JSON still return a nil `map[string]interface{}`. Who is affected: code type-asserting every `json` custom field to `map[string]interface{}`.
 
 ### Known issues
-- On a context whose `Clock_` was replaced, or one built as a `Context{...}` literal, each read finds the context's private state under the exclusive `ContextLock_`: about 70 ns more per cached `PeekTreatment` single-threaded (343 vs 276 ns/op on the same machine, 48 B and 2 allocations either way), and concurrent readers of that context serialise. Against v1.1.1, single-threaded reads of such a context cost the same (341 vs 340 ns/op) and only concurrent readers are slower (363 vs 307 ns/op at 8 goroutines on 2 cores). Contexts made with `CreateContext` and left with their clock are unaffected.
+- On a context whose `Clock_` was replaced, or one built as a `Context{...}` literal, each read finds the context's private state under the exclusive `ContextLock_`, so concurrent readers of that context serialise, and a cached `PeekTreatment` costs more: 375 ns/op against 316 on v1.1.1 and 290 on an ordinary v1.2.0 context (same machine, single-threaded; 48 B and 2 allocations, against 160 B and 3 on v1.1.1). Contexts made with `CreateContext` and left with their clock are unaffected.
 
 ### Fixed
 - `Publish()` returns the publish error instead of nil, and a failed publish keeps the events queued for the next publish instead of dropping them.

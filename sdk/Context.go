@@ -188,9 +188,16 @@ func (c *Context) ownClock() *contextClock {
 // literalState is the cold fallback for a context with no carrier of its own
 // (a literal, or one whose Clock_ was replaced), kept out of state so the
 // carrier lookup stays a short call.
+//
+// While an assignment evaluation holds ContextLock_, it publishes the state in
+// evaluatingStates, so a read the AudienceDeserializer makes from inside that
+// evaluation finds it without taking the lock it would deadlock on.
 func (c *Context) literalState() *contextState {
 	if c.ContextLock_ == nil {
 		return newContextState()
+	}
+	if st := evaluatingState(c.ContextLock_); st != nil {
+		return st
 	}
 	c.ContextLock_.Lock()
 	defer c.ContextLock_.Unlock()
@@ -226,6 +233,59 @@ func (c *Context) literalState() *contextState {
 	}
 	c.Assigners_[contextStateKey{}] = state
 	return state
+}
+
+// evaluatingStates holds, for each carrier-less context whose assignments are
+// being evaluated, its state and the number of evaluations in progress.
+// Entries exist only during an evaluation, so the table keeps nothing alive.
+var evaluatingStates = struct {
+	sync.Mutex
+	m map[*sync.RWMutex]*evaluatingEntry
+}{m: map[*sync.RWMutex]*evaluatingEntry{}}
+
+type evaluatingEntry struct {
+	st *contextState
+	n  int
+}
+
+func evaluatingState(lock *sync.RWMutex) *contextState {
+	evaluatingStates.Lock()
+	defer evaluatingStates.Unlock()
+	if entry, ok := evaluatingStates.m[lock]; ok {
+		return entry.st
+	}
+	return nil
+}
+
+// evaluating marks the start of an audience or rule evaluation, which calls
+// the AudienceDeserializer while ContextLock_ is held, and returns the
+// function that marks its end. For a context without a carrier it publishes
+// st, so reads the deserializer makes find it without that lock; a context
+// with a carrier finds its state without any lock and needs nothing.
+func (c *Context) evaluating(st *contextState) func() {
+	if c.ownClock() != nil {
+		return func() {}
+	}
+	return beginEvaluating(c.ContextLock_, st)
+}
+
+// beginEvaluating publishes st for lock until the returned function is called.
+func beginEvaluating(lock *sync.RWMutex, st *contextState) func() {
+	evaluatingStates.Lock()
+	var entry, ok = evaluatingStates.m[lock]
+	if !ok {
+		entry = &evaluatingEntry{st: st}
+		evaluatingStates.m[lock] = entry
+	}
+	entry.n++
+	evaluatingStates.Unlock()
+	return func() {
+		evaluatingStates.Lock()
+		if entry.n--; entry.n == 0 {
+			delete(evaluatingStates.m, lock)
+		}
+		evaluatingStates.Unlock()
+	}
 }
 
 func (c *Context) isSnapshot() bool {
@@ -1032,7 +1092,6 @@ func (c *Context) PeekTreatment(experimentName string) (int, error) {
 // GetVariableKeys returns, for each variable key, the name of the first
 // experiment that defines it. Use GetVariableKeysAll to get every experiment.
 func (c *Context) GetVariableKeys() (map[string]string, error) {
-	var st = c.state()
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
@@ -1041,7 +1100,7 @@ func (c *Context) GetVariableKeys() (map[string]string, error) {
 	var variableKeys = map[string]string{}
 
 	c.DataLock.RLock()
-	for key, experiments := range st.indexVariables_ {
+	for key, experiments := range c.readIndexVariables() {
 		if len(experiments) > 0 {
 			variableKeys[key] = experiments[0].Data.Name
 		}
@@ -1053,7 +1112,6 @@ func (c *Context) GetVariableKeys() (map[string]string, error) {
 // GetVariableKeysAll returns, for each variable key, the names of all
 // experiments that define it.
 func (c *Context) GetVariableKeysAll() (map[string][]string, error) {
-	var st = c.state()
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
@@ -1062,7 +1120,7 @@ func (c *Context) GetVariableKeysAll() (map[string][]string, error) {
 	var variableKeys = map[string][]string{}
 
 	c.DataLock.RLock()
-	for key, experiments := range st.indexVariables_ {
+	for key, experiments := range c.readIndexVariables() {
 		var names = make([]string, 0, len(experiments))
 		for _, value := range experiments {
 			names = append(names, value.Data.Name)
@@ -1564,6 +1622,7 @@ func (c *Context) validCachedAssignment(st *contextState, experimentName string)
 		if rules == entry.rules && atomic.LoadInt32(&st.attrsSeq_) <= entry.attrsSeq {
 			return entry, rules, assignmentValid
 		}
+		defer c.evaluating(st)()
 		if c.ruleMatches(st, experiment.Data, rules, entry) && c.audienceMatches(st, experiment.Data, entry) {
 			return entry, rules, assignmentRevalidated
 		}
@@ -1742,6 +1801,7 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 		return previous
 	}
 
+	defer c.evaluating(st)()
 	var custom, cfound = c.Cassignments_[experimentName]
 	var override, ofound = c.Overrides_[experimentName]
 	var experiment, rules, efound = st.experimentAndRules(experimentName)
@@ -2520,6 +2580,27 @@ func (c *Context) GetVariableAssignment(key string) (*Assignment, error) {
 	var exposed = &atomic.Value{}
 	exposed.Store(false)
 	return &Assignment{Exposed: exposed}, err
+}
+
+// readIndexVariables returns, per variable key, the experiments that define
+// it. The caller holds DataLock. A context with no carrier of its own (a
+// literal, or one whose Clock_ was replaced) uses the v1.1.1 IndexVariables_
+// field, which setData keeps current, so the lookup never takes ContextLock_:
+// an AudienceDeserializer can call it from inside an evaluation, which holds
+// that lock.
+func (c *Context) readIndexVariables() map[string][]ExperimentVariables {
+	if clock := c.ownClock(); clock != nil {
+		return clock.state.indexVariables_
+	}
+	var index = make(map[string][]ExperimentVariables, len(c.IndexVariables_))
+	for key, value := range c.IndexVariables_ {
+		if key, ok := key.(string); ok {
+			if experiment, ok := value.(ExperimentVariables); ok {
+				index[key] = []ExperimentVariables{experiment}
+			}
+		}
+	}
+	return index
 }
 
 func legacyIndexVariables(index map[string][]ExperimentVariables) map[interface{}]interface{} {
