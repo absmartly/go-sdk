@@ -1586,3 +1586,52 @@ func TestSwitchback_UnitExperimentUnitTypeRefreshReresolves(t *testing.T) {
 	expectInt(t, 2, len(exposures))
 	expectValue(t, "user_id", exposures[1].Unit)
 }
+
+// A slot resolved without a linked unit reads the cluster again once a unit
+// is set: an exposed overridden slot survives SetUnit, and the rebuild after
+// a later override change is recorded under the serving unit.
+func TestSwitchback_ResolutionAfterSetUnitReadsTheClusterAgain(t *testing.T) {
+	var experiment = sbDefault(2, sbHour)
+	experiment.SwitchbackClusters = sbClusters("device_id", "unset_zone", sbUnitType, sbClusterPath)
+	var h = sbCreateAt(t, sbAnchor+5, nil, sbData(experiment), sbOverride("exp_sb", 1))
+	expectInt(t, 1, h.treatment("exp_sb"))
+	if err := h.ctx.SetUnit(sbUnitType, sbUID); err != nil {
+		t.Fatal(err)
+	}
+	_ = h.ctx.SetOverride("exp_sb", 0)
+	expectInt(t, 0, h.treatment("exp_sb"))
+	var exposures = h.publishExposures()
+	expectInt(t, 2, len(exposures))
+	expectValue(t, "device_id", exposures[0].Unit)
+	expectValue(t, sbUnitType, exposures[1].Unit)
+}
+
+// sbTickingClock advances one millisecond per read.
+type sbTickingClock struct {
+	mu  sync.Mutex
+	now int64
+}
+
+func (c *sbTickingClock) Millis() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now++
+	return c.now - 1
+}
+
+// GetTreatment and GetVariableValue stamp a switchback exposure with the
+// reading that resolved it, not a later one within the period.
+func TestSwitchback_ExposureIsStampedWithTheResolvingReadingWithinThePeriod(t *testing.T) {
+	for _, read := range []func(*Context){
+		func(c *Context) { _, _ = c.GetTreatment("exp_sb") },
+		func(c *Context) { _, _ = c.GetVariableValue("sb.arm", -1) },
+	} {
+		var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+		var clock = &sbTickingClock{now: sbAnchor + 100}
+		h.ctx.Clock_ = clock
+		read(h.ctx)
+		var exposures = h.publishExposures()
+		expectInt(t, 1, len(exposures))
+		expectValue(t, sbAnchor+100, exposures[0].ExposedAt)
+	}
+}

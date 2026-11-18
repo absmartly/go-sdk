@@ -1958,3 +1958,18 @@ func TestHoldout_SetDataThroughACopyActsOnTheLiveContext(t *testing.T) {
 	names, _ = h.ctx.GetExperiments()
 	expectInt(t, 0, len(names))
 }
+
+// An overridden experiment a holdout covers stays cached: it is resolved
+// once and exposed once.
+func TestHoldout_OverriddenCoveredAssignmentStaysCached(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)), hoOverride("exp", 1))
+	h.treatment("exp")
+	var first = h.ctx.GetAssignment("exp")
+	for i := 0; i < 4; i++ {
+		h.treatment("exp")
+	}
+	if h.ctx.GetAssignment("exp") != first {
+		t.Fatal("the overridden assignment was resolved again")
+	}
+	h.expectPending(2)
+}
