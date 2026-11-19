@@ -17,6 +17,7 @@ import (
 	"reflect"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -3401,5 +3402,25 @@ func TestHoldout_VariableRetryChecksTheKeyOnTheSameExperiment(t *testing.T) {
 		if exposure.Name == "a" {
 			t.Fatalf("the replacement without the key was exposed: %+v", queuedExposures(h.ctx))
 		}
+	}
+}
+
+// A cached decision retains only key names from unselected variants, never
+// their configs or values. The snapshot remains valid after data removal.
+func TestHoldout_VariableKeySnapshotDoesNotRetainVariantValues(t *testing.T) {
+	var experiment = hoExperiment(1, "a", hoUnitType, 0, 11)
+	experiment.Split = []float64{1, 0}
+	experiment.Variants[0].Config = `{"v":"selected"}`
+	experiment.Variants[1].Config = `{"other":"` + strings.Repeat("x", 1<<20) + `"}`
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+	var entry = h.ctx.getAssignment("a")
+	h.ctx.SetData(hoData(nil))
+	if len(entry.variableKeys) != 2 || !definesVariable("v")(entry) || !definesVariable("other")(entry) {
+		t.Fatalf("lost the key snapshot: %v", entry.variableKeys)
+	}
+	// The map's value type is empty, so neither configs nor parsed values
+	// can be retained through this snapshot.
+	if _, found := entry.variableKeys["missing"]; found {
+		t.Fatal("snapshot contains an undefined key")
 	}
 }

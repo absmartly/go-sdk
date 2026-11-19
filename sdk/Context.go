@@ -156,9 +156,10 @@ type contextIndex struct {
 // rules (nil when it has none) and the holdouts covering it, sorted and
 // unique by id (nil when none), so a read finds them with one lookup.
 type indexedExperiment struct {
-	experiment ExperimentVariables
-	rules      *experimentRules
-	holdouts   []*jsonmodels.Holdout
+	variableKeys map[string]struct{}
+	experiment   ExperimentVariables
+	rules        *experimentRules
+	holdouts     []*jsonmodels.Holdout
 }
 
 type holdoutKey struct {
@@ -216,9 +217,9 @@ type cachedAssignment struct {
 	holdouts *assignmentHoldouts
 	// retirement is shared by entries that carry the same Exposed identity.
 	retirement *atomic.Bool
-	// indexed is the experiment definition the entry was resolved from, nil
-	// when the experiment was not in the data. Never modified.
-	indexed *indexedExperiment
+	// variableKeys is the compact definition snapshot used by a variable retry;
+	// it avoids retaining the full indexed experiment and unselected variants.
+	variableKeys map[string]struct{}
 }
 
 type loggerGoroutines struct {
@@ -966,15 +967,11 @@ func (e *cachedAssignment) needsSettling() bool {
 // that does not.
 func definesVariable(key string) func(*cachedAssignment) bool {
 	return func(e *cachedAssignment) bool {
-		if e.assignment.Variables == nil || e.indexed == nil {
+		if e.assignment.Variables == nil {
 			return false
 		}
-		for _, variables := range e.indexed.experiment.Variables {
-			if _, defined := variables[key]; defined {
-				return true
-			}
-		}
-		return false
+		_, defined := e.variableKeys[key]
+		return defined
 	}
 }
 
@@ -1938,8 +1935,10 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 	var assignment = &Assignment{Exposed: exposed}
 	assignment.Name = experimentName
 	assignment.Eligible = true
-	var entry = &cachedAssignment{assignment: assignment, rules: rules, attrsSeq: atomic.LoadInt32(&c.AttrsSeq_), retirement: &atomic.Bool{},
-		indexed: indexed}
+	var entry = &cachedAssignment{assignment: assignment, rules: rules, attrsSeq: atomic.LoadInt32(&c.AttrsSeq_), retirement: &atomic.Bool{}}
+	if indexed != nil {
+		entry.variableKeys = indexed.variableKeys
+	}
 
 	// Resolved for overrides and rule wins too: the holdouts' exposures fire
 	// whatever chose the variant.
@@ -2425,7 +2424,16 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	c.Index_ = index
 	var indexed = make(map[string]*indexedExperiment, len(index))
 	for name, experiment := range index {
-		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name], holdouts: coverage[name]}
+		var keys map[string]struct{}
+		for _, variables := range experiment.Variables {
+			for key := range variables {
+				if keys == nil {
+					keys = map[string]struct{}{}
+				}
+				keys[strings.Clone(key)] = struct{}{}
+			}
+		}
+		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name], holdouts: coverage[name], variableKeys: keys}
 	}
 	c.index_.Store(&contextIndex{experiments: indexed, holdouts: holdoutsById})
 	c.ContextCustomFields_ = contextCustomFields
