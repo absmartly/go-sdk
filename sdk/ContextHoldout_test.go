@@ -20,7 +20,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/absmartly/go-sdk/sdk/future"
 	"github.com/absmartly/go-sdk/sdk/internal"
@@ -2756,19 +2755,23 @@ func (c hoReplacingClock) Millis() int64 {
 	return hoMillis
 }
 
-// A claimed exposure whose assignment a refresh retires before the admission
-// commits publishes nothing; the replacement publishes its own decision.
-func TestHoldout_ClaimRetiredBeforeCommitPublishesNothing(t *testing.T) {
+// A claimed exposure whose assignment a refresh replaces before the admission
+// commits still publishes the claimed decision, as in the Java SDK (only an
+// unclaimed assignment is retired): a read may already serve it because the
+// claim marked it exposed. The replacement then publishes its own decision.
+func TestHoldout_ClaimReplacedBeforeCommitStillPublishes(t *testing.T) {
 	for _, covered := range []bool{true, false} {
 		var ctx *Context
 		var armed = false
 		var stale *Assignment
 		var experiment = hoExperiment(1, "exp", hoUnitType, 0, 11)
+		experiment.Split = []float64{1, 0}
 		if !covered {
 			experiment.HoldoutIds = nil
 		}
 		var replacement = hoExperiment(1, "exp", hoUnitType, 0, 11)
 		replacement.Iteration = 2
+		replacement.Split = []float64{0, 1}
 		var clock = hoReplacingClock{armed: &armed, replace: func() {
 			ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
 			ctx.GetAssignment("exp")
@@ -2788,15 +2791,20 @@ func TestHoldout_ClaimRetiredBeforeCommitPublishesNothing(t *testing.T) {
 		if armed {
 			t.Fatal("the clock was not read during the admission")
 		}
-		expectInt(t, 0, int(ctx.GetPendingCount()))
-		if _, err := ctx.GetTreatment("exp"); err != nil {
-			t.Fatal(err)
-		}
-		// Only the replacement's decision: its own exposure and the
-		// holdout's, once each.
 		var exposures = queuedExposures(ctx)
-		if len(exposures) != 2 || exposures[0].Name != "exp" || exposures[1].Id != 11 {
-			t.Fatalf("exposures %+v", exposures)
+		var claimed = 1
+		if covered {
+			claimed = 2
+		}
+		if len(exposures) != claimed || exposures[0].Name != "exp" || exposures[0].Variant != 0 {
+			t.Fatalf("covered=%v: claimed decision %+v", covered, exposures)
+		}
+		if variant, err := ctx.GetTreatment("exp"); err != nil || variant != 1 {
+			t.Fatalf("replacement: %d, %v", variant, err)
+		}
+		exposures = queuedExposures(ctx)
+		if len(exposures) < claimed+1 || exposures[claimed].Name != "exp" || exposures[claimed].Variant != 1 {
+			t.Fatalf("covered=%v: replacement decision %+v", covered, exposures)
 		}
 		ctx.ClearRefreshTimer()
 	}
@@ -2838,51 +2846,45 @@ func TestHoldout_NullSplitAndNullElementsAreKept(t *testing.T) {
 	}
 }
 
-// The retirement store happens under EventLock_, so an admission that holds
-// the lock either commits before the replacement retires its claim or sees the
-// retirement; a replacement cannot retire in the middle of one.
-func TestHoldout_RetirementIsStoredUnderEventLock(t *testing.T) {
-	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
-	var entry = h.ctx.getAssignment("exp")
-	var replacement = hoExperiment(1, "exp", hoUnitType, 0, 11)
-	replacement.Iteration = 2
-	// SetData itself takes EventLock_, so install the data first: only the
-	// replacing GetAssignment is left to meet the held lock.
-	h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
-	h.ctx.EventLock_.Lock()
-	var done = make(chan struct{})
-	go func() {
-		defer close(done)
-		h.ctx.GetAssignment("exp")
-	}()
-	// The replacing goroutine must reach, and block on, EventLock_ while the
-	// token is still clear.
-	for i := 0; i < 200; i++ {
-		runtime.Gosched()
-		time.Sleep(time.Millisecond)
-		if entry.retirement.Load() {
-			h.ctx.EventLock_.Unlock()
-			<-done
-			t.Fatal("the retirement was stored without EventLock_")
+// Two readers and one replacement: the first read claims the exposure, the
+// second finds it exposed and serves the same variant, then a refresh replaces
+// the assignment before the first read commits. The claim still commits, so
+// the variant both reads served is published.
+func TestHoldout_ClaimedDecisionServedByASecondReadIsPublished(t *testing.T) {
+	for _, variable := range []bool{false, true} {
+		var experiment = hoExperiment(1, "exp", hoUnitType, 0, 11)
+		experiment.Split = []float64{1, 0}
+		experiment.Variants[0].Config = `{"v":"old"}`
+		experiment.Variants[1].Config = `{"v":"new"}`
+		var replacement = experiment
+		replacement.Iteration = 2
+		replacement.Split = []float64{0, 1}
+		var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+		var entry = h.ctx.getAssignment("exp")
+		if !hoClaim(h, entry) {
+			t.Fatal("the first read did not claim")
 		}
-		select {
-		case <-done:
-			h.ctx.EventLock_.Unlock()
-			t.Fatal("the replacement finished while EventLock_ was held")
-		default:
+		if variable {
+			expectValue(t, "old", h.variable("v"))
+		} else {
+			expectInt(t, 0, h.treatment("exp"))
 		}
-	}
-	h.ctx.EventLock_.Unlock()
-	<-done
-	if !entry.retirement.Load() {
-		t.Fatal("the replaced assignment was not retired")
+		h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
+		h.ctx.PeekTreatment("exp")
+		if got := h.ctx.admitExposure(entry.assignment, entry); got != exposureQueued {
+			t.Fatalf("the first read's admission reported %v, want queued", got)
+		}
+		var exposures = queuedExposures(h.ctx)
+		if len(exposures) != 2 || exposures[0].Name != "exp" || exposures[0].Variant != 0 || exposures[1].Id != 11 {
+			t.Fatalf("exposures %+v", exposures)
+		}
 	}
 }
 
-// A read that loses the race to a replacement (a refresh lands between its
-// claim and its admission) serves and exposes the replacement instead of the
-// retired decision, as the Java SDK does, without a second read.
-func TestHoldout_ReadRetiredBeforeCommitServesTheReplacement(t *testing.T) {
+// A read whose claim a replacement follows (a refresh lands between its claim
+// and its admission) serves and exposes the decision it claimed, as the Java
+// SDK does; the replacement is exposed by the next read.
+func TestHoldout_ReadReplacedAfterItsClaimServesItsClaim(t *testing.T) {
 	for _, covered := range []bool{true, false} {
 		for _, variable := range []bool{false, true} {
 			var ctx *Context
@@ -2918,58 +2920,51 @@ func TestHoldout_ReadRetiredBeforeCommitServesTheReplacement(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				expectValue(t, "new", value)
+				expectValue(t, "old", value)
 			} else {
 				var variant, err = ctx.GetTreatment("exp")
 				if err != nil {
 					t.Fatal(err)
 				}
-				expectInt(t, 1, variant)
+				expectInt(t, 0, variant)
 			}
 			if armed {
 				t.Fatal("the clock was not read during the admission")
 			}
-			// Exactly the replacement's decision, once: its own exposure and
-			// the holdout's.
+			// The claimed decision, once: its own exposure, and the
+			// holdout's when it was covered.
 			var exposures = queuedExposures(ctx)
-			expectInt(t, 2, len(exposures))
-			expectValue(t, "exp", exposures[0].Name)
-			expectInt(t, 1, exposures[0].Variant)
-			expectInt(t, 11, exposures[1].Id)
+			var claimed = 1
+			if covered {
+				claimed = 2
+			}
+			if len(exposures) != claimed || exposures[0].Name != "exp" || exposures[0].Variant != 0 ||
+				(covered && exposures[1].Id != 11) {
+				t.Fatalf("covered=%v variable=%v: exposures %+v", covered, variable, exposures)
+			}
 			ctx.ClearRefreshTimer()
 		}
 	}
 }
 
-// When every attempt loses to a replacement, a read stops after
-// maxExposureAttempts and serves the last assignment it tried.
+// When every attempt loses to a replacement landing before its claim, a read
+// stops after maxExposureAttempts and serves the last assignment it tried.
 func TestHoldout_RetiredReadRetriesAreBounded(t *testing.T) {
-	var ctx *Context
-	var reads = 0
 	var experiment = hoExperiment(1, "exp", hoUnitType, 0, 11)
-	var clock = hoClockFunc(func() int64 {
-		reads++
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+	h.ctx.GetAssignment("exp")
+	var claims = 0
+	beforeSettleClaim = func() {
+		claims++
 		var next = experiment
-		next.Iteration = 1 + reads
-		ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, next))
-		ctx.GetAssignment("exp")
-		return hoMillis
-	})
-	var config = CreateDefaultContextConfig()
-	config.Units_ = map[string]string{hoUnitType: hoUIDNotHeldOut}
-	config.PublishDelay_ = -1
-	config.RefreshInterval_ = -1
-	var ft, done = future.New()
-	done(hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment), nil)
-	ctx = CreateContext(clock, config, ft, &hoProvider{}, &hoPublisher{}, nil,
-		DefaultVariableParser{}, AudienceMatcher{DefaultAudienceDeserializer{}})
-	ctx.WaitUntilReady()
-	t.Cleanup(func() { ctx.ClearRefreshTimer() })
-	if _, err := ctx.GetTreatment("exp"); err != nil {
-		t.Fatal(err)
+		next.Iteration = 1 + claims
+		h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, next))
+		h.ctx.GetAssignment("exp")
 	}
-	expectInt(t, 3, reads)
-	expectInt(t, 0, int(ctx.GetPendingCount()))
+	defer func() { beforeSettleClaim = nil }()
+	h.treatment("exp")
+	expectInt(t, maxExposureAttempts, claims)
+	h.expectPending(0)
 }
 
 type hoClockFunc func() int64
