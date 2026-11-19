@@ -648,6 +648,9 @@ func TestEvaluationRegistryConcurrentScopesAreRemoved(t *testing.T) {
 		}()
 	}
 	ready.Wait()
+	if active := atomic.LoadInt32(&evaluationsActive); active < 8 {
+		t.Fatalf("evaluationsActive = %d with 8 scopes active", active)
+	}
 	if evaluatingState(lock) != st {
 		t.Fatal("active scopes did not publish their state")
 	}
@@ -655,6 +658,9 @@ func TestEvaluationRegistryConcurrentScopesAreRemoved(t *testing.T) {
 	done.Wait()
 	if evaluatingState(lock) != nil {
 		t.Fatal("last evaluation scope retained state")
+	}
+	if active := atomic.LoadInt32(&evaluationsActive); active != 0 {
+		t.Fatalf("evaluationsActive = %d after every scope ended, want 0", active)
 	}
 }
 
@@ -684,4 +690,51 @@ func TestContextLiteralVariableKeysReadCurrentLegacyIndex(t *testing.T) {
 		all, _ = manual.GetVariableKeysAll()
 		assertAny(map[string][]string{"color": {"six"}, "size": {"five"}}, all, t)
 	}
+}
+
+type keysInEvaluation struct {
+	ctx  *Context
+	keys map[string]string
+}
+
+func (d *keysInEvaluation) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	if d.ctx != nil && d.keys == nil {
+		d.keys, _ = d.ctx.GetVariableKeys()
+	}
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+// v1.1.1: a literal's variable keys read its current IndexVariables_, also
+// from inside an audience evaluation.
+func TestContextLiteralVariableKeysInsideEvaluationAreCurrent(t *testing.T) {
+	var boolValue = func(value bool) *atomic.Value {
+		var result = &atomic.Value{}
+		result.Store(value)
+		return result
+	}
+	var count = &atomic.Value{}
+	count.Store(int32(0))
+	var five = ExperimentVariables{Data: jsonmodels.Experiment{Id: 5, Name: "five"}}
+	var six = ExperimentVariables{Data: jsonmodels.Experiment{Id: 6, Name: "six"}}
+	var d = &keysInEvaluation{}
+	var manual = Context{
+		PublishDelay_: -1, RefreshInterval_: -1, VariableParser_: DefaultVariableParser{},
+		AudienceMatcher_: AudienceMatcher{d},
+		Units_:           map[string]string{"session_id": ruleUnit}, Failed_: boolValue(false), Ready_: boolValue(true),
+		DataLock: &sync.RWMutex{}, ContextLock_: &sync.RWMutex{},
+		IndexVariables_: map[interface{}]interface{}{"color": five},
+		HashedUnits_:    map[interface{}]interface{}{}, Assigners_: map[interface{}]interface{}{},
+		AssignmentCache: map[string]Assignment{}, EventLock_: &sync.Mutex{},
+		Overrides_: map[interface{}]interface{}{}, Cassignments_: map[interface{}]interface{}{},
+		PendingCount_: count, Closing_: boolValue(false), Closed_: boolValue(false),
+		Refreshing_: boolValue(false), TimeoutLock_: &sync.Mutex{},
+		Clock_: internal.FixedClock{Millis_: 1},
+	}
+	manual.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{audienceExperiment("exp_app", appFilter, true)}})
+	manual.IndexVariables_ = map[interface{}]interface{}{"color": five}
+	_, _ = manual.GetVariableKeys()
+	manual.IndexVariables_["size"] = six
+	d.ctx = &manual
+	_, _ = manual.PeekTreatment("exp_app")
+	assertAny(map[string]string{"color": "five", "size": "six"}, d.keys, t)
 }

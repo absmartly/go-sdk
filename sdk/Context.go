@@ -1105,7 +1105,7 @@ func (c *Context) GetVariableKeys() (map[string]string, error) {
 	}
 
 	var variableKeys = map[string]string{}
-	if c.ownClock() == nil && evaluatingState(c.ContextLock_) == nil && (c.ContextLock_ == nil || c.state().manualRoot == nil) {
+	if c.ownClock() == nil && (c.ContextLock_ == nil || c.literalState().manualRoot == nil) {
 		c.DataLock.RLock()
 		for key, value := range c.IndexVariables_ {
 			if key, ok := key.(string); ok {
@@ -1138,7 +1138,7 @@ func (c *Context) GetVariableKeysAll() (map[string][]string, error) {
 	}
 
 	var variableKeys = map[string][]string{}
-	if c.ownClock() == nil && evaluatingState(c.ContextLock_) == nil && (c.ContextLock_ == nil || c.state().manualRoot == nil) {
+	if c.ownClock() == nil && (c.ContextLock_ == nil || c.literalState().manualRoot == nil) {
 		c.DataLock.RLock()
 		for key, value := range c.IndexVariables_ {
 			if key, ok := key.(string); ok {
