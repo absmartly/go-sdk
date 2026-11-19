@@ -1269,3 +1269,104 @@ func TestSameSplitMatchesDeepEqual(t *testing.T) {
 		assertAny(reflect.DeepEqual(tc[0], tc[1]), sameSplit(tc[0], tc[1]), t)
 	}
 }
+
+// A failing Publish from inside an evaluation, with a logger set, returns the
+// error, logs one Error event and keeps the batch queued.
+func TestDeserializerFailingPublishLogsErrorAndKeepsEvents(t *testing.T) {
+	var d = &callingDeserializer{}
+	var failure = errors.New("collector down")
+	var publisher = &CapturingPublishClient{publishErr: failure}
+	var logger = &MockEventLogger{}
+	var cc = CreateDefaultContextConfig()
+	cc.Units_, cc.PublishDelay_, cc.RefreshInterval_ = withUnit(), -1, -1
+	var ctx = Create(ABSmartlyConfig{ContextDataProvider_: syncDataProvider{},
+		ContextEventHandler_: DefaultContextEventHandler{client_: publisher}, AudienceDeserializer_: d,
+		ContextEventLogger_: logger}).CreateContextWith(cc, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+		audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true)}})
+	ctx.WaitUntilReady()
+	assertAny(nil, ctx.Track("goal", nil), t)
+	var result = make(chan error, 1)
+	d.ctx = ctx
+	d.call = func(c *Context) { result <- c.Publish() }
+	var done = make(chan struct{})
+	go func() { ctx.PeekTreatment("exp_app"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a failing Publish from a deserializer with a logger deadlocked")
+	}
+	assertAny(failure, <-result, t)
+	var errors_ = 0
+	for _, e := range logger.GetEvents() {
+		if e.EventType == Error {
+			errors_++
+		}
+	}
+	assertAny(1, errors_, t)
+	assertAny(int32(1), ctx.GetPendingCount(), t)
+}
+
+// publishClosingLogger closes the context from its Publish event.
+type publishClosingLogger struct {
+	ctx    *Context
+	closed chan struct{}
+}
+
+func (l *publishClosingLogger) HandleEvent(_ Context, event EventType, _ interface{}) {
+	if event == Publish && l.ctx != nil {
+		var ctx = l.ctx
+		l.ctx = nil
+		ctx.Close()
+		close(l.closed)
+	}
+}
+
+// A logger that calls Close from the Publish event of a publish started by a
+// deserializer does not wait for its own delivery.
+func TestLoggerClosingFromDeserializerStartedPublishDoesNotDeadlock(t *testing.T) {
+	var d = &callingDeserializer{}
+	var publisher = &CapturingPublishClient{}
+	var logger = &publishClosingLogger{closed: make(chan struct{})}
+	var cc = CreateDefaultContextConfig()
+	cc.Units_, cc.PublishDelay_, cc.RefreshInterval_ = withUnit(), -1, -1
+	var ctx = Create(ABSmartlyConfig{ContextDataProvider_: syncDataProvider{},
+		ContextEventHandler_: DefaultContextEventHandler{client_: publisher}, AudienceDeserializer_: d,
+		ContextEventLogger_: logger}).CreateContextWith(cc, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+		audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true)}})
+	ctx.WaitUntilReady()
+	assertAny(nil, ctx.Track("goal", nil), t)
+	logger.ctx = ctx
+	d.ctx = ctx
+	d.call = func(c *Context) {
+		if f, err := c.PublishAsync(); err == nil {
+			_, _ = f.Get(context.Background())
+		}
+	}
+	var done = make(chan struct{})
+	go func() { ctx.PeekTreatment("exp_app"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("PeekTreatment deadlocked")
+	}
+	select {
+	case <-logger.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close from the logger's Publish event deadlocked")
+	}
+	assertAny(true, ctx.IsClosed(), t)
+}
+
+// ExperimentMatches compares the traffic split: a changed split invalidates
+// the cached assignment.
+func TestChangedTrafficSplitInvalidatesCachedAssignment(t *testing.T) {
+	var experiment = ruleExperiment("exp", "")
+	var ctx, _ = newRuleContext(t, "production", withUnit(), experiment)
+	var before = ctx.GetAssignment("exp")
+	assertAny(true, before.Eligible, t)
+	experiment.TrafficSplit = []float64{1, 0}
+	ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{experiment}})
+	var after = ctx.GetAssignment("exp")
+	assertAny(false, after.Eligible, t)
+	assertAny([]float64{1, 0}, after.TrafficSplit, t)
+}
