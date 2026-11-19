@@ -38,10 +38,10 @@ These follow the cross-SDK contract agreed for all ABsmartly SDKs in 2026-11; ea
 - `json` custom fields with the default parser return any JSON value (array, string, number, boolean) instead of only objects (cross-SDK scenarios 53-58); JSON `null` and invalid JSON still return a nil `map[string]interface{}`. Who is affected: code type-asserting every `json` custom field to `map[string]interface{}`.
 
 ### Known issues
-- With an event logger configured, an `AudienceDeserializer` that calls `QueueExposure`, `Track` or another method that logs an event, from inside an audience evaluation, deadlocks: the logger is given a snapshot of the context, which needs the lock the evaluation holds. Without a logger these calls work. Unreleased main behaves the same; a fix is planned for the 2.0 line. Read methods called from a deserializer (`GetExperiment`, `GetVariableKeys`, `GetVariableKeysAll`, `GetVariableExperiment`) do not deadlock.
 - On a context whose `Clock_` was replaced, or one built as a `Context{...}` literal, each read finds the context's private state under that context's exclusive `ContextLock_`, so concurrent readers of the same context serialise. A process-wide read lock is used only while such a context is evaluating an audience or rule, so readers of different contexts do not serialise on it otherwise. Contexts made with `CreateContext` and left with their clock are unaffected.
 
 ### Fixed
+- An `AudienceDeserializer` that calls back into the context during an audience evaluation no longer hangs. Read methods (`GetExperiment`, `GetVariableKeys`, `GetVariableKeysAll`, `GetVariableExperiment`), `QueueExposure` and `Track` work from inside it, including with an event logger configured, as in v1.1.1, and after `Clock_` is replaced.
 - `Publish()` returns the publish error instead of nil, and a failed publish keeps the events queued for the next publish instead of dropping them.
 - A failed `Close()` leaves the context open with its events queued and can be retried; the `Close` event is logged only on success, and the refresh timer is not restarted. On success, `Close()` and an empty-queue `CloseAsync()` settle after the `Close` event is logged. Concurrent `CloseAsync` callers share one future, and in-flight publishes are waited for.
 - Exposures are no longer queued on a closed context.

@@ -763,8 +763,6 @@ func TestReplacedClockVariableKeysIgnoreLegacyIndexWrites(t *testing.T) {
 	assertAny("exp", keys["color"], t)
 }
 
-// An attribute written through a value copy of an SDK-created context is
-// what that copy's assignments are evaluated with.
 func TestAttributeWrittenThroughCopyIsEvaluated(t *testing.T) {
 	var ctx, _ = newRuleContext(t, "production", withUnit(),
 		ruleExperiment("exp", rulesJSON(`{"type":"assign","variant":2,"conditions":{"eq":[{"var":"country"},{"value":"US"}]}}`)))
@@ -898,6 +896,105 @@ func TestFailedLoadSettlesReadyFutureBeforeClearingIt(t *testing.T) {
 		assertAny(true, ctx.IsFailed(), t)
 		if ctx.getReadyFuture() != nil {
 			t.Errorf("%s failure: ReadyFuture_ still installed after settlement", failure)
+		}
+	}
+}
+
+// callingDeserializer runs call (once per evaluation, from inside it) while
+// the context evaluates an audience.
+type callingDeserializer struct {
+	mu   sync.Mutex
+	ctx  *Context
+	call func(*Context)
+}
+
+func (d *callingDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	d.mu.Lock()
+	var ctx, call = d.ctx, d.call
+	d.mu.Unlock()
+	if ctx != nil && call != nil {
+		call(ctx)
+	}
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+// v1.1.1 handed event loggers the context without locking, so an
+// AudienceDeserializer that logs an event (QueueExposure, Track) with a
+// logger configured did not hang. Covers the build and revalidation paths,
+// with and without a replaced clock, and concurrent evaluations.
+func TestDeserializerThatLogsEventsWithLoggerDoesNotDeadlock(t *testing.T) {
+	for _, name := range []string{"QueueExposure", "Track"} {
+		for _, replace := range []bool{false, true} {
+			var d = &callingDeserializer{}
+			var logger = &MockEventLogger{}
+			var client = &systemAttrClient{application: "website", environment: "production"}
+			var abs = Create(ABsmartlyConfig{Client_: client,
+				ContextDataProvider_:  DefaultContextDataProvider{client_: client},
+				ContextEventHandler_:  DefaultContextEventHandler{client_: client},
+				AudienceDeserializer_: d, ContextEventLogger_: logger})
+			var config = CreateDefaultContextConfig()
+			config.Units_, config.PublishDelay_, config.RefreshInterval_ = withUnit(), -1, -1
+			var ctx = abs.CreateContextWith(config, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+				ruleExperiment("rule", rulesJSON(`{"type":"assign","variant":2}`)),
+				audienceExperiment("exp_app", appFilter, true)}})
+			ctx.WaitUntilReady()
+			if replace {
+				ctx.Clock_ = internal.FixedClock{Millis_: 1}
+			}
+			// Take the assignments before the evaluations: GetAssignment from
+			// inside one would wait for the lock it holds (as in v1.1.1).
+			var retained = make(chan *Assignment, 64)
+			for i := 0; i < 64; i++ {
+				retained <- ctx.GetAssignment("rule")
+			}
+			var call = func(c *Context) { _ = c.Track("evaluated", nil) }
+			if name == "QueueExposure" {
+				call = func(c *Context) {
+					select {
+					case a := <-retained:
+						c.QueueExposure(a)
+					default:
+					}
+				}
+			}
+			d.mu.Lock()
+			d.ctx, d.call = ctx, call
+			d.mu.Unlock()
+
+			var done = make(chan struct{})
+			go func() {
+				defer close(done)
+				var wg sync.WaitGroup
+				for g := 0; g < 4; g++ {
+					wg.Add(1)
+					go func(g int) {
+						defer wg.Done()
+						for i := 0; i < 8; i++ {
+							_, _ = ctx.PeekTreatment("exp_app")
+							_ = ctx.SetAttribute("round", g*100+i) // forces revalidation
+						}
+					}(g)
+				}
+				wg.Wait()
+			}()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("%s from the deserializer with a logger deadlocked (Clock_ replaced: %v)", name, replace)
+			}
+			var wanted = Exposure
+			if name == "Track" {
+				wanted = Goal
+			}
+			var logged = 0
+			for _, event := range logger.GetEvents() {
+				if event.EventType == wanted {
+					logged++
+				}
+			}
+			if logged == 0 {
+				t.Errorf("%s: no %s event was logged", name, wanted)
+			}
 		}
 	}
 }
