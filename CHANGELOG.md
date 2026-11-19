@@ -38,7 +38,7 @@ These follow the cross-SDK contract agreed for all ABsmartly SDKs in 2026-11; ea
 - `json` custom fields with the default parser return any JSON value (array, string, number, boolean) instead of only objects (cross-SDK scenarios 53-58); JSON `null` and invalid JSON still return a nil `map[string]interface{}`. Who is affected: code type-asserting every `json` custom field to `map[string]interface{}`.
 
 ### Known issues
-- `Refresh`/`RefreshAsync` called from a custom `AudienceDeserializer` during an audience evaluation waits for the data provider before the evaluation continues, holding the context lock: other goroutines reading that context wait too, and a provider that never answers hangs the evaluation. v1.1.1 returned at once and installed the data later. Called anywhere else, `RefreshAsync` still returns at once.
+- `RefreshAsync` called from a custom `AudienceDeserializer` during an audience evaluation now waits for the data provider before returning, holding the context lock, so other goroutines reading that context wait too. A provider that never answers hangs the evaluation. In v1.1.1 `RefreshAsync` returned at once there. `Refresh` waits for the provider in both versions, as it always did. Called anywhere else, `RefreshAsync` still returns at once.
 - On a context whose `Clock_` was replaced, or one built as a `Context{...}` literal, each read finds the context's private state under that context's exclusive `ContextLock_`, so concurrent readers of the same context serialise. A process-wide read lock is used only while such a context is evaluating an audience or rule, so readers of different contexts do not serialise on it otherwise. Contexts made with `CreateContext` and left with their clock are unaffected.
 
 ### Fixed
