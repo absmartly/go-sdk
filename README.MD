@@ -561,9 +561,11 @@ them as the JavaScript SDK does.
   over one the unit is assigned to; if none is, the held-out experiment's
   control value is returned rather than the default.
 
-A unit keeps its arm until the holdout's iteration changes. Payloads without
-holdouts are served and published exactly as before, with no extra
-allocations.
+A unit keeps its arm until the holdout's iteration changes. Holdouts add
+nothing to the publish payload of experiments without holdouts (the
+`ruleOverride` flag every exposure now carries comes with assignment rules),
+and warmed cached reads and exposures allocate nothing more. Creating a
+context and rebuilding an assignment each allocate one small extra object.
 
 `ContextData` gained a `Holdouts` field and `Experiment` a `HoldoutIds` field,
 so unkeyed (positional) literals of `jsonmodels.ContextData` must become keyed
@@ -616,8 +618,11 @@ for the full rules):
 
 The cluster of a period is read once: a `SetAttribute` later in the same
 period takes effect from the next period. Payloads without switchback
-experiments are served and published exactly as before, with no extra
-allocations (the decoded experiment structs are a little wider).
+experiments are served and published exactly as before, and cached reads and
+exposures allocate as before (the decoded experiment structs are a little
+wider). An attribute value with its own `MarshalJSON` or `MarshalText` is read
+through that encoding under the context lock, so the marshaler must not call
+back into the context.
 
 ### Custom Assignments
 

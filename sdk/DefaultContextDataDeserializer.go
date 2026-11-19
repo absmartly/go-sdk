@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"math"
+	"strconv"
 
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
@@ -85,7 +86,10 @@ func holdoutIds(raw json.RawMessage) []int {
 	return ids
 }
 
-// holdoutId decodes an integral JSON number that fits a holdout id.
+// holdoutId decodes an integral JSON number that fits an int. It goes
+// through float64, as JavaScript's JSON.parse does, so 10, 10.0 and 1e1 are
+// the same id, and any two spellings of one number decode alike (above 2^53
+// they round together, as in JavaScript).
 func holdoutId(raw json.RawMessage) (int, bool) {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || raw[0] == '"' {
@@ -96,27 +100,47 @@ func holdoutId(raw json.RawMessage) (int, bool) {
 	if json.Unmarshal(raw, &number) != nil || len(number) == 0 {
 		return 0, false
 	}
-	if id, err := number.Int64(); err == nil {
-		return int(id), id == int64(int(id))
-	}
 	var value, err = number.Float64()
-	if err != nil || value != math.Trunc(value) || math.Abs(value) > 1<<53 {
+	if err != nil || value != math.Trunc(value) || value < -math.Exp2(float64(strconv.IntSize-1)) || value >= math.Exp2(float64(strconv.IntSize-1)) {
 		return 0, false
 	}
 	return int(value), true
 }
 
-// wireHoldout decodes a holdout with an id written as any integral number.
+// holdoutSeed decodes numeric JSON seeds as the JS SDK's DataView.setUint32:
+// truncated and taken modulo 2^32. Non-numeric values default to 0 rather than
+// applying JavaScript's broader coercions; non-finite numbers also give 0.
+func holdoutSeed(raw json.RawMessage) int {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] == '"' {
+		return 0
+	}
+	var number json.Number
+	if json.Unmarshal(raw, &number) != nil || len(number) == 0 {
+		return 0
+	}
+	// Through float64, as JavaScript parses every JSON number.
+	var value, err = number.Float64()
+	if err != nil || math.IsInf(value, 0) || math.IsNaN(value) {
+		return 0
+	}
+	return int(uint32(int64(math.Mod(math.Trunc(value), 1<<32))))
+}
+
+// wireHoldout decodes a holdout with its integer fields written as any
+// integral JSON number, so a producer re-encoding 1 as 1.0 keeps the same
+// epoch and seeds. holdoutType and unitType are informational (the arity
+// comes from the split, the arm from the covered experiment's unit), so a
+// value of the wrong type drops only that field rather than the holdout, as
+// an unknown field would.
 type wireHoldout struct {
 	jsonmodels.Holdout
-	Id json.RawMessage `json:"id"`
-	// holdoutType and unitType are informational (the arity comes from the
-	// split, the arm from the covered experiment's unit), and iteration may
-	// be absent, so a value of the wrong type drops only that field rather
-	// than the holdout, as an unknown field would.
+	Id          json.RawMessage `json:"id"`
+	Iteration   json.RawMessage `json:"iteration"`
+	SeedHi      json.RawMessage `json:"seedHi"`
+	SeedLo      json.RawMessage `json:"seedLo"`
 	HoldoutType json.RawMessage `json:"holdoutType"`
 	UnitType    json.RawMessage `json:"unitType"`
-	Iteration   json.RawMessage `json:"iteration"`
 }
 
 // holdouts decodes the payload's holdouts, skipping entries that are not
@@ -137,9 +161,11 @@ func holdouts(raw json.RawMessage) []jsonmodels.Holdout {
 		}
 		if id, ok := holdoutId(holdout.Id); ok {
 			holdout.Holdout.Id = id
+			holdout.Holdout.Iteration, _ = holdoutId(holdout.Iteration)
+			holdout.Holdout.SeedHi = holdoutSeed(holdout.SeedHi)
+			holdout.Holdout.SeedLo = holdoutSeed(holdout.SeedLo)
 			_ = json.Unmarshal(holdout.HoldoutType, &holdout.Holdout.HoldoutType)
 			_ = json.Unmarshal(holdout.UnitType, &holdout.Holdout.UnitType)
-			_ = json.Unmarshal(holdout.Iteration, &holdout.Holdout.Iteration)
 			result = append(result, holdout.Holdout)
 		}
 	}

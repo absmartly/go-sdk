@@ -1775,7 +1775,7 @@ func TestSwitchback_ExposureOfASlotDroppedAfterItsResolutionIsKept(t *testing.T)
 	regridded.SwitchbackDesignType = "other"
 	h.refresh(regridded)
 	h.ctx.GetAssignment("exp_sb")
-	h.ctx.queueExposure(entry.assignment, entry.holdouts, entry.switchback, &at)
+	h.ctx.queueExposureAt(entry.assignment, entry, &at)
 	h.expectPublished(sbExposure(1, "exp_sb", sbExpected2Arms[0], sbAnchor+5, true, true))
 }
 

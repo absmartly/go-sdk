@@ -132,7 +132,8 @@ func tryParseInt32(s string) (int, bool) {
 // Go float stays a float: encoding/json writes 3.0 as 3, which would read
 // back as an integer. Values with their own JSON encoding (a json.Marshaler
 // or encoding.TextMarshaler, []byte, structs, maps with non-string keys) are
-// read from that encoding, decoded with UseNumber.
+// read from that encoding, decoded with UseNumber. It runs under ContextLock_,
+// so such a marshaler must not call back into the context.
 func (p *switchbackPath) resolveAttribute(root interface{}) string {
 	if root == nil {
 		return ""
