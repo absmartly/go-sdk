@@ -2446,7 +2446,9 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	// so the set is built only once the context has seen holdouts or
 	// assignment rules; payloads with neither cost nothing more.
 	var keys variableKeySet
-	if len(holdoutsById) > 0 || len(rules) > 0 || (previous != nil && previous.keyed) {
+	// The index installed now, under the lock: an install that finished
+	// while this one was parsing must not lose its gate.
+	if current := c.index_.Load(); len(holdoutsById) > 0 || len(rules) > 0 || (current != nil && current.keyed) {
 		keys = variableKeySet{}
 	}
 	for name, experiment := range index {

@@ -3541,4 +3541,87 @@ func TestHoldout_SetDataFailedKeepsTheKeySetGate(t *testing.T) {
 	if h.ctx.getAssignment("a").variableKeys == nil {
 		t.Fatal("SetDataFailed reset the key set gate")
 	}
+	// A context that never had holdouts or rules still builds none.
+	var plain = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, experiment))
+	plain.ctx.SetDataFailed(errors.New("boom"))
+	plain.ctx.SetData(hoData(nil, experiment))
+	if plain.ctx.getAssignment("a").variableKeys != nil {
+		t.Fatal("SetDataFailed turned the key set gate on")
+	}
+}
+
+// Rules that first appear in a later install also turn the gate on.
+func TestHoldout_RulesInALaterInstallTurnTheKeySetGateOn(t *testing.T) {
+	var plain = hoWithVariables(hoExperiment(1, "exp", "user_id", 2), "color")
+	plain.Variants = append(plain.Variants, jsonmodels.ExperimentVariant{Name: "C", Config: `{"color":"full-on"}`})
+	var ruled = plain
+	ruled.AssignmentRules = `{"rules":[{"name":"Everyone","type":"split","conditions":null,"environments":[],"percentages":"0/100/0"}]}`
+	var replacement = plain
+	replacement.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"w":"a"}`}, {Name: "B", Config: `{"w":"b"}`},
+		{Name: "C", Config: `{"w":"c"}`}}
+	var h = hoCreate(t, map[string]string{}, hoData(nil, plain))
+	h.ctx.SetData(hoData(nil, ruled))
+	h.ctx.GetAssignment("exp")
+	var armed = true
+	beforeSettleClaim = func() {
+		if armed {
+			armed = false
+			h.ctx.SetData(hoData(nil, replacement))
+			h.setUnit("user_id", hoUID)
+		}
+	}
+	defer func() { beforeSettleClaim = nil }()
+	expectValue(t, "default", h.variable("color"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	if exposures := queuedExposures(h.ctx); len(exposures) != 0 {
+		t.Fatalf("the replacement without the key was exposed: %+v", exposures)
+	}
+}
+
+// blockingParser holds a "block" config's parse until released, so a test can
+// finish another install while this one is still parsing.
+type blockingParser struct {
+	parsing chan struct{}
+	release chan struct{}
+}
+
+func (p blockingParser) Parse(context Context, experimentName string, variantName string, config string) map[string]interface{} {
+	if config == `{"block":1}` {
+		p.parsing <- struct{}{}
+		<-p.release
+	}
+	return DefaultVariableParser{}.Parse(context, experimentName, variantName, config)
+}
+
+// An install with holdouts that finishes while a plain install is still
+// parsing keeps the key set gate on: the plain install reads the gate under
+// the lock, not from before its parse.
+func TestHoldout_ConcurrentInstallKeepsTheKeySetGate(t *testing.T) {
+	var parser = blockingParser{parsing: make(chan struct{}), release: make(chan struct{})}
+	var config = CreateDefaultContextConfig()
+	config.Units_ = map[string]string{hoUnitType: hoUIDNotHeldOut}
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = -1
+	var ft, done = future.New()
+	done(hoData(nil), nil)
+	var ctx = CreateContext(internal.FixedClock{Millis_: hoMillis}, config, ft, &hoProvider{}, &hoPublisher{}, nil,
+		parser, AudienceMatcher{DefaultAudienceDeserializer{}})
+	ctx.WaitUntilReady()
+	t.Cleanup(func() { ctx.ClearRefreshTimer() })
+	var plain = hoExperiment(1, "a", hoUnitType, 0)
+	plain.Variants[0].Config = `{"block":1}`
+	var finished = make(chan struct{})
+	go func() {
+		defer close(finished)
+		ctx.SetData(hoData(nil, plain))
+	}()
+	<-parser.parsing
+	ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoWithVariables(hoExperiment(1, "a", hoUnitType, 0, 11), "v")))
+	close(parser.release)
+	<-finished
+	if index := ctx.index_.Load(); index == nil || !index.keyed {
+		t.Fatal("the plain install dropped the key set gate")
+	}
 }
