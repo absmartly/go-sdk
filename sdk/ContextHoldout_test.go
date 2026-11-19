@@ -2291,19 +2291,6 @@ func TestHoldout_RejectedSameNameAssignmentDoesNotEvictTheExposedEntry(t *testin
 	h.expectPublished(own)
 }
 
-// hoGenerations installs payloads whose holdout iteration is 1..n and
-// returns each generation's assignment, so each replaces the one before.
-func hoGenerations(h *hoContext, from int, to int) []*Assignment {
-	var held []*Assignment
-	for i := from; i <= to; i++ {
-		var holdout = hoHoldoutA()
-		holdout.Iteration = i
-		h.ctx.SetData(hoData([]jsonmodels.Holdout{holdout}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
-		held = append(held, h.ctx.GetAssignment("exp"))
-	}
-	return held
-}
-
 // A held-out decision taken before a refresh removed every holdout still
 // publishes only its holdout exposure through QueueExposure.
 func TestHoldout_HeldAssignmentQueuedAfterHoldoutsRemoved(t *testing.T) {
@@ -2658,7 +2645,8 @@ func TestHoldout_HoldoutIdSpellingsDecodeAlike(t *testing.T) {
 func TestHoldout_DuplicateHoldoutDefinitionsAreOrderIndependent(t *testing.T) {
 	var a = hoHoldoutA()
 	var b = hoHoldout(11, "holdout_a", hoUnitType, hoSeedBHi, hoSeedBLo)
-	for _, holdouts := range [][]jsonmodels.Holdout{{a, b}, {b, a}} {
+	// A third duplicate never reinstates a conflicting id.
+	for _, holdouts := range [][]jsonmodels.Holdout{{a, b}, {b, a}, {a, b, a}, {a, b, b}} {
 		var h = hoCreateFor(t, hoUID, hoData(holdouts, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 		expectInt(t, hoNormalVariant, h.treatment("exp"))
 		h.expectPublished(hoOwn(hoUnitType, 1, "exp", hoNormalVariant))
@@ -3082,9 +3070,7 @@ func TestHoldout_WarmedReadDoesNoClaim(t *testing.T) {
 	}
 }
 
-// A claim that fails because the entry is already exposed reports queued,
-// so a read racing an exposure by another read does not retry; only a
-// retired entry reports retired.
+// Another read's exposure does not make this read retry.
 func TestHoldout_FailedClaimReportsRetiredOnlyWhenRetired(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 	h.treatment("exp")

@@ -143,10 +143,7 @@ func holdoutSplit(raw json.RawMessage) ([]float64, bool) {
 // an unknown field would.
 type wireHoldout struct {
 	jsonmodels.Holdout
-	// Split is decoded raw: an element that is not a number (null decodes
-	// as 0 in a []float64) makes the whole entry malformed, so it is
-	// skipped rather than compared against a valid duplicate.
-	Split       json.RawMessage `json:"split"`
+	Split       json.RawMessage `json:"split"` // see holdoutSplit
 	Id          json.RawMessage `json:"id"`
 	Iteration   json.RawMessage `json:"iteration"`
 	SeedHi      json.RawMessage `json:"seedHi"`

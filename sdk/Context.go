@@ -1348,11 +1348,7 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 			afterReadResolve()
 		}
 		if expose && entry.needsSettling() {
-			// An assignment retired before this read claimed it is exposed
-			// on the replacement instead, whose variables are the ones
-			// served. A replacement that is no longer a candidate for this
-			// read (the experiment was removed, or no longer defines key)
-			// is not exposed, as Java re-resolves by key.
+			// A replacement that no longer defines key is not exposed.
 			var candidate = definesVariable(key)
 			entry = c.settleExposure(experiment.Data.Name, entry, candidate)
 			assignment = entry.assignment
@@ -2286,25 +2282,29 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		// depends on the entries' order; duplicates that draw the same arm
 		// count as one (the first one's name is published). The collector
 		// never sends duplicates.
-		var conflicting map[int]bool
+		// A conflicting id is kept as a nil sentinel until the end, so a later
+		// duplicate can never reinstate it.
+		var conflicts = false
 		for i := range installed {
 			if len(installed[i].Split) == 0 {
 				continue
 			}
 			installed[i].Split = append([]float64(nil), installed[i].Split...)
 			if seen, found := holdoutsById[installed[i].Id]; found {
-				if !sameHoldoutDraw(seen, &installed[i]) {
-					if conflicting == nil {
-						conflicting = map[int]bool{}
-					}
-					conflicting[installed[i].Id] = true
+				if seen != nil && !sameHoldoutDraw(seen, &installed[i]) {
+					holdoutsById[installed[i].Id] = nil
+					conflicts = true
 				}
 				continue
 			}
 			holdoutsById[installed[i].Id] = &installed[i]
 		}
-		for id := range conflicting {
-			delete(holdoutsById, id)
+		if conflicts {
+			for id, holdout := range holdoutsById {
+				if holdout == nil {
+					delete(holdoutsById, id)
+				}
+			}
 		}
 	}
 	var coverage map[string][]*jsonmodels.Holdout
