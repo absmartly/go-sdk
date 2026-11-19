@@ -237,6 +237,10 @@ func (c *Context) dropSwitchbackEpoch(experimentName string) {
 	c.retireSwitchbackSlot(experimentName, experimentName)
 }
 
+// beforeSwitchbackRetireClaim, when set by a test, runs when a switchback
+// retirement has stored the retirement and not yet claimed the exposure.
+var beforeSwitchbackRetireClaim func(*cachedAssignment)
+
 // retireAcrossRandomization retires a covered decision replaced across the
 // randomization boundary, which the same-key replacement in getAssignmentAt
 // does not see: a unit entry lives under the experiment name and a switchback
@@ -252,6 +256,9 @@ func (c *Context) retireAcrossRandomization(experimentName string, slot assignme
 		c.EventLock_.Lock()
 		old.retirement.Store(true)
 		c.EventLock_.Unlock()
+		if beforeSwitchbackRetireClaim != nil {
+			beforeSwitchbackRetireClaim(old)
+		}
 		old.assignment.Exposed.CompareAndSwap(false, true)
 	}
 	if entry.switchback != nil {
@@ -299,6 +306,9 @@ func (c *Context) retireSwitchbackSlot(experimentName string, key string) {
 			c.EventLock_.Lock()
 			expired.retirement.Store(true)
 			c.EventLock_.Unlock()
+			if beforeSwitchbackRetireClaim != nil {
+				beforeSwitchbackRetireClaim(expired)
+			}
 			expired.assignment.Exposed.CompareAndSwap(false, true)
 		}
 		retired = retired[len(retired)-switchbackRetiredSlots:]

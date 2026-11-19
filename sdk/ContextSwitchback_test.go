@@ -1945,3 +1945,108 @@ func TestSwitchback_ReplacementAcrossRandomizationWithoutHoldoutsStillPublishes(
 		h.expectPending(before + 1)
 	}
 }
+
+// A SetUnit landing after a read resolved an overridden switchback that had
+// no linked unit, and before the read claimed it, retires the slot first: the
+// read loses the claim, resolves again and exposes the replacement, through
+// either read API.
+func TestSwitchback_SetUnitBeforeTheClaimExposesTheReplacement(t *testing.T) {
+	for _, variable := range []bool{false, true} {
+		var h = sbCreateAt(t, sbAnchor+5, nil, sbData(sbDefault(2, sbHour)), sbOverride("exp_sb", 1))
+		var armed = true
+		beforeSettleClaim = func() {
+			if armed {
+				armed = false
+				_ = h.ctx.SetUnit(sbUnitType, sbUID)
+			}
+		}
+		if variable {
+			expectValue(t, 1, h.variable("sb.arm"))
+		} else {
+			expectInt(t, 1, h.treatment("exp_sb"))
+		}
+		beforeSettleClaim = nil
+		if armed {
+			t.Fatal("the hook did not run")
+		}
+		h.expectPublished(jsonmodels.Exposure{Id: 1, Name: "exp_sb", Unit: sbUnitType, Variant: 1, ExposedAt: sbAnchor + 5,
+			Eligible: true, Overridden: true})
+	}
+}
+
+// A covered decision replaced by a switchback is retired before it is
+// claimed: a claim replayed right after the replacement's reports retired.
+func TestSwitchback_ReplacementAcrossRandomizationRetiresBeforeTheClaim(t *testing.T) {
+	var holdout = jsonmodels.Holdout{Id: 11, Name: "holdout_a", UnitType: sbUnitType, Iteration: 1, SeedHi: 13, SeedLo: 111,
+		Split: []float64{0, 1}}
+	var unit = sbUnit(sbDefault(2, sbHour))
+	unit.HoldoutIds = []int{11}
+	var covered = sbData(unit)
+	covered.Holdouts = []jsonmodels.Holdout{holdout}
+	var switchback = sbData(sbDefault(2, sbHour))
+	switchback.Holdouts = []jsonmodels.Holdout{holdout}
+	var h = sbCreate(t, covered)
+	h.at(sbAnchor + 5)
+	var entry = h.ctx.getAssignment("exp_sb")
+	var status = exposureQueued
+	var ran = false
+	// The read claims between the retirement and the replacement's claim: it
+	// must see the retirement.
+	beforeSwitchbackRetireClaim = func(replaced *cachedAssignment) {
+		if replaced == entry {
+			ran = true
+			status = h.ctx.queueExposure(entry.assignment, entry)
+		}
+	}
+	h.refreshData(switchback)
+	h.ctx.GetAssignment("exp_sb")
+	beforeSwitchbackRetireClaim = nil
+	if !ran || status != exposureRetired {
+		t.Fatalf("hook ran %v, status %v; want a retired claim", ran, status)
+	}
+}
+
+// A slot that ages out of the retired window is retired before it is
+// claimed: a claim replayed right after reports retired.
+func TestSwitchback_ExpiredSlotRetiresBeforeTheClaim(t *testing.T) {
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+	h.at(sbAnchor + 5)
+	var entry = h.ctx.getAssignment("exp_sb")
+	var status = exposureQueued
+	var ran = false
+	beforeSwitchbackRetireClaim = func(expired *cachedAssignment) {
+		if expired == entry {
+			ran = true
+			status = h.ctx.queueExposure(entry.assignment, entry)
+		}
+	}
+	for i := int64(1); i < 20 && !ran; i++ {
+		h.at(sbAnchor + i*sbHour).ctx.GetAssignment("exp_sb")
+	}
+	beforeSwitchbackRetireClaim = nil
+	if !ran || status != exposureRetired {
+		t.Fatalf("hook ran %v, status %v; want a retired claim", ran, status)
+	}
+	h.expectPending(0)
+}
+
+// A read whose claim is retired resolves again at a fresh clock reading and
+// stamps the replacement's exposure with it.
+func TestSwitchback_RetriedReadStampsAFreshReading(t *testing.T) {
+	var h = sbCreateAt(t, sbAnchor+5, nil, sbData(sbDefault(2, sbHour)), sbOverride("exp_sb", 1))
+	var armed = true
+	beforeSettleClaim = func() {
+		if armed {
+			armed = false
+			h.at(sbAnchor + 20*sbHour + 7)
+			_ = h.ctx.SetUnit(sbUnitType, sbUID)
+		}
+	}
+	expectInt(t, 1, h.treatment("exp_sb"))
+	beforeSettleClaim = nil
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	h.expectPublished(jsonmodels.Exposure{Id: 1, Name: "exp_sb", Unit: sbUnitType, Variant: 1, ExposedAt: sbAnchor + 20*sbHour + 7,
+		Eligible: true, Overridden: true})
+}
