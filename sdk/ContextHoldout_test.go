@@ -3124,3 +3124,64 @@ func TestHoldout_ClaimLosingToAnEvictionSeesTheRetirement(t *testing.T) {
 		t.Fatalf("a claim losing to the eviction reported %v, want retired", status)
 	}
 }
+
+// A read that claims an entry after an eviction stored the retirement but
+// before the eviction's own claim keeps its claim: the eviction restores the
+// retirement and keeps the entry, and the read's admission queues the
+// exposure for the variant it serves.
+func TestHoldout_ReadClaimingBeforeTheEvictionKeepsItsClaim(t *testing.T) {
+	var experiment = hoExperiment(1, "exp", "user_id", 0, 11)
+	experiment.Split = []float64{0, 1}
+	var h = hoCreate(t, map[string]string{}, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_u", "user_id", hoSeedBHi, hoSeedBLo)}, experiment))
+	var entry = h.ctx.getAssignment("exp")
+	var claimed bool
+	beforeEvictionClaim = func(evicting *cachedAssignment) {
+		if evicting == entry {
+			claimed = entry.assignment.Exposed.CompareAndSwap(false, true)
+		}
+	}
+	h.setUnit("user_id", hoUID)
+	beforeEvictionClaim = nil
+	if !claimed {
+		t.Fatal("the read did not claim")
+	}
+	if entry.retirement.Load() {
+		t.Fatal("the eviction left a claimed entry retired")
+	}
+	if got := h.ctx.admitExposure(entry.assignment, entry); got != exposureQueued {
+		t.Fatalf("admission reported %v, want queued", got)
+	}
+	h.expectPending(1)
+	h.ctx.ContextLock_.RLock()
+	var cached = h.ctx.assignmentCache_["exp"]
+	h.ctx.ContextLock_.RUnlock()
+	if cached != entry {
+		t.Fatal("the claimed entry was evicted")
+	}
+}
+
+// A replacement retires the replaced entry before it marks it exposed, so a
+// claim that loses to the replacement always sees the retirement.
+func TestHoldout_ClaimLosingToAReplacementSeesTheRetirement(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	var entry = h.ctx.getAssignment("exp")
+	var status = exposureQueued
+	var ran = false
+	afterReplacementClaim = func(replaced *cachedAssignment) {
+		if replaced == entry {
+			ran = true
+			status = h.ctx.queueExposure(entry.assignment, entry)
+		}
+	}
+	var replacement = hoExperiment(1, "exp", hoUnitType, 0, 11)
+	replacement.Iteration = 2
+	h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
+	h.ctx.GetAssignment("exp")
+	afterReplacementClaim = nil
+	if !ran {
+		t.Fatal("the hook did not run")
+	}
+	if status != exposureRetired {
+		t.Fatalf("a claim losing to the replacement reported %v, want retired", status)
+	}
+}

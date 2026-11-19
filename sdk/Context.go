@@ -739,6 +739,9 @@ func (c *Context) evictAssignmentsMissingUnit(unitType string) {
 		var evict = !assignment.Exposed.Load().(bool)
 		if evict {
 			entry.retirement.Store(true)
+			if beforeEvictionClaim != nil {
+				beforeEvictionClaim(entry)
+			}
 			evict = assignment.Exposed.CompareAndSwap(false, true)
 			if evict && afterEvictionClaim != nil {
 				afterEvictionClaim(entry)
@@ -941,8 +944,14 @@ func (c *Context) settleExposure(experimentName string, entry *cachedAssignment)
 }
 
 // afterEvictionClaim, when set by a test, runs right after an eviction marks
-// an entry exposed, with EventLock_ held.
-var afterEvictionClaim func(*cachedAssignment)
+// an entry exposed, with EventLock_ held; beforeEvictionClaim runs between
+// its retirement store and that claim. afterReplacementClaim runs right after
+// a replacement marks the replaced entry exposed.
+var (
+	afterEvictionClaim    func(*cachedAssignment)
+	beforeEvictionClaim   func(*cachedAssignment)
+	afterReplacementClaim func(*cachedAssignment)
+)
 
 // beforeSettleClaim, when set by a test, runs before each claim in
 // settleExposure, between resolving the assignment and claiming its exposure.
@@ -2001,6 +2010,9 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 		previous.retirement.Store(true)
 		c.EventLock_.Unlock()
 		previous.assignment.Exposed.CompareAndSwap(false, true)
+		if afterReplacementClaim != nil {
+			afterReplacementClaim(previous)
+		}
 	}
 
 	c.assignmentCache_[experimentName] = entry
