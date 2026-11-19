@@ -131,6 +131,17 @@ type contextState struct {
 	// ContextLock_: entries are only written under the write lock.
 	assignmentCache_ map[string]*cachedAssignment
 	ruleIdentities   *ruleAssignmentIdentities
+
+	// evaluator is the goroutine running an assignment evaluation while
+	// holding ContextLock_ for writing, or 0; evaluating is set while it does
+	// (only the write-lock holder sets either, so there is one at a time).
+	// Events that goroutine logs in the meantime (an AudienceDeserializer
+	// that calls QueueExposure) wait in deferredEvents until it releases the
+	// lock: the logger's snapshot needs ContextLock_.
+	evaluating     int32
+	evaluatorsMu   sync.Mutex
+	evaluator      uint64
+	deferredEvents []bufferedEvent
 }
 
 // contextClock carries private state in an existing interface field without
@@ -292,6 +303,48 @@ func beginEvaluating(lock *sync.RWMutex, st *contextState) func() {
 		}
 		atomic.AddInt32(&evaluationsActive, -1)
 		evaluatingStates.Unlock()
+	}
+}
+
+// deferEvent queues an event logged during an assignment evaluation by the
+// goroutine running it, and reports whether it did. Outside an evaluation it
+// costs one atomic load. The goroutine is identified only when an event
+// arrives while an evaluation runs, so evaluations themselves stay cheap.
+func (st *contextState) deferEvent(event EventType, data interface{}) bool {
+	if atomic.LoadInt32(&st.evaluating) == 0 {
+		return false
+	}
+	var id = goroutineID()
+	st.evaluatorsMu.Lock()
+	defer st.evaluatorsMu.Unlock()
+	if st.evaluator == 0 {
+		// The first event of this evaluation: the evaluating goroutine is the
+		// one holding the write lock, which this is only if it logs from
+		// inside the evaluation. Any other goroutine is blocked on the lock
+		// and cannot log here, so this goroutine is the evaluator.
+		st.evaluator = id
+	}
+	if st.evaluator != id {
+		return false
+	}
+	st.deferredEvents = append(st.deferredEvents, bufferedEvent{event, data})
+	return true
+}
+
+// deliverDeferredEvents ends an evaluation, after ContextLock_ is released,
+// and logs the events deferred during it.
+func (c *Context) deliverDeferredEvents(st *contextState) {
+	if atomic.LoadInt32(&st.evaluating) == 0 {
+		return
+	}
+	st.evaluatorsMu.Lock()
+	var events = st.deferredEvents
+	st.deferredEvents = nil
+	st.evaluator = 0
+	atomic.StoreInt32(&st.evaluating, 0)
+	st.evaluatorsMu.Unlock()
+	for _, e := range events {
+		c.logEvent(e.event, e.data)
 	}
 }
 
@@ -1087,7 +1140,12 @@ func (c *Context) queueExposure(assignment *Assignment, ruleOverride bool) {
 		c.Exposures_ = append(c.Exposures_, exposure)
 		c.EventLock_.Unlock()
 
-		c.LogEvent(Exposure, exposure)
+		// Called from inside an assignment evaluation (an
+		// AudienceDeserializer), ContextLock_ is held by this goroutine and
+		// the logger's snapshot would deadlock on it: log once it is released.
+		if c.EventLogger_ == nil || !c.state().deferEvent(Exposure, exposure) {
+			c.LogEvent(Exposure, exposure)
+		}
 
 		c.SetTimeout()
 	}
@@ -1827,7 +1885,11 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 	// Cache miss, out of date, or revalidated. Check again under the write
 	// lock: another goroutine may have rebuilt the assignment meanwhile, and
 	// replacing it would lose its exposed flag and queue a second exposure.
+	// Events logged during the evaluation are delivered once the lock is
+	// released (the deferred call runs after every Unlock below).
+	defer c.deliverDeferredEvents(st)
 	c.ContextLock_.Lock()
+	atomic.StoreInt32(&st.evaluating, 1)
 	var previous, validated, state = c.validCachedAssignment(st, experimentName)
 	if state == assignmentValid {
 		c.ContextLock_.Unlock()

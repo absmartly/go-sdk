@@ -798,9 +798,11 @@ func TestQueueExposureFromInsideEvaluationDoesNotDeadlock(t *testing.T) {
 	for _, replace := range []bool{false, true} {
 		var d = &queueingDeserializer{}
 		var client = &systemAttrClient{application: "website", environment: "production"}
+		var logger = &MockEventLogger{}
 		var abs = Create(ABsmartlyConfig{Client_: client,
 			ContextDataProvider_: DefaultContextDataProvider{client_: client},
-			ContextEventHandler_: DefaultContextEventHandler{client_: client}, AudienceDeserializer_: d})
+			ContextEventHandler_: DefaultContextEventHandler{client_: client}, AudienceDeserializer_: d,
+			ContextEventLogger_: logger})
 		var config = CreateDefaultContextConfig()
 		config.Units_, config.PublishDelay_, config.RefreshInterval_ = withUnit(), -1, -1
 		var ctx = abs.CreateContextWith(config, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
@@ -825,6 +827,14 @@ func TestQueueExposureFromInsideEvaluationDoesNotDeadlock(t *testing.T) {
 		var exposures = expectExposures(t, ctx, 1)
 		assertAny("rule", exposures[0].Name, t)
 		assertAny(true, exposures[0].RuleOverride, t)
+		var logged = 0
+		for _, event := range logger.GetEvents() {
+			if event.EventType == Exposure {
+				logged++
+				assertAny(true, event.Data.(jsonmodels.Exposure).RuleOverride, t)
+			}
+		}
+		assertAny(1, logged, t)
 	}
 }
 
