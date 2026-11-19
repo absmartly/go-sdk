@@ -150,9 +150,9 @@ type Context struct {
 type contextIndex struct {
 	experiments map[string]*indexedExperiment
 	holdouts    map[int]*jsonmodels.Holdout
-	// keyed is set once any install had holdouts: from then on every install
-	// builds its variable key set, since an entry resolved under holdouts
-	// may be retired by any later replacement.
+	// keyed is set once any install had holdouts or assignment rules: from
+	// then on every install builds its variable key set, since an entry
+	// resolved under them may be retired by any later replacement.
 	keyed bool
 }
 
@@ -984,7 +984,7 @@ func definesVariable(key string) func(*cachedAssignment) bool {
 			return false
 		}
 		if e.variableKeys == nil {
-			// The context never had holdouts, so nothing was retired.
+			// The context never had holdouts or rules, so nothing was retired.
 			return true
 		}
 		_, defined := e.variableKeys[variableKeyOf{experiment: e.assignment.Name, key: key}]
@@ -2442,10 +2442,11 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	var indexed = make(map[string]*indexedExperiment, len(index))
 	// One set of (experiment, key) pairs per install: cached entries keep it
 	// rather than the definitions, so they never retain variant values. Only
-	// a holdout retires an assignment, so the set is built only once the
-	// context has seen holdouts; payloads without them cost nothing more.
+	// a holdout or a SetUnit eviction of a split rule retires an assignment,
+	// so the set is built only once the context has seen holdouts or
+	// assignment rules; payloads with neither cost nothing more.
 	var keys variableKeySet
-	if len(holdoutsById) > 0 || (previous != nil && previous.keyed) {
+	if len(holdoutsById) > 0 || len(rules) > 0 || (previous != nil && previous.keyed) {
 		keys = variableKeySet{}
 	}
 	for name, experiment := range index {
@@ -2564,7 +2565,11 @@ func (c *Context) SetDataFailed(err error) {
 	defer c.ContextLock_.Unlock()
 	c.DataLock.Lock()
 	c.Index_ = map[string]ExperimentVariables{}
-	c.index_.Store(&contextIndex{})
+	var keyed = false
+	if previous := c.index_.Load(); previous != nil {
+		keyed = previous.keyed
+	}
+	c.index_.Store(&contextIndex{keyed: keyed})
 	c.indexVariables_ = map[string][]ExperimentVariables{}
 	c.IndexVariables_ = map[interface{}]interface{}{}
 	c.customFieldErrors_ = nil

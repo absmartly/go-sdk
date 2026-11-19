@@ -3500,3 +3500,45 @@ func TestHoldout_VariableKeySetOnceHoldoutsWereSeen(t *testing.T) {
 		t.Fatalf("key set after holdouts left: %v", entry.variableKeys)
 	}
 }
+
+// Without any holdout, a SetUnit eviction of a split rule resolved before the
+// unit retires the entry too: a variable read whose retry lands on a version
+// that no longer defines the key does not expose it, as before holdouts.
+func TestHoldout_SplitRuleEvictionRetryWithoutHoldoutsChecksTheKey(t *testing.T) {
+	var experiment = hoWithVariables(hoExperiment(1, "exp", "user_id", 2), "color")
+	experiment.Variants = append(experiment.Variants, jsonmodels.ExperimentVariant{Name: "C", Config: `{"color":"full-on"}`})
+	experiment.AssignmentRules = `{"rules":[{"name":"Everyone","type":"split","conditions":null,"environments":[],"percentages":"0/100/0"}]}`
+	var replacement = experiment
+	replacement.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"w":"a"}`}, {Name: "B", Config: `{"w":"b"}`},
+		{Name: "C", Config: `{"w":"c"}`}}
+	var h = hoCreate(t, map[string]string{}, hoData(nil, experiment))
+	h.ctx.GetAssignment("exp")
+	var armed = true
+	beforeSettleClaim = func() {
+		if armed {
+			armed = false
+			h.ctx.SetData(hoData(nil, replacement))
+			h.setUnit("user_id", hoUID)
+		}
+	}
+	defer func() { beforeSettleClaim = nil }()
+	expectValue(t, "default", h.variable("color"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	if exposures := queuedExposures(h.ctx); len(exposures) != 0 {
+		t.Fatalf("the replacement without the key was exposed: %+v", exposures)
+	}
+}
+
+// A context that had holdouts keeps building key sets after a public
+// SetDataFailed and a later install without holdouts.
+func TestHoldout_SetDataFailedKeepsTheKeySetGate(t *testing.T) {
+	var experiment = hoWithVariables(hoExperiment(1, "a", hoUnitType, 0), "v")
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+	h.ctx.SetDataFailed(errors.New("boom"))
+	h.ctx.SetData(hoData(nil, experiment))
+	if h.ctx.getAssignment("a").variableKeys == nil {
+		t.Fatal("SetDataFailed reset the key set gate")
+	}
+}
