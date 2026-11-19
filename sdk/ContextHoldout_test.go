@@ -3036,3 +3036,68 @@ func TestHoldout_RejectedReadIsNotRetried(t *testing.T) {
 	h.treatment("exp")
 	h.expectPending(2)
 }
+
+// A SetUnit that evicts an assignment resolved without its unit, landing
+// after a read resolved it and before the claim, makes the read serve and
+// expose the assignment with the unit.
+func TestHoldout_EvictionBeforeTheClaimServesTheResolvedAssignment(t *testing.T) {
+	for _, variable := range []bool{false, true} {
+		var experiment = hoExperiment(1, "exp", "user_id", 0, 11)
+		experiment.Split = []float64{0, 1}
+		experiment.Variants[0].Config = `{"v":"control"}`
+		experiment.Variants[1].Config = `{"v":"treatment"}`
+		var h = hoCreate(t, map[string]string{}, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_u", "user_id", hoSeedBHi, hoSeedBLo)}, experiment))
+		var armed = true
+		beforeSettleClaim = func() {
+			if armed {
+				armed = false
+				h.setUnit("user_id", hoUID)
+			}
+		}
+		if variable {
+			expectValue(t, "treatment", h.variable("v"))
+		} else {
+			expectInt(t, 1, h.treatment("exp"))
+		}
+		beforeSettleClaim = nil
+		var exposures = queuedExposures(h.ctx)
+		if len(exposures) != 2 || exposures[0].Name != "exp" || exposures[0].Variant != 1 || exposures[1].Id != 11 {
+			t.Fatalf("exposures %+v", exposures)
+		}
+	}
+}
+
+// A warmed, exposed read does no claim and no further resolution, so it
+// costs what a cached read did before holdouts.
+func TestHoldout_WarmedReadDoesNoClaim(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData(nil, hoWithVariables(hoExperiment(1, "exp", hoUnitType, 0), "color")))
+	h.treatment("exp")
+	h.variable("color")
+	var claims = 0
+	beforeSettleClaim = func() { claims++ }
+	defer func() { beforeSettleClaim = nil }()
+	for i := 0; i < 5; i++ {
+		h.treatment("exp")
+		h.variable("color")
+	}
+	expectInt(t, 0, claims)
+	if n := hoLeastAllocs(func() { _, _ = h.ctx.GetTreatment("exp") }); n > 2 {
+		t.Errorf("warmed GetTreatment: %.0f allocations", n)
+	}
+}
+
+// A claim that fails because the entry is already exposed reports queued,
+// so a read racing an exposure by another read does not retry; only a
+// retired entry reports retired.
+func TestHoldout_FailedClaimReportsRetiredOnlyWhenRetired(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.treatment("exp")
+	var entry = h.ctx.getAssignment("exp")
+	if got := h.ctx.queueExposure(entry.assignment, entry); got != exposureQueued {
+		t.Fatalf("exposed entry: got %v, want queued", got)
+	}
+	entry.retirement.Store(true)
+	if got := h.ctx.queueExposure(entry.assignment, entry); got != exposureRetired {
+		t.Fatalf("retired entry: got %v, want retired", got)
+	}
+}

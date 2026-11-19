@@ -728,6 +728,12 @@ func (c *Context) evictAssignmentsMissingUnit(unitType string) {
 			continue
 		}
 		if entry.missingUnit() && assignment.Exposed.CompareAndSwap(false, true) {
+			// Retired as well, under EventLock_ like a replacement, so a read
+			// that resolved this entry and has not claimed it yet resolves
+			// again and serves the assignment with the unit.
+			c.EventLock_.Lock()
+			entry.retirement.Store(true)
+			c.EventLock_.Unlock()
 			delete(c.assignmentCache_, name)
 			delete(c.AssignmentCache, name)
 		}
@@ -887,7 +893,10 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	var entry = c.settleExposure(experimentName, c.getAssignment(experimentName))
+	var entry = c.getAssignment(experimentName)
+	if !entry.assignment.Exposed.Load().(bool) {
+		entry = c.settleExposure(experimentName, entry)
+	}
 	return entry.assignment.Variant, nil
 }
 
@@ -1287,7 +1296,7 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 			continue
 		}
 
-		if expose {
+		if expose && !assignment.Exposed.Load().(bool) {
 			// A claim retired before it committed is exposed again on the
 			// replacement, whose variables are the ones served.
 			entry = c.settleExposure(experiment.Data.Name, entry)
