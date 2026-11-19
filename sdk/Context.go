@@ -727,13 +727,30 @@ func (c *Context) evictAssignmentsMissingUnit(unitType string) {
 		if assignment.UnitType != unitType {
 			continue
 		}
-		if entry.missingUnit() && assignment.Exposed.CompareAndSwap(false, true) {
-			// Retired as well, under EventLock_ like a replacement, so a read
-			// that resolved this entry and has not claimed it yet resolves
-			// again and serves the assignment with the unit.
-			c.EventLock_.Lock()
+		if !entry.missingUnit() {
+			continue
+		}
+		// Retired before the exposed flag is set, as a replacement does,
+		// so a read whose claim loses to this eviction always sees the
+		// retirement and resolves again with the unit. Both under
+		// EventLock_, so an admission commits before or sees it. An exposed
+		// assignment is kept, and stays unretired.
+		c.EventLock_.Lock()
+		var evict = !assignment.Exposed.Load().(bool)
+		if evict {
 			entry.retirement.Store(true)
-			c.EventLock_.Unlock()
+			evict = assignment.Exposed.CompareAndSwap(false, true)
+			if evict && afterEvictionClaim != nil {
+				afterEvictionClaim(entry)
+			}
+			if !evict {
+				// Claimed meanwhile by a read already past the lock-free CAS:
+				// that read holds the claim and admits it; keep the entry.
+				entry.retirement.Store(false)
+			}
+		}
+		c.EventLock_.Unlock()
+		if evict {
 			delete(c.assignmentCache_, name)
 			delete(c.AssignmentCache, name)
 		}
@@ -922,6 +939,10 @@ func (c *Context) settleExposure(experimentName string, entry *cachedAssignment)
 		entry = c.getAssignment(experimentName)
 	}
 }
+
+// afterEvictionClaim, when set by a test, runs right after an eviction marks
+// an entry exposed, with EventLock_ held.
+var afterEvictionClaim func(*cachedAssignment)
 
 // beforeSettleClaim, when set by a test, runs before each claim in
 // settleExposure, between resolving the assignment and claiming its exposure.

@@ -3101,3 +3101,26 @@ func TestHoldout_FailedClaimReportsRetiredOnlyWhenRetired(t *testing.T) {
 		t.Fatalf("retired entry: got %v, want retired", got)
 	}
 }
+
+// An eviction marks the entry retired before it marks it exposed, so a
+// read whose claim loses to the eviction always finds the retirement and
+// resolves again: it never serves the evicted variant without an exposure.
+// The read's claim is replayed at the exact point the eviction has flipped
+// the exposed flag.
+func TestHoldout_ClaimLosingToAnEvictionSeesTheRetirement(t *testing.T) {
+	var experiment = hoExperiment(1, "exp", "user_id", 0, 11)
+	experiment.Split = []float64{0, 1}
+	var h = hoCreate(t, map[string]string{}, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_u", "user_id", hoSeedBHi, hoSeedBLo)}, experiment))
+	var entry = h.ctx.getAssignment("exp")
+	var status exposureStatus
+	afterEvictionClaim = func(evicted *cachedAssignment) {
+		if evicted == entry {
+			status = h.ctx.queueExposure(entry.assignment, entry)
+		}
+	}
+	defer func() { afterEvictionClaim = nil }()
+	h.setUnit("user_id", hoUID)
+	if status != exposureRetired {
+		t.Fatalf("a claim losing to the eviction reported %v, want retired", status)
+	}
+}
