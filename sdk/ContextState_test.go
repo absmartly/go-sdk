@@ -998,3 +998,113 @@ func TestDeserializerThatLogsEventsWithLoggerDoesNotDeadlock(t *testing.T) {
 		}
 	}
 }
+
+// The evaluator bookkeeping is only for a custom deserializer with a logger;
+// the default deserializer, or no logger, registers nothing. Registration is
+// observed through the per-context evaluation counter while an audience is
+// evaluated (a wrapping deserializer records it for the default case).
+type countingDeserializer struct {
+	inner AudienceDeserializer
+	st    *contextState
+	seen  int32
+}
+
+func (d *countingDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	if d.st != nil {
+		atomic.StoreInt32(&d.seen, atomic.LoadInt32(&d.st.evaluatorCount))
+	}
+	return d.inner.Deserialize(b, offset, length)
+}
+
+func TestAudienceEvaluatorBookkeepingIsGated(t *testing.T) {
+	for _, logger := range []bool{false, true} {
+		var d = &countingDeserializer{inner: DefaultAudienceDeserializer{}}
+		var client = &systemAttrClient{application: "website", environment: "production"}
+		var config = ABsmartlyConfig{Client_: client,
+			ContextDataProvider_: DefaultContextDataProvider{client_: client},
+			ContextEventHandler_: DefaultContextEventHandler{client_: client}, AudienceDeserializer_: d}
+		if logger {
+			config.ContextEventLogger_ = &MockEventLogger{}
+		}
+		var cc = CreateDefaultContextConfig()
+		cc.Units_, cc.PublishDelay_, cc.RefreshInterval_ = withUnit(), -1, -1
+		var ctx = Create(config).CreateContextWith(cc, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+			audienceExperiment("exp_app", appFilter, true)}})
+		ctx.WaitUntilReady()
+		d.st = ctx.state()
+		assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
+		var want int32
+		if logger {
+			want = 1
+		}
+		if got := atomic.LoadInt32(&d.seen); got != want {
+			t.Errorf("custom deserializer, logger=%v: evaluatorCount during evaluation = %d, want %d", logger, got, want)
+		}
+		assertAny(int32(0), atomic.LoadInt32(&d.st.evaluatorCount), t)
+	}
+	// The default deserializer never re-enters, so it never registers.
+	var abs = Create(ABsmartlyConfig{AudienceDeserializer_: DefaultAudienceDeserializer{}, ContextEventLogger_: &MockEventLogger{}})
+	assertAny(false, abs.CreateContextWith(CreateDefaultContextConfig(), jsonmodels.ContextData{}).AudienceMatcher_.customDeserializer(), t)
+	assertAny(false, AudienceMatcher{}.customDeserializer(), t)
+	assertAny(false, AudienceMatcher{&DefaultAudienceDeserializer{}}.customDeserializer(), t)
+	assertAny(true, AudienceMatcher{&countingDeserializer{}}.customDeserializer(), t)
+}
+
+// Another goroutine's logger must not read the context without its lock
+// while an evaluation holds it: only the evaluating goroutine skips the lock.
+func TestOnlyTheEvaluatingGoroutineSkipsTheSnapshotLock(t *testing.T) {
+	var d = &callingDeserializer{}
+	var logger = &MockEventLogger{}
+	var client = &systemAttrClient{application: "website", environment: "production"}
+	var ctx = Create(ABsmartlyConfig{Client_: client,
+		ContextDataProvider_:  DefaultContextDataProvider{client_: client},
+		ContextEventHandler_:  DefaultContextEventHandler{client_: client},
+		AudienceDeserializer_: d, ContextEventLogger_: logger}).CreateContextWith(func() ContextConfig {
+		var cc = CreateDefaultContextConfig()
+		cc.Units_, cc.PublishDelay_, cc.RefreshInterval_ = withUnit(), -1, -1
+		return cc
+	}(), jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{audienceExperiment("exp_app", appFilter, true)}})
+	ctx.WaitUntilReady()
+	var entered, release = make(chan struct{}), make(chan struct{})
+	d.mu.Lock()
+	d.ctx = ctx
+	d.call = func(*Context) {
+		close(entered)
+		<-release
+	}
+	d.mu.Unlock()
+	var evaluated = make(chan struct{})
+	go func() {
+		_, _ = ctx.PeekTreatment("exp_app")
+		close(evaluated)
+	}()
+	<-entered
+	var tracked = make(chan struct{})
+	go func() {
+		_ = ctx.Track("other goroutine", nil)
+		close(tracked)
+	}()
+	select {
+	case <-tracked:
+		close(release)
+		t.Fatal("another goroutine's Track logged while the evaluation held ContextLock_")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	<-evaluated
+	<-tracked
+}
+
+func TestAudienceEvaluationRegistrationNestsAndClears(t *testing.T) {
+	var st = newContextState()
+	var outer = st.enterAudienceEvaluation()
+	var inner = st.enterAudienceEvaluation()
+	assertAny(int32(2), atomic.LoadInt32(&st.evaluatorCount), t)
+	inner()
+	assertAny(true, st.isAudienceEvaluator(), t)
+	outer()
+	assertAny(false, st.isAudienceEvaluator(), t)
+	assertAny(int32(0), atomic.LoadInt32(&st.evaluatorCount), t)
+	var _, left = st.audienceEvaluators.Load(goroutineID())
+	assertAny(false, left, t)
+}

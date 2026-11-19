@@ -43,6 +43,16 @@ func (am AudienceMatcher) Evaluate(audience string, attributes map[string]interf
 	return Result{}, errors.New("can't evaluate data")
 }
 
+// customDeserializer reports whether evaluating an audience runs customer
+// code, which may call back into the context.
+func (am AudienceMatcher) customDeserializer() bool {
+	switch am.Deserializer_.(type) {
+	case nil, DefaultAudienceDeserializer, *DefaultAudienceDeserializer:
+		return false
+	}
+	return true
+}
+
 func (am AudienceMatcher) deserializer() AudienceDeserializer {
 	if am.Deserializer_ == nil {
 		return DefaultAudienceDeserializer{}

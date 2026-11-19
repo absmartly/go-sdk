@@ -132,8 +132,9 @@ type contextState struct {
 	assignmentCache_ map[string]*cachedAssignment
 	ruleIdentities   *ruleAssignmentIdentities
 
-	// audienceEvaluators counts, per goroutine, the audience or rule
-	// evaluations it is running while holding ContextLock_ (read or write);
+	// audienceEvaluators counts, per goroutine, the audience evaluations with
+	// a custom deserializer it is running while holding ContextLock_ (read or
+	// write);
 	// evaluatorCount is their total, so snapshot pays nothing when it is 0.
 	// snapshot skips ContextLock_ for those goroutines: v1.1.1 handed loggers
 	// the context without locking, so a deserializer that logs an event
@@ -338,8 +339,14 @@ func (st *contextState) enterAudienceEvaluation() func() {
 // ContextLock_, recording the goroutine so a snapshot taken by an event the
 // AudienceDeserializer logs does not lock it again (a second read lock would
 // wait behind a queued writer).
+//
+// Only a custom deserializer can call back into the context, and only a
+// configured logger takes a snapshot, so the bookkeeping (a goroutine id
+// lookup) is done just then; the ordinary path pays nothing.
 func (c *Context) evaluateAudienceLocked(st *contextState, audience string, attrs map[string]interface{}) (Result, error) {
-	defer st.enterAudienceEvaluation()()
+	if c.EventLogger_ != nil && c.AudienceMatcher_.customDeserializer() {
+		defer st.enterAudienceEvaluation()()
+	}
 	return c.AudienceMatcher_.Evaluate(audience, attrs)
 }
 
@@ -723,7 +730,8 @@ func (c *Context) snapshot() Context {
 	c = c.live()
 	var st = c.state()
 	// The goroutine evaluating an audience under ContextLock_ already holds
-	// it for writing, so its fields are stable; re-locking would deadlock.
+	// it (for reading or writing), so its fields are stable; locking it again
+	// would deadlock.
 	if c.ContextLock_ != nil && !st.isAudienceEvaluator() {
 		c.ContextLock_.RLock()
 		defer c.ContextLock_.RUnlock()
@@ -1785,9 +1793,7 @@ func (c *Context) resolveRule(st *contextState, data jsonmodels.Experiment, rule
 		return nil
 	}
 
-	var done = st.enterAudienceEvaluation()
 	var action = c.AudienceMatcher_.evaluateRules(rules.parsed, st.environment_, c.evaluationAttributesWithState(st))
-	done()
 	if action == nil {
 		return nil
 	}
