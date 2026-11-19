@@ -903,14 +903,20 @@ const maxExposureAttempts = 3
 // replacement that was exposed, or on exhaustion the last one tried. It holds
 // no lock itself, so loggers run after admit released its locks.
 func (c *Context) settleExposure(experimentName string, entry *cachedAssignment) *cachedAssignment {
-	for attempt := 1; !entry.assignment.Exposed.Load().(bool); attempt++ {
+	for attempt := 1; ; attempt++ {
+		if beforeSettleClaim != nil {
+			beforeSettleClaim()
+		}
 		if c.queueExposure(entry.assignment, entry) != exposureRetired || attempt >= maxExposureAttempts {
-			break
+			return entry
 		}
 		entry = c.getAssignment(experimentName)
 	}
-	return entry
 }
+
+// beforeSettleClaim, when set by a test, runs before each claim in
+// settleExposure, between resolving the assignment and claiming its exposure.
+var beforeSettleClaim func()
 
 // QueueExposure queues the assignment's exposure once, then the exposures of
 // the holdouts covering it that are not exposed yet, in holdout id order. A
@@ -951,6 +957,11 @@ const (
 func (c *Context) queueExposure(assignment *Assignment, entry *cachedAssignment) exposureStatus {
 	c = c.live()
 	if !assignment.Exposed.CompareAndSwap(false, true) {
+		// Already exposed, or retired by a replacement that landed after the
+		// read resolved this entry and before it claimed it.
+		if entry != nil && entry.retirement.Load() {
+			return exposureRetired
+		}
 		return exposureQueued
 	}
 	return c.admitExposure(assignment, entry)

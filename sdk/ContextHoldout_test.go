@@ -2975,3 +2975,64 @@ func TestHoldout_RetiredReadRetriesAreBounded(t *testing.T) {
 type hoClockFunc func() int64
 
 func (f hoClockFunc) Millis() int64 { return f() }
+
+// A replacement that lands after a read resolved its assignment and before
+// it claimed the exposure retires the entry the read holds: the read
+// serves and exposes the replacement instead.
+func TestHoldout_ReplacementBeforeTheClaimServesTheReplacement(t *testing.T) {
+	for _, covered := range []bool{true, false} {
+		for _, variable := range []bool{false, true} {
+			var experiment = hoExperiment(1, "exp", hoUnitType, 0)
+			experiment.Split = []float64{1, 0}
+			experiment.Variants[0].Config = `{"v":"old"}`
+			experiment.Variants[1].Config = `{"v":"new"}`
+			if covered {
+				experiment.HoldoutIds = []int{11}
+			}
+			var replacement = experiment
+			replacement.Iteration = 2
+			replacement.Split = []float64{0, 1}
+			replacement.HoldoutIds = []int{11}
+			var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+			var armed = true
+			beforeSettleClaim = func() {
+				if armed {
+					armed = false
+					h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
+					h.ctx.GetAssignment("exp")
+				}
+			}
+			if variable {
+				expectValue(t, "new", h.variable("v"))
+			} else {
+				expectInt(t, 1, h.treatment("exp"))
+			}
+			beforeSettleClaim = nil
+			if armed {
+				t.Fatal("the hook did not run")
+			}
+			var exposures = queuedExposures(h.ctx)
+			if len(exposures) != 2 || exposures[0].Name != "exp" || exposures[0].Variant != 1 || exposures[1].Id != 11 {
+				t.Fatalf("exposures %+v", exposures)
+			}
+		}
+	}
+}
+
+// A close that rejects a read's exposure is not retried: the read claims
+// its assignment once, and the rolled-back exposure stays retryable.
+func TestHoldout_RejectedReadIsNotRetried(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	var claims = 0
+	beforeSettleClaim = func() {
+		claims++
+		h.ctx.Closing_.Store(true)
+	}
+	h.treatment("exp")
+	beforeSettleClaim = nil
+	h.ctx.Closing_.Store(false)
+	expectInt(t, 1, claims)
+	h.expectPending(0)
+	h.treatment("exp")
+	h.expectPending(2)
+}
