@@ -1451,7 +1451,8 @@ func (c *Context) RefreshAsync() *future.Future {
 	c.RefreshFuture_ = tempfuture
 	st.stateLock_.Unlock()
 
-	c.callDataProvider().Listen(func(value future.Value, err error) {
+	var loaded = c.callDataProvider()
+	var complete = func(value future.Value, err error) {
 		// Whatever happens below, the refresh ends: Refreshing_ is cleared and
 		// the future settles, so later refreshes are not blocked for ever.
 		var outcome = err
@@ -1482,7 +1483,16 @@ func (c *Context) RefreshAsync() *future.Future {
 			c.LogError(outcome)
 		}
 		donefun(nil, outcome)
-	})
+	}
+	if st.isAudienceEvaluator() {
+		// The evaluator holds ContextLock_. Wait for transport here, then
+		// install and log on this goroutine, whose snapshot already owns the
+		// lock. Never make another goroutine bypass the lock.
+		value, err := loaded.Get(context.Background())
+		complete(value, err)
+	} else {
+		loaded.Listen(complete)
+	}
 	return tempfuture
 }
 
@@ -2316,6 +2326,20 @@ func (c *Context) logEvent(event EventType, data interface{}) {
 // logger goes through here, including the ones made while a
 // context is being created or its data parsed, so a logger can never end the
 // host process or abort the SDK code that reports to it.
+// logSnapshot delivers a snapshot captured by the calling evaluator, rather
+// than acquiring ContextLock_ on the transport completion goroutine.
+func (c *Context) logSnapshot(snapshot Context, event EventType, data interface{}) {
+	if snapshot.EventLogger_ == nil {
+		return
+	}
+	var st = snapshot.state()
+	if st.loggers_ != nil {
+		var id = st.loggers_.enter()
+		defer st.loggers_.exit(id)
+	}
+	notifyLogger(snapshot.EventLogger_, snapshot, event, data)
+}
+
 func notifyLogger(logger ContextEventLogger, ctx Context, event EventType, data interface{}) {
 	if logger == nil {
 		return
@@ -2397,7 +2421,10 @@ func (c *Context) Flush() *future.Future {
 			event.Hashed = true
 			event.PublishedAt = c.Clock_.Millis()
 
-			c.ContextLock_.Lock()
+			var evaluator = st.isAudienceEvaluator()
+			if !evaluator {
+				c.ContextLock_.Lock()
+			}
 			var entrySet []interface{}
 			for key, value := range c.Units_ {
 				entrySet = append(entrySet, Pair{a: key, b: value})
@@ -2417,10 +2444,27 @@ func (c *Context) Flush() *future.Future {
 					event.Attributes[key] = value.(jsonmodels.Attribute)
 				}
 			}
-			c.ContextLock_.Unlock()
+			if !evaluator {
+				c.ContextLock_.Unlock()
+			}
 			event.Goals = achievements
 			event.Exposures = exposures
 
+			// Capture callback data while the caller can safely snapshot. A
+			// transport completion on another goroutine must not snapshot a
+			// context whose evaluator is waiting here for Publish to finish.
+			var callbackContext *Context
+			if evaluator {
+				var snapshot = c.snapshot()
+				callbackContext = &snapshot
+			}
+			var log = func(kind EventType, data interface{}) {
+				if callbackContext == nil {
+					c.logEvent(kind, data)
+					return
+				}
+				c.logSnapshot(*callbackContext, kind, data)
+			}
 			c.callPublisher(event).Listen(
 				func(value future.Value, err error) {
 					// The publisher may return a future that is already complete,
@@ -2432,10 +2476,10 @@ func (c *Context) Flush() *future.Future {
 						// Start the logger first: settledDone runs Close's listeners
 						// synchronously, and a panic there must not leave the
 						// caller's future unsettled.
-						runLogger(done, nil, func() { c.logEvent(Publish, event) })
+						runLogger(done, nil, func() { log(Publish, event) })
 					} else {
 						c.requeueEvents(exposures, achievements, eventCount)
-						runLogger(done, err, func() { c.logEvent(Error, err) })
+						runLogger(done, err, func() { log(Error, err) })
 					}
 					st.removeInflight(settled)
 					settledDone(nil, err)

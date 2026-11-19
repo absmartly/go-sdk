@@ -1023,6 +1023,7 @@ func TestAudienceEvaluatorBookkeepingIsGated(t *testing.T) {
 	}{
 		{"nil deserializer, logger", nil, true, false},
 		{"default deserializer, logger", DefaultAudienceDeserializer{}, true, false},
+		{"pointer default deserializer, logger", &DefaultAudienceDeserializer{}, true, false},
 		{"custom deserializer, no logger", &countingDeserializer{inner: DefaultAudienceDeserializer{}}, false, true},
 		{"custom deserializer, logger", &countingDeserializer{inner: DefaultAudienceDeserializer{}}, true, true},
 	}
@@ -1171,4 +1172,82 @@ func TestAudienceEvaluationRegistrationNestsAndClears(t *testing.T) {
 	assertAny(int32(0), atomic.LoadInt32(&st.evaluatorCount), t)
 	var _, left = st.audienceEvaluators.Load(goroutineID())
 	assertAny(false, left, t)
+}
+
+func TestDeserializerCanRefreshWithAsyncProvider(t *testing.T) {
+	for _, withLogger := range []bool{false, true} {
+		var d = &snapshotCallingDeserializer{}
+		var client = &fetchClient{systemAttrClient: systemAttrClient{application: "website", environment: "production"},
+			data: jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{audienceExperiment("exp_app", appFilter, true)}}}
+		var cfg = ABSmartlyConfig{Client_: client, ContextDataProvider_: DefaultContextDataProvider{client_: client},
+			ContextEventHandler_: DefaultContextEventHandler{client_: client}, AudienceDeserializer_: d}
+		if withLogger {
+			cfg.ContextEventLogger_ = &MockEventLogger{}
+		}
+		var cc = CreateDefaultContextConfig()
+		cc.Units_, cc.PublishDelay_, cc.RefreshInterval_ = withUnit(), -1, -1
+		var ctx = Create(cfg).CreateContextWith(cc, client.data)
+		ctx.WaitUntilReady()
+		d.ctx = ctx
+		var done = make(chan int, 1)
+		go func() { v, _ := ctx.PeekTreatment("exp_app"); done <- v }()
+		select {
+		case v := <-done:
+			assertAny(1, v, t)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("async Refresh deadlocked, logger=%v", withLogger)
+		}
+	}
+}
+
+func TestDeserializerCanPublishQueuedEvents(t *testing.T) {
+	for _, withLogger := range []bool{false, true} {
+		for _, async := range []bool{false, true} {
+			var d = &callingDeserializer{}
+			var publisher = &CapturingPublishClient{}
+			var logger = &MockEventLogger{}
+			var cfg = ABSmartlyConfig{ContextDataProvider_: syncDataProvider{},
+				ContextEventHandler_: DefaultContextEventHandler{client_: publisher}, AudienceDeserializer_: d}
+			if withLogger {
+				cfg.ContextEventLogger_ = logger
+			}
+			var cc = CreateDefaultContextConfig()
+			cc.Units_, cc.PublishDelay_, cc.RefreshInterval_ = withUnit(), -1, -1
+			var ctx = Create(cfg).CreateContextWith(cc, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true)}})
+			ctx.WaitUntilReady()
+			assertAny(nil, ctx.Track("goal", map[string]interface{}{"value": 1}), t)
+			var result = make(chan error, 1)
+			d.ctx = ctx
+			d.call = func(c *Context) {
+				if async {
+					f, err := c.PublishAsync()
+					if err == nil {
+						_, err = f.Get(context.Background())
+					}
+					result <- err
+				} else {
+					result <- c.Publish()
+				}
+			}
+			var done = make(chan struct{})
+			go func() { ctx.PeekTreatment("exp_app"); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("Publish deadlocked, logger=%v async=%v", withLogger, async)
+			}
+			assertAny(nil, <-result, t)
+			assertAny(1, len(publisher.publishEvents), t)
+			assertAny("goal", publisher.publishEvents[0].Goals[0].Name, t)
+			if withLogger {
+				var n int
+				for _, e := range logger.GetEvents() {
+					if e.EventType == Publish {
+						n++
+					}
+				}
+				assertAny(1, n, t)
+			}
+		}
+	}
 }
