@@ -588,3 +588,41 @@ func TestSwitchbackCluster_PointerAndInterfaceCyclesHaveNoKey(t *testing.T) {
 	}
 	expectValue(t, "Porto", parseSwitchbackPath("city").resolveAttribute(chain))
 }
+
+type sbPointerCity string
+
+func (c *sbPointerCity) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]string{"city": string(*c)})
+}
+
+type sbPointerText string
+
+func (c *sbPointerText) MarshalText() ([]byte, error) {
+	return []byte("text-" + string(*c)), nil
+}
+
+// A path is read through the attribute's published JSON shape: encoding/json
+// encodes an addressable slice element through its pointer type's
+// marshaler, so the path reads that encoding. An array or map value element
+// is not addressable, and is encoded and read as itself.
+func TestSwitchbackCluster_TypedSliceElementsAreReadAsPublished(t *testing.T) {
+	for _, c := range []struct {
+		path  string
+		value interface{}
+		key   string
+	}{
+		{"items/0/city", []sbPointerCity{"Porto"}, "Porto"},
+		{"geo/items/0/city", map[string]interface{}{"items": []sbPointerCity{"Faro"}}, "Faro"},
+		{"geo/items/0/text", map[string]interface{}{"items": []map[string]sbPointerText{{"text": "x"}}}, "x"},
+		{"geo/items/1/city", map[string]interface{}{"items": []sbPointerCity{"Faro", "Beja"}}, "Beja"},
+	} {
+		var published, _ = json.Marshal(c.value)
+		if got := parseSwitchbackPath(c.path).resolveAttribute(c.value); got != c.key {
+			t.Errorf("%s over %s: %q, want %q", c.path, published, got, c.key)
+		}
+	}
+	// Through a context: the cluster served is the published one.
+	var h = sbCreateBare(t, map[string]string{sbUnitType: sbUID}, sbData(sbAttributeSwitchback("items/0/city")))
+	h.setAttribute("items", []sbPointerCity{"Porto"})
+	expectValue(t, sbExpectedSchedule("Porto"), h.peekSchedule("exp_sb", sbHour, 12))
+}

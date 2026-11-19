@@ -157,7 +157,7 @@ func switchbackStep(current interface{}, key string, index int, isIndex bool) in
 	}
 	if isIndex {
 		if (value.Kind() == reflect.Slice || value.Kind() == reflect.Array) && index < value.Len() {
-			return value.Index(index).Interface()
+			return jsonElement(value.Index(index))
 		}
 		return nil
 	}
@@ -168,6 +168,20 @@ func switchbackStep(current interface{}, key string, index int, isIndex bool) in
 		}
 	}
 	return nil
+}
+
+// jsonElement is a container element as encoding/json encodes it: an
+// addressable element (a slice's) whose pointer type has a JSON or text
+// marshaler is encoded through that marshaler, so the element is read
+// through its address.
+func jsonElement(element reflect.Value) interface{} {
+	if element.Kind() != reflect.Ptr && element.Kind() != reflect.Interface && element.CanAddr() {
+		var pointer = element.Addr()
+		if pointer.Type().Implements(jsonMarshalerType) || pointer.Type().Implements(textMarshalerType) {
+			return pointer.Interface()
+		}
+	}
+	return element.Interface()
 }
 
 // switchbackJSONView is the value as a JSON reader would see it: pointers

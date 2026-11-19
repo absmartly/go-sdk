@@ -2050,3 +2050,59 @@ func TestSwitchback_RetriedReadStampsAFreshReading(t *testing.T) {
 	h.expectPublished(jsonmodels.Exposure{Id: 1, Name: "exp_sb", Unit: sbUnitType, Variant: 1, ExposedAt: sbAnchor + 20*sbHour + 7,
 		Eligible: true, Overridden: true})
 }
+
+// A read that claims an overridden no-unit switchback before SetUnit's
+// eviction keeps its claim: the eviction restores the retirement, keeps the
+// slot, and the read's admission queues the exposure.
+func TestSwitchback_ReadClaimingBeforeTheSetUnitEvictionKeepsItsClaim(t *testing.T) {
+	var h = sbCreateAt(t, sbAnchor+5, nil, sbData(sbDefault(2, sbHour)), sbOverride("exp_sb", 1))
+	var entry = h.ctx.getAssignment("exp_sb")
+	var claimed bool
+	beforeEvictionClaim = func(evicting *cachedAssignment) {
+		if evicting == entry {
+			claimed = entry.assignment.Exposed.CompareAndSwap(false, true)
+		}
+	}
+	if err := h.ctx.SetUnit(sbUnitType, sbUID); err != nil {
+		t.Fatal(err)
+	}
+	beforeEvictionClaim = nil
+	if !claimed {
+		t.Fatal("the read did not claim")
+	}
+	if entry.retirement.Load() {
+		t.Fatal("the eviction left a claimed slot retired")
+	}
+	if got := h.ctx.admitExposure(entry.assignment, entry); got != exposureQueued {
+		t.Fatalf("admission reported %v, want queued", got)
+	}
+	h.expectPending(1)
+	h.ctx.ContextLock_.RLock()
+	var cached = h.ctx.cachedEntryFor(entry.assignment)
+	h.ctx.ContextLock_.RUnlock()
+	if cached != entry {
+		t.Fatal("the claimed slot was evicted")
+	}
+}
+
+// SetUnit's eviction of an overridden no-unit switchback retires the slot
+// before claiming it: a claim replayed right after reports retired.
+func TestSwitchback_SetUnitEvictionRetiresBeforeTheClaim(t *testing.T) {
+	var h = sbCreateAt(t, sbAnchor+5, nil, sbData(sbDefault(2, sbHour)), sbOverride("exp_sb", 1))
+	var entry = h.ctx.getAssignment("exp_sb")
+	var status = exposureQueued
+	var ran bool
+	afterEvictionClaim = func(evicted *cachedAssignment) {
+		if evicted == entry {
+			ran = true
+			status = h.ctx.queueExposure(entry.assignment, entry)
+		}
+	}
+	if err := h.ctx.SetUnit(sbUnitType, sbUID); err != nil {
+		t.Fatal(err)
+	}
+	afterEvictionClaim = nil
+	if !ran || status != exposureRetired {
+		t.Fatalf("hook ran %v, status %v; want a retired claim", ran, status)
+	}
+}

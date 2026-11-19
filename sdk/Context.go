@@ -762,6 +762,9 @@ func (c *Context) evictAssignmentsMissingUnit(unitType string) {
 					beforeEvictionClaim(entry)
 				}
 				evict = assignment.Exposed.CompareAndSwap(false, true)
+				if evict && afterEvictionClaim != nil {
+					afterEvictionClaim(entry)
+				}
 				if !evict {
 					entry.retirement.Store(false)
 				}
