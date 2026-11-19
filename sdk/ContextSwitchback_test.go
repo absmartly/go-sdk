@@ -1833,3 +1833,94 @@ func TestSwitchback_SamePeriodReplacementKeepsHeldSlotMetadata(t *testing.T) {
 		}
 	}
 }
+
+// A covered unit decision replaced by a switchback, and a switchback replaced
+// by a covered unit decision, retire the old decision: a caller holding it
+// publishes nothing beside its replacement, as for any replacement that
+// involves holdouts.
+func TestSwitchback_ReplacementAcrossRandomizationRetiresTheHeldDecision(t *testing.T) {
+	var holdout = jsonmodels.Holdout{Id: 11, Name: "holdout_a", UnitType: sbUnitType, Iteration: 1, SeedHi: 13, SeedLo: 111,
+		Split: []float64{0, 1}}
+	var unit = sbUnit(sbDefault(2, sbHour))
+	unit.HoldoutIds = []int{11}
+	var covered = sbData(unit)
+	covered.Holdouts = []jsonmodels.Holdout{holdout}
+	var switchback = sbData(sbDefault(2, sbHour))
+	switchback.Holdouts = []jsonmodels.Holdout{holdout}
+
+	// Covered unit, then a switchback.
+	var h = sbCreate(t, covered)
+	h.at(sbAnchor + 5)
+	var held = h.ctx.GetAssignment("exp_sb")
+	h.refreshData(switchback)
+	h.ctx.GetAssignment("exp_sb")
+	h.ctx.QueueExposure(held)
+	h.expectPending(0)
+
+	// A switchback, then a covered unit.
+	h = sbCreate(t, switchback)
+	h.at(sbAnchor + 5)
+	held = h.ctx.GetAssignment("exp_sb")
+	h.refreshData(covered)
+	h.ctx.GetAssignment("exp_sb")
+	h.ctx.QueueExposure(held)
+	h.expectPending(0)
+}
+
+// A slot claimed, aged out of the retired window and then rejected by a
+// close stays retired: QueueExposure cannot reopen and publish it.
+func TestSwitchback_ExpiredSlotRejectedByACloseStaysRetired(t *testing.T) {
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+	h.at(sbAnchor + 5)
+	var entry = h.ctx.getAssignment("exp_sb")
+	if !entry.assignment.Exposed.CompareAndSwap(false, true) {
+		t.Fatal("not claimed")
+	}
+	for i := int64(1); i < 20; i++ {
+		h.at(sbAnchor + i*sbHour).ctx.GetAssignment("exp_sb")
+	}
+	h.ctx.Closing_.Store(true)
+	h.ctx.admitExposure(entry.assignment, entry)
+	h.ctx.Closing_.Store(false)
+	h.ctx.QueueExposure(entry.assignment)
+	h.expectPending(0)
+}
+
+// A held slot stays findable across several period rolls inside the
+// retired window, so its exposure keeps its own period's stamp.
+func TestSwitchback_HeldSlotIsFoundAcrossSeveralPeriodRolls(t *testing.T) {
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+	h.at(sbAnchor + 5)
+	var held = h.ctx.GetAssignment("exp_sb")
+	for i := int64(1); i <= 4; i++ {
+		h.at(sbAnchor + i*sbHour).ctx.GetAssignment("exp_sb")
+	}
+	h.ctx.QueueExposure(held)
+	h.expectPublished(sbExposure(1, "exp_sb", sbExpected2Arms[0], sbAnchor+5, true, true))
+}
+
+// A covered unit decision whose exposure is in flight when a switchback
+// replaces it stays retired after a close rejects that admission.
+func TestSwitchback_InFlightDecisionReplacedByASwitchbackStaysRetired(t *testing.T) {
+	var holdout = jsonmodels.Holdout{Id: 11, Name: "holdout_a", UnitType: sbUnitType, Iteration: 1, SeedHi: 13, SeedLo: 111,
+		Split: []float64{0, 1}}
+	var unit = sbUnit(sbDefault(2, sbHour))
+	unit.HoldoutIds = []int{11}
+	var covered = sbData(unit)
+	covered.Holdouts = []jsonmodels.Holdout{holdout}
+	var switchback = sbData(sbDefault(2, sbHour))
+	switchback.Holdouts = []jsonmodels.Holdout{holdout}
+	var h = sbCreate(t, covered)
+	h.at(sbAnchor + 5)
+	var entry = h.ctx.getAssignment("exp_sb")
+	if !entry.assignment.Exposed.CompareAndSwap(false, true) {
+		t.Fatal("not claimed")
+	}
+	h.refreshData(switchback)
+	h.ctx.GetAssignment("exp_sb")
+	h.ctx.Closing_.Store(true)
+	h.ctx.admitExposure(entry.assignment, entry)
+	h.ctx.Closing_.Store(false)
+	h.ctx.QueueExposure(entry.assignment)
+	h.expectPending(0)
+}

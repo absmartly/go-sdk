@@ -163,10 +163,6 @@ type Context struct {
 	// QueueExposure still finds the slot of an assignment a caller holds.
 	// Guarded by ContextLock_.
 	retiredSwitchbackSlots_ map[string][]*cachedAssignment
-
-	// switchbackSlotsSeen_ is set once a switchback slot was cached, so
-	// QueueExposure only looks one up after that. Nil on a Context literal.
-	switchbackSlotsSeen_ *atomic.Bool
 }
 
 // contextIndex is an installed experiment index and, by experiment name, the
@@ -400,7 +396,6 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	cntx.assignmentCache_ = map[string]*cachedAssignment{}
 	cntx.index_ = &atomic.Pointer[contextIndex]{}
 	cntx.holdoutsSeen_ = &atomic.Bool{}
-	cntx.switchbackSlotsSeen_ = &atomic.Bool{}
 	cntx.unitValues_ = map[string]interface{}{}
 	cntx.readyDeliverer_ = &atomic.Uint64{}
 	cntx.loggers_ = &loggerGoroutines{ids: map[uint64]int{}}
@@ -2063,6 +2058,7 @@ func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cach
 		// for QueueExposure on an Assignment the caller still holds.
 		c.retireSwitchbackSlot(experimentName, slot.key)
 	}
+	c.retireAcrossRandomization(experimentName, slot, entry)
 	c.assignmentCache_[slot.key] = entry
 	if entry.switchback != nil {
 		c.retainSwitchbackSlot(experimentName, indexed, slot)

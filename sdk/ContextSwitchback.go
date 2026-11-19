@@ -223,11 +223,6 @@ func (c *Context) switchbackEpochStale(experimentName string, indexed *indexedEx
 	return epoch != nil && (indexed == nil || indexed.switchback == nil || epoch.generation != indexed.switchback.generation)
 }
 
-// hasSwitchbackSlots reports whether a switchback slot was ever cached.
-func (c *Context) hasSwitchbackSlots() bool {
-	return c.switchbackSlotsSeen_ != nil && c.switchbackSlotsSeen_.Load()
-}
-
 // dropSwitchbackEpoch drops every slot of an experiment's epoch, the one
 // without a period included. The caller holds ContextLock_ for writing.
 func (c *Context) dropSwitchbackEpoch(experimentName string) {
@@ -240,6 +235,42 @@ func (c *Context) dropSwitchbackEpoch(experimentName string) {
 		c.retireSwitchbackSlot(experimentName, switchbackSlotKey(experimentName, period))
 	}
 	c.retireSwitchbackSlot(experimentName, experimentName)
+}
+
+// retireAcrossRandomization retires a covered decision replaced across the
+// randomization boundary, which the same-key replacement in getAssignmentAt
+// does not see: a unit entry lives under the experiment name and a switchback
+// slot under name and period. A covered unit decision replaced by a
+// switchback slot, and a switchback slot replaced by a covered unit decision,
+// are superseded like any replacement involving holdouts: a caller still
+// holding the old one must not publish it beside its replacement. The caller
+// holds ContextLock_ for writing.
+func (c *Context) retireAcrossRandomization(experimentName string, slot assignmentSlot, entry *cachedAssignment) {
+	var retire = func(old *cachedAssignment) {
+		old.retirement.Store(true)
+		old.assignment.Exposed.CompareAndSwap(false, true)
+	}
+	if entry.switchback != nil {
+		if old, found := c.assignmentCache_[experimentName]; found && slot.key != experimentName &&
+			old.switchback == nil && old.holdouts != nil {
+			retire(old)
+			delete(c.assignmentCache_, experimentName)
+		}
+		return
+	}
+	if entry.holdouts == nil {
+		return
+	}
+	if epoch := c.switchbackEpochs_[experimentName]; epoch != nil {
+		for _, period := range epoch.periods {
+			if old, found := c.assignmentCache_[switchbackSlotKey(experimentName, period)]; found {
+				retire(old)
+			}
+		}
+	}
+	for _, old := range c.retiredSwitchbackSlots_[experimentName] {
+		retire(old)
+	}
 }
 
 // retireSwitchbackSlot removes a cached switchback slot and remembers it in
@@ -285,9 +316,6 @@ func (c *Context) retainSwitchbackSlot(experimentName string, indexed *indexedEx
 	if epoch == nil {
 		if c.switchbackEpochs_ == nil {
 			c.switchbackEpochs_ = map[string]*switchbackEpoch{}
-			if c.switchbackSlotsSeen_ != nil {
-				c.switchbackSlotsSeen_.Store(true)
-			}
 		}
 		epoch = &switchbackEpoch{generation: indexed.switchback.generation}
 		c.switchbackEpochs_[experimentName] = epoch
