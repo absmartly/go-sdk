@@ -261,13 +261,9 @@ func (c *Context) retireAcrossRandomization(experimentName string, slot assignme
 	if entry.holdouts == nil {
 		return
 	}
-	if epoch := c.switchbackEpochs_[experimentName]; epoch != nil {
-		for _, period := range epoch.periods {
-			if old, found := c.assignmentCache_[switchbackSlotKey(experimentName, period)]; found {
-				retire(old)
-			}
-		}
-	}
+	// A switchback replaced by a unit experiment changed its generation, so
+	// getAssignmentAt has already dropped its live slots into the retired
+	// window; only that window can still hold them.
 	for _, old := range c.retiredSwitchbackSlots_[experimentName] {
 		retire(old)
 	}

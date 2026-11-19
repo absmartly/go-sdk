@@ -143,11 +143,6 @@ type Context struct {
 	// ContextLock_.
 	holdoutArms_ map[holdoutKey]*holdoutArm
 
-	// holdoutsSeen_ is set once any installed payload had holdouts and is
-	// never cleared: an assignment resolved then can still carry holdout
-	// decisions after a refresh removes them all.
-	holdoutsSeen_ *atomic.Bool
-
 	// switchbackEpochs_ records, by experiment name, the period slots a
 	// switchback experiment has cached and the generation they were
 	// resolved under. Created with the first switchback slot, so a context
@@ -395,7 +390,6 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	cntx.AssignmentCache = map[string]Assignment{}
 	cntx.assignmentCache_ = map[string]*cachedAssignment{}
 	cntx.index_ = &atomic.Pointer[contextIndex]{}
-	cntx.holdoutsSeen_ = &atomic.Bool{}
 	cntx.unitValues_ = map[string]interface{}{}
 	cntx.readyDeliverer_ = &atomic.Uint64{}
 	cntx.loggers_ = &loggerGoroutines{ids: map[uint64]int{}}
@@ -2298,11 +2292,30 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		// caller reuses its slice.
 		var installed = append([]jsonmodels.Holdout(nil), data.Holdouts...)
 		holdoutsById = make(map[int]*jsonmodels.Holdout, len(installed))
+		// An id defined more than once with definitions that draw different
+		// arms (iteration, seeds or split) covers nothing, so the outcome never
+		// depends on the entries' order; duplicates that draw the same arm
+		// count as one (the first one's name is published). The collector
+		// never sends duplicates.
+		var conflicting map[int]bool
 		for i := range installed {
-			if len(installed[i].Split) > 0 {
-				installed[i].Split = append([]float64(nil), installed[i].Split...)
-				holdoutsById[installed[i].Id] = &installed[i]
+			if len(installed[i].Split) == 0 {
+				continue
 			}
+			installed[i].Split = append([]float64(nil), installed[i].Split...)
+			if seen, found := holdoutsById[installed[i].Id]; found {
+				if !sameHoldoutDraw(seen, &installed[i]) {
+					if conflicting == nil {
+						conflicting = map[int]bool{}
+					}
+					conflicting[installed[i].Id] = true
+				}
+				continue
+			}
+			holdoutsById[installed[i].Id] = &installed[i]
+		}
+		for id := range conflicting {
+			delete(holdoutsById, id)
 		}
 	}
 	var coverage map[string][]*jsonmodels.Holdout
@@ -2424,9 +2437,6 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 
 	// Serialize publication with resolution to keep coverage and arms in one generation.
 	c.ContextLock_.Lock()
-	if len(data.Holdouts) > 0 {
-		c.holdoutsSeen_.Store(true)
-	}
 	c.DataLock.Lock()
 
 	c.Index_ = index
@@ -2451,6 +2461,13 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	c.SetRefreshTimer()
 	c.DataLock.Unlock()
 	c.ContextLock_.Unlock()
+}
+
+// sameHoldoutDraw reports whether two definitions of one holdout id draw the
+// same arm for every unit: same iteration, seeds and split.
+func sameHoldoutDraw(a *jsonmodels.Holdout, b *jsonmodels.Holdout) bool {
+	return a.Iteration == b.Iteration && a.SeedHi == b.SeedHi && a.SeedLo == b.SeedLo &&
+		reflect.DeepEqual(a.Split, b.Split)
 }
 
 // coveringHoldouts resolves an experiment's holdoutIds to the installed

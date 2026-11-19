@@ -1924,3 +1924,24 @@ func TestSwitchback_InFlightDecisionReplacedByASwitchbackStaysRetired(t *testing
 	h.ctx.QueueExposure(entry.assignment)
 	h.expectPending(0)
 }
+
+// Without holdouts on either side, a replacement across the randomization
+// boundary leaves the held decision retryable, as a same-key replacement
+// without holdouts does: QueueExposure still publishes it.
+func TestSwitchback_ReplacementAcrossRandomizationWithoutHoldoutsStillPublishes(t *testing.T) {
+	for _, c := range []struct {
+		from, to jsonmodels.Experiment
+	}{
+		{sbUnit(sbDefault(2, sbHour)), sbDefault(2, sbHour)},
+		{sbDefault(2, sbHour), sbUnit(sbDefault(2, sbHour))},
+	} {
+		var h = sbCreate(t, sbData(c.from))
+		h.at(sbAnchor + 5)
+		var held = h.ctx.GetAssignment("exp_sb")
+		h.refresh(c.to)
+		h.treatment("exp_sb")
+		var before = h.pending()
+		h.ctx.QueueExposure(held)
+		h.expectPending(before + 1)
+	}
+}
