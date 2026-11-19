@@ -1,6 +1,7 @@
 package jsonTest
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 
@@ -143,4 +144,19 @@ func TestSemverOperatorsInExpressions(t *testing.T) {
 		}
 	}
 	assert(false, jsonexpr.EvaluateBooleanExpr(expr, map[string]interface{}{}), t)
+}
+
+// A json.Number semver operand converts like the JS SDK's number: an integer
+// beyond 2^53 rounds through the float, as 9007199254740993 does in JS.
+func TestSemverJSONNumberOperandsConvertLikeJS(t *testing.T) {
+	expectEq(t, 0, versionCompare(json.Number("9007199254740993"), "9007199254740992"))
+	expectEq(t, 0, versionCompare(json.Number("1.5"), "1.5"))
+	expectEq(t, 0, versionCompare(json.Number("1e-7"), "0.0000001"))
+}
+
+func expectEq(t *testing.T, want interface{}, got interface{}) {
+	t.Helper()
+	if !reflect.DeepEqual(want, got) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
 }

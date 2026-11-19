@@ -142,6 +142,7 @@ func compareIdentifiers(a string, b string) int {
 // with jsNumberString. It is local to the semver operators; the general
 // StringConvert used by the older operators is unchanged.
 func semverString(x reflect.Value) (string, bool) {
+	x = numberValue(x)
 	switch x.Kind() {
 	case reflect.String:
 		return x.String(), true

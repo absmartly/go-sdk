@@ -1,6 +1,7 @@
 package jsonTest
 
 import (
+	"encoding/json"
 	"github.com/absmartly/go-sdk/sdk/jsonexpr"
 	"github.com/absmartly/go-sdk/sdk/jsonexpr/eval"
 	"math"
@@ -759,4 +760,26 @@ func TestCompareDeepEqualsCollections(t *testing.T) {
 		reflect.ValueOf([]interface{}{1, []interface{}{2, 3}, 4})), t)
 	assert(nil, e.Compare(reflect.ValueOf([]interface{}{1.0, 2.0}), reflect.ValueOf([]interface{}{2.0, 1.0})), t)
 	assert(nil, e.Compare(reflect.ValueOf(map[string]interface{}{"a": 1.0}), reflect.ValueOf(map[string]interface{}{"b": 1.0})), t)
+}
+
+// A json.Number (an attribute decoded with UseNumber) is the number it
+// denotes, as every JSON number is in the JS SDK: it compares, converts and
+// tests equal numerically, never as text.
+func TestJSONNumbersAreNumbers(t *testing.T) {
+	var eval = eval.Evaluator{}
+	var wide = json.Number("9223372036854775808")
+	assert(1, eval.Compare(reflect.ValueOf(wide), reflect.ValueOf(99)), t)
+	assert(-1, eval.Compare(reflect.ValueOf(99), reflect.ValueOf(wide)), t)
+	assert(1, eval.Compare(reflect.ValueOf(json.Number("100")), reflect.ValueOf(99)), t)
+	assert(-1, eval.Compare(reflect.ValueOf(json.Number("9")), reflect.ValueOf(json.Number("100"))), t)
+	assert(0, eval.Compare(reflect.ValueOf(json.Number("3.0")), reflect.ValueOf(3)), t)
+	assert(0, eval.Compare(reflect.ValueOf(json.Number("1e1")), reflect.ValueOf(10)), t)
+	var f, err = eval.NumberConvert(reflect.ValueOf(json.Number("1.5")))
+	assert(nil, err, t)
+	assert(1.5, f, t)
+	var s, _ = eval.StringConvert(reflect.ValueOf(json.Number("3.0")))
+	assert("3", s, t)
+	assert(false, eval.BooleanConvert(reflect.ValueOf(json.Number("0"))), t)
+	assert(true, eval.BooleanConvert(reflect.ValueOf(json.Number("2"))), t)
+	assert(0, eval.Compare(reflect.ValueOf([]interface{}{json.Number("1")}), reflect.ValueOf([]interface{}{1.0})), t)
 }

@@ -1,6 +1,7 @@
 package eval
 
 import (
+	"encoding/json"
 	"errors"
 	"math"
 	"reflect"
@@ -30,6 +31,7 @@ func (e Evaluator) Evaluate(expr reflect.Value) interface{} {
 }
 
 func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
+	lhs, rhs = numberValue(lhs), numberValue(rhs)
 	if lhs.IsValid() && rhs.IsValid() {
 		if lhs.IsZero() && rhs.IsZero() {
 			return 0
@@ -91,6 +93,7 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 }
 
 func (e Evaluator) BooleanConvert(x reflect.Value) bool {
+	x = numberValue(x)
 	if x.Kind() == reflect.Bool {
 		return x.Bool()
 	} else if x.Kind() == reflect.String {
@@ -118,6 +121,7 @@ func (e Evaluator) BooleanConvert(x reflect.Value) bool {
 }
 
 func (e Evaluator) NumberConvert(x reflect.Value) (float64, error) {
+	x = numberValue(x)
 	if x.Kind() == reflect.Bool {
 		if x.Bool() {
 			return 1.0, nil
@@ -137,6 +141,7 @@ func (e Evaluator) NumberConvert(x reflect.Value) (float64, error) {
 }
 
 func (e Evaluator) StringConvert(x reflect.Value) (string, error) {
+	x = numberValue(x)
 	if x.Kind() == reflect.Bool {
 		return strconv.FormatBool(x.Bool()), nil
 	} else if x.Kind() == reflect.String {
@@ -189,6 +194,21 @@ func (e Evaluator) ExtractVar(path string) interface{} {
 	return target
 }
 
+var jsonNumberType = reflect.TypeOf(json.Number(""))
+
+// numberValue is a json.Number (a value decoded with UseNumber) as the
+// float64 it denotes, as the JS SDK holds every JSON number; any other value,
+// and a json.Number that is not a finite number, is returned unchanged.
+// Without it a json.Number, whose kind is string, compared as text.
+func numberValue(x reflect.Value) reflect.Value {
+	if x.IsValid() && x.Type() == jsonNumberType {
+		if f, err := strconv.ParseFloat(x.String(), 64); err == nil {
+			return reflect.ValueOf(f)
+		}
+	}
+	return x
+}
+
 func unwrap(v reflect.Value) reflect.Value {
 	for v.IsValid() && (v.Kind() == reflect.Interface || v.Kind() == reflect.Pointer) {
 		if v.IsNil() {
@@ -217,8 +237,8 @@ func toFloat(v reflect.Value) (float64, bool) {
 }
 
 func deepEquals(lhs reflect.Value, rhs reflect.Value) bool {
-	lhs = unwrap(lhs)
-	rhs = unwrap(rhs)
+	lhs = numberValue(unwrap(lhs))
+	rhs = numberValue(unwrap(rhs))
 	if !lhs.IsValid() || !rhs.IsValid() {
 		return !lhs.IsValid() && !rhs.IsValid()
 	}

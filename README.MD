@@ -595,7 +595,8 @@ for the full rules):
   keeps `3` and `3.0` apart: an `int` attribute is the integer `3`, a
   `float64` is a float even when whole. Values from a JSON document should be
   decoded with `json.Decoder.UseNumber`, so `json.Number("3")` keys a cluster
-  and `json.Number("3.0")` does not; plain `encoding/json` decodes every
+  and `json.Number("3.0")` does not (audiences compare a `json.Number` as the
+  number it denotes); plain `encoding/json` decodes every
   number as a `float64`, which gives no value. Prefer integer or string
   attributes: a whole `float64` is published as `3`, which the collector
   reads back as an integer when it re-resolves the cluster.

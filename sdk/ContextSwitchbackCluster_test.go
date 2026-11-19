@@ -626,3 +626,20 @@ func TestSwitchbackCluster_TypedSliceElementsAreReadAsPublished(t *testing.T) {
 	h.setAttribute("items", []sbPointerCity{"Porto"})
 	expectValue(t, sbExpectedSchedule("Porto"), h.peekSchedule("exp_sb", sbHour, 12))
 }
+
+// One json.Number attribute (a JSON document decoded with UseNumber) is both
+// an exact switchback cluster key and a number to audiences, beyond int64
+// too: a strict audience store_number > 99 matches it and the cluster is
+// keyed by its digits.
+func TestSwitchbackCluster_JSONNumberIsAKeyAndANumber(t *testing.T) {
+	for _, digits := range []string{"4000000002", "123456789012345678901234567890"} {
+		var experiment = sbAttributeSwitchback("store_number")
+		experiment.Audience = `{"filter":[{"gt":[{"var":"store_number"},{"value":99}]}]}`
+		experiment.AudienceStrict = true
+		experiment.SwitchbackClusterValues = []string{digits}
+		var h = sbCreateBare(t, map[string]string{sbUnitType: sbUID}, sbData(experiment))
+		h.setAttribute("store_number", json.Number(digits))
+		expectInt(t, sbDraw(digits, 0, sbClusterArms), h.at(sbAnchor+5).treatment("exp_sb"))
+		h.expectPublished(sbClusterExposure(sbDraw(digits, 0, sbClusterArms), sbAnchor+5, true, false))
+	}
+}
