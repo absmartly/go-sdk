@@ -21,6 +21,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/absmartly/go-sdk/sdk/future"
 	"github.com/absmartly/go-sdk/sdk/internal"
@@ -3617,7 +3618,11 @@ func TestHoldout_ConcurrentInstallKeepsTheKeySetGate(t *testing.T) {
 		defer close(finished)
 		ctx.SetData(hoData(nil, plain))
 	}()
-	<-parser.parsing
+	select {
+	case <-parser.parsing:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the plain install never parsed its variants")
+	}
 	ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoWithVariables(hoExperiment(1, "a", hoUnitType, 0, 11), "v")))
 	close(parser.release)
 	<-finished
