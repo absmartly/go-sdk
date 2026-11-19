@@ -150,13 +150,26 @@ type Context struct {
 type contextIndex struct {
 	experiments map[string]*indexedExperiment
 	holdouts    map[int]*jsonmodels.Holdout
+	// keyed is set once any install had holdouts: from then on every install
+	// builds its variable key set, since an entry resolved under holdouts
+	// may be retired by any later replacement.
+	keyed bool
 }
 
 // indexedExperiment is an installed experiment with its parsed assignment
 // rules (nil when it has none) and the holdouts covering it, sorted and
 // unique by id (nil when none), so a read finds them with one lookup.
+// variableKeySet holds, for one installed payload, every variable key each
+// experiment defines in some variant.
+type variableKeySet map[variableKeyOf]struct{}
+
+type variableKeyOf struct {
+	experiment string
+	key        string
+}
+
 type indexedExperiment struct {
-	variableKeys map[string]struct{}
+	variableKeys variableKeySet
 	experiment   ExperimentVariables
 	rules        *experimentRules
 	holdouts     []*jsonmodels.Holdout
@@ -217,9 +230,9 @@ type cachedAssignment struct {
 	holdouts *assignmentHoldouts
 	// retirement is shared by entries that carry the same Exposed identity.
 	retirement *atomic.Bool
-	// variableKeys is the compact definition snapshot used by a variable retry;
-	// it avoids retaining the full indexed experiment and unselected variants.
-	variableKeys map[string]struct{}
+	// variableKeys is the install's (experiment, key) set, which a variable
+	// retry checks instead of retaining the definition and its values.
+	variableKeys variableKeySet
 }
 
 type loggerGoroutines struct {
@@ -970,7 +983,11 @@ func definesVariable(key string) func(*cachedAssignment) bool {
 		if e.assignment.Variables == nil {
 			return false
 		}
-		_, defined := e.variableKeys[key]
+		if e.variableKeys == nil {
+			// The context never had holdouts, so nothing was retired.
+			return true
+		}
+		_, defined := e.variableKeys[variableKeyOf{experiment: e.assignment.Name, key: key}]
 		return defined
 	}
 }
@@ -2423,19 +2440,27 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 
 	c.Index_ = index
 	var indexed = make(map[string]*indexedExperiment, len(index))
+	// One set of (experiment, key) pairs per install: cached entries keep it
+	// rather than the definitions, so they never retain variant values. Only
+	// a holdout retires an assignment, so the set is built only once the
+	// context has seen holdouts; payloads without them cost nothing more.
+	var keys variableKeySet
+	if len(holdoutsById) > 0 || (previous != nil && previous.keyed) {
+		keys = variableKeySet{}
+	}
 	for name, experiment := range index {
-		var keys map[string]struct{}
-		for _, variables := range experiment.Variables {
-			for key := range variables {
-				if keys == nil {
-					keys = map[string]struct{}{}
+		if keys != nil {
+			for _, variables := range experiment.Variables {
+				for key := range variables {
+					if _, found := keys[variableKeyOf{experiment: name, key: key}]; !found {
+						keys[variableKeyOf{experiment: name, key: strings.Clone(key)}] = struct{}{}
+					}
 				}
-				keys[strings.Clone(key)] = struct{}{}
 			}
 		}
 		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name], holdouts: coverage[name], variableKeys: keys}
 	}
-	c.index_.Store(&contextIndex{experiments: indexed, holdouts: holdoutsById})
+	c.index_.Store(&contextIndex{experiments: indexed, holdouts: holdoutsById, keyed: keys != nil})
 	c.ContextCustomFields_ = contextCustomFields
 	c.customFieldErrors_ = customFieldErrors
 	c.indexVariables_ = indexVariables

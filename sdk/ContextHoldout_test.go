@@ -3391,22 +3391,112 @@ func TestHoldout_VariableRetryChecksTheKeyOnTheSameExperiment(t *testing.T) {
 	}
 }
 
-// A cached decision retains only key names from unselected variants, never
-// their configs or values. The snapshot remains valid after data removal.
-func TestHoldout_VariableKeySnapshotDoesNotRetainVariantValues(t *testing.T) {
-	var experiment = hoExperiment(1, "a", hoUnitType, 0, 11)
-	experiment.Split = []float64{1, 0}
-	experiment.Variants[0].Config = `{"v":"selected"}`
-	experiment.Variants[1].Config = `{"other":"` + strings.Repeat("x", 1<<20) + `"}`
-	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
-	var entry = h.ctx.getAssignment("a")
+// The install's key set is per experiment: a key one experiment defines in
+// any variant does not make another experiment that lacks it a candidate,
+// and the set stays valid after a refresh removes the experiments.
+func TestHoldout_VariableKeySetIsPerExperiment(t *testing.T) {
+	var a = hoExperiment(1, "a", hoUnitType, 0, 11)
+	a.Split = []float64{1, 0}
+	a.Variants[0].Config = `{"v":"selected"}`
+	a.Variants[1].Config = `{"other":"unselected"}`
+	var b = hoExperiment(2, "b", hoUnitType, 0)
+	b.Variants[0].Config = `{"w":"b"}`
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, a, b))
+	var entryA, entryB = h.ctx.getAssignment("a"), h.ctx.getAssignment("b")
 	h.ctx.SetData(hoData(nil))
-	if len(entry.variableKeys) != 2 || !definesVariable("v")(entry) || !definesVariable("other")(entry) {
-		t.Fatalf("lost the key snapshot: %v", entry.variableKeys)
+	for _, c := range []struct {
+		entry *cachedAssignment
+		key   string
+		want  bool
+	}{
+		{entryA, "v", true}, {entryA, "other", true}, {entryA, "w", false},
+		{entryB, "w", true}, {entryB, "v", false}, {entryA, "missing", false},
+	} {
+		if got := definesVariable(c.key)(c.entry); got != c.want {
+			t.Errorf("%s defines %s: %v, want %v", c.entry.assignment.Name, c.key, got, c.want)
+		}
 	}
-	// The map's value type is empty, so neither configs nor parsed values
-	// can be retained through this snapshot.
-	if _, found := entry.variableKeys["missing"]; found {
-		t.Fatal("snapshot contains an undefined key")
+}
+
+// aliasingParser returns key strings that point into the variant's config,
+// as a custom parser may, so a snapshot that does not copy its keys would
+// keep the whole config alive.
+type aliasingParser struct{}
+
+func (aliasingParser) Parse(_ Context, _ string, _ string, config string) map[string]interface{} {
+	if strings.HasPrefix(config, "big") {
+		return map[string]interface{}{config[:3]: "x"}
+	}
+	return DefaultVariableParser{}.Parse(Context{}, "", "", config)
+}
+
+// A cached entry keeps no part of a refreshed-away definition beyond its key
+// names: an 8 MiB unselected config is released once a refresh removes the
+// experiment, also when a custom parser's keys alias the config.
+func TestHoldout_CachedEntryReleasesTheOldDefinition(t *testing.T) {
+	const size = 8 << 20
+	for _, c := range []struct {
+		name   string
+		parser VariableParser
+		config func() string
+	}{
+		{"default parser", DefaultVariableParser{}, func() string { return `{"other":"` + strings.Repeat("x", size) + `"}` }},
+		{"aliasing parser", aliasingParser{}, func() string { return "big" + strings.Repeat("x", size) }},
+	} {
+		var heap = func() uint64 {
+			var stats runtime.MemStats
+			runtime.GC()
+			runtime.GC()
+			runtime.ReadMemStats(&stats)
+			return stats.HeapAlloc
+		}
+		var before = heap()
+		var experiment = hoExperiment(1, "a", hoUnitType, 0, 11)
+		experiment.Split = []float64{1, 0}
+		experiment.Variants[0].Config = `{"v":"selected"}`
+		experiment.Variants[1].Config = c.config()
+		var config = CreateDefaultContextConfig()
+		config.Units_ = map[string]string{hoUnitType: hoUIDNotHeldOut}
+		config.PublishDelay_ = -1
+		config.RefreshInterval_ = -1
+		var ft, done = future.New()
+		done(hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment), nil)
+		experiment = jsonmodels.Experiment{}
+		var ctx = CreateContext(internal.FixedClock{Millis_: hoMillis}, config, ft, &hoProvider{}, &hoPublisher{}, nil,
+			c.parser, AudienceMatcher{DefaultAudienceDeserializer{}})
+		ctx.WaitUntilReady()
+		var entry = ctx.getAssignment("a")
+		ctx.SetData(hoData(nil))
+		var retained = int64(heap()) - int64(before)
+		if !definesVariable("v")(entry) {
+			t.Fatalf("%s: lost the key snapshot", c.name)
+		}
+		runtime.KeepAlive(entry)
+		runtime.KeepAlive(ctx)
+		if retained > 2<<20 {
+			t.Errorf("%s: %d bytes retained after the refresh", c.name, retained)
+		}
+		ctx.ClearRefreshTimer()
+	}
+}
+
+// Once a context has seen holdouts, every later install keeps its variable
+// key set, so a retry two refreshes after the holdouts left still checks
+// the key; a context that never had holdouts builds none.
+func TestHoldout_VariableKeySetOnceHoldoutsWereSeen(t *testing.T) {
+	var experiment = hoWithVariables(hoExperiment(1, "a", hoUnitType, 0), "v")
+	var plain = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, experiment))
+	if plain.ctx.getAssignment("a").variableKeys != nil {
+		t.Fatal("a context without holdouts built a key set")
+	}
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+	for i := 2; i <= 3; i++ {
+		var next = experiment
+		next.Iteration = i
+		h.ctx.SetData(hoData(nil, next))
+	}
+	var entry = h.ctx.getAssignment("a")
+	if entry.variableKeys == nil || !definesVariable("v")(entry) || definesVariable("w")(entry) {
+		t.Fatalf("key set after holdouts left: %v", entry.variableKeys)
 	}
 }
