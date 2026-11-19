@@ -2072,7 +2072,26 @@ func (c *Context) ExperimentMatches(experiment jsonmodels.Experiment, assignment
 		experiment.UnitType == assignment.UnitType &&
 		experiment.Iteration == assignment.Iteration &&
 		experiment.FullOnVariant == assignment.FullOnVariant &&
-		reflect.DeepEqual(experiment.TrafficSplit, assignment.TrafficSplit)
+		sameSplit(experiment.TrafficSplit, assignment.TrafficSplit)
+}
+
+// sameSplit is reflect.DeepEqual for two []float64, without its reflection
+// and allocation on the cached-read path. As DeepEqual: nil and empty differ,
+// the same backing array is equal, and other elements compare with == (so a
+// NaN in two different arrays differs).
+func sameSplit(a []float64, b []float64) bool {
+	if (a == nil) != (b == nil) || len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 || &a[0] == &b[0] {
+		return true
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Errors returned by context reads and writes. The texts are the ones

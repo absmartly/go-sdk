@@ -3,6 +3,8 @@ package sdk
 import (
 	"context"
 	"errors"
+	"math"
+	"reflect"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -1249,5 +1251,21 @@ func TestDeserializerCanPublishQueuedEvents(t *testing.T) {
 				assertAny(1, n, t)
 			}
 		}
+	}
+}
+
+// sameSplit must agree with reflect.DeepEqual, which ExperimentMatches used.
+func TestSameSplitMatchesDeepEqual(t *testing.T) {
+	var nan = math.NaN()
+	var shared = []float64{0, 1}
+	var nanShared = []float64{nan}
+	var cases = [][2][]float64{
+		{nil, nil}, {nil, {}}, {{}, nil}, {{}, {}},
+		{{0, 1}, {0, 1}}, {{0, 1}, {1, 0}}, {{0, 1}, {0, 1, 0}},
+		{shared, shared}, {nanShared, nanShared}, {{nan}, {nan}},
+		{{0}, {math.Copysign(0, -1)}}, {{0.5, 0.5}, {0.5, 0.5000001}},
+	}
+	for _, tc := range cases {
+		assertAny(reflect.DeepEqual(tc[0], tc[1]), sameSplit(tc[0], tc[1]), t)
 	}
 }
