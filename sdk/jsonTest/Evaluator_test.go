@@ -814,3 +814,18 @@ func TestJSONNumberStringCoercionAndFractionalZero(t *testing.T) {
 		}
 	}
 }
+
+// A json.Number zero is a number, not an empty value: it does not equal "",
+// and NaN stays its text rather than a number that equals nothing.
+func TestJSONNumberZeroIsNotEmptyAndNaNIsText(t *testing.T) {
+	var evaluator = eval.Evaluator{}
+	for _, raw := range []string{"0", "0.0", "-0"} {
+		var expr = map[string]interface{}{"eq": []interface{}{map[string]interface{}{"var": "x"}, map[string]interface{}{"value": ""}}}
+		if jsonexpr.EvaluateBooleanExpr(expr, map[string]interface{}{"x": json.Number(raw)}) {
+			t.Errorf("json.Number(%q) equals \"\"", raw)
+		}
+	}
+	if got := evaluator.Compare(reflect.ValueOf(json.Number("NaN")), reflect.ValueOf("NaN")); got != 0 {
+		t.Errorf("json.Number(NaN) compared with \"NaN\": %v, want 0", got)
+	}
+}

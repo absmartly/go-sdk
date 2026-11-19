@@ -31,7 +31,6 @@ func (e Evaluator) Evaluate(expr reflect.Value) interface{} {
 }
 
 func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
-	lhs = numberValue(lhs)
 	if lhs.IsValid() && rhs.IsValid() {
 		if lhs.IsZero() && rhs.IsZero() {
 			return 0
@@ -39,6 +38,9 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 			return 0
 		}
 	}
+	// After the zero shortcut, which compares the operands as given: a
+	// json.Number zero is not the empty string.
+	lhs = numberValue(lhs)
 
 	if lhs.Kind() == reflect.Int || lhs.Kind() == reflect.Float64 {
 		var rvalue, rerror = e.NumberConvert(rhs)
