@@ -115,22 +115,28 @@ func holdoutSeed(raw json.RawMessage) int {
 	return int(uint32(int64(math.Mod(math.Trunc(value), 1<<32))))
 }
 
-// holdoutSplit decodes a holdout's split. Absent or null is no split (the
-// holdout then covers nothing); an array whose elements are not all numbers
-// is malformed.
+// holdoutSplit decodes a holdout's split. Absent or null is no split: the
+// holdout is kept, as in the JS SDK, and covers nothing. A null element is
+// kept as 0, which is what JavaScript's arithmetic makes of it. Any other
+// element that is not a number (a string, boolean, array or object) makes the
+// entry malformed, and it is skipped; the JS SDK would keep it and coerce the
+// element, a divergence the CHANGELOG documents.
 func holdoutSplit(raw json.RawMessage) ([]float64, bool) {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
 		return nil, true
 	}
-	var entries []json.RawMessage
+	var entries []interface{}
 	if raw[0] != '[' || json.Unmarshal(raw, &entries) != nil {
 		return nil, false
 	}
 	var split = make([]float64, len(entries))
 	for i, entry := range entries {
-		entry = bytes.TrimSpace(entry)
-		if len(entry) == 0 || entry[0] == 'n' || json.Unmarshal(entry, &split[i]) != nil {
+		switch value := entry.(type) {
+		case float64:
+			split[i] = value
+		case nil:
+		default:
 			return nil, false
 		}
 	}

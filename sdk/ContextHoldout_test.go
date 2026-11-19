@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/absmartly/go-sdk/sdk/future"
 	"github.com/absmartly/go-sdk/sdk/internal"
@@ -2713,10 +2714,10 @@ func TestHoldout_DuplicateHoldoutConflictFields(t *testing.T) {
 	}
 }
 
-// A duplicate entry with a malformed split (a null or non-number element) is
+// A duplicate entry with a malformed split (a non-number, non-null element) is
 // skipped, so it never cancels a valid definition of the same id.
 func TestHoldout_MalformedDuplicateDoesNotCancelAValidHoldout(t *testing.T) {
-	for _, split := range []string{`[null,0.9]`, `[0.1,"x"]`, `[0.1,true]`, `[[0.1],0.9]`, `"0.1/0.9"`} {
+	for _, split := range []string{`[0.1,"x"]`, `[0.1,true]`, `[[0.1],0.9]`, `"0.1/0.9"`} {
 		for _, order := range []bool{false, true} {
 			var valid = `{"id":11,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":[0.1,0.9]}`
 			var malformed = `{"id":11,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":` + split + `}`
@@ -2800,3 +2801,177 @@ func TestHoldout_ClaimRetiredBeforeCommitPublishesNothing(t *testing.T) {
 		ctx.ClearRefreshTimer()
 	}
 }
+
+// A holdout whose split is null, or has null elements, is kept by the decoder,
+// as in the JS SDK (which keeps any non-empty split and adds a null as 0). A
+// null split covers nothing; a null element counts as 0, so [1,null] holds the
+// unit out and [null,1] does not.
+func TestHoldout_NullSplitAndNullElementsAreKept(t *testing.T) {
+	var decode = func(split string) []jsonmodels.Holdout {
+		var payload = `{"holdouts":[{"id":11,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":` + split + `}]}`
+		var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data.Holdouts
+	}
+	expectInt(t, 1, len(decode(`null`)))
+	if split := decode(`null`)[0].Split; len(split) != 0 {
+		t.Fatalf("split %v", split)
+	}
+	expectValue(t, []float64{1, 0}, decode(`[1,null]`)[0].Split)
+	expectValue(t, []float64{0, 1}, decode(`[null,1]`)[0].Split)
+	expectInt(t, 0, len(decode(`[1,"x"]`)))
+
+	for _, c := range []struct {
+		split   string
+		variant int
+	}{{`[1,null]`, 0}, {`[null,1]`, hoNormalVariant}} {
+		var payload = `{"experiments":[{"id":1,"name":"exp","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
+			"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
+			"holdouts":[{"id":11,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":` + c.split + `}]}`
+		var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectInt(t, c.variant, hoCreateFor(t, hoUID, data).treatment("exp"))
+	}
+}
+
+// The retirement store happens under EventLock_, so an admission that holds
+// the lock either commits before the replacement retires its claim or sees the
+// retirement; a replacement cannot retire in the middle of one.
+func TestHoldout_RetirementIsStoredUnderEventLock(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	var entry = h.ctx.getAssignment("exp")
+	var replacement = hoExperiment(1, "exp", hoUnitType, 0, 11)
+	replacement.Iteration = 2
+	// SetData itself takes EventLock_, so install the data first: only the
+	// replacing GetAssignment is left to meet the held lock.
+	h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
+	h.ctx.EventLock_.Lock()
+	var done = make(chan struct{})
+	go func() {
+		defer close(done)
+		h.ctx.GetAssignment("exp")
+	}()
+	// The replacing goroutine must reach, and block on, EventLock_ while the
+	// token is still clear.
+	for i := 0; i < 200; i++ {
+		runtime.Gosched()
+		time.Sleep(time.Millisecond)
+		if entry.retirement.Load() {
+			h.ctx.EventLock_.Unlock()
+			<-done
+			t.Fatal("the retirement was stored without EventLock_")
+		}
+		select {
+		case <-done:
+			h.ctx.EventLock_.Unlock()
+			t.Fatal("the replacement finished while EventLock_ was held")
+		default:
+		}
+	}
+	h.ctx.EventLock_.Unlock()
+	<-done
+	if !entry.retirement.Load() {
+		t.Fatal("the replaced assignment was not retired")
+	}
+}
+
+// A read that loses the race to a replacement (a refresh lands between its
+// claim and its admission) serves and exposes the replacement instead of the
+// retired decision, as the Java SDK does, without a second read.
+func TestHoldout_ReadRetiredBeforeCommitServesTheReplacement(t *testing.T) {
+	for _, covered := range []bool{true, false} {
+		for _, variable := range []bool{false, true} {
+			var ctx *Context
+			var armed = false
+			var experiment = hoExperiment(1, "exp", hoUnitType, 0)
+			experiment.Split = []float64{1, 0}
+			experiment.Variants[0].Config = `{"v":"old"}`
+			experiment.Variants[1].Config = `{"v":"new"}`
+			if covered {
+				experiment.HoldoutIds = []int{11}
+			}
+			var replacement = experiment
+			replacement.Iteration = 2
+			replacement.Split = []float64{0, 1}
+			replacement.HoldoutIds = []int{11}
+			var clock = hoReplacingClock{armed: &armed, replace: func() {
+				ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
+				ctx.GetAssignment("exp")
+			}}
+			var config = CreateDefaultContextConfig()
+			config.Units_ = map[string]string{hoUnitType: hoUIDNotHeldOut}
+			config.PublishDelay_ = -1
+			config.RefreshInterval_ = -1
+			var ft, done = future.New()
+			done(hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment), nil)
+			ctx = CreateContext(clock, config, ft, &hoProvider{}, &hoPublisher{}, nil,
+				DefaultVariableParser{}, AudienceMatcher{DefaultAudienceDeserializer{}})
+			ctx.WaitUntilReady()
+			ctx.GetAssignment("exp")
+			armed = true
+			if variable {
+				var value, err = ctx.GetVariableValue("v", "default")
+				if err != nil {
+					t.Fatal(err)
+				}
+				expectValue(t, "new", value)
+			} else {
+				var variant, err = ctx.GetTreatment("exp")
+				if err != nil {
+					t.Fatal(err)
+				}
+				expectInt(t, 1, variant)
+			}
+			if armed {
+				t.Fatal("the clock was not read during the admission")
+			}
+			// Exactly the replacement's decision, once: its own exposure and
+			// the holdout's.
+			var exposures = queuedExposures(ctx)
+			expectInt(t, 2, len(exposures))
+			expectValue(t, "exp", exposures[0].Name)
+			expectInt(t, 1, exposures[0].Variant)
+			expectInt(t, 11, exposures[1].Id)
+			ctx.ClearRefreshTimer()
+		}
+	}
+}
+
+// When every attempt loses to a replacement, a read stops after
+// maxExposureAttempts and serves the last assignment it tried.
+func TestHoldout_RetiredReadRetriesAreBounded(t *testing.T) {
+	var ctx *Context
+	var reads = 0
+	var experiment = hoExperiment(1, "exp", hoUnitType, 0, 11)
+	var clock = hoClockFunc(func() int64 {
+		reads++
+		var next = experiment
+		next.Iteration = 1 + reads
+		ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, next))
+		ctx.GetAssignment("exp")
+		return hoMillis
+	})
+	var config = CreateDefaultContextConfig()
+	config.Units_ = map[string]string{hoUnitType: hoUIDNotHeldOut}
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = -1
+	var ft, done = future.New()
+	done(hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment), nil)
+	ctx = CreateContext(clock, config, ft, &hoProvider{}, &hoPublisher{}, nil,
+		DefaultVariableParser{}, AudienceMatcher{DefaultAudienceDeserializer{}})
+	ctx.WaitUntilReady()
+	t.Cleanup(func() { ctx.ClearRefreshTimer() })
+	if _, err := ctx.GetTreatment("exp"); err != nil {
+		t.Fatal(err)
+	}
+	expectInt(t, 3, reads)
+	expectInt(t, 0, int(ctx.GetPendingCount()))
+}
+
+type hoClockFunc func() int64
+
+func (f hoClockFunc) Millis() int64 { return f() }

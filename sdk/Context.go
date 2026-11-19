@@ -887,12 +887,29 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	var entry = c.getAssignment(experimentName)
-	if !entry.assignment.Exposed.Load().(bool) {
-		c.queueExposure(entry.assignment, entry)
-	}
-
+	var entry = c.settleExposure(experimentName, c.getAssignment(experimentName))
 	return entry.assignment.Variant, nil
+}
+
+// maxExposureAttempts bounds how many assignments a read tries to expose when
+// each is retired by a concurrent replacement before its admission commits, as
+// in the Java SDK.
+const maxExposureAttempts = 3
+
+// settleExposure exposes entry on a read. If a replacement retired the claimed
+// assignment before the admission committed, nothing of it was published, so
+// the current assignment is resolved again and exposed instead, up to
+// maxExposureAttempts times. It returns the entry the read must serve: the
+// replacement that was exposed, or on exhaustion the last one tried. It holds
+// no lock itself, so loggers run after admit released its locks.
+func (c *Context) settleExposure(experimentName string, entry *cachedAssignment) *cachedAssignment {
+	for attempt := 1; !entry.assignment.Exposed.Load().(bool); attempt++ {
+		if c.queueExposure(entry.assignment, entry) != exposureRetired || attempt >= maxExposureAttempts {
+			break
+		}
+		entry = c.getAssignment(experimentName)
+	}
+	return entry
 }
 
 // QueueExposure queues the assignment's exposure once, then the exposures of
@@ -917,17 +934,31 @@ func (c *Context) QueueExposure(assignment *Assignment) {
 	c.queueExposure(assignment, entry)
 }
 
-func (c *Context) queueExposure(assignment *Assignment, entry *cachedAssignment) {
+// exposureStatus is the outcome of admitting a claimed exposure.
+type exposureStatus int
+
+const (
+	// exposureQueued: the decision was queued, or there was nothing to queue.
+	exposureQueued exposureStatus = iota
+	// exposureRejected: a close rejected it.
+	exposureRejected
+	// exposureRetired: a replacement retired the claimed assignment before the
+	// admission committed, so nothing of it was published and the claim stays
+	// consumed.
+	exposureRetired
+)
+
+func (c *Context) queueExposure(assignment *Assignment, entry *cachedAssignment) exposureStatus {
 	c = c.live()
 	if !assignment.Exposed.CompareAndSwap(false, true) {
-		return
+		return exposureQueued
 	}
-	c.admitExposure(assignment, entry)
+	return c.admitExposure(assignment, entry)
 }
 
 // admitExposure queues a claimed decision or rolls it back after a rejected
 // close. The retained entry carries retirement even across later replacements.
-func (c *Context) admitExposure(assignment *Assignment, entry *cachedAssignment) {
+func (c *Context) admitExposure(assignment *Assignment, entry *cachedAssignment) exposureStatus {
 	var holdouts *assignmentHoldouts
 	if entry != nil {
 		holdouts = entry.holdouts
@@ -936,18 +967,21 @@ func (c *Context) admitExposure(assignment *Assignment, entry *cachedAssignment)
 	if entry != nil {
 		retirement = entry.retirement
 	}
-	if !c.admit(assignment, holdouts, retirement) {
+	var status = c.admit(assignment, holdouts, retirement)
+	if status == exposureRejected {
 		c.ContextLock_.Lock()
 		c.reopenExposure(assignment, entry)
 		c.ContextLock_.Unlock()
 	}
+	return status
 }
 
-// admit queues the claimed exposures and reports false when a close
-// rejected them. A claim whose assignment a replacement retired before the
-// admission took EventLock_ publishes nothing and stays exposed (consumed),
-// so a superseded decision never appears beside its replacement's.
-func (c *Context) admit(assignment *Assignment, holdouts *assignmentHoldouts, retirement *atomic.Bool) bool {
+// admit queues the claimed exposures. It reports exposureRejected when a close
+// rejected them, and exposureRetired for a claim whose assignment a
+// replacement retired before the admission took EventLock_: that publishes
+// nothing and stays exposed (consumed), so a superseded decision never appears
+// beside its replacement's.
+func (c *Context) admit(assignment *Assignment, holdouts *assignmentHoldouts, retirement *atomic.Bool) exposureStatus {
 	if holdouts == nil {
 		return c.enqueueRetirable(assignment, retirement)
 	}
@@ -959,11 +993,11 @@ func (c *Context) admit(assignment *Assignment, holdouts *assignmentHoldouts, re
 	c.EventLock_.Lock()
 	if c.CheckNotClosed() != nil {
 		c.EventLock_.Unlock()
-		return false
+		return exposureRejected
 	}
 	if retirement != nil && retirement.Load() {
 		c.EventLock_.Unlock()
-		return true
+		return exposureRetired
 	}
 	var exposures []jsonmodels.Exposure
 	if !holdouts.isSuppressed() {
@@ -983,7 +1017,7 @@ func (c *Context) admit(assignment *Assignment, holdouts *assignmentHoldouts, re
 	if len(exposures) != 0 {
 		c.SetTimeout()
 	}
-	return true
+	return exposureQueued
 }
 
 // reopenExposure rolls back a rejected admission unless its exact identity
@@ -1032,13 +1066,13 @@ func (c *Context) exposureFor(assignment *Assignment, exposedAt int64) jsonmodel
 // exposed. When the context is closed it reports false, and the caller
 // clears the mark so a later read can retry.
 func (c *Context) enqueueExposure(assignment *Assignment) bool {
-	return c.enqueueRetirable(assignment, nil)
+	return c.enqueueRetirable(assignment, nil) != exposureRejected
 }
 
 // enqueueRetirable is enqueueExposure for a claim that a replacement may
 // retire: if it was retired before the append, it publishes nothing and
-// reports true (the claim is consumed).
-func (c *Context) enqueueRetirable(assignment *Assignment, retirement *atomic.Bool) bool {
+// reports exposureRetired (the claim is consumed).
+func (c *Context) enqueueRetirable(assignment *Assignment, retirement *atomic.Bool) exposureStatus {
 	var exposure = jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
 		Variant: assignment.Variant, ExposedAt: c.Clock_.Millis(), Assigned: assignment.Assigned,
 		Eligible: assignment.Eligible, Overridden: assignment.Overridden, FullOn: assignment.FullOn,
@@ -1050,11 +1084,11 @@ func (c *Context) enqueueRetirable(assignment *Assignment, retirement *atomic.Bo
 	// or rejected after it, never stranded behind it.
 	if c.CheckNotClosed() != nil {
 		c.EventLock_.Unlock()
-		return false
+		return exposureRejected
 	}
 	if retirement != nil && retirement.Load() {
 		c.EventLock_.Unlock()
-		return true
+		return exposureRetired
 	}
 	c.PendingCount_.Store(c.PendingCount_.Load().(int32) + 1)
 	c.Exposures_ = append(c.Exposures_, exposure)
@@ -1063,7 +1097,7 @@ func (c *Context) enqueueRetirable(assignment *Assignment, retirement *atomic.Bo
 	c.LogEvent(Exposure, exposure)
 
 	c.SetTimeout()
-	return true
+	return exposureQueued
 }
 
 func (c *Context) PeekTreatment(experimentName string) (int, error) {
@@ -1242,8 +1276,14 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 			continue
 		}
 
-		if expose && !assignment.Exposed.Load().(bool) {
-			c.queueExposure(assignment, entry)
+		if expose {
+			// A claim retired before it committed is exposed again on the
+			// replacement, whose variables are the ones served.
+			entry = c.settleExposure(experiment.Data.Name, entry)
+			assignment = entry.assignment
+			if assignment.Variables == nil {
+				continue
+			}
 		}
 
 		if value, exist := assignment.Variables[key]; exist && (assignment.Assigned || assignment.Overridden || assignment.RuleOverride) {
