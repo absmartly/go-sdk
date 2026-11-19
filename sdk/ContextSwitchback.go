@@ -246,8 +246,12 @@ func (c *Context) dropSwitchbackEpoch(experimentName string) {
 // holding the old one must not publish it beside its replacement. The caller
 // holds ContextLock_ for writing.
 func (c *Context) retireAcrossRandomization(experimentName string, slot assignmentSlot, entry *cachedAssignment) {
+	// Retired under EventLock_ before the claim, as a same-key replacement
+	// does, so an admission in flight commits before this or sees it.
 	var retire = func(old *cachedAssignment) {
+		c.EventLock_.Lock()
 		old.retirement.Store(true)
+		c.EventLock_.Unlock()
 		old.assignment.Exposed.CompareAndSwap(false, true)
 	}
 	if entry.switchback != nil {
@@ -292,7 +296,9 @@ func (c *Context) retireSwitchbackSlot(experimentName string, key string) {
 		// the exposure is claimed, and its retirement keeps a rejected
 		// admission from reopening it.
 		for _, expired := range retired[:len(retired)-switchbackRetiredSlots] {
+			c.EventLock_.Lock()
 			expired.retirement.Store(true)
+			c.EventLock_.Unlock()
 			expired.assignment.Exposed.CompareAndSwap(false, true)
 		}
 		retired = retired[len(retired)-switchbackRetiredSlots:]

@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
@@ -544,4 +545,46 @@ func TestSwitchbackCluster_IneligibleSlotNeverEvaluatesTheAudience(t *testing.T)
 	}
 	expectInt(t, 0, counter.count)
 	h.expectPending(0)
+}
+
+// A pointer or interface cycle has no JSON encoding, so it yields no cluster
+// value instead of hanging the read; a long but finite pointer chain is read
+// through.
+func TestSwitchbackCluster_PointerAndInterfaceCyclesHaveNoKey(t *testing.T) {
+	var self interface{}
+	self = &self
+	var a, b interface{}
+	a, b = &b, &a
+	var cyclicInMap interface{}
+	cyclicInMap = map[string]interface{}{"city": &cyclicInMap}
+	for _, value := range []interface{}{self, a, cyclicInMap} {
+		var done = make(chan string, 1)
+		go func() { done <- parseSwitchbackPath("geo/city").resolveAttribute(value) }()
+		select {
+		case key := <-done:
+			expectValue(t, "", key)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%T: resolveAttribute did not return", value)
+		}
+		var keyDone = make(chan string, 1)
+		go func() { keyDone <- switchbackClusterKey(value) }()
+		select {
+		case key := <-keyDone:
+			expectValue(t, "", key)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%T: switchbackClusterKey did not return", value)
+		}
+	}
+	var h = sbCreateBare(t, map[string]string{sbUnitType: sbUID}, sbData(sbAttributeSwitchback("city")))
+	h.setAttribute("city", self)
+	expectInt(t, 0, h.at(sbAnchor+10).treatment("exp_sb"))
+	h.expectPending(0)
+
+	var porto interface{} = "Porto"
+	var chain interface{} = &porto
+	for i := 0; i < 10; i++ {
+		var next = chain
+		chain = &next
+	}
+	expectValue(t, "Porto", parseSwitchbackPath("city").resolveAttribute(chain))
 }

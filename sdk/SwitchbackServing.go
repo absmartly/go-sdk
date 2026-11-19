@@ -175,8 +175,8 @@ func switchbackStep(current interface{}, key string, index int, isIndex bool) in
 // encoding is not their Go shape replaced by that encoding decoded with
 // UseNumber.
 func switchbackJSONView(value reflect.Value) reflect.Value {
-	for value.IsValid() && (value.Kind() == reflect.Ptr || value.Kind() == reflect.Interface) {
-		if value.IsNil() {
+	for hops := 0; value.IsValid() && (value.Kind() == reflect.Ptr || value.Kind() == reflect.Interface); hops++ {
+		if value.IsNil() || hops > switchbackMaxDepth {
 			return reflect.Value{}
 		}
 		if switchbackOpaque(value) {
@@ -232,9 +232,14 @@ func switchbackOpaque(value reflect.Value) bool {
 // deep. path holds the containers on the current branch only, so a value
 // shared by two siblings is not a cycle.
 func switchbackEncodable(value reflect.Value, path map[uintptr]bool, depth int) bool {
-	for value.IsValid() && (value.Kind() == reflect.Ptr || value.Kind() == reflect.Interface) && !switchbackOpaque(value) {
+	for hops := 0; value.IsValid() && (value.Kind() == reflect.Ptr || value.Kind() == reflect.Interface) && !switchbackOpaque(value); hops++ {
 		if value.IsNil() {
 			return true
+		}
+		if hops > switchbackMaxDepth {
+			// A pointer or interface cycle (var v any; v = &v) has no
+			// JSON encoding.
+			return false
 		}
 		value = value.Elem()
 	}
@@ -296,8 +301,8 @@ func switchbackEncodable(value reflect.Value, path map[uintptr]bool, depth int) 
 // assigner unhashed.
 func switchbackClusterKey(value interface{}) string {
 	var v = reflect.ValueOf(value)
-	for v.IsValid() && (v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface) && !switchbackOpaque(v) {
-		if v.IsNil() {
+	for hops := 0; v.IsValid() && (v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface) && !switchbackOpaque(v); hops++ {
+		if v.IsNil() || hops > switchbackMaxDepth {
 			return ""
 		}
 		v = v.Elem()
