@@ -1071,7 +1071,8 @@ func (c *Context) reopenExposure(assignment *Assignment, claimed *cachedAssignme
 	if claimed != nil && claimed.retirement.Load() {
 		return
 	}
-	if entry := c.cachedEntryFor(assignment); entry != nil {
+	var entry = c.assignmentCache_[assignment.Name]
+	if entry != nil && entry.assignment.Exposed == assignment.Exposed {
 		if _, unitSet := c.Units_[assignment.UnitType]; unitSet && entry.missingUnit() {
 			delete(c.assignmentCache_, assignment.Name)
 			delete(c.AssignmentCache, assignment.Name)
