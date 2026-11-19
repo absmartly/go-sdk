@@ -914,8 +914,11 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 		return -1, err
 	}
 	var entry = c.getAssignment(experimentName)
-	if !entry.assignment.Exposed.Load().(bool) {
-		entry = c.settleExposure(experimentName, entry)
+	if afterReadResolve != nil {
+		afterReadResolve()
+	}
+	if entry.needsSettling() {
+		entry = c.settleExposure(experimentName, entry, nil)
 	}
 	return entry.assignment.Variant, nil
 }
@@ -931,7 +934,8 @@ const maxExposureAttempts = 3
 // maxExposureAttempts times. It returns the entry the read must serve: the
 // replacement that was exposed, or on exhaustion the last one tried. It holds
 // no lock itself, so loggers run after admit released its locks.
-func (c *Context) settleExposure(experimentName string, entry *cachedAssignment) *cachedAssignment {
+func (c *Context) settleExposure(experimentName string, entry *cachedAssignment,
+	candidate func(*cachedAssignment) bool) *cachedAssignment {
 	for attempt := 1; ; attempt++ {
 		if beforeSettleClaim != nil {
 			beforeSettleClaim()
@@ -940,7 +944,24 @@ func (c *Context) settleExposure(experimentName string, entry *cachedAssignment)
 			return entry
 		}
 		entry = c.getAssignment(experimentName)
+		if candidate != nil && !candidate(entry) {
+			return entry
+		}
 	}
+}
+
+// needsSettling reports whether an exposing read must settle the entry's
+// exposure: it is not exposed yet, or it was retired (marked exposed by a
+// replacement or an eviction without being recorded). A warmed, exposed,
+// unretired read skips settling, as before holdouts.
+func (e *cachedAssignment) needsSettling() bool {
+	return !e.assignment.Exposed.Load().(bool) || e.retirement.Load()
+}
+
+// hasVariables is the variable read's candidate check: an entry with no
+// variables (its experiment was removed) is not exposed by the read.
+func hasVariables(e *cachedAssignment) bool {
+	return e.assignment.Variables != nil
 }
 
 // afterEvictionClaim, when set by a test, runs right after an eviction marks
@@ -948,6 +969,7 @@ func (c *Context) settleExposure(experimentName string, entry *cachedAssignment)
 // its retirement store and that claim. afterReplacementClaim runs right after
 // a replacement marks the replaced entry exposed.
 var (
+	afterReadResolve      func()
 	afterEvictionClaim    func(*cachedAssignment)
 	beforeEvictionClaim   func(*cachedAssignment)
 	afterReplacementClaim func(*cachedAssignment)
@@ -1326,10 +1348,15 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 			continue
 		}
 
-		if expose && !assignment.Exposed.Load().(bool) {
+		if expose && afterReadResolve != nil {
+			afterReadResolve()
+		}
+		if expose && entry.needsSettling() {
 			// A claim retired before it committed is exposed again on the
-			// replacement, whose variables are the ones served.
-			entry = c.settleExposure(experiment.Data.Name, entry)
+			// replacement, whose variables are the ones served. A replacement
+			// that is no longer a candidate for this read (the experiment was
+			// removed, so it has no variables) is not exposed.
+			entry = c.settleExposure(experiment.Data.Name, entry, hasVariables)
 			assignment = entry.assignment
 			if assignment.Variables == nil {
 				continue

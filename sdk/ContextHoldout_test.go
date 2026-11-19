@@ -3185,3 +3185,83 @@ func TestHoldout_ClaimLosingToAReplacementSeesTheRetirement(t *testing.T) {
 		t.Fatalf("a claim losing to the replacement reported %v, want retired", status)
 	}
 }
+
+// A replacement landing after a read resolved its assignment and before the
+// read checks whether it is exposed marks the old entry exposed without
+// recording it: the read still settles, serving and exposing the
+// replacement.
+func TestHoldout_ReplacementBeforeTheExposedCheckServesTheReplacement(t *testing.T) {
+	for _, variable := range []bool{false, true} {
+		var experiment = hoExperiment(1, "exp", hoUnitType, 0, 11)
+		experiment.Split = []float64{1, 0}
+		experiment.Variants[0].Config = `{"v":"old"}`
+		experiment.Variants[1].Config = `{"v":"new"}`
+		var replacement = experiment
+		replacement.Iteration = 2
+		replacement.Split = []float64{0, 1}
+		var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+		h.ctx.GetAssignment("exp")
+		var armed = true
+		afterReadResolve = func() {
+			if armed {
+				armed = false
+				h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
+				h.ctx.PeekTreatment("exp")
+			}
+		}
+		if variable {
+			expectValue(t, "new", h.variable("v"))
+		} else {
+			expectInt(t, 1, h.treatment("exp"))
+		}
+		afterReadResolve = nil
+		var exposures = queuedExposures(h.ctx)
+		if len(exposures) != 2 || exposures[0].Name != "exp" || exposures[0].Variant != 1 || exposures[1].Id != 11 {
+			t.Fatalf("exposures %+v", exposures)
+		}
+	}
+}
+
+// A variable read whose claim is retired because the experiment was removed
+// returns the default and exposes nothing for the removed experiment.
+func TestHoldout_VariableRetryDoesNotExposeARemovedExperiment(t *testing.T) {
+	var experiment = hoExperiment(1, "a", hoUnitType, 0, 11)
+	experiment.Variants[0].Config = `{"v":"x"}`
+	experiment.Variants[1].Config = `{"v":"x"}`
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+	h.ctx.GetAssignment("a")
+	var armed = true
+	beforeSettleClaim = func() {
+		if armed {
+			armed = false
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}))
+			h.ctx.GetAssignment("a")
+		}
+	}
+	defer func() { beforeSettleClaim = nil }()
+	expectValue(t, "default", h.variable("v"))
+	for _, exposure := range queuedExposures(h.ctx) {
+		if exposure.Name == "a" {
+			t.Fatalf("the removed experiment was exposed: %+v", queuedExposures(h.ctx))
+		}
+	}
+}
+
+// A warmed, exposed, unretired read does not settle.
+func TestHoldout_NeedsSettling(t *testing.T) {
+	var exposed = &atomic.Value{}
+	exposed.Store(true)
+	var entry = &cachedAssignment{assignment: &Assignment{Exposed: exposed}, retirement: &atomic.Bool{}}
+	if entry.needsSettling() {
+		t.Fatal("a warmed entry settles")
+	}
+	entry.retirement.Store(true)
+	if !entry.needsSettling() {
+		t.Fatal("a retired entry does not settle")
+	}
+	exposed.Store(false)
+	entry.retirement.Store(false)
+	if !entry.needsSettling() {
+		t.Fatal("an unexposed entry does not settle")
+	}
+}

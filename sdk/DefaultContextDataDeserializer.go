@@ -126,19 +126,11 @@ func holdoutSplit(raw json.RawMessage) ([]float64, bool) {
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
 		return nil, true
 	}
-	var entries []interface{}
-	if raw[0] != '[' || json.Unmarshal(raw, &entries) != nil {
+	// encoding/json decodes a null element as 0 and rejects any other
+	// non-number element or an out-of-range number.
+	var split []float64
+	if json.Unmarshal(raw, &split) != nil {
 		return nil, false
-	}
-	var split = make([]float64, len(entries))
-	for i, entry := range entries {
-		switch value := entry.(type) {
-		case float64:
-			split[i] = value
-		case nil:
-		default:
-			return nil, false
-		}
 	}
 	return split, true
 }
