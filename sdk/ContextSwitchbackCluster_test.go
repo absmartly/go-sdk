@@ -643,3 +643,19 @@ func TestSwitchbackCluster_JSONNumberIsAKeyAndANumber(t *testing.T) {
 		h.expectPublished(sbClusterExposure(sbDraw(digits, 0, sbClusterArms), sbAnchor+5, true, false))
 	}
 }
+
+type sbTextCity struct{ City string }
+
+func (c *sbTextCity) MarshalText() ([]byte, error) {
+	return []byte("text-" + c.City), nil
+}
+
+func TestSwitchbackCluster_PointerTextMarshalerSliceUsesPublishedShape(t *testing.T) {
+	var value = map[string]interface{}{"items": []sbTextCity{{City: "Porto"}}}
+	var encoded, err = json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectValue(t, `{"items":["text-Porto"]}`, string(encoded))
+	expectValue(t, "", parseSwitchbackPath("geo/items/0/City").resolveAttribute(value))
+}

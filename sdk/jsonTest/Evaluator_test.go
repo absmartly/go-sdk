@@ -6,6 +6,7 @@ import (
 	"github.com/absmartly/go-sdk/sdk/jsonexpr/eval"
 	"math"
 	"reflect"
+	"regexp"
 	"testing"
 )
 
@@ -782,4 +783,34 @@ func TestJSONNumbersAreNumbers(t *testing.T) {
 	assert(false, eval.BooleanConvert(reflect.ValueOf(json.Number("0"))), t)
 	assert(true, eval.BooleanConvert(reflect.ValueOf(json.Number("2"))), t)
 	assert(0, eval.Compare(reflect.ValueOf([]interface{}{json.Number("1")}), reflect.ValueOf([]interface{}{1.0})), t)
+}
+
+func TestJSONNumberStringCoercionAndFractionalZero(t *testing.T) {
+	var evaluator = eval.Evaluator{}
+	for raw, want := range map[string]string{"1e-7": "0.0000001", "12345678901234567": "12345678901234568"} {
+		var n = json.Number(raw)
+		var text, err = evaluator.StringConvert(reflect.ValueOf(n))
+		if err != nil || text != want || evaluator.Compare(reflect.ValueOf(want), reflect.ValueOf(n)) != 0 || evaluator.Compare(reflect.ValueOf(n), reflect.ValueOf(want)) != 0 {
+			t.Errorf("%s: text=%s err=%v compares=%v/%v", raw, text, err, evaluator.Compare(reflect.ValueOf(want), reflect.ValueOf(n)), evaluator.Compare(reflect.ValueOf(n), reflect.ValueOf(want)))
+		}
+		var expr = map[string]interface{}{"match": []interface{}{map[string]interface{}{"var": "n"}, map[string]interface{}{"value": "^" + regexp.QuoteMeta(want) + "$"}}}
+		if !jsonexpr.EvaluateBooleanExpr(expr, map[string]interface{}{"n": n}) {
+			t.Errorf("match %s", raw)
+		}
+		var inExpr = map[string]interface{}{"in": []interface{}{map[string]interface{}{"var": "hay"}, map[string]interface{}{"value": want}}}
+		if !jsonexpr.EvaluateBooleanExpr(inExpr, map[string]interface{}{"hay": "prefix" + want + "suffix"}) {
+			t.Errorf("in %s", raw)
+		}
+	}
+	for _, raw := range []string{"0.0", "0e0", "-0"} {
+		if evaluator.BooleanConvert(reflect.ValueOf(json.Number(raw))) {
+			t.Errorf("%s is truthy", raw)
+		}
+	}
+	for _, raw := range []string{"NaN", "Inf", "-Inf"} {
+		var text, _ = evaluator.StringConvert(reflect.ValueOf(json.Number(raw)))
+		if text != raw {
+			t.Errorf("%s stringified as %s", raw, text)
+		}
+	}
 }

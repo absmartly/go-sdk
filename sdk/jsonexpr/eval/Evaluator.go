@@ -31,7 +31,7 @@ func (e Evaluator) Evaluate(expr reflect.Value) interface{} {
 }
 
 func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
-	lhs, rhs = numberValue(lhs), numberValue(rhs)
+	lhs = numberValue(lhs)
 	if lhs.IsValid() && rhs.IsValid() {
 		if lhs.IsZero() && rhs.IsZero() {
 			return 0
@@ -141,7 +141,11 @@ func (e Evaluator) NumberConvert(x reflect.Value) (float64, error) {
 }
 
 func (e Evaluator) StringConvert(x reflect.Value) (string, error) {
-	x = numberValue(x)
+	if x.IsValid() && x.Type() == jsonNumberType {
+		if number := numberValue(x); number.Kind() == reflect.Float64 {
+			return jsNumberString(number.Float()), nil
+		}
+	}
 	if x.Kind() == reflect.Bool {
 		return strconv.FormatBool(x.Bool()), nil
 	} else if x.Kind() == reflect.String {
@@ -202,7 +206,7 @@ var jsonNumberType = reflect.TypeOf(json.Number(""))
 // Without it a json.Number, whose kind is string, compared as text.
 func numberValue(x reflect.Value) reflect.Value {
 	if x.IsValid() && x.Type() == jsonNumberType {
-		if f, err := strconv.ParseFloat(x.String(), 64); err == nil {
+		if f, err := strconv.ParseFloat(x.String(), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
 			return reflect.ValueOf(f)
 		}
 	}
