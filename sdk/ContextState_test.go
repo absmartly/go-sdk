@@ -999,31 +999,39 @@ func TestDeserializerThatLogsEventsWithLoggerDoesNotDeadlock(t *testing.T) {
 	}
 }
 
-// The evaluator bookkeeping is only for a custom deserializer with a logger;
-// the default deserializer, or no logger, registers nothing. Registration is
-// observed through the per-context evaluation counter while an audience is
-// evaluated (a wrapping deserializer records it for the default case).
+// countingDeserializer wraps a deserializer so the test can see whether an
+// audience evaluation ran.
 type countingDeserializer struct {
 	inner AudienceDeserializer
-	st    *contextState
-	seen  int32
+	calls int32
 }
 
 func (d *countingDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
-	if d.st != nil {
-		atomic.StoreInt32(&d.seen, atomic.LoadInt32(&d.st.evaluatorCount))
-	}
+	atomic.AddInt32(&d.calls, 1)
 	return d.inner.Deserialize(b, offset, length)
 }
 
+// The evaluator bookkeeping runs for a custom deserializer, the only code that
+// can call back into the context, with or without a logger; the default or a
+// nil deserializer never pays for it.
 func TestAudienceEvaluatorBookkeepingIsGated(t *testing.T) {
-	for _, logger := range []bool{false, true} {
-		var d = &countingDeserializer{inner: DefaultAudienceDeserializer{}}
+	var cases = []struct {
+		name         string
+		deserializer AudienceDeserializer
+		logger       bool
+		register     bool
+	}{
+		{"nil deserializer, logger", nil, true, false},
+		{"default deserializer, logger", DefaultAudienceDeserializer{}, true, false},
+		{"custom deserializer, no logger", &countingDeserializer{inner: DefaultAudienceDeserializer{}}, false, true},
+		{"custom deserializer, logger", &countingDeserializer{inner: DefaultAudienceDeserializer{}}, true, true},
+	}
+	for _, tc := range cases {
 		var client = &systemAttrClient{application: "website", environment: "production"}
 		var config = ABsmartlyConfig{Client_: client,
 			ContextDataProvider_: DefaultContextDataProvider{client_: client},
-			ContextEventHandler_: DefaultContextEventHandler{client_: client}, AudienceDeserializer_: d}
-		if logger {
+			ContextEventHandler_: DefaultContextEventHandler{client_: client}, AudienceDeserializer_: tc.deserializer}
+		if tc.logger {
 			config.ContextEventLogger_ = &MockEventLogger{}
 		}
 		var cc = CreateDefaultContextConfig()
@@ -1031,23 +1039,79 @@ func TestAudienceEvaluatorBookkeepingIsGated(t *testing.T) {
 		var ctx = Create(config).CreateContextWith(cc, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
 			audienceExperiment("exp_app", appFilter, true)}})
 		ctx.WaitUntilReady()
-		d.st = ctx.state()
+		var st = ctx.state()
+		var before = atomic.LoadInt64(&st.evaluationsRegistered)
 		assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
-		var want int32
-		if logger {
-			want = 1
+		var registered = atomic.LoadInt64(&st.evaluationsRegistered) - before
+		if tc.register && registered != 1 {
+			t.Errorf("%s: %d registrations, want 1", tc.name, registered)
 		}
-		if got := atomic.LoadInt32(&d.seen); got != want {
-			t.Errorf("custom deserializer, logger=%v: evaluatorCount during evaluation = %d, want %d", logger, got, want)
+		if !tc.register && registered != 0 {
+			t.Errorf("%s: %d registrations, want 0", tc.name, registered)
 		}
-		assertAny(int32(0), atomic.LoadInt32(&d.st.evaluatorCount), t)
+		assertAny(int32(0), atomic.LoadInt32(&st.evaluatorCount), t)
 	}
-	// The default deserializer never re-enters, so it never registers.
-	var abs = Create(ABsmartlyConfig{AudienceDeserializer_: DefaultAudienceDeserializer{}, ContextEventLogger_: &MockEventLogger{}})
-	assertAny(false, abs.CreateContextWith(CreateDefaultContextConfig(), jsonmodels.ContextData{}).AudienceMatcher_.customDeserializer(), t)
-	assertAny(false, AudienceMatcher{}.customDeserializer(), t)
-	assertAny(false, AudienceMatcher{&DefaultAudienceDeserializer{}}.customDeserializer(), t)
-	assertAny(true, AudienceMatcher{&countingDeserializer{}}.customDeserializer(), t)
+}
+
+// snapshotCallingDeserializer calls WaitUntilReady and Refresh, which take a
+// snapshot of the context, from inside an audience evaluation.
+type snapshotCallingDeserializer struct {
+	mu  sync.Mutex
+	ctx *Context
+}
+
+func (d *snapshotCallingDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	d.mu.Lock()
+	var ctx = d.ctx
+	d.ctx = nil
+	d.mu.Unlock()
+	if ctx != nil {
+		ctx.WaitUntilReady()
+		ctx.Refresh()
+	}
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+// syncDataProvider settles its future before returning it, so a refresh
+// installs the data on the calling goroutine.
+type syncDataProvider struct {
+	data jsonmodels.ContextData
+}
+
+func (p syncDataProvider) GetContextData() *future.Future {
+	var f, done = future.New()
+	done(p.data, nil)
+	return f
+}
+
+// v1.1.1: a custom deserializer with no logger could call WaitUntilReady and
+// Refresh from inside an evaluation. (With a provider that settles on another
+// goroutine, Refresh from a deserializer hangs; see CHANGELOG Known issues.)
+func TestDeserializerWithoutLoggerCanWaitAndRefresh(t *testing.T) {
+	var d = &snapshotCallingDeserializer{}
+	var client = &systemAttrClient{application: "website", environment: "production"}
+	var data = jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{audienceExperiment("exp_app", appFilter, true)}}
+	var cc = CreateDefaultContextConfig()
+	cc.Units_, cc.PublishDelay_, cc.RefreshInterval_ = withUnit(), -1, -1
+	var ctx = Create(ABsmartlyConfig{Client_: client,
+		ContextDataProvider_:  syncDataProvider{data},
+		ContextEventHandler_:  DefaultContextEventHandler{client_: client},
+		AudienceDeserializer_: d}).CreateContextWith(cc, data)
+	ctx.WaitUntilReady()
+	d.mu.Lock()
+	d.ctx = ctx
+	d.mu.Unlock()
+	var done = make(chan int, 1)
+	go func() {
+		var variant, _ = ctx.PeekTreatment("exp_app")
+		done <- variant
+	}()
+	select {
+	case variant := <-done:
+		assertAny(1, variant, t)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WaitUntilReady/Refresh from a deserializer without a logger deadlocked")
+	}
 }
 
 // Another goroutine's logger must not read the context without its lock

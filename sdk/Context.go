@@ -141,6 +141,8 @@ type contextState struct {
 	// (QueueExposure, Track) did not hang.
 	evaluatorCount     int32
 	audienceEvaluators sync.Map
+	// evaluationsRegistered counts every registration, for tests.
+	evaluationsRegistered int64
 }
 
 // contextClock carries private state in an existing interface field without
@@ -320,6 +322,7 @@ func (st *contextState) isAudienceEvaluator() bool {
 // ContextLock_ and returns the function that ends it. Nested evaluations on
 // the same goroutine are counted.
 func (st *contextState) enterAudienceEvaluation() func() {
+	atomic.AddInt64(&st.evaluationsRegistered, 1)
 	var id = goroutineID()
 	var n, _ = st.audienceEvaluators.Load(id)
 	var count, _ = n.(int)
@@ -340,11 +343,12 @@ func (st *contextState) enterAudienceEvaluation() func() {
 // AudienceDeserializer logs does not lock it again (a second read lock would
 // wait behind a queued writer).
 //
-// Only a custom deserializer can call back into the context, and only a
-// configured logger takes a snapshot, so the bookkeeping (a goroutine id
-// lookup) is done just then; the ordinary path pays nothing.
+// Only a custom deserializer can call back into the context, so the
+// bookkeeping (a goroutine id lookup) is done just then; the default setup
+// pays nothing. A logger is not required: WaitUntilReady, Refresh and the
+// publisher also take snapshots.
 func (c *Context) evaluateAudienceLocked(st *contextState, audience string, attrs map[string]interface{}) (Result, error) {
-	if c.EventLogger_ != nil && c.AudienceMatcher_.customDeserializer() {
+	if c.AudienceMatcher_.customDeserializer() {
 		defer st.enterAudienceEvaluation()()
 	}
 	return c.AudienceMatcher_.Evaluate(audience, attrs)
