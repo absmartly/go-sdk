@@ -2712,3 +2712,91 @@ func TestHoldout_DuplicateHoldoutConflictFields(t *testing.T) {
 		}
 	}
 }
+
+// A duplicate entry with a malformed split (a null or non-number element) is
+// skipped, so it never cancels a valid definition of the same id.
+func TestHoldout_MalformedDuplicateDoesNotCancelAValidHoldout(t *testing.T) {
+	for _, split := range []string{`[null,0.9]`, `[0.1,"x"]`, `[0.1,true]`, `[[0.1],0.9]`, `"0.1/0.9"`} {
+		for _, order := range []bool{false, true} {
+			var valid = `{"id":11,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":[0.1,0.9]}`
+			var malformed = `{"id":11,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":` + split + `}`
+			var holdouts = valid + "," + malformed
+			if order {
+				holdouts = malformed + "," + valid
+			}
+			var payload = `{"experiments":[{"id":1,"name":"exp","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
+				"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
+				"holdouts":[` + holdouts + `]}`
+			var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
+			if err != nil {
+				t.Fatal(err)
+			}
+			expectInt(t, 1, len(data.Holdouts))
+			var h = hoCreateFor(t, hoUID, data)
+			expectInt(t, 0, h.treatment("exp"))
+			h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+		}
+	}
+}
+
+// hoReplacingClock replaces the assignment the first time the clock is read
+// with armed set, which happens after an exposure is claimed and before its
+// admission takes EventLock_.
+type hoReplacingClock struct {
+	armed   *bool
+	replace func()
+}
+
+func (c hoReplacingClock) Millis() int64 {
+	if *c.armed {
+		*c.armed = false
+		c.replace()
+	}
+	return hoMillis
+}
+
+// A claimed exposure whose assignment a refresh retires before the admission
+// commits publishes nothing; the replacement publishes its own decision.
+func TestHoldout_ClaimRetiredBeforeCommitPublishesNothing(t *testing.T) {
+	for _, covered := range []bool{true, false} {
+		var ctx *Context
+		var armed = false
+		var stale *Assignment
+		var experiment = hoExperiment(1, "exp", hoUnitType, 0, 11)
+		if !covered {
+			experiment.HoldoutIds = nil
+		}
+		var replacement = hoExperiment(1, "exp", hoUnitType, 0, 11)
+		replacement.Iteration = 2
+		var clock = hoReplacingClock{armed: &armed, replace: func() {
+			ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
+			ctx.GetAssignment("exp")
+		}}
+		var config = CreateDefaultContextConfig()
+		config.Units_ = map[string]string{hoUnitType: hoUIDNotHeldOut}
+		config.PublishDelay_ = -1
+		config.RefreshInterval_ = -1
+		var ft, done = future.New()
+		done(hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment), nil)
+		ctx = CreateContext(clock, config, ft, &hoProvider{}, &hoPublisher{}, nil,
+			DefaultVariableParser{}, AudienceMatcher{DefaultAudienceDeserializer{}})
+		ctx.WaitUntilReady()
+		stale = ctx.GetAssignment("exp")
+		armed = true
+		ctx.QueueExposure(stale)
+		if armed {
+			t.Fatal("the clock was not read during the admission")
+		}
+		expectInt(t, 0, int(ctx.GetPendingCount()))
+		if _, err := ctx.GetTreatment("exp"); err != nil {
+			t.Fatal(err)
+		}
+		// Only the replacement's decision: its own exposure and the
+		// holdout's, once each.
+		var exposures = queuedExposures(ctx)
+		if len(exposures) != 2 || exposures[0].Name != "exp" || exposures[1].Id != 11 {
+			t.Fatalf("exposures %+v", exposures)
+		}
+		ctx.ClearRefreshTimer()
+	}
+}

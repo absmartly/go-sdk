@@ -115,6 +115,28 @@ func holdoutSeed(raw json.RawMessage) int {
 	return int(uint32(int64(math.Mod(math.Trunc(value), 1<<32))))
 }
 
+// holdoutSplit decodes a holdout's split. Absent or null is no split (the
+// holdout then covers nothing); an array whose elements are not all numbers
+// is malformed.
+func holdoutSplit(raw json.RawMessage) ([]float64, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil, true
+	}
+	var entries []json.RawMessage
+	if raw[0] != '[' || json.Unmarshal(raw, &entries) != nil {
+		return nil, false
+	}
+	var split = make([]float64, len(entries))
+	for i, entry := range entries {
+		entry = bytes.TrimSpace(entry)
+		if len(entry) == 0 || entry[0] == 'n' || json.Unmarshal(entry, &split[i]) != nil {
+			return nil, false
+		}
+	}
+	return split, true
+}
+
 // wireHoldout decodes a holdout with its integer fields written as any
 // integral JSON number, so a producer re-encoding 1 as 1.0 keeps the same
 // epoch and seeds. holdoutType and unitType are informational (the arity
@@ -123,6 +145,10 @@ func holdoutSeed(raw json.RawMessage) int {
 // an unknown field would.
 type wireHoldout struct {
 	jsonmodels.Holdout
+	// Split is decoded raw: an element that is not a number (null decodes
+	// as 0 in a []float64) makes the whole entry malformed, so it is
+	// skipped rather than compared against a valid duplicate.
+	Split       json.RawMessage `json:"split"`
 	Id          json.RawMessage `json:"id"`
 	Iteration   json.RawMessage `json:"iteration"`
 	SeedHi      json.RawMessage `json:"seedHi"`
@@ -147,6 +173,11 @@ func holdouts(raw json.RawMessage) []jsonmodels.Holdout {
 		if trimmed := bytes.TrimSpace(entry); len(trimmed) == 0 || trimmed[0] != '{' || json.Unmarshal(entry, &holdout) != nil {
 			continue
 		}
+		var split, ok = holdoutSplit(holdout.Split)
+		if !ok {
+			continue
+		}
+		holdout.Holdout.Split = split
 		if id, ok := holdoutId(holdout.Id); ok {
 			holdout.Holdout.Id = id
 			holdout.Holdout.Iteration, _ = holdoutId(holdout.Iteration)

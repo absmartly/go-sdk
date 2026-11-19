@@ -932,7 +932,11 @@ func (c *Context) admitExposure(assignment *Assignment, entry *cachedAssignment)
 	if entry != nil {
 		holdouts = entry.holdouts
 	}
-	if !c.admit(assignment, holdouts) {
+	var retirement *atomic.Bool
+	if entry != nil {
+		retirement = entry.retirement
+	}
+	if !c.admit(assignment, holdouts, retirement) {
 		c.ContextLock_.Lock()
 		c.reopenExposure(assignment, entry)
 		c.ContextLock_.Unlock()
@@ -940,10 +944,12 @@ func (c *Context) admitExposure(assignment *Assignment, entry *cachedAssignment)
 }
 
 // admit queues the claimed exposures and reports false when a close
-// rejected them.
-func (c *Context) admit(assignment *Assignment, holdouts *assignmentHoldouts) bool {
+// rejected them. A claim whose assignment a replacement retired before the
+// admission took EventLock_ publishes nothing and stays exposed (consumed),
+// so a superseded decision never appears beside its replacement's.
+func (c *Context) admit(assignment *Assignment, holdouts *assignmentHoldouts, retirement *atomic.Bool) bool {
 	if holdouts == nil {
-		return c.enqueueExposure(assignment)
+		return c.enqueueRetirable(assignment, retirement)
 	}
 
 	var exposedAt = c.Clock_.Millis()
@@ -954,6 +960,10 @@ func (c *Context) admit(assignment *Assignment, holdouts *assignmentHoldouts) bo
 	if c.CheckNotClosed() != nil {
 		c.EventLock_.Unlock()
 		return false
+	}
+	if retirement != nil && retirement.Load() {
+		c.EventLock_.Unlock()
+		return true
 	}
 	var exposures []jsonmodels.Exposure
 	if !holdouts.isSuppressed() {
@@ -1022,6 +1032,13 @@ func (c *Context) exposureFor(assignment *Assignment, exposedAt int64) jsonmodel
 // exposed. When the context is closed it reports false, and the caller
 // clears the mark so a later read can retry.
 func (c *Context) enqueueExposure(assignment *Assignment) bool {
+	return c.enqueueRetirable(assignment, nil)
+}
+
+// enqueueRetirable is enqueueExposure for a claim that a replacement may
+// retire: if it was retired before the append, it publishes nothing and
+// reports true (the claim is consumed).
+func (c *Context) enqueueRetirable(assignment *Assignment, retirement *atomic.Bool) bool {
 	var exposure = jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
 		Variant: assignment.Variant, ExposedAt: c.Clock_.Millis(), Assigned: assignment.Assigned,
 		Eligible: assignment.Eligible, Overridden: assignment.Overridden, FullOn: assignment.FullOn,
@@ -1034,6 +1051,10 @@ func (c *Context) enqueueExposure(assignment *Assignment) bool {
 	if c.CheckNotClosed() != nil {
 		c.EventLock_.Unlock()
 		return false
+	}
+	if retirement != nil && retirement.Load() {
+		c.EventLock_.Unlock()
+		return true
 	}
 	c.PendingCount_.Store(c.PendingCount_.Load().(int32) + 1)
 	c.Exposures_ = append(c.Exposures_, exposure)
@@ -1893,7 +1914,11 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 		// Retire the replaced assignment, as eviction does: a caller still
 		// holding it must not publish a decision, or holdout arms, that the
 		// replacement has superseded, also when its admission is in flight.
+		// Under EventLock_, so an admission either commits before this or
+		// sees the retirement (lock order ContextLock_, EventLock_).
+		c.EventLock_.Lock()
 		previous.retirement.Store(true)
+		c.EventLock_.Unlock()
 		previous.assignment.Exposed.CompareAndSwap(false, true)
 	}
 
