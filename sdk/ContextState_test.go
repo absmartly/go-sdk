@@ -863,23 +863,30 @@ func TestCopySetDataIsReadBackConsistently(t *testing.T) {
 // listener on the ready future runs as it settles and checks the future is
 // still installed then.
 func TestFailedLoadSettlesReadyFutureBeforeClearingIt(t *testing.T) {
-	for _, failure := range []string{"provider", "type"} {
+	for _, failure := range []string{"provider", "type", "panic"} {
 		setUp()
 		var config = CreateDefaultContextConfig()
 		config.Units_ = units
 		config.PublishDelay_ = -1
 		config.RefreshInterval_ = 0
 		var pending, settle = future.New()
-		var ctx = createTrackedContext(clock, config, pending, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
+		var parser VariableParser = variableParser
+		if failure == "panic" {
+			parser = panickingParser{}
+		}
+		var ctx = createTrackedContext(clock, config, pending, dataProvider, eventHandler, nil, parser, audienceMatcher)
 		var ready = ctx.getReadyFuture()
 		var installedAtSettlement = make(chan bool, 1)
 		ready.Listen(func(_ future.Value, _ error) {
 			installedAtSettlement <- ctx.getReadyFuture() != nil
 		})
-		if failure == "provider" {
+		switch failure {
+		case "provider":
 			settle(nil, errors.New("load failed"))
-		} else {
+		case "type":
 			settle("not context data", nil)
+		case "panic":
+			settle(data, nil)
 		}
 		if !<-installedAtSettlement {
 			t.Errorf("%s failure: ReadyFuture_ was cleared before the ready future settled", failure)
