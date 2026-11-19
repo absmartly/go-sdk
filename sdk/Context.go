@@ -951,6 +951,9 @@ func (c *Context) SetUnits(units map[string]string) error {
 }
 
 func (c *Context) SetAttribute(name string, value interface{}) error {
+	// Write to the live context, whose attributes assignments are evaluated
+	// with (setUnit does the same for units).
+	c = c.live()
 	var st = c.state()
 	var err = c.CheckNotClosed()
 	if err != nil {
@@ -967,6 +970,7 @@ func (c *Context) SetAttribute(name string, value interface{}) error {
 
 // GetAttribute returns the last value set for an attribute, or nil.
 func (c *Context) GetAttribute(name string) interface{} {
+	c = c.live()
 	c.ContextLock_.RLock()
 	defer c.ContextLock_.RUnlock()
 	for i := len(c.Attributes_) - 1; i >= 0; i-- {
@@ -979,6 +983,7 @@ func (c *Context) GetAttribute(name string) interface{} {
 
 // GetAttributes returns the last value set for each attribute.
 func (c *Context) GetAttributes() map[string]interface{} {
+	c = c.live()
 	c.ContextLock_.RLock()
 	defer c.ContextLock_.RUnlock()
 	var result = map[string]interface{}{}
@@ -1043,18 +1048,12 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 func (c *Context) QueueExposure(assignment *Assignment) {
 	c = c.live()
 	var st = c.state()
-	// A copy returned by GetAssignment shares the cached assignment's
-	// exposed flag, which identifies the cache entry its rule flag is on.
-	var ruleOverride = st.ruleIdentities.contains(assignment.Exposed)
-	// A literal without ContextLock_ has no assignment cache to consult.
-	if c.ContextLock_ != nil {
-		c.ContextLock_.RLock()
-		if entry, found := st.assignmentCache_[assignment.Name]; found && entry.assignment.Exposed == assignment.Exposed {
-			ruleOverride = entry.ruleOverride
-		}
-		c.ContextLock_.RUnlock()
-	}
-	c.queueExposure(assignment, ruleOverride)
+	// A copy returned by GetAssignment shares the cached assignment's exposed
+	// flag. Every rule-selected assignment's flag is recorded in
+	// ruleIdentities, which has its own lock, so this takes no ContextLock_:
+	// an AudienceDeserializer may call QueueExposure from inside an
+	// evaluation, which holds it.
+	c.queueExposure(assignment, st.ruleIdentities.contains(assignment.Exposed))
 }
 
 func (c *Context) queueExposure(assignment *Assignment, ruleOverride bool) {

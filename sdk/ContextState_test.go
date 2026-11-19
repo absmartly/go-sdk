@@ -762,3 +762,68 @@ func TestReplacedClockVariableKeysIgnoreLegacyIndexWrites(t *testing.T) {
 	}
 	assertAny("exp", keys["color"], t)
 }
+
+// An attribute written through a value copy of an SDK-created context is
+// what that copy's assignments are evaluated with.
+func TestAttributeWrittenThroughCopyIsEvaluated(t *testing.T) {
+	var ctx, _ = newRuleContext(t, "production", withUnit(),
+		ruleExperiment("exp", rulesJSON(`{"type":"assign","variant":2,"conditions":{"eq":[{"var":"country"},{"value":"US"}]}}`)))
+	assertAny(0, treatmentPeek(t, ctx, "exp"), t)
+	var copied = *ctx
+	assertAny(nil, copied.SetAttribute("country", "US"), t)
+	assertAny("US", copied.GetAttribute("country"), t)
+	assertAny("US", copied.GetAttributes()["country"], t)
+	assertAny(2, treatmentPeek(t, &copied, "exp"), t)
+	assertAny(2, treatmentPeek(t, ctx, "exp"), t)
+	assertAny("US", ctx.GetAttribute("country"), t)
+}
+
+// queueingDeserializer queues an exposure it already holds from inside an
+// audience evaluation, which runs while ContextLock_ is held.
+type queueingDeserializer struct {
+	ctx      *Context
+	retained *Assignment
+}
+
+func (d *queueingDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	if d.ctx != nil && d.retained != nil {
+		var retained = d.retained
+		d.retained = nil
+		d.ctx.QueueExposure(retained)
+	}
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+func TestQueueExposureFromInsideEvaluationDoesNotDeadlock(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		var d = &queueingDeserializer{}
+		var client = &systemAttrClient{application: "website", environment: "production"}
+		var abs = Create(ABsmartlyConfig{Client_: client,
+			ContextDataProvider_: DefaultContextDataProvider{client_: client},
+			ContextEventHandler_: DefaultContextEventHandler{client_: client}, AudienceDeserializer_: d})
+		var config = CreateDefaultContextConfig()
+		config.Units_, config.PublishDelay_, config.RefreshInterval_ = withUnit(), -1, -1
+		var ctx = abs.CreateContextWith(config, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+			ruleExperiment("rule", rulesJSON(`{"type":"assign","variant":2}`)),
+			audienceExperiment("exp_app", appFilter, true)}})
+		ctx.WaitUntilReady()
+		if replace {
+			ctx.Clock_ = internal.FixedClock{Millis_: 1}
+		}
+		d.ctx, d.retained = ctx, ctx.GetAssignment("rule")
+		var done = make(chan int, 1)
+		go func() {
+			var variant, _ = ctx.PeekTreatment("exp_app")
+			done <- variant
+		}()
+		select {
+		case variant := <-done:
+			assertAny(1, variant, t)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("PeekTreatment deadlocked when the deserializer queued an exposure (Clock_ replaced: %v)", replace)
+		}
+		var exposures = expectExposures(t, ctx, 1)
+		assertAny("rule", exposures[0].Name, t)
+		assertAny(true, exposures[0].RuleOverride, t)
+	}
+}
