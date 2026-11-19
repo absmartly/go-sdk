@@ -2153,10 +2153,6 @@ func TestHoldout_RejectedSharedArmIsNotTakenAsAccepted(t *testing.T) {
 	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
 }
 
-// A held-out assignment whose exposure is in flight while two replacements
-// land (covered, then uncovered) stays retired when a close rejects the
-// admission: it never publishes beside the current assignment, however many
-// replacements land.
 func TestHoldout_RetirementSurvivesASecondReplacement(t *testing.T) {
 	for _, replacements := range []int{2, 12} {
 		var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0)))
@@ -2317,20 +2313,10 @@ func TestHoldout_HeldAssignmentQueuedAfterHoldoutsRemoved(t *testing.T) {
 	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
 }
 
-// A context without holdouts still leaves no in-flight registration after
-// its public QueueExposure path.
 func TestHoldout_QueueExposureWithoutHoldoutsLeavesNoRegistration(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
 	h.ctx.QueueExposure(h.ctx.GetAssignment("exp"))
 	h.expectPending(1)
-}
-
-func TestHoldout_SetDataFailedKeepsHoldoutsSeen(t *testing.T) {
-	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
-	h.ctx.SetDataFailed(errors.New("load failed"))
-	if !h.ctx.holdoutsSeen_.Load() {
-		t.Fatal("SetDataFailed cleared holdoutsSeen_")
-	}
 }
 
 // QueueExposure on a Context built as a literal returns, as in v1.1.1, for
@@ -2471,7 +2457,6 @@ func TestHoldout_PanickingLoggerLeavesDecisionIntact(t *testing.T) {
 	h.expectPending(2)
 }
 
-// A claim racing a replacement remains retired regardless of their order.
 func TestHoldout_ClaimAndReplacementNeverInterleave(t *testing.T) {
 	for round := 0; round < 200; round++ {
 		var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0)))
@@ -2665,4 +2650,25 @@ func TestHoldout_HoldoutIdSpellingsDecodeAlike(t *testing.T) {
 		holdoutIds([]byte(`[9007199254740993, 9.007199254740993e15, 9007199254740992]`)))
 	expectValue(t, []int{1000000000000000000, 1000000000000000000},
 		holdoutIds([]byte(`[1000000000000000001, 1.000000000000000001e18]`)))
+}
+
+// Duplicate holdout ids: identical definitions count as one, and conflicting
+// definitions cover nothing, so neither depends on the entries' order.
+func TestHoldout_DuplicateHoldoutDefinitionsAreOrderIndependent(t *testing.T) {
+	var a = hoHoldoutA()
+	var b = hoHoldout(11, "holdout_a", hoUnitType, hoSeedBHi, hoSeedBLo)
+	for _, holdouts := range [][]jsonmodels.Holdout{{a, b}, {b, a}} {
+		var h = hoCreateFor(t, hoUID, hoData(holdouts, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+		expectInt(t, hoNormalVariant, h.treatment("exp"))
+		h.expectPublished(hoOwn(hoUnitType, 1, "exp", hoNormalVariant))
+	}
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{a, a}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	expectInt(t, 0, h.treatment("exp"))
+	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
+	// A refresh that only reorders conflicting duplicates changes nothing.
+	var r = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{a, b}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	expectInt(t, hoNormalVariant, r.treatment("exp"))
+	r.refresh(hoData([]jsonmodels.Holdout{b, a}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	expectInt(t, hoNormalVariant, r.treatment("exp"))
+	r.expectPublished(hoOwn(hoUnitType, 1, "exp", hoNormalVariant))
 }

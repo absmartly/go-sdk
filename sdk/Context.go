@@ -142,11 +142,6 @@ type Context struct {
 	// so a context without holdouts never allocates it. Guarded by
 	// ContextLock_.
 	holdoutArms_ map[holdoutKey]*holdoutArm
-
-	// holdoutsSeen_ is set once any installed payload had holdouts and is
-	// never cleared: an assignment resolved then can still carry holdout
-	// decisions after a refresh removes them all.
-	holdoutsSeen_ *atomic.Bool
 }
 
 // contextIndex is an installed experiment index and, by experiment name, the
@@ -373,7 +368,6 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	cntx.AssignmentCache = map[string]Assignment{}
 	cntx.assignmentCache_ = map[string]*cachedAssignment{}
 	cntx.index_ = &atomic.Pointer[contextIndex]{}
-	cntx.holdoutsSeen_ = &atomic.Bool{}
 	cntx.unitValues_ = map[string]interface{}{}
 	cntx.readyDeliverer_ = &atomic.Uint64{}
 	cntx.loggers_ = &loggerGoroutines{ids: map[uint64]int{}}
@@ -2139,11 +2133,29 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		// caller reuses its slice.
 		var installed = append([]jsonmodels.Holdout(nil), data.Holdouts...)
 		holdoutsById = make(map[int]*jsonmodels.Holdout, len(installed))
+		// An id listed more than once with conflicting definitions covers
+		// nothing, so the outcome never depends on the entries' order;
+		// identical duplicates count as one. The collector never sends
+		// duplicates.
+		var conflicting map[int]bool
 		for i := range installed {
-			if len(installed[i].Split) > 0 {
-				installed[i].Split = append([]float64(nil), installed[i].Split...)
-				holdoutsById[installed[i].Id] = &installed[i]
+			if len(installed[i].Split) == 0 {
+				continue
 			}
+			installed[i].Split = append([]float64(nil), installed[i].Split...)
+			if seen, found := holdoutsById[installed[i].Id]; found {
+				if !reflect.DeepEqual(*seen, installed[i]) {
+					if conflicting == nil {
+						conflicting = map[int]bool{}
+					}
+					conflicting[installed[i].Id] = true
+				}
+				continue
+			}
+			holdoutsById[installed[i].Id] = &installed[i]
+		}
+		for id := range conflicting {
+			delete(holdoutsById, id)
 		}
 	}
 	var coverage map[string][]*jsonmodels.Holdout
@@ -2258,9 +2270,6 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 
 	// Serialize publication with resolution to keep coverage and arms in one generation.
 	c.ContextLock_.Lock()
-	if len(data.Holdouts) > 0 {
-		c.holdoutsSeen_.Store(true)
-	}
 	c.DataLock.Lock()
 
 	c.Index_ = index
