@@ -695,11 +695,13 @@ func TestContextLiteralVariableKeysReadCurrentLegacyIndex(t *testing.T) {
 type keysInEvaluation struct {
 	ctx  *Context
 	keys map[string]string
+	all  map[string][]string
 }
 
 func (d *keysInEvaluation) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
 	if d.ctx != nil && d.keys == nil {
 		d.keys, _ = d.ctx.GetVariableKeys()
+		d.all, _ = d.ctx.GetVariableKeysAll()
 	}
 	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
 }
@@ -737,4 +739,26 @@ func TestContextLiteralVariableKeysInsideEvaluationAreCurrent(t *testing.T) {
 	d.ctx = &manual
 	_, _ = manual.PeekTreatment("exp_app")
 	assertAny(map[string]string{"color": "five", "size": "six"}, d.keys, t)
+	assertAny(map[string][]string{"color": {"five"}, "size": {"six"}}, d.all, t)
+}
+
+// An SDK-created context reads its own index even after Clock_ is replaced,
+// so writes to IndexVariables_ do not change its variable keys (CHANGELOG).
+func TestReplacedClockVariableKeysIgnoreLegacyIndexWrites(t *testing.T) {
+	var ctx, _ = newRuleContext(t, "production", withUnit(), ruleExperiment("exp", ""))
+	ctx.Clock_ = internal.FixedClock{Millis_: 1}
+	ctx.DataLock.Lock()
+	ctx.IndexVariables_["injected"] = ExperimentVariables{Data: jsonmodels.Experiment{Name: "injected"}}
+	ctx.DataLock.Unlock()
+	var keys, err = ctx.GetVariableKeys()
+	assertAny(nil, err, t)
+	if _, found := keys["injected"]; found {
+		t.Errorf("GetVariableKeys sees an IndexVariables_ write: %v", keys)
+	}
+	var all, allErr = ctx.GetVariableKeysAll()
+	assertAny(nil, allErr, t)
+	if _, found := all["injected"]; found {
+		t.Errorf("GetVariableKeysAll sees an IndexVariables_ write: %v", all)
+	}
+	assertAny("exp", keys["color"], t)
 }
