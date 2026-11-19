@@ -561,8 +561,8 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 					err = &TypeError{Expected: "jsonmodels.ContextData", Actual: val}
 					tmp.SetDataFailed(err)
 					tmp.LogError(err)
-					cntx.setReadyFutureWith(state, nil)
 					readyFutureDone(nil, err)
+					cntx.setReadyFutureWith(state, nil)
 					return
 				}
 				var diagnostics, panicErr = tmp.applyRefreshedData(result)
@@ -570,8 +570,8 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 					tmp.SetDataFailed(panicErr)
 					tmp.dispatchDiagnostics(diagnostics)
 					tmp.LogError(panicErr)
-					cntx.setReadyFutureWith(state, nil)
 					readyFutureDone(nil, panicErr)
+					cntx.setReadyFutureWith(state, nil)
 					return
 				}
 				// Log before settling, so WaitUntilReady returns after the
@@ -590,8 +590,11 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 			} else {
 				tmp.SetDataFailed(err)
 				tmp.LogError(err)
-				cntx.setReadyFutureWith(state, nil)
+				// Settle the failed future before clearing it, so a waiter
+				// that arrives in between joins it and sees the error. Nothing
+				// below reads Clock_, so the order is safe here.
 				readyFutureDone(nil, err)
+				cntx.setReadyFutureWith(state, nil)
 			}
 
 		})
@@ -707,6 +710,8 @@ func (c *Context) live() *Context {
 }
 
 func (c *Context) GetExperiments() ([]string, error) {
+	// SetData installs data on the live context; read it from there.
+	c = c.live()
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
@@ -724,6 +729,8 @@ func (c *Context) GetExperiments() ([]string, error) {
 }
 
 func (c *Context) GetData() (jsonmodels.ContextData, error) {
+	// SetData installs data on the live context; read it from there.
+	c = c.live()
 	var err = c.CheckReady(true)
 	if err != nil {
 		return jsonmodels.ContextData{}, err
@@ -1177,6 +1184,8 @@ func removeDuplicateValues(intSlice []string) []string {
 }
 
 func (c *Context) GetCustomFieldValueKeys() ([]string, error) {
+	// SetData installs data on the live context; read it from there.
+	c = c.live()
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
@@ -1210,6 +1219,8 @@ func (c *Context) GetCustomFieldValue(experimentName string, key string) interfa
 
 // GetCustomFieldValueE returns a custom field value or the context read error.
 func (c *Context) GetCustomFieldValueE(experimentName string, key string) (interface{}, error) {
+	// SetData installs data on the live context; read it from there.
+	c = c.live()
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
@@ -1230,6 +1241,8 @@ func (c *Context) GetCustomFieldValueE(experimentName string, key string) (inter
 }
 
 func (c *Context) GetCustomFieldValueType(experimentName string, key string) string {
+	// SetData installs data on the live context; read it from there.
+	c = c.live()
 	c.DataLock.Lock()
 	defer c.DataLock.Unlock()
 

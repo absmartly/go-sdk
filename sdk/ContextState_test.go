@@ -827,3 +827,70 @@ func TestQueueExposureFromInsideEvaluationDoesNotDeadlock(t *testing.T) {
 		assertAny(true, exposures[0].RuleOverride, t)
 	}
 }
+
+// Data installed through a value copy is what every read through that copy,
+// and through the original, returns.
+func TestCopySetDataIsReadBackConsistently(t *testing.T) {
+	var before, after = ruleExperiment("before", ""), ruleExperiment("after", "")
+	after.Id = 9
+	after.CustomFieldValues = []jsonmodels.CustomFieldValue{{Name: "f", Type: "string", Value: "v"}}
+	var ctx, _ = newRuleContext(t, "production", withUnit(), before)
+	var copied = *ctx
+	copied.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{after}})
+	for name, c := range map[string]*Context{"copy": &copied, "original": ctx} {
+		var names, err = c.GetExperiments()
+		assertAny(nil, err, t)
+		assertAny([]string{"after"}, names, t)
+		var data, dataErr = c.GetData()
+		assertAny(nil, dataErr, t)
+		assertAny(1, len(data.Experiments), t)
+		assertAny("after", data.Experiments[0].Name, t)
+		var keys, keysErr = c.GetCustomFieldValueKeys()
+		assertAny(nil, keysErr, t)
+		assertAny([]string{"f"}, keys, t)
+		assertAny("v", c.GetCustomFieldValue("after", "f"), t)
+		assertAny("string", c.GetCustomFieldValueType("after", "f"), t)
+		if _, found := c.GetExperiment("after"); !found {
+			t.Errorf("%s: GetExperiment does not see the installed data", name)
+		}
+	}
+}
+
+// A waiter that arrives while a failed initial load is being reported gets
+// the load error: the callback settles the ready future before clearing
+// ReadyFuture_. With the clear first, a waiter in between would find no
+// future and Ready_ already set, and would be told the context is ready. A
+// listener on the ready future runs as it settles and checks the future is
+// still installed then.
+func TestFailedLoadSettlesReadyFutureBeforeClearingIt(t *testing.T) {
+	for _, failure := range []string{"provider", "type"} {
+		setUp()
+		var config = CreateDefaultContextConfig()
+		config.Units_ = units
+		config.PublishDelay_ = -1
+		config.RefreshInterval_ = 0
+		var pending, settle = future.New()
+		var ctx = createTrackedContext(clock, config, pending, dataProvider, eventHandler, nil, variableParser, audienceMatcher)
+		var ready = ctx.getReadyFuture()
+		var installedAtSettlement = make(chan bool, 1)
+		ready.Listen(func(_ future.Value, _ error) {
+			installedAtSettlement <- ctx.getReadyFuture() != nil
+		})
+		if failure == "provider" {
+			settle(nil, errors.New("load failed"))
+		} else {
+			settle("not context data", nil)
+		}
+		if !<-installedAtSettlement {
+			t.Errorf("%s failure: ReadyFuture_ was cleared before the ready future settled", failure)
+		}
+		var _, err = ready.Get(context.Background())
+		if err == nil {
+			t.Errorf("%s failure: ready future settled without the load error", failure)
+		}
+		assertAny(true, ctx.IsFailed(), t)
+		if ctx.getReadyFuture() != nil {
+			t.Errorf("%s failure: ReadyFuture_ still installed after settlement", failure)
+		}
+	}
+}
