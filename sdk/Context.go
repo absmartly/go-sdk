@@ -955,21 +955,35 @@ func (e *cachedAssignment) needsSettling() bool {
 	return !e.assignment.Exposed.Load().(bool) || e.retirement.Load()
 }
 
-// hasVariables is the variable read's candidate check: an entry with no
-// variables (its experiment was removed) is not exposed by the read.
-func hasVariables(e *cachedAssignment) bool {
-	return e.assignment.Variables != nil
+// definesVariable is the variable read's candidate check: a replacement is
+// exposed by the read only if it has variables (its experiment was not
+// removed) and its experiment still defines key in the current data.
+func (c *Context) definesVariable(key string, experimentName string) func(*cachedAssignment) bool {
+	return func(e *cachedAssignment) bool {
+		if e.assignment.Variables == nil {
+			return false
+		}
+		c.DataLock.RLock()
+		defer c.DataLock.RUnlock()
+		for _, experiment := range c.indexVariables_[key] {
+			if experiment.Data.Name == experimentName {
+				return true
+			}
+		}
+		return false
+	}
 }
 
 // afterEvictionClaim, when set by a test, runs right after an eviction marks
 // an entry exposed; beforeEvictionClaim runs between
-// its retirement store and that claim. afterReplacementClaim runs right after
-// a replacement marks the replaced entry exposed.
+// its retirement store and that claim. beforeReplacementClaim and
+// afterReplacementClaim do the same for a replacement.
 var (
-	afterReadResolve      func()
-	afterEvictionClaim    func(*cachedAssignment)
-	beforeEvictionClaim   func(*cachedAssignment)
-	afterReplacementClaim func(*cachedAssignment)
+	afterReadResolve       func()
+	afterEvictionClaim     func(*cachedAssignment)
+	beforeEvictionClaim    func(*cachedAssignment)
+	beforeReplacementClaim func(*cachedAssignment)
+	afterReplacementClaim  func(*cachedAssignment)
 )
 
 // beforeSettleClaim, when set by a test, runs before each claim in
@@ -1334,10 +1348,11 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 		}
 		if expose && entry.needsSettling() {
 			// An assignment retired before this read claimed it is exposed
-			// on the replacement instead, whose variables are the ones served. A replacement
-			// that is no longer a candidate for this read (the experiment was
-			// removed, so it has no variables) is not exposed.
-			entry = c.settleExposure(experiment.Data.Name, entry, hasVariables)
+			// on the replacement instead, whose variables are the ones
+			// served. A replacement that is no longer a candidate for this
+			// read (the experiment was removed, or no longer defines key)
+			// is not exposed, as Java re-resolves by key.
+			entry = c.settleExposure(experiment.Data.Name, entry, c.definesVariable(key, experiment.Data.Name))
 			assignment = entry.assignment
 			if assignment.Variables == nil {
 				continue
@@ -2016,6 +2031,9 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 		// retirement and resolves again. A claim already taken still
 		// commits: the decision is served by the read that claimed it.
 		previous.retirement.Store(true)
+		if beforeReplacementClaim != nil {
+			beforeReplacementClaim(previous)
+		}
 		previous.assignment.Exposed.CompareAndSwap(false, true)
 		if afterReplacementClaim != nil {
 			afterReplacementClaim(previous)

@@ -3260,3 +3260,76 @@ func TestHoldout_NeedsSettling(t *testing.T) {
 		t.Fatal("an unexposed entry does not settle")
 	}
 }
+
+// A replacement and an eviction store the retirement before they mark the
+// entry exposed, so a read whose claim fails to either always finds it.
+func TestHoldout_RetirementIsStoredBeforeTheClaim(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	var entry = h.ctx.getAssignment("exp")
+	var ran = false
+	beforeReplacementClaim = func(replaced *cachedAssignment) {
+		if replaced == entry {
+			ran = true
+			if !replaced.retirement.Load() || replaced.assignment.Exposed.Load().(bool) {
+				t.Error("the replacement claims before it retires")
+			}
+		}
+	}
+	var replacement = hoExperiment(1, "exp", hoUnitType, 0, 11)
+	replacement.Iteration = 2
+	h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
+	h.ctx.GetAssignment("exp")
+	beforeReplacementClaim = nil
+	if !ran {
+		t.Fatal("the replacement hook did not run")
+	}
+
+	var experiment = hoExperiment(1, "exp", "user_id", 0, 11)
+	var u = hoCreate(t, map[string]string{}, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_u", "user_id", hoSeedBHi, hoSeedBLo)}, experiment))
+	var evicted = u.ctx.getAssignment("exp")
+	ran = false
+	beforeEvictionClaim = func(evicting *cachedAssignment) {
+		if evicting == evicted {
+			ran = true
+			if !evicting.retirement.Load() || evicting.assignment.Exposed.Load().(bool) {
+				t.Error("the eviction claims before it retires")
+			}
+		}
+	}
+	u.setUnit("user_id", hoUID)
+	beforeEvictionClaim = nil
+	if !ran {
+		t.Fatal("the eviction hook did not run")
+	}
+}
+
+// A variable read whose assignment is replaced, before its claim, by a
+// version of the experiment that no longer defines the key does not expose
+// the replacement; it falls through to the default.
+func TestHoldout_VariableRetryDoesNotExposeAnExperimentWithoutTheKey(t *testing.T) {
+	var experiment = hoExperiment(1, "a", hoUnitType, 0, 11)
+	experiment.Variants[0].Config = `{"v":"x"}`
+	experiment.Variants[1].Config = `{"v":"x"}`
+	var replacement = hoExperiment(1, "a", hoUnitType, 0, 11)
+	replacement.Iteration = 2
+	replacement.Variants[0].Config = `{"w":"y"}`
+	replacement.Variants[1].Config = `{"w":"y"}`
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+	h.ctx.GetAssignment("a")
+	var armed = true
+	beforeSettleClaim = func() {
+		if armed {
+			armed = false
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
+			h.ctx.GetAssignment("a")
+		}
+	}
+	defer func() { beforeSettleClaim = nil }()
+	expectValue(t, "default", h.variable("v"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	if exposures := queuedExposures(h.ctx); len(exposures) != 0 {
+		t.Fatalf("the replacement without the key was exposed: %+v", exposures)
+	}
+}
