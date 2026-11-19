@@ -2672,3 +2672,43 @@ func TestHoldout_DuplicateHoldoutDefinitionsAreOrderIndependent(t *testing.T) {
 	expectInt(t, hoNormalVariant, r.treatment("exp"))
 	r.expectPublished(hoOwn(hoUnitType, 1, "exp", hoNormalVariant))
 }
+
+// Duplicates conflict when any field that changes the arm differs (split,
+// seeds, iteration), and cover nothing in either order; duplicates that
+// differ only in informational fields (name, holdoutType, unitType) count as
+// one; a duplicate with no split is ignored, so the valid entry applies.
+func TestHoldout_DuplicateHoldoutConflictFields(t *testing.T) {
+	var a = hoHoldoutA()
+	var conflicting = []func(*jsonmodels.Holdout){
+		func(h *jsonmodels.Holdout) { h.Split = []float64{0.9, 0.1} },
+		func(h *jsonmodels.Holdout) { h.SeedLo = 112 },
+		func(h *jsonmodels.Holdout) { h.Iteration = 2 },
+	}
+	for _, change := range conflicting {
+		var b = hoHoldoutA()
+		change(&b)
+		for _, holdouts := range [][]jsonmodels.Holdout{{a, b}, {b, a}} {
+			var h = hoCreateFor(t, hoUID, hoData(holdouts, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+			expectInt(t, hoNormalVariant, h.treatment("exp"))
+			h.expectPublished(hoOwn(hoUnitType, 1, "exp", hoNormalVariant))
+		}
+	}
+	var informational = []func(*jsonmodels.Holdout){
+		func(h *jsonmodels.Holdout) { h.Name = "renamed" },
+		func(h *jsonmodels.Holdout) { h.HoldoutType = "all_full_on" },
+		func(h *jsonmodels.Holdout) { h.UnitType = "user_id" },
+		func(h *jsonmodels.Holdout) { h.Split = nil },
+	}
+	for _, change := range informational {
+		var b = hoHoldoutA()
+		change(&b)
+		for _, holdouts := range [][]jsonmodels.Holdout{{a, b}, {b, a}} {
+			var h = hoCreateFor(t, hoUID, hoData(holdouts, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+			expectInt(t, 0, h.treatment("exp"))
+			var exposures = queuedExposures(h.ctx)
+			if len(exposures) != 1 || exposures[0].Id != 11 || exposures[0].Variant != 0 {
+				t.Fatalf("exposures %+v", exposures)
+			}
+		}
+	}
+}

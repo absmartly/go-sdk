@@ -2133,10 +2133,11 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		// caller reuses its slice.
 		var installed = append([]jsonmodels.Holdout(nil), data.Holdouts...)
 		holdoutsById = make(map[int]*jsonmodels.Holdout, len(installed))
-		// An id listed more than once with conflicting definitions covers
-		// nothing, so the outcome never depends on the entries' order;
-		// identical duplicates count as one. The collector never sends
-		// duplicates.
+		// An id defined more than once with definitions that draw different
+		// arms (iteration, seeds or split) covers nothing, so the outcome never
+		// depends on the entries' order; duplicates that draw the same arm
+		// count as one (the first one's name is published). The collector
+		// never sends duplicates.
 		var conflicting map[int]bool
 		for i := range installed {
 			if len(installed[i].Split) == 0 {
@@ -2144,7 +2145,7 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 			}
 			installed[i].Split = append([]float64(nil), installed[i].Split...)
 			if seen, found := holdoutsById[installed[i].Id]; found {
-				if !reflect.DeepEqual(*seen, installed[i]) {
+				if !sameHoldoutDraw(seen, &installed[i]) {
 					if conflicting == nil {
 						conflicting = map[int]bool{}
 					}
@@ -2288,6 +2289,13 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	c.SetRefreshTimer()
 	c.DataLock.Unlock()
 	c.ContextLock_.Unlock()
+}
+
+// sameHoldoutDraw reports whether two definitions of one holdout id draw the
+// same arm for every unit: same iteration, seeds and split.
+func sameHoldoutDraw(a *jsonmodels.Holdout, b *jsonmodels.Holdout) bool {
+	return a.Iteration == b.Iteration && a.SeedHi == b.SeedHi && a.SeedLo == b.SeedLo &&
+		reflect.DeepEqual(a.Split, b.Split)
 }
 
 // coveringHoldouts resolves an experiment's holdoutIds to the installed
