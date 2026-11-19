@@ -216,6 +216,9 @@ type cachedAssignment struct {
 	holdouts *assignmentHoldouts
 	// retirement is shared by entries that carry the same Exposed identity.
 	retirement *atomic.Bool
+	// indexed is the experiment definition the entry was resolved from, nil
+	// when the experiment was not in the data. Never modified.
+	indexed *indexedExperiment
 }
 
 type loggerGoroutines struct {
@@ -957,16 +960,17 @@ func (e *cachedAssignment) needsSettling() bool {
 
 // definesVariable is the variable read's candidate check: a replacement is
 // exposed by the read only if it has variables (its experiment was not
-// removed) and its experiment still defines key in the current data.
-func (c *Context) definesVariable(key string, experimentName string) func(*cachedAssignment) bool {
+// removed) and the experiment definition it was resolved from defines key in
+// some variant. The entry's own definition is checked, never newer data, so
+// a later refresh cannot reject an entry that defines key or accept one
+// that does not.
+func definesVariable(key string) func(*cachedAssignment) bool {
 	return func(e *cachedAssignment) bool {
-		if e.assignment.Variables == nil {
+		if e.assignment.Variables == nil || e.indexed == nil {
 			return false
 		}
-		c.DataLock.RLock()
-		defer c.DataLock.RUnlock()
-		for _, experiment := range c.indexVariables_[key] {
-			if experiment.Data.Name == experimentName {
+		for _, variables := range e.indexed.experiment.Variables {
+			if _, defined := variables[key]; defined {
 				return true
 			}
 		}
@@ -1352,9 +1356,10 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 			// served. A replacement that is no longer a candidate for this
 			// read (the experiment was removed, or no longer defines key)
 			// is not exposed, as Java re-resolves by key.
-			entry = c.settleExposure(experiment.Data.Name, entry, c.definesVariable(key, experiment.Data.Name))
+			var candidate = definesVariable(key)
+			entry = c.settleExposure(experiment.Data.Name, entry, candidate)
 			assignment = entry.assignment
-			if assignment.Variables == nil {
+			if !candidate(entry) {
 				continue
 			}
 		}
@@ -1933,7 +1938,8 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 	var assignment = &Assignment{Exposed: exposed}
 	assignment.Name = experimentName
 	assignment.Eligible = true
-	var entry = &cachedAssignment{assignment: assignment, rules: rules, attrsSeq: atomic.LoadInt32(&c.AttrsSeq_), retirement: &atomic.Bool{}}
+	var entry = &cachedAssignment{assignment: assignment, rules: rules, attrsSeq: atomic.LoadInt32(&c.AttrsSeq_), retirement: &atomic.Bool{},
+		indexed: indexed}
 
 	// Resolved for overrides and rule wins too: the holdouts' exposures fire
 	// whatever chose the variant.

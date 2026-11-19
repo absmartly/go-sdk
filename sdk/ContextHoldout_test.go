@@ -3333,3 +3333,73 @@ func TestHoldout_VariableRetryDoesNotExposeAnExperimentWithoutTheKey(t *testing.
 		t.Fatalf("the replacement without the key was exposed: %+v", exposures)
 	}
 }
+
+// The variable read's candidate check judges an entry by the definition it
+// was resolved from, not by data a later refresh installed: an entry that
+// defines the key stays a candidate after a refresh drops the key, and one
+// that does not define it stays rejected after a refresh adds it back.
+func TestHoldout_VariableCandidateIsJudgedByTheEntrysOwnDefinition(t *testing.T) {
+	var version = func(iteration int, config string) jsonmodels.Experiment {
+		var experiment = hoExperiment(1, "a", hoUnitType, 0, 11)
+		experiment.Iteration = iteration
+		experiment.Variants[0].Config = config
+		experiment.Variants[1].Config = config
+		return experiment
+	}
+	for _, c := range []struct {
+		resolved, later string
+		candidate       bool
+	}{
+		{`{"v":"x"}`, `{"w":"y"}`, true},
+		{`{"w":"y"}`, `{"v":"x"}`, false},
+	} {
+		var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, version(1, c.resolved)))
+		var entry = h.ctx.getAssignment("a")
+		h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, version(2, c.later)))
+		if got := definesVariable("v")(entry); got != c.candidate {
+			t.Errorf("resolved %s, later %s: candidate %v, want %v", c.resolved, c.later, got, c.candidate)
+		}
+	}
+	// An entry with no definition (the experiment was not in the data) is
+	// never a candidate.
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil))
+	if definesVariable("v")(h.ctx.getAssignment("a")) {
+		t.Error("an entry of an unknown experiment is a candidate")
+	}
+}
+
+// A variable read whose assignment is replaced, before its claim, by a
+// version that no longer defines the key does not expose the replacement,
+// even though another experiment still defines the key; that experiment
+// serves the value instead.
+func TestHoldout_VariableRetryChecksTheKeyOnTheSameExperiment(t *testing.T) {
+	var a = hoExperiment(1, "a", hoUnitType, 0, 11)
+	a.Variants[0].Config = `{"v":"a"}`
+	a.Variants[1].Config = `{"v":"a"}`
+	var b = hoExperiment(2, "b", hoUnitType, 0)
+	b.Variants[0].Config = `{"v":"b"}`
+	b.Variants[1].Config = `{"v":"b"}`
+	var replacement = a
+	replacement.Iteration = 2
+	replacement.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"w":"y"}`}, {Name: "B", Config: `{"w":"y"}`}}
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, a, b))
+	h.ctx.GetAssignment("a")
+	var armed = true
+	beforeSettleClaim = func() {
+		if armed {
+			armed = false
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement, b))
+			h.ctx.GetAssignment("a")
+		}
+	}
+	defer func() { beforeSettleClaim = nil }()
+	expectValue(t, "b", h.variable("v"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	for _, exposure := range queuedExposures(h.ctx) {
+		if exposure.Name == "a" {
+			t.Fatalf("the replacement without the key was exposed: %+v", queuedExposures(h.ctx))
+		}
+	}
+}
