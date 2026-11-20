@@ -123,6 +123,7 @@ func (e Evaluator) BooleanConvert(x reflect.Value) bool {
 }
 
 func (e Evaluator) NumberConvert(x reflect.Value) (float64, error) {
+	x = numberValue(x)
 	if x.Kind() == reflect.Bool {
 		if x.Bool() {
 			return 1.0, nil
@@ -202,11 +203,16 @@ func (e Evaluator) ExtractVar(path string) interface{} {
 var jsonNumberType = reflect.TypeOf(json.Number(""))
 
 // numberValue is a json.Number (a value decoded with UseNumber) as the
-// float64 it denotes, as the JS SDK holds every JSON number; any other value,
-// and a json.Number that is not a finite number, is returned unchanged.
+// float64 it denotes, as the JS SDK holds every JSON number: a literal
+// beyond float64 is ±Infinity, as in JavaScript. Any other value, and a
+// json.Number that is not a JSON number literal ("NaN", "Inf"), is returned
+// unchanged.
 func numberValue(x reflect.Value) reflect.Value {
 	if x.IsValid() && x.Type() == jsonNumberType {
-		if f, err := strconv.ParseFloat(x.String(), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+		var text = x.String()
+		if len(text) > 0 && (text[0] == '-' || text[0] >= '0' && text[0] <= '9') && json.Valid([]byte(text)) {
+			// A range error still returns the ±Inf the literal rounds to.
+			var f, _ = strconv.ParseFloat(text, 64)
 			return reflect.ValueOf(f)
 		}
 	}

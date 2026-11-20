@@ -777,3 +777,32 @@ func TestSwitchbackCluster_AddressableFieldsAndSharedSubslice(t *testing.T) {
 	items[1] = items
 	expectValue(t, "", parseSwitchbackPath("items/0/city").resolveAttribute(items))
 }
+
+// A cluster value is the attribute as published: a json.Number that
+// encoding/json cannot encode gives no key, and an invalid UTF-8 string is
+// keyed by its published text, each bad byte replaced by U+FFFD, so it
+// matches an allow-list holding that text and agrees with another spelling
+// that publishes the same.
+func TestSwitchbackCluster_ValuesAreReadAsPublished(t *testing.T) {
+	var invalid = map[string]interface{}{"city": "Lisboa", "n": json.Number("not-a-number")}
+	if _, err := json.Marshal(invalid); err == nil {
+		t.Fatal("fixture: the invalid json.Number encoded")
+	}
+	expectValue(t, "", parseSwitchbackPath("geo/city").resolveAttribute(invalid))
+	expectValue(t, "", parseSwitchbackPath("n").resolveAttribute(json.Number("not-a-number")))
+
+	var raw = "Lis\xffboa"
+	var encoded, _ = json.Marshal(raw)
+	var published string
+	_ = json.Unmarshal(encoded, &published)
+	expectValue(t, "Lis�boa", published)
+	expectValue(t, published, parseSwitchbackPath("city").resolveAttribute(raw))
+	expectValue(t, published, parseSwitchbackPath("city").resolveAttribute("Lis\xfeboa"))
+
+	var experiment = sbAttributeSwitchback("city")
+	experiment.SwitchbackClusterValues = []string{published}
+	var h = sbCreateBare(t, map[string]string{sbUnitType: sbUID}, sbData(experiment))
+	h.setAttribute("city", raw)
+	expectInt(t, sbDraw(published, 0, sbClusterArms), h.at(sbAnchor+5).treatment("exp_sb"))
+	h.expectPublished(sbClusterExposure(sbDraw(published, 0, sbClusterArms), sbAnchor+5, true, false))
+}

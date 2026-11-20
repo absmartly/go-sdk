@@ -833,3 +833,22 @@ func TestJSONNumberZeroIsNotEmptyAndNaNIsText(t *testing.T) {
 		t.Errorf("json.Number(NaN) compared with \"NaN\": %v, want 0", got)
 	}
 }
+
+// A json.Number literal beyond float64 is ±Infinity, as JavaScript reads it:
+// it compares above every finite number and its text is "Infinity".
+func TestJSONNumberBeyondFloat64IsInfinity(t *testing.T) {
+	var evaluator = eval.Evaluator{}
+	for raw, sign := range map[string]int{"1e400": 1, "-1e400": -1} {
+		if got := evaluator.Compare(reflect.ValueOf(json.Number(raw)), reflect.ValueOf(5)); got != sign {
+			t.Errorf("%s compared with 5: %v, want %d", raw, got, sign)
+		}
+	}
+	for raw, want := range map[string]string{"1e400": "Infinity", "-1e400": "-Infinity"} {
+		if text, err := evaluator.StringConvert(reflect.ValueOf(json.Number(raw))); err != nil || text != want {
+			t.Errorf("%s: %q, %v; want %q", raw, text, err, want)
+		}
+	}
+	if number, err := evaluator.NumberConvert(reflect.ValueOf(json.Number("1e400"))); err != nil || !math.IsInf(number, 1) {
+		t.Errorf("1e400: %v, %v", number, err)
+	}
+}

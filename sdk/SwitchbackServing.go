@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
@@ -265,7 +266,7 @@ func switchbackEncodable(value reflect.Value, path map[switchbackContainer]bool,
 	if !value.IsValid() {
 		return true
 	}
-	if switchbackOpaque(value) {
+	if switchbackOpaque(value) || value.Type() == jsonNumberType {
 		var _, err = json.Marshal(jsonElement(value).Interface())
 		return err == nil
 	}
@@ -344,13 +345,32 @@ func switchbackClusterKey(value interface{}) string {
 	}
 	switch v.Kind() {
 	case reflect.String:
-		return v.String()
+		return publishedString(v.String())
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return strconv.FormatInt(v.Int(), 10)
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 		return strconv.FormatUint(v.Uint(), 10)
 	}
 	return ""
+}
+
+// publishedString is s as encoding/json publishes it: each byte of an
+// invalid UTF-8 sequence becomes U+FFFD.
+func publishedString(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		var r, size = utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			b.WriteRune(utf8.RuneError)
+		} else {
+			b.WriteString(s[i : i+size])
+		}
+		i += size
+	}
+	return b.String()
 }
 
 // integerNumberText is the decimal text of a JSON number written as an
