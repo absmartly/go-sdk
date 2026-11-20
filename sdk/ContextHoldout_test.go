@@ -3751,3 +3751,28 @@ func TestHoldout_SkippedRetryDoesNotTakeTheSuppressedFallback(t *testing.T) {
 		t.Fatal("the hook did not run")
 	}
 }
+
+// A refresh that removes an experiment after a read listed the key's
+// experiments leaves only the experiments still installed to be exposed.
+func TestHoldout_SharedKeyReadSkipsAnExperimentRefreshedAway(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")
+	var f = hoWithVariables(hoExperiment(2, "f", hoUnitType, 0), "v")
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e, f))
+	h.peek("e")
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, f))
+		}
+	}
+	defer func() { afterReadResolve = nil }()
+	h.variable("v")
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	var exposures = queuedExposures(h.ctx)
+	if len(exposures) != 1 || exposures[0].Id != 2 {
+		t.Fatalf("exposures %+v, want only experiment 2", exposures)
+	}
+}
