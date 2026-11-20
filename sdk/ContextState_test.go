@@ -245,11 +245,13 @@ func TestContextLiteralHonoursAssignmentCacheAndIndexVariables(t *testing.T) {
 // reentrantDeserializer calls back into the context from inside an audience
 // evaluation, which runs while ContextLock_ is held.
 type reentrantDeserializer struct {
-	ctx *Context
+	ctx   *Context
+	calls int32
 }
 
 func (d *reentrantDeserializer) Deserialize(bytes []byte, offset int, length int) (map[string]interface{}, error) {
 	if d.ctx != nil {
+		atomic.AddInt32(&d.calls, 1)
 		d.ctx.GetExperiment("exp_app")
 		_, _ = d.ctx.GetVariableExperiment("banner")
 		_, _ = d.ctx.GetVariableKeys()
@@ -288,13 +290,17 @@ func TestReentrantDeserializerAfterClockReplacementDoesNotDeadlock(t *testing.T)
 			if replace {
 				ctx.Clock_ = internal.FixedClock{Millis_: 1}
 			}
-			if path == "revalidate" {
-				assertAny(nil, ctx.SetAttribute("other", 1), t)
-			}
 			deserializer.ctx = ctx
 			var done = make(chan int, 1)
 			go func() {
-				var variant, _ = reparseAudience(ctx)
+				var variant int
+				if path == "revalidate" {
+					// Text only, then an attribute change: the cached
+					// assignment is revalidated against the new audience.
+					variant, _ = revalidateAudience(ctx)
+				} else {
+					variant, _ = reparseAudience(ctx)
+				}
 				done <- variant
 			}()
 			select {
@@ -303,6 +309,7 @@ func TestReentrantDeserializerAfterClockReplacementDoesNotDeadlock(t *testing.T)
 			case <-time.After(5 * time.Second):
 				t.Fatalf("PeekTreatment deadlocked (%s, Clock_ replaced: %v)", path, replace)
 			}
+			assertAny(int32(1), atomic.LoadInt32(&deserializer.calls), t)
 		}
 	}
 }
@@ -1282,6 +1289,26 @@ func TestAudienceDeserializerRunsOutsideTheContextLock(t *testing.T) {
 // for exp_app, so the AudienceDeserializer runs (it runs when data is
 // installed), then reads the treatment.
 var reparseRound int32
+
+// revalidateAudience changes only exp_app's audience text, which keeps its
+// cached assignment (as in v1.1.1), then sets an attribute, so the next read
+// revalidates the cached assignment against the new text.
+func revalidateAudience(ctx *Context) (int, error) {
+	var data, _ = ctx.GetData()
+	var round = atomic.AddInt32(&reparseRound, 1)
+	var experiments = make([]jsonmodels.Experiment, len(data.Experiments))
+	copy(experiments, data.Experiments)
+	for i := range experiments {
+		if experiments[i].Name == "exp_app" {
+			experiments[i].Audience = fmt.Sprintf(`{"filter":[{"eq":[{"var":"application"},{"value":"website"}]},{"value":%d}]}`, round)
+		}
+	}
+	ctx.SetData(jsonmodels.ContextData{Experiments: experiments})
+	if err := ctx.SetAttribute("revalidate", round); err != nil {
+		return 0, err
+	}
+	return ctx.PeekTreatment("exp_app")
+}
 
 func reparseAudience(ctx *Context) (int, error) {
 	var data, _ = ctx.GetData()
