@@ -194,7 +194,6 @@ func TestSwitchback_CachedUnitReadsDoNotAllocateMore(t *testing.T) {
 		"GetVariableValue": func() { _, _ = h.ctx.GetVariableValue("color", 1) },
 	}
 	for name, read := range reads {
-		// The two boxed return values.
 		if n := hoLeastAllocs(read); n > 2 {
 			t.Errorf("%s: %.0f allocations", name, n)
 		}

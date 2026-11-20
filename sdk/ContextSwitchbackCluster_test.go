@@ -189,7 +189,7 @@ func TestSwitchbackCluster_NestedAndArrayPathsAndIntegerValuesResolve(t *testing
 func TestSwitchbackCluster_ValuesWithoutAClusterKeyAreIneligible(t *testing.T) {
 	var empty *sbStruct
 	for _, value := range []interface{}{nil, "", true, false, 1.5, 2.0, float32(2), 0.0, math.NaN(), math.Inf(1),
-		json.Number("3.0"), json.Number("1e1"), json.Number("2E0"), json.Number(""), json.Number("x"), json.RawMessage(`3.0`),
+		json.Number("3.0"), json.Number("1e1"), json.Number("2E0"), json.Number("x"), json.RawMessage(`3.0`),
 		json.RawMessage(`null`), json.RawMessage(`""`), json.RawMessage(`true`), empty, map[string]interface{}{"a": "b"},
 		[]interface{}{"x"}, []string{"x"}, complex(1, 2), struct{}{}} {
 		var h = sbCreateBare(t, map[string]string{sbUnitType: sbUID}, sbData(sbAttributeSwitchback("city")))
@@ -805,4 +805,19 @@ func TestSwitchbackCluster_ValuesAreReadAsPublished(t *testing.T) {
 	h.setAttribute("city", raw)
 	expectInt(t, sbDraw(published, 0, sbClusterArms), h.at(sbAnchor+5).treatment("exp_sb"))
 	h.expectPublished(sbClusterExposure(sbDraw(published, 0, sbClusterArms), sbAnchor+5, true, false))
+}
+
+func TestSwitchbackCluster_AdjacentInvalidBytesAndPublishedMemberNames(t *testing.T) {
+	var raw = "Lis\xff\xfeboa"
+	expectValue(t, "Lis��boa", publishedString(raw))
+	var experiment = sbAttributeSwitchback("city")
+	experiment.SwitchbackClusterValues = []string{"Lis��boa"}
+	var h = sbCreateBare(t, map[string]string{sbUnitType: sbUID}, sbData(experiment))
+	h.setAttribute("city", raw)
+	h.at(sbAnchor + 5).treatment("exp_sb")
+	h.expectPending(1)
+	expectValue(t, "Porto", parseSwitchbackPath("geo/cit�").resolveAttribute(map[string]string{"cit\xff": "Porto"}))
+	expectValue(t, "", parseSwitchbackPath("geo/cit�").resolveAttribute(map[string]string{"cit\xff": "Porto", "cit\xfe": "Lisboa"}))
+	expectValue(t, "", parseSwitchbackPath("geo/cit�").resolveAttribute(map[string]string{"cit�": "Porto", "cit\xfe": "Lisboa"}))
+	expectValue(t, "0", parseSwitchbackPath("city").resolveAttribute(json.Number("")))
 }

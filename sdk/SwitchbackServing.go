@@ -163,8 +163,19 @@ func switchbackStep(current interface{}, key string, index int, isIndex bool) in
 	}
 	if value.Kind() == reflect.Map && value.Type().Key().Kind() == reflect.String {
 		var element = value.MapIndex(reflect.ValueOf(key).Convert(value.Type().Key()))
-		if element.IsValid() {
+		if element.IsValid() && utf8.ValidString(key) && !strings.ContainsRune(key, utf8.RuneError) {
 			return element.Interface()
+		}
+		var matches []reflect.Value
+		var it = value.MapRange()
+		for it.Next() {
+			if publishedString(it.Key().String()) == key {
+				matches = append(matches, it.Value())
+			}
+		}
+		// Ambiguous published names fail closed, independent of map order.
+		if len(matches) == 1 {
+			return matches[0].Interface()
 		}
 	}
 	return nil
@@ -334,6 +345,9 @@ func switchbackClusterKey(value interface{}) string {
 		return ""
 	}
 	if v.Type() == jsonNumberType {
+		if v.String() == "" {
+			return "0"
+		}
 		return integerNumberText(v.String())
 	}
 	if switchbackOpaque(v) {
@@ -360,17 +374,7 @@ func publishedString(s string) string {
 	if utf8.ValidString(s) {
 		return s
 	}
-	var b strings.Builder
-	for i := 0; i < len(s); {
-		var r, size = utf8.DecodeRuneInString(s[i:])
-		if r == utf8.RuneError && size == 1 {
-			b.WriteRune(utf8.RuneError)
-		} else {
-			b.WriteString(s[i : i+size])
-		}
-		i += size
-	}
-	return b.String()
+	return strings.Map(func(r rune) rune { return r }, s)
 }
 
 // integerNumberText is the decimal text of a JSON number written as an

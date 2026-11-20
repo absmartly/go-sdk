@@ -2155,6 +2155,7 @@ func TestSwitchback_RejectedNoUnitOverrideResolvesWithArrivingUnit(t *testing.T)
 	h.ctx.Closing_.Store(true)
 	expectInt(t, int(exposureRejected), int(h.ctx.admitExposure(entry.assignment, entry)))
 	h.ctx.Closing_.Store(false)
+	_ = h.ctx.SetUnit(sbUnitType, sbUID)
 	expectInt(t, 1, h.treatment("exp_sb"))
 	var exposures = queuedExposures(h.ctx)
 	if len(exposures) != 1 || exposures[0].Unit != sbUnitType {
@@ -2191,4 +2192,29 @@ func TestSwitchback_VariableRetrySkipsReplacementWithoutKey(t *testing.T) {
 		beforeSettleClaim = nil
 		h.expectPending(0)
 	}
+}
+
+func TestSwitchback_VariableRetryChecksInstalledKeyForCachedPeriod(t *testing.T) {
+	var h = sbCreateAt(t, sbAnchor+5, map[string]string{}, sbData(sbDefault(2, sbHour)), sbOverride("exp_sb", 1))
+	var armed = true
+	beforeSettleClaim = func() {
+		if !armed {
+			return
+		}
+		armed = false
+		_ = h.ctx.SetUnit(sbUnitType, sbUID)
+		h.at(sbAnchor + sbHour).peek("exp_sb")
+		var replacement = sbDefault(2, sbHour)
+		for i := range replacement.Variants {
+			replacement.Variants[i].Config = `{"other":1}`
+		}
+		h.refresh(replacement)
+	}
+	defer func() { beforeSettleClaim = nil }()
+	var value, err = h.ctx.GetVariableValue("sb.arm", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectValue(t, "default", value)
+	h.expectPending(0)
 }

@@ -764,7 +764,7 @@ func (c *Context) evictAssignmentsMissingUnit(unitType string) {
 			var evict = !assignment.Overridden
 			if !evict {
 				c.EventLock_.Lock()
-				entry.retirement.Store(true)
+				var retired = entry.retirement.Swap(true)
 				if beforeEvictionClaim != nil {
 					beforeEvictionClaim(entry)
 				}
@@ -773,7 +773,7 @@ func (c *Context) evictAssignmentsMissingUnit(unitType string) {
 					afterEvictionClaim(entry)
 				}
 				if !evict {
-					entry.retirement.Store(false)
+					entry.retirement.Store(retired)
 				}
 				c.EventLock_.Unlock()
 			}
