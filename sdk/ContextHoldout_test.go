@@ -2646,7 +2646,6 @@ func TestHoldout_HoldoutIdSpellingsDecodeAlike(t *testing.T) {
 func TestHoldout_DuplicateHoldoutDefinitionsAreOrderIndependent(t *testing.T) {
 	var a = hoHoldoutA()
 	var b = hoHoldout(11, "holdout_a", hoUnitType, hoSeedBHi, hoSeedBLo)
-	// A third duplicate never reinstates a conflicting id.
 	for _, holdouts := range [][]jsonmodels.Holdout{{a, b}, {b, a}, {a, b, a}, {a, b, b}} {
 		var h = hoCreateFor(t, hoUID, hoData(holdouts, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 		expectInt(t, hoNormalVariant, h.treatment("exp"))
@@ -3644,4 +3643,151 @@ func TestHoldout_OverriddenCoveredAssignmentStaysCached(t *testing.T) {
 		t.Fatal("the overridden assignment was resolved again")
 	}
 	h.expectPending(2)
+}
+
+// A refresh between a shared-key read listing its experiments and resolving
+// one of them can install a version that no longer defines the key: that
+// experiment, and its holdout, are not exposed by the read.
+func TestHoldout_SharedKeyReadSkipsACandidateRefreshedWithoutTheKey(t *testing.T) {
+	var a = hoExperiment(1, "a", hoUnitType, 0)
+	a.Split = []float64{1, 0}
+	a.Variants[0].Config = `{"w":"a"}`
+	a.Variants[1].Config = `{"v":"a"}`
+	var b = hoWithVariables(hoExperiment(2, "b", hoUnitType, 0, 12), "v")
+	var refreshed = b
+	refreshed.Iteration = 2
+	refreshed.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"w":"b"}`}, {Name: "B", Config: `{"w":"b"}`}}
+	var c = hoWithVariables(hoExperiment(3, "c", hoUnitType, 0), "v")
+	c.Split = []float64{1, 0}
+	var holdout = hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{holdout}, a, b, c))
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{holdout}, a, refreshed, c))
+		}
+	}
+	defer func() { afterReadResolve = nil }()
+	// The read goes on to the next experiment defining the key.
+	expectValue(t, "control", h.variable("v"))
+	var served = false
+	for _, exposure := range queuedExposures(h.ctx) {
+		served = served || exposure.Id == 3
+	}
+	if !served {
+		t.Fatalf("the experiment serving the value was not exposed: %+v", queuedExposures(h.ctx))
+	}
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	for _, exposure := range queuedExposures(h.ctx) {
+		if exposure.Id == 2 || exposure.Id == 12 {
+			t.Fatalf("the refreshed candidate without the key was exposed: %+v", queuedExposures(h.ctx))
+		}
+	}
+}
+
+// A read already holding a missing-unit decision whose claim by another read
+// a close rejected, after the unit arrived, resolves it again with the unit
+// and exposes that decision: the rollback's eviction retires the entry.
+func TestHoldout_ReadHoldingARejectedMissingUnitDecisionResolvesAgain(t *testing.T) {
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_user", "user_id", hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp", "user_id", 2, 11)))
+	h.ctx.GetAssignment("exp")
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			var entry = h.ctx.getAssignment("exp")
+			if !hoClaim(h, entry) {
+				t.Error("the other read did not claim")
+			}
+			h.setUnit("user_id", hoUID)
+			h.ctx.Closing_.Store(true)
+			h.ctx.admitExposure(entry.assignment, entry)
+			h.ctx.Closing_.Store(false)
+		}
+	}
+	defer func() { afterReadResolve = nil }()
+	expectInt(t, 2, h.treatment("exp"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	var own = hoOwn("user_id", 1, "exp", 2)
+	own.FullOn = true
+	h.expectPublished(own, hoExposure("user_id", 11, "holdout_user", 1))
+}
+
+// A cached, unexposed experiment that a refresh gave the key, without
+// changing its assignment, is still exposed by a read of that key.
+func TestHoldout_SharedKeyReadExposesACachedExperimentRefreshedWithTheKey(t *testing.T) {
+	var before = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "x")
+	var after = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, before))
+	h.peek("e")
+	h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, after))
+	h.variable("v")
+	var exposed = false
+	for _, exposure := range queuedExposures(h.ctx) {
+		exposed = exposed || exposure.Id == 1
+	}
+	if !exposed {
+		t.Fatalf("the experiment listed for the key was not exposed: %+v", queuedExposures(h.ctx))
+	}
+}
+
+// A suppressed experiment whose retry lands on a replacement without the key
+// is skipped, so it does not take the suppressed fallback from a later
+// suppressed experiment that defines the key.
+func TestHoldout_SkippedRetryDoesNotTakeTheSuppressedFallback(t *testing.T) {
+	var a = hoExperiment(1, "a", hoUnitType, 0, 11)
+	a.Variants[0].Config = `{"v":"a0"}`
+	a.Variants[1].Config = `{"v":"a1"}`
+	var replacement = a
+	replacement.Iteration = 2
+	replacement.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"w":"a0"}`}, {Name: "B", Config: `{"w":"a1"}`}}
+	var b = hoExperiment(2, "b", hoUnitType, 0, 11)
+	b.Variants[0].Config = `{"v":"b0"}`
+	b.Variants[1].Config = `{"v":"b1"}`
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, a, b))
+	h.ctx.GetAssignment("a")
+	var armed = true
+	beforeSettleClaim = func() {
+		if armed {
+			armed = false
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement, b))
+			h.ctx.GetAssignment("a")
+		}
+	}
+	defer func() { beforeSettleClaim = nil }()
+	expectValue(t, "b0", h.variable("v"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+}
+
+// A refresh that removes an experiment after a read listed the key's
+// experiments leaves only the experiments still installed to be exposed.
+func TestHoldout_SharedKeyReadSkipsAnExperimentRefreshedAway(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")
+	var f = hoWithVariables(hoExperiment(2, "f", hoUnitType, 0), "v")
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e, f))
+	h.peek("e")
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, f))
+		}
+	}
+	defer func() { afterReadResolve = nil }()
+	h.variable("v")
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	var exposures = queuedExposures(h.ctx)
+	if len(exposures) != 1 || exposures[0].Id != 2 {
+		t.Fatalf("exposures %+v, want only experiment 2", exposures)
+	}
 }
