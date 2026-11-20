@@ -2218,3 +2218,65 @@ func TestSwitchback_VariableRetryChecksInstalledKeyForCachedPeriod(t *testing.T)
 	expectValue(t, "default", value)
 	h.expectPending(0)
 }
+
+// A switchback makes a context check variable reads against the installed
+// experiment: an unexposed override of a unit experiment beside it is
+// rebuilt when a refresh changes that experiment's iteration, so the read
+// serves and exposes the current definition.
+func TestSwitchback_SwitchbackContextRebuildsAnUnexposedOverride(t *testing.T) {
+	var unit = sbUnit(sbExperiment(2, "exp_unit", 2, sbHour))
+	unit.Variants[1].Config = `{"color":"old"}`
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour), unit), sbOverride("exp_unit", 1))
+	h.at(sbAnchor + 5)
+	expectInt(t, 1, h.peek("exp_unit"))
+	var refreshed = unit
+	refreshed.Iteration++
+	refreshed.Variants = append([]jsonmodels.ExperimentVariant(nil), unit.Variants...)
+	refreshed.Variants[1].Config = `{"color":"new"}`
+	h.refresh(sbDefault(2, sbHour), refreshed)
+	var value, err = h.ctx.GetVariableValue("color", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectValue(t, "new", value)
+	h.expectPending(1)
+}
+
+type sbCountingClock struct {
+	now   int64
+	reads atomic.Int32
+}
+
+func (c *sbCountingClock) Millis() int64 {
+	c.reads.Add(1)
+	return c.now
+}
+
+// Warmed reads of a unit experiment never read the clock: only a switchback
+// resolution does.
+func TestSwitchback_UnitReadsDoNotReadTheClock(t *testing.T) {
+	var config = CreateDefaultContextConfig()
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = -1
+	config.Units_[sbUnitType] = sbUID
+	var clock = &sbCountingClock{now: sbAnchor}
+	var ft, done = future.New()
+	done(sbData(sbUnit(sbDefault(2, sbHour))), nil)
+	var ctx = CreateContext(clock, config, ft, &hoProvider{}, &hoPublisher{}, nil, DefaultVariableParser{},
+		AudienceMatcher{DefaultAudienceDeserializer{}})
+	ctx.WaitUntilReady()
+	t.Cleanup(func() {
+		ctx.ClearTimeout()
+		ctx.ClearRefreshTimer()
+	})
+	_, _ = ctx.GetTreatment("exp_sb")
+	_, _ = ctx.GetVariableValue("sb.arm", -1)
+	var before = clock.reads.Load()
+	for i := 0; i < 5; i++ {
+		_, _ = ctx.GetTreatment("exp_sb")
+		_, _ = ctx.PeekTreatment("exp_sb")
+		_, _ = ctx.GetVariableValue("sb.arm", -1)
+		_, _ = ctx.PeekVariableValue("sb.arm", -1)
+	}
+	expectInt(t, int(before), int(clock.reads.Load()))
+}

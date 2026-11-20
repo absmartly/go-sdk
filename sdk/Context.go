@@ -166,9 +166,10 @@ type Context struct {
 type contextIndex struct {
 	experiments map[string]*indexedExperiment
 	holdouts    map[int]*jsonmodels.Holdout
-	// keyed is set once any install had holdouts or assignment rules: from
-	// then on every install builds its variable key set, since an entry
-	// resolved under them may be retired by any later replacement.
+	// keyed is set once any install had holdouts, assignment rules or
+	// switchbacks: from then on every install builds its variable key set,
+	// since an entry resolved under them may be retired by any later
+	// replacement.
 	keyed bool
 }
 
@@ -1082,8 +1083,8 @@ func (e *cachedAssignment) needsSettling() bool {
 // variableEligible is the variable read's claim check: once the context has
 // seen holdouts, assignment rules or switchbacks (sources of retirement), a read
 // of key claims an exposure only for an experiment that, as installed now,
-// still exists and defines key in some variant. Contexts with neither keep
-// the released behaviour. The caller holds ContextLock_.
+// still exists and defines key in some variant. Contexts with none of them
+// keep the released behaviour. The caller holds ContextLock_.
 func (c *Context) variableEligible(experimentName string, key string) func(*cachedAssignment) bool {
 	return func(e *cachedAssignment) bool {
 		if e.assignment.Variables == nil {
@@ -2722,9 +2723,10 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	var indexed = make(map[string]*indexedExperiment, len(index))
 	// Each installed experiment's key set is owned by the index, not by
 	// cached assignments, so old decisions retain neither variant values
-	// nor key sets. Only a holdout or a SetUnit eviction of a split rule retires an
-	// assignment, so the sets are built only once the context has seen
-	// holdouts or assignment rules; payloads with neither cost nothing more.
+	// nor key sets. Only a holdout, a SetUnit eviction of a split rule or a
+	// switchback slot retirement retires an assignment, so the sets are built
+	// only once the context has seen holdouts, assignment rules or
+	// switchbacks; payloads with none of them cost nothing more.
 	// The index installed now is read under the lock, so an install that
 	// finished while this one was parsing does not lose the gate.
 	var current = c.index_.Load()
