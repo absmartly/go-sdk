@@ -981,6 +981,12 @@ func TestCopySetDataRacingReadsAfterClockReplacement(t *testing.T) {
 	var experiment, found = copied.GetExperiment("after")
 	assertAny(true, found, t)
 	assertAny(20, experiment.Data.Iteration, t)
+	// The copy's other v1.1.1 data fields follow too.
+	copied.DataLock.RLock()
+	defer copied.DataLock.RUnlock()
+	assertAny(20, copied.Data_.Experiments[0].Iteration, t)
+	var _, hasFields = copied.ContextCustomFields_["after"]
+	assertAny(true, hasFields, t)
 }
 
 // Refresh through a copy of a context whose Clock_ was replaced updates the
