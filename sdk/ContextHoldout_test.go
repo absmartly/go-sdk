@@ -2329,7 +2329,7 @@ func TestHoldout_CoveredAndUncoveredExposureMappingsAgree(t *testing.T) {
 		exposed.Store(true)
 		assignment.Exposed = exposed
 		var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "other", hoUnitType, 0)))
-		if !h.ctx.enqueueExposure(assignment) {
+		if !h.ctx.enqueueExposure(assignment, h.ctx.Clock_.Millis()) {
 			t.Fatal("not queued")
 		}
 		var queued = queuedExposures(h.ctx)
@@ -3632,6 +3632,21 @@ func TestHoldout_ConcurrentInstallKeepsTheKeySetGate(t *testing.T) {
 	if index := ctx.index_.Load(); index == nil || !index.keyed {
 		t.Fatal("the plain install dropped the key set gate")
 	}
+}
+
+// An overridden experiment a holdout covers stays cached: it is resolved
+// once and exposed once.
+func TestHoldout_OverriddenCoveredAssignmentStaysCached(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)), hoOverride("exp", 1))
+	h.treatment("exp")
+	var first = h.ctx.GetAssignment("exp")
+	for i := 0; i < 4; i++ {
+		h.treatment("exp")
+	}
+	if h.ctx.GetAssignment("exp") != first {
+		t.Fatal("the overridden assignment was resolved again")
+	}
+	h.expectPending(2)
 }
 
 // A refresh between a shared-key read listing its experiments and resolving

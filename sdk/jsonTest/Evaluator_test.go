@@ -1,10 +1,12 @@
 package jsonTest
 
 import (
+	"encoding/json"
 	"github.com/absmartly/go-sdk/sdk/jsonexpr"
 	"github.com/absmartly/go-sdk/sdk/jsonexpr/eval"
 	"math"
 	"reflect"
+	"regexp"
 	"testing"
 )
 
@@ -759,4 +761,93 @@ func TestCompareDeepEqualsCollections(t *testing.T) {
 		reflect.ValueOf([]interface{}{1, []interface{}{2, 3}, 4})), t)
 	assert(nil, e.Compare(reflect.ValueOf([]interface{}{1.0, 2.0}), reflect.ValueOf([]interface{}{2.0, 1.0})), t)
 	assert(nil, e.Compare(reflect.ValueOf(map[string]interface{}{"a": 1.0}), reflect.ValueOf(map[string]interface{}{"b": 1.0})), t)
+}
+
+// A json.Number (an attribute decoded with UseNumber) is the number it
+// denotes, as every JSON number is in the JS SDK: it compares, converts and
+// tests equal numerically, never as text.
+func TestJSONNumbersAreNumbers(t *testing.T) {
+	var eval = eval.Evaluator{}
+	var wide = json.Number("9223372036854775808")
+	assert(1, eval.Compare(reflect.ValueOf(wide), reflect.ValueOf(99)), t)
+	assert(-1, eval.Compare(reflect.ValueOf(99), reflect.ValueOf(wide)), t)
+	assert(1, eval.Compare(reflect.ValueOf(json.Number("100")), reflect.ValueOf(99)), t)
+	assert(-1, eval.Compare(reflect.ValueOf(json.Number("9")), reflect.ValueOf(json.Number("100"))), t)
+	assert(0, eval.Compare(reflect.ValueOf(json.Number("3.0")), reflect.ValueOf(3)), t)
+	assert(0, eval.Compare(reflect.ValueOf(json.Number("1e1")), reflect.ValueOf(10)), t)
+	var f, err = eval.NumberConvert(reflect.ValueOf(json.Number("1.5")))
+	assert(nil, err, t)
+	assert(1.5, f, t)
+	var s, _ = eval.StringConvert(reflect.ValueOf(json.Number("3.0")))
+	assert("3", s, t)
+	assert(false, eval.BooleanConvert(reflect.ValueOf(json.Number("0"))), t)
+	assert(true, eval.BooleanConvert(reflect.ValueOf(json.Number("2"))), t)
+	assert(0, eval.Compare(reflect.ValueOf([]interface{}{json.Number("1")}), reflect.ValueOf([]interface{}{1.0})), t)
+}
+
+func TestJSONNumberStringCoercionAndFractionalZero(t *testing.T) {
+	var evaluator = eval.Evaluator{}
+	for raw, want := range map[string]string{"1e-7": "0.0000001", "12345678901234567": "12345678901234568"} {
+		var n = json.Number(raw)
+		var text, err = evaluator.StringConvert(reflect.ValueOf(n))
+		if err != nil || text != want || evaluator.Compare(reflect.ValueOf(want), reflect.ValueOf(n)) != 0 || evaluator.Compare(reflect.ValueOf(n), reflect.ValueOf(want)) != 0 {
+			t.Errorf("%s: text=%s err=%v compares=%v/%v", raw, text, err, evaluator.Compare(reflect.ValueOf(want), reflect.ValueOf(n)), evaluator.Compare(reflect.ValueOf(n), reflect.ValueOf(want)))
+		}
+		var expr = map[string]interface{}{"match": []interface{}{map[string]interface{}{"var": "n"}, map[string]interface{}{"value": "^" + regexp.QuoteMeta(want) + "$"}}}
+		if !jsonexpr.EvaluateBooleanExpr(expr, map[string]interface{}{"n": n}) {
+			t.Errorf("match %s", raw)
+		}
+		var inExpr = map[string]interface{}{"in": []interface{}{map[string]interface{}{"var": "hay"}, map[string]interface{}{"var": "n"}}}
+		if !jsonexpr.EvaluateBooleanExpr(inExpr, map[string]interface{}{"hay": "prefix" + want + "suffix", "n": n}) {
+			t.Errorf("in %s", raw)
+		}
+		if jsonexpr.EvaluateBooleanExpr(inExpr, map[string]interface{}{"hay": "prefix" + raw + "suffix", "n": n}) && raw != want {
+			t.Errorf("in %s matched its raw spelling", raw)
+		}
+	}
+	for _, raw := range []string{"0.0", "0e0", "-0"} {
+		if evaluator.BooleanConvert(reflect.ValueOf(json.Number(raw))) {
+			t.Errorf("%s is truthy", raw)
+		}
+	}
+	for _, raw := range []string{"NaN", "Inf", "-Inf"} {
+		var text, _ = evaluator.StringConvert(reflect.ValueOf(json.Number(raw)))
+		if text != raw {
+			t.Errorf("%s stringified as %s", raw, text)
+		}
+	}
+}
+
+// A json.Number zero is a number, not an empty value: it does not equal "",
+// and NaN stays its text rather than a number that equals nothing.
+func TestJSONNumberZeroIsNotEmptyAndNaNIsText(t *testing.T) {
+	var evaluator = eval.Evaluator{}
+	for _, raw := range []string{"0", "0.0", "-0"} {
+		var expr = map[string]interface{}{"eq": []interface{}{map[string]interface{}{"var": "x"}, map[string]interface{}{"value": ""}}}
+		if jsonexpr.EvaluateBooleanExpr(expr, map[string]interface{}{"x": json.Number(raw)}) {
+			t.Errorf("json.Number(%q) equals \"\"", raw)
+		}
+	}
+	if got := evaluator.Compare(reflect.ValueOf(json.Number("NaN")), reflect.ValueOf("NaN")); got != 0 {
+		t.Errorf("json.Number(NaN) compared with \"NaN\": %v, want 0", got)
+	}
+}
+
+// A json.Number literal beyond float64 is ±Infinity, as JavaScript reads it:
+// it compares above every finite number and its text is "Infinity".
+func TestJSONNumberBeyondFloat64IsInfinity(t *testing.T) {
+	var evaluator = eval.Evaluator{}
+	for raw, sign := range map[string]int{"1e400": 1, "-1e400": -1} {
+		if got := evaluator.Compare(reflect.ValueOf(json.Number(raw)), reflect.ValueOf(5)); got != sign {
+			t.Errorf("%s compared with 5: %v, want %d", raw, got, sign)
+		}
+	}
+	for raw, want := range map[string]string{"1e400": "Infinity", "-1e400": "-Infinity"} {
+		if text, err := evaluator.StringConvert(reflect.ValueOf(json.Number(raw))); err != nil || text != want {
+			t.Errorf("%s: %q, %v; want %q", raw, text, err, want)
+		}
+	}
+	if number, err := evaluator.NumberConvert(reflect.ValueOf(json.Number("1e400"))); err != nil || !math.IsInf(number, 1) {
+		t.Errorf("1e400: %v, %v", number, err)
+	}
 }
