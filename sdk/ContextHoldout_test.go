@@ -4106,3 +4106,52 @@ func TestHoldout_FreshOverrideVariableClaimHasResolvedIdentity(t *testing.T) {
 		t.Fatalf("override exposures %+v", exposures)
 	}
 }
+
+// Without holdouts or rules an unclaimed override keeps its cached values
+// across an experiment refresh, as in v1.1.1 and the JS SDK.
+func TestHoldout_PlainUnclaimedOverrideKeepsItsValuesAcrossARefresh(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e))
+	if err := h.ctx.SetOverride("e", 0); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := h.ctx.PeekVariableValue("v", "default"); err != nil || value != "control" {
+		t.Fatalf("peek: %v, %v", value, err)
+	}
+	var fresh = e
+	fresh.Iteration++
+	fresh.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"v":"new"}`}, {Name: "B", Config: `{"v":"other"}`}}
+	h.ctx.SetData(hoData(nil, fresh))
+	expectValue(t, "control", h.variable("v"))
+}
+
+// An exposed override is kept across an id or iteration refresh: the same
+// assignment keeps serving its values and is not exposed again.
+func TestHoldout_ExposedOverrideIsKeptAcrossAnIdentityRefresh(t *testing.T) {
+	for _, changeID := range []bool{false, true} {
+		var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")
+		var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
+		if err := h.ctx.SetOverride("e", 0); err != nil {
+			t.Fatal(err)
+		}
+		expectValue(t, "control", h.variable("v"))
+		var before = h.ctx.getAssignment("e")
+		var fresh = e
+		if changeID {
+			fresh.Id++
+		} else {
+			fresh.Iteration++
+		}
+		fresh.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"v":"new"}`}, {Name: "B", Config: `{"v":"other"}`}}
+		h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, fresh))
+		for i := 0; i < 3; i++ {
+			expectValue(t, "control", h.variable("v"))
+		}
+		if h.ctx.getAssignment("e") != before {
+			t.Fatalf("idChange=%v: the exposed override was rebuilt", changeID)
+		}
+		if exposures := queuedExposures(h.ctx); len(exposures) != 2 {
+			t.Fatalf("idChange=%v: exposures %+v", changeID, exposures)
+		}
+	}
+}

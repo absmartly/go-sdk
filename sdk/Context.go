@@ -1806,7 +1806,7 @@ func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignmen
 		// (experiment == null || holdoutSetMatches).
 		// A still-unclaimed override needs current variables and resolved
 		// identity before a variable read can claim it in the new epoch.
-		if efound && !assignment.Exposed.Load().(bool) &&
+		if efound && !assignment.Exposed.Load().(bool) && c.index_.Load().keyed &&
 			(entry.resolvedId != experiment.Data.Id || entry.resolvedIteration != experiment.Data.Iteration) {
 			return entry, rules, assignmentStale
 		}
