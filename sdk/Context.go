@@ -79,6 +79,10 @@ type contextState struct {
 	// transport/sealing, allowing loggers to re-enter Close safely.
 	finalizedFuture_ *future.Future
 	publishLogs_     []*future.Future
+	// indexLock_ makes a literal's Index_ write and index install in setData
+	// atomic for syncLiteralExperiment. It is taken last, with no other lock
+	// taken inside it.
+	indexLock_ sync.Mutex
 	// stateLock_ guards ReadyFuture_, RefreshFuture_, ClosingFuture_, RefreshTimer_ and closeStarted_.
 	stateLock_ *sync.Mutex
 	// inflight_ holds the publishes that have been sent and not yet settled. Guarded by stateLock_.
@@ -2082,33 +2086,31 @@ func (st *contextState) hasAudience(text string) bool {
 // and otherwise has none, as an entry present at the first read has none
 // (v1.1.1 had no rules). Contexts the SDK created keep their own index.
 func (c *Context) syncLiteralExperiment(st *contextState, experimentName string) {
+	// indexLock_, not DataLock: setData holds it while it writes Index_ and
+	// installs the index, so the two are read consistently and race-free,
+	// and a caller holding DataLock can still read treatments.
+	st.indexLock_.Lock()
+	defer st.indexLock_.Unlock()
 	var experiment, found = c.Index_[experimentName]
-	for {
-		var previous = st.loadIndex()
-		var current, rules, installed = st.experimentAndRules(experimentName)
-		if found == installed && (!found || sameLiteralEntry(current, experiment)) {
-			return
-		}
-		var indexed = map[string]*indexedExperiment{}
-		if previous != nil {
-			for name, entry := range previous.experiments {
-				indexed[name] = entry
-			}
-		}
-		if !installed || current.Data.AssignmentRules != experiment.Data.AssignmentRules {
-			rules = nil
-		}
-		if found {
-			indexed[experimentName] = &indexedExperiment{experiment: experiment, rules: rules}
-		} else {
-			delete(indexed, experimentName)
-		}
-		// Publish only over the index this was built from, so a concurrent
-		// SetData is never overwritten; on a race, compare again.
-		if st.index_.CompareAndSwap(previous, &contextIndex{experiments: indexed}) {
-			return
+	var current, rules, installed = st.experimentAndRules(experimentName)
+	if found == installed && (!found || sameLiteralEntry(current, experiment)) {
+		return
+	}
+	var indexed = map[string]*indexedExperiment{}
+	if previous := st.loadIndex(); previous != nil {
+		for name, entry := range previous.experiments {
+			indexed[name] = entry
 		}
 	}
+	if !installed || current.Data.AssignmentRules != experiment.Data.AssignmentRules {
+		rules = nil
+	}
+	if found {
+		indexed[experimentName] = &indexedExperiment{experiment: experiment, rules: rules}
+	} else {
+		delete(indexed, experimentName)
+	}
+	st.index_.Store(&contextIndex{experiments: indexed})
 }
 
 // sameLiteralEntry reports whether an Index_ entry still matches the private
@@ -2362,12 +2364,14 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 
 	c.DataLock.Lock()
 
-	c.Index_ = index
 	var indexed = make(map[string]*indexedExperiment, len(index))
 	for name, experiment := range index {
 		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name]}
 	}
+	st.indexLock_.Lock()
+	c.Index_ = index
 	st.index_.Store(&contextIndex{experiments: indexed})
+	st.indexLock_.Unlock()
 	st.pruneAudiences()
 	c.ContextCustomFields_ = contextCustomFields
 	st.indexVariables_ = indexVariables
@@ -2438,8 +2442,10 @@ func (c *Context) SetDataFailed(err error) {
 	c = c.live()
 	var st = c.state()
 	c.DataLock.Lock()
+	st.indexLock_.Lock()
 	c.Index_ = map[string]ExperimentVariables{}
 	st.index_.Store(&contextIndex{})
+	st.indexLock_.Unlock()
 	st.indexVariables_ = map[string][]ExperimentVariables{}
 	c.IndexVariables_ = map[interface{}]interface{}{}
 	c.Data_ = jsonmodels.ContextData{}

@@ -1751,6 +1751,93 @@ func TestLiteralIndexEditKeepsRulesAndOtherEntries(t *testing.T) {
 	}
 }
 
+// Each field an assignment reads is picked up from an edited literal entry,
+// and a deleted entry is unassigned, as v1.1.1 read Index_.
+func TestLiteralIndexEditsArePickedUp(t *testing.T) {
+	var base = audienceExperiment("exp_app", "", false)
+	base.FullOnVariant = 0
+	var vars = []map[string]interface{}{{"color": "red"}, {"color": "blue"}}
+	var setup = func() *Context {
+		var manual = audienceLiteral(base)
+		manual.Index_["exp_app"] = ExperimentVariables{Data: base, Variables: vars}
+		assertAny(1, treatmentPeek(t, manual, "exp_app"), t)
+		return manual
+	}
+	var edit = func(manual *Context, change func(*jsonmodels.Experiment)) {
+		var data = base
+		change(&data)
+		manual.Index_["exp_app"] = ExperimentVariables{Data: data, Variables: vars}
+	}
+
+	var manual = setup()
+	edit(manual, func(e *jsonmodels.Experiment) { e.FullOnVariant = 2 })
+	assertAny(2, treatmentPeek(t, manual, "exp_app"), t)
+
+	// A Split edit keeps the cached assignment (ExperimentMatches does not
+	// compare it, as in v1.1.1), but the private copy follows Index_.
+	manual = setup()
+	edit(manual, func(e *jsonmodels.Experiment) { e.Split = []float64{1, 0} })
+	assertAny(1, treatmentPeek(t, manual, "exp_app"), t)
+	var split, _, _ = manual.state().experimentAndRules("exp_app")
+	assertAny([]float64{1, 0}, split.Data.Split, t)
+
+	manual = setup()
+	delete(manual.Index_, "exp_app")
+	assertAny(0, treatmentPeek(t, manual, "exp_app"), t)
+
+	// New variable values (a new Variables slice) are read, as from Index_.
+	manual = setup()
+	manual.Index_["exp_app"] = ExperimentVariables{Data: base, Variables: []map[string]interface{}{{"color": "red"}, {"color": "green"}}}
+	var assignment = manual.GetAssignment("exp_app")
+	assertAny(1, assignment.Variant, t)
+	var _, _ = manual.PeekVariableValue("color", "")
+	var current, _, _ = manual.state().experimentAndRules("exp_app")
+	assertAny("green", current.Variables[1]["color"], t)
+
+	// A new assignmentRules text drops SetData's rules.
+	var ruled = ruleExperiment("ruled", rulesJSON(`{"type":"assign","variant":2}`))
+	manual = audienceLiteral(base)
+	manual.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{ruled}})
+	assertAny(2, treatmentPeek(t, manual, "ruled"), t)
+	var next = ruled
+	next.AssignmentRules = rulesJSON(`{"type":"assign","variant":1}`)
+	manual.Index_["ruled"] = ExperimentVariables{Data: next, Variables: manual.Index_["ruled"].Variables}
+	assertAny(0, treatmentPeek(t, manual, "ruled"), t)
+}
+
+// A literal read racing a SetData that changes the rules never leaves the
+// private index with the new data but without its rules.
+func TestLiteralSyncDoesNotOverwriteConcurrentSetData(t *testing.T) {
+	var oldRules = ruleExperiment("ruled", rulesJSON(`{"type":"assign","variant":1}`))
+	var newRules = ruleExperiment("ruled", rulesJSON(`{"type":"assign","variant":2}`))
+	newRules.Iteration = 2
+	var wrong = 0
+	for trial := 0; trial < 500; trial++ {
+		var manual = audienceLiteral(oldRules)
+		manual.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{oldRules}})
+		assertAny(1, treatmentPeek(t, manual, "ruled"), t)
+		var stop int32
+		var wg sync.WaitGroup
+		for r := 0; r < 4; r++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for atomic.LoadInt32(&stop) == 0 {
+					var _, _ = manual.PeekTreatment("ruled")
+				}
+			}()
+		}
+		runtime.Gosched()
+		manual.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{newRules}})
+		atomic.StoreInt32(&stop, 1)
+		wg.Wait()
+		if variant := treatmentPeek(t, manual, "ruled"); variant != 2 {
+			wrong++
+		}
+	}
+	assertAny(0, wrong, t)
+}
+
 // funcDeserializer is a func-typed adapter, whose values Go cannot hash or
 // compare.
 type funcDeserializer func(b []byte, offset, length int) (map[string]interface{}, error)
