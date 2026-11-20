@@ -1598,6 +1598,18 @@ func TestDeserializerComparisonNeverPanicsOrSpins(t *testing.T) {
 	}
 }
 
+// Replacing a func-adapter deserializer with one of another type parses
+// again with the new one.
+func TestReplacingUncomparableDeserializerWithAnotherTypeParsesAgain(t *testing.T) {
+	var ctx, _ = newSystemAttrContext("website", "production",
+		audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true))
+	ctx.AudienceMatcher_ = AudienceMatcher{funcDeserializer(DefaultAudienceDeserializer{}.Deserialize)}
+	assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
+	ctx.AudienceMatcher_ = AudienceMatcher{rejectingDeserializer{}}
+	assertAny(nil, ctx.SetAttribute("x", 1), t)
+	assertAny(0, treatmentPeek(t, ctx, "exp_app"), t)
+}
+
 // restlessDeserializer installs a new audience text on every parse.
 type restlessDeserializer struct {
 	ctx   *Context
