@@ -29,28 +29,36 @@ func CreateResult(result bool) Result {
 }
 
 func (am AudienceMatcher) Evaluate(audience string, attributes map[string]interface{}) (Result, error) {
+	return am.parseAudience(audience).evaluate(attributes)
+}
+
+// parsedAudience is an audience run through the AudienceDeserializer, ready to
+// be evaluated against attributes. Parsing runs customer code, so the context
+// does it before taking its locks; evaluating runs only SDK code.
+type parsedAudience struct {
+	text   string
+	filter interface{}
+	err    error
+}
+
+func (am AudienceMatcher) parseAudience(audience string) parsedAudience {
 	result, err := am.deserializer().Deserialize([]byte(audience), 0, len(audience))
 	if err != nil {
-		return Result{}, errors.New("can't evaluate data")
+		return parsedAudience{text: audience, err: errors.New("can't evaluate data")}
 	}
+	return parsedAudience{text: audience, filter: result["filter"]}
+}
 
-	var filter = result["filter"]
-	var kind = reflect.ValueOf(filter).Kind()
+func (p parsedAudience) evaluate(attributes map[string]interface{}) (Result, error) {
+	if p.err != nil {
+		return Result{}, p.err
+	}
+	var kind = reflect.ValueOf(p.filter).Kind()
 	if kind == reflect.Map || kind == reflect.Slice || kind == reflect.Array {
-		return CreateResult(jsonexpr.EvaluateBooleanExpr(filter, attributes)), nil
+		return CreateResult(jsonexpr.EvaluateBooleanExpr(p.filter, attributes)), nil
 	}
 
 	return Result{}, errors.New("can't evaluate data")
-}
-
-// customDeserializer reports whether evaluating an audience runs customer
-// code, which may call back into the context.
-func (am AudienceMatcher) customDeserializer() bool {
-	switch am.Deserializer_.(type) {
-	case nil, DefaultAudienceDeserializer, *DefaultAudienceDeserializer:
-		return false
-	}
-	return true
 }
 
 func (am AudienceMatcher) deserializer() AudienceDeserializer {

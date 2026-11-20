@@ -131,18 +131,6 @@ type contextState struct {
 	// ContextLock_: entries are only written under the write lock.
 	assignmentCache_ map[string]*cachedAssignment
 	ruleIdentities   *ruleAssignmentIdentities
-
-	// audienceEvaluators counts, per goroutine, the audience evaluations with
-	// a custom deserializer it is running while holding ContextLock_ (read or
-	// write);
-	// evaluatorCount is their total, so snapshot pays nothing when it is 0.
-	// snapshot skips ContextLock_ for those goroutines: v1.1.1 handed loggers
-	// the context without locking, so a deserializer that logs an event
-	// (QueueExposure, Track) did not hang.
-	evaluatorCount     int32
-	audienceEvaluators sync.Map
-	// evaluationsRegistered counts every registration, for tests.
-	evaluationsRegistered int64
 }
 
 // contextClock carries private state in an existing interface field without
@@ -200,16 +188,9 @@ func (c *Context) ownClock() *contextClock {
 // literalState is the cold fallback for a context with no carrier of its own
 // (a literal, or one whose Clock_ was replaced), kept out of state so the
 // carrier lookup stays a short call.
-//
-// While an assignment evaluation holds ContextLock_, it publishes the state in
-// evaluatingStates, so a read the AudienceDeserializer makes from inside that
-// evaluation finds it without taking the lock it would deadlock on.
 func (c *Context) literalState() *contextState {
 	if c.ContextLock_ == nil {
 		return newContextState()
-	}
-	if st := evaluatingState(c.ContextLock_); st != nil {
-		return st
 	}
 	c.ContextLock_.Lock()
 	defer c.ContextLock_.Unlock()
@@ -245,113 +226,6 @@ func (c *Context) literalState() *contextState {
 	}
 	c.Assigners_[contextStateKey{}] = state
 	return state
-}
-
-// evaluatingStates holds, for each carrier-less context whose assignments are
-// being evaluated, its state and the number of evaluations in progress.
-// Entries exist only during an evaluation, so the table keeps nothing alive.
-var evaluatingStates = struct {
-	sync.RWMutex
-	m map[*sync.RWMutex]*evaluatingEntry
-}{m: map[*sync.RWMutex]*evaluatingEntry{}}
-
-type evaluatingEntry struct {
-	st *contextState
-	n  int
-}
-
-var evaluationsActive int32
-
-func evaluatingState(lock *sync.RWMutex) *contextState {
-	if atomic.LoadInt32(&evaluationsActive) == 0 {
-		return nil
-	}
-	evaluatingStates.RLock()
-	defer evaluatingStates.RUnlock()
-	if entry, ok := evaluatingStates.m[lock]; ok {
-		return entry.st
-	}
-	return nil
-}
-
-// evaluating marks the start of an audience or rule evaluation, which calls
-// the AudienceDeserializer while ContextLock_ is held, and returns the
-// function that marks its end. For a context without a carrier it publishes
-// st, so reads the deserializer makes find it without that lock; a context
-// with a carrier finds its state without any lock and needs nothing.
-func (c *Context) evaluating(st *contextState) func() {
-	if c.ownClock() != nil {
-		return func() {}
-	}
-	return beginEvaluating(c.ContextLock_, st)
-}
-
-// beginEvaluating publishes st for lock until the returned function is called.
-func beginEvaluating(lock *sync.RWMutex, st *contextState) func() {
-	evaluatingStates.Lock()
-	var entry, ok = evaluatingStates.m[lock]
-	if !ok {
-		entry = &evaluatingEntry{st: st}
-		evaluatingStates.m[lock] = entry
-	}
-	entry.n++
-	atomic.AddInt32(&evaluationsActive, 1)
-	evaluatingStates.Unlock()
-	return func() {
-		evaluatingStates.Lock()
-		if entry.n--; entry.n == 0 {
-			delete(evaluatingStates.m, lock)
-		}
-		atomic.AddInt32(&evaluationsActive, -1)
-		evaluatingStates.Unlock()
-	}
-}
-
-// isAudienceEvaluator reports whether this goroutine is evaluating an audience
-// or rules while holding ContextLock_. It costs one atomic load when no
-// evaluation is running.
-func (st *contextState) isAudienceEvaluator() bool {
-	if atomic.LoadInt32(&st.evaluatorCount) == 0 {
-		return false
-	}
-	var n, ok = st.audienceEvaluators.Load(goroutineID())
-	return ok && n.(int) > 0
-}
-
-// enterAudienceEvaluation records this goroutine as evaluating under
-// ContextLock_ and returns the function that ends it. Nested evaluations on
-// the same goroutine are counted.
-func (st *contextState) enterAudienceEvaluation() func() {
-	atomic.AddInt64(&st.evaluationsRegistered, 1)
-	var id = goroutineID()
-	var n, _ = st.audienceEvaluators.Load(id)
-	var count, _ = n.(int)
-	st.audienceEvaluators.Store(id, count+1)
-	atomic.AddInt32(&st.evaluatorCount, 1)
-	return func() {
-		atomic.AddInt32(&st.evaluatorCount, -1)
-		if count == 0 {
-			st.audienceEvaluators.Delete(id)
-		} else {
-			st.audienceEvaluators.Store(id, count)
-		}
-	}
-}
-
-// evaluateAudienceLocked evaluates an audience while this goroutine holds
-// ContextLock_, recording the goroutine so a snapshot taken by an event the
-// AudienceDeserializer logs does not lock it again (a second read lock would
-// wait behind a queued writer).
-//
-// Only a custom deserializer can call back into the context, so the
-// bookkeeping (a goroutine id lookup) is done just then; the default setup
-// pays nothing. A logger is not required: WaitUntilReady, Refresh and the
-// publisher also take snapshots.
-func (c *Context) evaluateAudienceLocked(st *contextState, audience string, attrs map[string]interface{}) (Result, error) {
-	if c.AudienceMatcher_.customDeserializer() {
-		defer st.enterAudienceEvaluation()()
-	}
-	return c.AudienceMatcher_.Evaluate(audience, attrs)
 }
 
 func (c *Context) isSnapshot() bool {
@@ -407,6 +281,11 @@ type contextIndex struct {
 type indexedExperiment struct {
 	experiment ExperimentVariables
 	rules      *experimentRules
+	// audience is the experiment's audience, already run through the
+	// AudienceDeserializer when the data was installed: that is customer code,
+	// and assignment evaluation holds ContextLock_, so it must not run there
+	// (a deserializer that calls back into the context would deadlock).
+	audience parsedAudience
 }
 
 // experimentRules is an experiment's assignmentRules text and its parsed
@@ -733,10 +612,7 @@ func (c *Context) setReadyFutureWith(st *contextState, f *future.Future) {
 func (c *Context) snapshot() Context {
 	c = c.live()
 	var st = c.state()
-	// The goroutine evaluating an audience under ContextLock_ already holds
-	// it (for reading or writing), so its fields are stable; locking it again
-	// would deadlock.
-	if c.ContextLock_ != nil && !st.isAudienceEvaluator() {
+	if c.ContextLock_ != nil {
 		c.ContextLock_.RLock()
 		defer c.ContextLock_.RUnlock()
 	}
@@ -1484,15 +1360,7 @@ func (c *Context) RefreshAsync() *future.Future {
 		}
 		donefun(nil, outcome)
 	}
-	if st.isAudienceEvaluator() {
-		// The evaluator holds ContextLock_. Wait for transport here, then
-		// install and log on this goroutine, whose snapshot already owns the
-		// lock. Never make another goroutine bypass the lock.
-		value, err := loaded.Get(context.Background())
-		complete(value, err)
-	} else {
-		loaded.Listen(complete)
-	}
+	loaded.Listen(complete)
 	return tempfuture
 }
 
@@ -1739,7 +1607,6 @@ func (c *Context) validCachedAssignment(st *contextState, experimentName string)
 		if rules == entry.rules && atomic.LoadInt32(&st.attrsSeq_) <= entry.attrsSeq {
 			return entry, rules, assignmentValid
 		}
-		defer c.evaluating(st)()
 		if c.ruleMatches(st, experiment.Data, rules, entry) && c.audienceMatches(st, experiment.Data, entry) {
 			return entry, rules, assignmentRevalidated
 		}
@@ -1777,7 +1644,7 @@ func (c *Context) audienceMatches(st *contextState, data jsonmodels.Experiment, 
 	if entry.ruleOverride || len(data.Audience) == 0 {
 		return true
 	}
-	var match, err = c.evaluateAudienceLocked(st, data.Audience, c.evaluationAttributesWithState(st))
+	var match, err = st.audienceOf(data.Name).evaluate(c.evaluationAttributesWithState(st))
 	var newAudienceMismatch = false
 	if err == nil {
 		newAudienceMismatch = !match.Get()
@@ -1918,7 +1785,6 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 		return previous
 	}
 
-	defer c.evaluating(st)()
 	var custom, cfound = c.Cassignments_[experimentName]
 	var override, ofound = c.Overrides_[experimentName]
 	var experiment, rules, efound = st.experimentAndRules(experimentName)
@@ -1954,7 +1820,7 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 			if !entry.ruleOverride && len(experiment.Data.Audience) > 0 {
 				var attrs = c.evaluationAttributesWithState(st)
 
-				var match, err = c.evaluateAudienceLocked(st, experiment.Data.Audience, attrs)
+				var match, err = st.audienceOf(experimentName).evaluate(attrs)
 				if err == nil {
 					assignment.AudienceMismatch = !match.Get()
 				}
@@ -2056,6 +1922,16 @@ func (st *contextState) loadIndex() *contextIndex {
 
 // experimentAndRules is GetExperiment plus the experiment's parsed assignment
 // rules, read from the same installed index.
+// audienceOf returns the experiment's pre-parsed audience.
+func (st *contextState) audienceOf(experimentName string) parsedAudience {
+	if index := st.loadIndex(); index != nil {
+		if entry, found := index.experiments[experimentName]; found {
+			return entry.audience
+		}
+	}
+	return parsedAudience{}
+}
+
 func (st *contextState) experimentAndRules(experimentName string) (ExperimentVariables, *experimentRules, bool) {
 	var index = st.loadIndex()
 	if index == nil {
@@ -2205,6 +2081,7 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	var indexVariables = map[string][]ExperimentVariables{}
 	var contextCustomFields = map[string]map[string]ContextCustomFieldValue{}
 	var rules = map[string]*experimentRules{}
+	var audiences = map[string]parsedAudience{}
 	var previous = st.loadIndex()
 	var previousRules = func(name string) *experimentRules {
 		if previous != nil {
@@ -2269,6 +2146,9 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		if len(experiment.AssignmentRules) > 0 {
 			rules[experiment.Name] = c.experimentRulesFor(previousRules(experiment.Name), experiment.AssignmentRules)
 		}
+		if len(experiment.Audience) > 0 {
+			audiences[experiment.Name] = c.parsedAudienceFor(previous, experiment.Name, experiment.Audience)
+		}
 
 		contextCustomFields[experiment.Name] = experimentCustomFields
 		index[experiment.Name] = experiemntVariables
@@ -2292,7 +2172,7 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	c.Index_ = index
 	var indexed = make(map[string]*indexedExperiment, len(index))
 	for name, experiment := range index {
-		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name]}
+		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name], audience: audiences[name]}
 	}
 	st.index_.Store(&contextIndex{experiments: indexed})
 	c.ContextCustomFields_ = contextCustomFields
@@ -2317,6 +2197,24 @@ func (c *Context) experimentRulesFor(previous *experimentRules, text string) *ex
 	}
 	var parsed, _ = c.AudienceMatcher_.parseRules(text)
 	return &experimentRules{text: text, parsed: parsed}
+}
+
+// parsedAudienceFor runs an experiment's audience through the
+// AudienceDeserializer, or reuses the previous parse when a refresh left the
+// text unchanged. A deserializer panic counts as an unparseable audience, as
+// a deserializer error does.
+func (c *Context) parsedAudienceFor(previous *contextIndex, name string, text string) (parsed parsedAudience) {
+	if previous != nil {
+		if entry, found := previous.experiments[name]; found && entry.audience.text == text {
+			return entry.audience
+		}
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			parsed = parsedAudience{text: text, err: errors.New("can't evaluate data")}
+		}
+	}()
+	return c.AudienceMatcher_.parseAudience(text)
 }
 
 // LogEvent and LogError pass an event to the event logger. A logger is an
@@ -2345,20 +2243,6 @@ func (c *Context) logEvent(event EventType, data interface{}) {
 // logger goes through here, including the ones made while a
 // context is being created or its data parsed, so a logger can never end the
 // host process or abort the SDK code that reports to it.
-// logSnapshot delivers a snapshot captured by the calling evaluator, rather
-// than acquiring ContextLock_ on the transport completion goroutine.
-func (c *Context) logSnapshot(snapshot Context, event EventType, data interface{}) {
-	if snapshot.EventLogger_ == nil {
-		return
-	}
-	var st = snapshot.state()
-	if st.loggers_ != nil {
-		var id = st.loggers_.enter()
-		defer st.loggers_.exit(id)
-	}
-	notifyLogger(snapshot.EventLogger_, snapshot, event, data)
-}
-
 func notifyLogger(logger ContextEventLogger, ctx Context, event EventType, data interface{}) {
 	if logger == nil {
 		return
@@ -2440,10 +2324,7 @@ func (c *Context) Flush() *future.Future {
 			event.Hashed = true
 			event.PublishedAt = c.Clock_.Millis()
 
-			var evaluator = st.isAudienceEvaluator()
-			if !evaluator {
-				c.ContextLock_.Lock()
-			}
+			c.ContextLock_.Lock()
 			var entrySet []interface{}
 			for key, value := range c.Units_ {
 				entrySet = append(entrySet, Pair{a: key, b: value})
@@ -2463,27 +2344,10 @@ func (c *Context) Flush() *future.Future {
 					event.Attributes[key] = value.(jsonmodels.Attribute)
 				}
 			}
-			if !evaluator {
-				c.ContextLock_.Unlock()
-			}
+			c.ContextLock_.Unlock()
 			event.Goals = achievements
 			event.Exposures = exposures
 
-			// Capture callback data while the caller can safely snapshot. A
-			// transport completion on another goroutine must not snapshot a
-			// context whose evaluator is waiting here for Publish to finish.
-			var callbackContext *Context
-			if evaluator {
-				var snapshot = c.snapshot()
-				callbackContext = &snapshot
-			}
-			var log = func(kind EventType, data interface{}) {
-				if callbackContext == nil {
-					c.logEvent(kind, data)
-					return
-				}
-				c.logSnapshot(*callbackContext, kind, data)
-			}
 			c.callPublisher(event).Listen(
 				func(value future.Value, err error) {
 					// The publisher may return a future that is already complete,
@@ -2495,10 +2359,10 @@ func (c *Context) Flush() *future.Future {
 						// Start the logger first: settledDone runs Close's listeners
 						// synchronously, and a panic there must not leave the
 						// caller's future unsettled.
-						runLogger(done, nil, func() { log(Publish, event) })
+						runLogger(done, nil, func() { c.logEvent(Publish, event) })
 					} else {
 						c.requeueEvents(exposures, achievements, eventCount)
-						runLogger(done, err, func() { log(Error, err) })
+						runLogger(done, err, func() { c.logEvent(Error, err) })
 					}
 					st.removeInflight(settled)
 					settledDone(nil, err)

@@ -3,6 +3,7 @@ package sdk
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"runtime"
@@ -293,7 +294,7 @@ func TestReentrantDeserializerAfterClockReplacementDoesNotDeadlock(t *testing.T)
 			deserializer.ctx = ctx
 			var done = make(chan int, 1)
 			go func() {
-				var variant, _ = ctx.PeekTreatment("exp_app")
+				var variant, _ = reparseAudience(ctx)
 				done <- variant
 			}()
 			select {
@@ -590,82 +591,6 @@ func TestSharedVariableKeysKeepAllExperimentsAfterClockReplacement(t *testing.T)
 	assertAny("first", one["color"], t)
 }
 
-type registryCheckingDeserializer struct {
-	ctx            *Context
-	wantRegistered bool
-	calls          int
-	wrong          bool
-}
-
-func (d *registryCheckingDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
-	if d.ctx != nil {
-		d.calls++
-		if (evaluatingState(d.ctx.ContextLock_) != nil) != d.wantRegistered {
-			d.wrong = true
-		}
-	}
-	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
-}
-
-func TestEvaluationRegistryIsScopedAndOrdinaryContextsBypassIt(t *testing.T) {
-	for _, replace := range []bool{false, true} {
-		var d = &registryCheckingDeserializer{wantRegistered: replace}
-		var client = &systemAttrClient{application: "website", environment: "production"}
-		var abs = Create(ABSmartlyConfig{Client_: client, AudienceDeserializer_: d})
-		var config = CreateDefaultContextConfig()
-		config.Units_, config.PublishDelay_, config.RefreshInterval_ = withUnit(), -1, -1
-		var ctx = abs.CreateContextWith(config, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{audienceExperiment("exp", appFilter, true)}})
-		ctx.WaitUntilReady()
-		if replace {
-			ctx.Clock_ = internal.FixedClock{Millis_: 1}
-		}
-		d.ctx = ctx
-		assertAny(1, treatmentPeek(t, ctx, "exp"), t)
-		assertAny(nil, ctx.SetAttribute("other", 1), t)
-		assertAny(1, treatmentPeek(t, ctx, "exp"), t)
-		if d.calls < 2 || d.wrong {
-			t.Fatalf("replace=%v: calls=%d wrong registration=%v", replace, d.calls, d.wrong)
-		}
-		if evaluatingState(ctx.ContextLock_) != nil {
-			t.Fatal("evaluation state retained after build/revalidation")
-		}
-	}
-}
-
-func TestEvaluationRegistryConcurrentScopesAreRemoved(t *testing.T) {
-	var lock = &sync.RWMutex{}
-	var st = newContextState()
-	var ready sync.WaitGroup
-	ready.Add(8)
-	var release = make(chan struct{})
-	var done sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		done.Add(1)
-		go func() {
-			defer done.Done()
-			var end = beginEvaluating(lock, st)
-			ready.Done()
-			<-release
-			end()
-		}()
-	}
-	ready.Wait()
-	if active := atomic.LoadInt32(&evaluationsActive); active < 8 {
-		t.Fatalf("evaluationsActive = %d with 8 scopes active", active)
-	}
-	if evaluatingState(lock) != st {
-		t.Fatal("active scopes did not publish their state")
-	}
-	close(release)
-	done.Wait()
-	if evaluatingState(lock) != nil {
-		t.Fatal("last evaluation scope retained state")
-	}
-	if active := atomic.LoadInt32(&evaluationsActive); active != 0 {
-		t.Fatalf("evaluationsActive = %d after every scope ended, want 0", active)
-	}
-}
-
 func TestContextLiteralVariableKeysReadCurrentLegacyIndex(t *testing.T) {
 	var ready = &atomic.Value{}
 	ready.Store(true)
@@ -738,8 +663,18 @@ func TestContextLiteralVariableKeysInsideEvaluationAreCurrent(t *testing.T) {
 	manual.IndexVariables_ = map[interface{}]interface{}{"color": five}
 	_, _ = manual.GetVariableKeys()
 	manual.IndexVariables_["size"] = six
+	// The deserializer runs while data is installed, so install data with a
+	// new audience text to run it (as reparseAudience does). SetData replaces
+	// IndexVariables_, so the keys it reads are checked against what was
+	// current just before.
 	d.ctx = &manual
-	_, _ = manual.PeekTreatment("exp_app")
+	var current = map[string]string{}
+	for key, value := range manual.IndexVariables_ {
+		current[key.(string)] = value.(ExperimentVariables).Data.Name
+	}
+	manual.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+		audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true)}})
+	assertAny(current, d.keys, t)
 	assertAny(map[string]string{"color": "five", "size": "six"}, d.keys, t)
 	assertAny(map[string][]string{"color": {"five"}, "size": {"six"}}, d.all, t)
 }
@@ -813,7 +748,7 @@ func TestQueueExposureFromInsideEvaluationDoesNotDeadlock(t *testing.T) {
 		d.ctx, d.retained = ctx, ctx.GetAssignment("rule")
 		var done = make(chan int, 1)
 		go func() {
-			var variant, _ = ctx.PeekTreatment("exp_app")
+			var variant, _ = reparseAudience(ctx)
 			done <- variant
 		}()
 		select {
@@ -972,7 +907,7 @@ func TestDeserializerThatLogsEventsWithLoggerDoesNotDeadlock(t *testing.T) {
 					go func(g int) {
 						defer wg.Done()
 						for i := 0; i < 8; i++ {
-							_, _ = ctx.PeekTreatment("exp_app")
+							_, _ = reparseAudience(ctx)
 							_ = ctx.SetAttribute("round", g*100+i) // forces revalidation
 						}
 					}(g)
@@ -998,61 +933,6 @@ func TestDeserializerThatLogsEventsWithLoggerDoesNotDeadlock(t *testing.T) {
 				t.Errorf("%s: no %s event was logged", name, wanted)
 			}
 		}
-	}
-}
-
-// countingDeserializer wraps a deserializer so the test can see whether an
-// audience evaluation ran.
-type countingDeserializer struct {
-	inner AudienceDeserializer
-	calls int32
-}
-
-func (d *countingDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
-	atomic.AddInt32(&d.calls, 1)
-	return d.inner.Deserialize(b, offset, length)
-}
-
-// The evaluator bookkeeping runs for a custom deserializer, the only code that
-// can call back into the context, with or without a logger; the default or a
-// nil deserializer never pays for it.
-func TestAudienceEvaluatorBookkeepingIsGated(t *testing.T) {
-	var cases = []struct {
-		name         string
-		deserializer AudienceDeserializer
-		logger       bool
-		register     bool
-	}{
-		{"nil deserializer, logger", nil, true, false},
-		{"default deserializer, logger", DefaultAudienceDeserializer{}, true, false},
-		{"pointer default deserializer, logger", &DefaultAudienceDeserializer{}, true, false},
-		{"custom deserializer, no logger", &countingDeserializer{inner: DefaultAudienceDeserializer{}}, false, true},
-		{"custom deserializer, logger", &countingDeserializer{inner: DefaultAudienceDeserializer{}}, true, true},
-	}
-	for _, tc := range cases {
-		var client = &systemAttrClient{application: "website", environment: "production"}
-		var config = ABsmartlyConfig{Client_: client,
-			ContextDataProvider_: DefaultContextDataProvider{client_: client},
-			ContextEventHandler_: DefaultContextEventHandler{client_: client}, AudienceDeserializer_: tc.deserializer}
-		if tc.logger {
-			config.ContextEventLogger_ = &MockEventLogger{}
-		}
-		var cc = CreateDefaultContextConfig()
-		cc.Units_, cc.PublishDelay_, cc.RefreshInterval_ = withUnit(), -1, -1
-		var ctx = Create(config).CreateContextWith(cc, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
-			audienceExperiment("exp_app", appFilter, true)}})
-		ctx.WaitUntilReady()
-		var st = ctx.state()
-		var before = atomic.LoadInt64(&st.evaluationsRegistered)
-		assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
-		var registered = atomic.LoadInt64(&st.evaluationsRegistered) - before
-		if tc.register && registered != 1 {
-			t.Errorf("%s: %d registrations, want 1", tc.name, registered)
-		}
-		if !tc.register && registered != 0 {
-			t.Errorf("%s: %d registrations, want 0", tc.name, registered)
-		}
-		assertAny(int32(0), atomic.LoadInt32(&st.evaluatorCount), t)
 	}
 }
 
@@ -1106,7 +986,7 @@ func TestDeserializerWithoutLoggerCanWaitAndRefresh(t *testing.T) {
 	d.mu.Unlock()
 	var done = make(chan int, 1)
 	go func() {
-		var variant, _ = ctx.PeekTreatment("exp_app")
+		var variant, _ = reparseAudience(ctx)
 		done <- variant
 	}()
 	select {
@@ -1115,65 +995,6 @@ func TestDeserializerWithoutLoggerCanWaitAndRefresh(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("WaitUntilReady/Refresh from a deserializer without a logger deadlocked")
 	}
-}
-
-// Another goroutine's logger must not read the context without its lock
-// while an evaluation holds it: only the evaluating goroutine skips the lock.
-func TestOnlyTheEvaluatingGoroutineSkipsTheSnapshotLock(t *testing.T) {
-	var d = &callingDeserializer{}
-	var logger = &MockEventLogger{}
-	var client = &systemAttrClient{application: "website", environment: "production"}
-	var ctx = Create(ABsmartlyConfig{Client_: client,
-		ContextDataProvider_:  DefaultContextDataProvider{client_: client},
-		ContextEventHandler_:  DefaultContextEventHandler{client_: client},
-		AudienceDeserializer_: d, ContextEventLogger_: logger}).CreateContextWith(func() ContextConfig {
-		var cc = CreateDefaultContextConfig()
-		cc.Units_, cc.PublishDelay_, cc.RefreshInterval_ = withUnit(), -1, -1
-		return cc
-	}(), jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{audienceExperiment("exp_app", appFilter, true)}})
-	ctx.WaitUntilReady()
-	var entered, release = make(chan struct{}), make(chan struct{})
-	d.mu.Lock()
-	d.ctx = ctx
-	d.call = func(*Context) {
-		close(entered)
-		<-release
-	}
-	d.mu.Unlock()
-	var evaluated = make(chan struct{})
-	go func() {
-		_, _ = ctx.PeekTreatment("exp_app")
-		close(evaluated)
-	}()
-	<-entered
-	var tracked = make(chan struct{})
-	go func() {
-		_ = ctx.Track("other goroutine", nil)
-		close(tracked)
-	}()
-	select {
-	case <-tracked:
-		close(release)
-		t.Fatal("another goroutine's Track logged while the evaluation held ContextLock_")
-	case <-time.After(200 * time.Millisecond):
-	}
-	close(release)
-	<-evaluated
-	<-tracked
-}
-
-func TestAudienceEvaluationRegistrationNestsAndClears(t *testing.T) {
-	var st = newContextState()
-	var outer = st.enterAudienceEvaluation()
-	var inner = st.enterAudienceEvaluation()
-	assertAny(int32(2), atomic.LoadInt32(&st.evaluatorCount), t)
-	inner()
-	assertAny(true, st.isAudienceEvaluator(), t)
-	outer()
-	assertAny(false, st.isAudienceEvaluator(), t)
-	assertAny(int32(0), atomic.LoadInt32(&st.evaluatorCount), t)
-	var _, left = st.audienceEvaluators.Load(goroutineID())
-	assertAny(false, left, t)
 }
 
 func TestDeserializerCanRefreshWithAsyncProvider(t *testing.T) {
@@ -1232,7 +1053,7 @@ func TestDeserializerCanPublishQueuedEvents(t *testing.T) {
 				}
 			}
 			var done = make(chan struct{})
-			go func() { ctx.PeekTreatment("exp_app"); close(done) }()
+			go func() { _, _ = reparseAudience(ctx); close(done) }()
 			select {
 			case <-done:
 			case <-time.After(5 * time.Second):
@@ -1289,7 +1110,7 @@ func TestDeserializerFailingPublishLogsErrorAndKeepsEvents(t *testing.T) {
 	d.ctx = ctx
 	d.call = func(c *Context) { result <- c.Publish() }
 	var done = make(chan struct{})
-	go func() { ctx.PeekTreatment("exp_app"); close(done) }()
+	go func() { _, _ = reparseAudience(ctx); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -1343,7 +1164,7 @@ func TestLoggerClosingFromDeserializerStartedPublishDoesNotDeadlock(t *testing.T
 		}
 	}
 	var done = make(chan struct{})
-	go func() { ctx.PeekTreatment("exp_app"); close(done) }()
+	go func() { _, _ = reparseAudience(ctx); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -1369,4 +1190,206 @@ func TestChangedTrafficSplitInvalidatesCachedAssignment(t *testing.T) {
 	var after = ctx.GetAssignment("exp")
 	assertAny(false, after.Eligible, t)
 	assertAny([]float64{1, 0}, after.TrafficSplit, t)
+}
+
+// lockProbeDeserializer records whether ContextLock_ was free (could be taken
+// for writing) when the AudienceDeserializer ran.
+type lockProbeDeserializer struct {
+	mu    sync.Mutex
+	ctx   *Context
+	calls int
+	free  int
+}
+
+func (d *lockProbeDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	d.mu.Lock()
+	var ctx = d.ctx
+	d.mu.Unlock()
+	if ctx != nil {
+		var free = make(chan struct{})
+		go func() {
+			ctx.ContextLock_.Lock()
+			ctx.ContextLock_.Unlock()
+			close(free)
+		}()
+		select {
+		case <-free:
+			d.mu.Lock()
+			d.free++
+			d.mu.Unlock()
+		case <-time.After(200 * time.Millisecond):
+		}
+		d.mu.Lock()
+		d.calls++
+		d.mu.Unlock()
+	}
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+// The AudienceDeserializer is customer code, so it runs when data is
+// installed, never while an assignment holds ContextLock_. That is what lets
+// it call any context method (as in v1.1.1) without the SDK bypassing its
+// own locks. Assignments and revalidations reuse the parse.
+func TestAudienceDeserializerRunsOutsideTheContextLock(t *testing.T) {
+	var d = &lockProbeDeserializer{}
+	var client = &systemAttrClient{application: "website", environment: "production"}
+	var cc = CreateDefaultContextConfig()
+	cc.Units_, cc.PublishDelay_, cc.RefreshInterval_ = withUnit(), -1, -1
+	var data = jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{audienceExperiment("exp_app", appFilter, true)}}
+	var ctx = Create(ABsmartlyConfig{Client_: client,
+		ContextDataProvider_:  syncDataProvider{data},
+		ContextEventHandler_:  DefaultContextEventHandler{client_: client},
+		AudienceDeserializer_: d}).CreateContextWith(cc, data)
+	ctx.WaitUntilReady()
+	d.mu.Lock()
+	d.ctx = ctx
+	d.mu.Unlock()
+
+	assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
+	assertAny(nil, ctx.SetAttribute("other", 1), t)
+	assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
+	d.mu.Lock()
+	assertAny(0, d.calls, t) // evaluations reuse the parse from data install
+	d.mu.Unlock()
+
+	ctx.Refresh() // reinstalls the data: the parse is reused for unchanged text
+	var changed = audienceExperiment("exp_app", `{"filter":[{"eq":[{"var":"application"},{"value":"website"}]},{"value":true}]}`, true)
+	ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{changed}})
+	d.mu.Lock()
+	assertAny(1, d.calls, t)
+	assertAny(1, d.free, t)
+	d.mu.Unlock()
+}
+
+// reparseAudience installs the context's data again with a new audience text
+// for exp_app, so the AudienceDeserializer runs (it runs when data is
+// installed), then reads the treatment.
+var reparseRound int32
+
+func reparseAudience(ctx *Context) (int, error) {
+	var data, _ = ctx.GetData()
+	var round = atomic.AddInt32(&reparseRound, 1)
+	var experiments = make([]jsonmodels.Experiment, len(data.Experiments))
+	copy(experiments, data.Experiments)
+	for i := range experiments {
+		if experiments[i].Name == "exp_app" {
+			experiments[i].Audience = fmt.Sprintf(`{"filter":[{"eq":[{"var":"application"},{"value":"website"}]},{"value":%d}]}`, round)
+		}
+	}
+	ctx.SetData(jsonmodels.ContextData{Experiments: experiments})
+	return ctx.PeekTreatment("exp_app")
+}
+
+// pendingProvider answers a refresh only when released.
+type pendingProvider struct {
+	release chan struct{}
+	data    jsonmodels.ContextData
+}
+
+func (p *pendingProvider) GetContextData() *future.Future {
+	return future.Call(func() (future.Value, error) {
+		<-p.release
+		return p.data, nil
+	})
+}
+
+type refreshingDeserializer struct {
+	mu  sync.Mutex
+	ctx *Context
+}
+
+func (d *refreshingDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	d.mu.Lock()
+	var ctx = d.ctx
+	d.ctx = nil
+	d.mu.Unlock()
+	if ctx != nil {
+		ctx.Refresh()
+	}
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+// A deserializer that calls Refresh while another refresh is pending joins
+// it, and the pending refresh completes.
+func TestDeserializerRefreshJoinsAPendingRefresh(t *testing.T) {
+	var p = &pendingProvider{release: make(chan struct{}),
+		data: jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{audienceExperiment("exp_app", appFilter, true)}}}
+	var d = &refreshingDeserializer{}
+	var client = &systemAttrClient{application: "website", environment: "production"}
+	var cc = CreateDefaultContextConfig()
+	cc.Units_, cc.PublishDelay_, cc.RefreshInterval_ = withUnit(), -1, -1
+	var ctx = Create(ABsmartlyConfig{Client_: client, ContextDataProvider_: p,
+		ContextEventHandler_: DefaultContextEventHandler{client_: client}, AudienceDeserializer_: d}).CreateContextWith(cc, p.data)
+	ctx.WaitUntilReady()
+	var pending = ctx.RefreshAsync()
+	d.mu.Lock()
+	d.ctx = ctx
+	d.mu.Unlock()
+	var done = make(chan struct{})
+	go func() {
+		_, _ = reparseAudience(ctx)
+		close(done)
+	}()
+	close(p.release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Refresh from a deserializer joined a pending refresh and deadlocked")
+	}
+	assertAny(nil, getWithTimeout(t, pending), t)
+}
+
+// trackingLogger calls Track from the Publish event.
+type trackingLogger struct {
+	mu  sync.Mutex
+	ctx *Context
+}
+
+func (l *trackingLogger) HandleEvent(_ Context, event EventType, _ interface{}) {
+	l.mu.Lock()
+	var ctx = l.ctx
+	if event == Publish {
+		l.ctx = nil
+	}
+	l.mu.Unlock()
+	if event == Publish && ctx != nil {
+		_ = ctx.Track("follow-up", nil)
+	}
+}
+
+// A publish started by a deserializer, whose logger calls Track from the
+// Publish event, completes and queues the follow-up goal.
+func TestDeserializerPublishWithTrackingLoggerCompletes(t *testing.T) {
+	var d = &callingDeserializer{}
+	var publisher = &CapturingPublishClient{}
+	var logger = &trackingLogger{}
+	var cc = CreateDefaultContextConfig()
+	cc.Units_, cc.PublishDelay_, cc.RefreshInterval_ = withUnit(), -1, -1
+	var ctx = Create(ABsmartlyConfig{ContextDataProvider_: syncDataProvider{},
+		ContextEventHandler_: DefaultContextEventHandler{client_: publisher}, AudienceDeserializer_: d,
+		ContextEventLogger_: logger}).CreateContextWith(cc, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+		audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true)}})
+	ctx.WaitUntilReady()
+	assertAny(nil, ctx.Track("goal", nil), t)
+	logger.mu.Lock()
+	logger.ctx = ctx
+	logger.mu.Unlock()
+	var result = make(chan error, 1)
+	d.mu.Lock()
+	d.ctx = ctx
+	d.call = func(c *Context) { result <- c.Publish() }
+	d.mu.Unlock()
+	var done = make(chan struct{})
+	go func() {
+		_, _ = reparseAudience(ctx)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a publish whose logger calls Track deadlocked")
+	}
+	assertAny(nil, <-result, t)
+	assertAny(1, len(publisher.publishEvents), t)
+	assertAny(int32(1), ctx.GetPendingCount(), t)
 }
