@@ -988,6 +988,48 @@ func TestCopySetDataRacingReadsAfterClockReplacement(t *testing.T) {
 	assertAny(true, hasFields, t)
 }
 
+// An assignment built with a failed parse is evaluated again once a different
+// deserializer is installed.
+func TestFailedAudienceParseIsRetriedWithANewDeserializer(t *testing.T) {
+	var ctx, _ = newSystemAttrContext("website", "production",
+		audienceExperiment("exp_app", `{"filter":[{"value":false}]}`, true))
+	ctx.AudienceMatcher_ = AudienceMatcher{&recoveringDeserializer{}}
+	assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
+	ctx.AudienceMatcher_ = AudienceMatcher{DefaultAudienceDeserializer{}}
+	assertAny(nil, ctx.SetAttribute("x", 1), t)
+	assertAny(0, treatmentPeek(t, ctx, "exp_app"), t)
+}
+
+// endlessDeserializer installs a new audience text on every parse, then parses
+// normally, so a read gives up after maxAudienceAttempts.
+type endlessDeserializer struct {
+	ctx    *Context
+	calls  int32
+	stable int32
+}
+
+func (d *endlessDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	var n = atomic.AddInt32(&d.calls, 1)
+	if atomic.LoadInt32(&d.stable) == 0 {
+		d.ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+			audienceExperiment("exp_app", fmt.Sprintf(`{"filter":[{"value":false},{"value":%d}]}`, n), true)}})
+	}
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+// After giving up on a read whose data changed during every parse, the next
+// revalidation parses the installed audience and evaluates it.
+func TestGivenUpAudienceIsParsedAgainOnRevalidation(t *testing.T) {
+	var ctx, _ = newSystemAttrContext("website", "production",
+		audienceExperiment("exp_app", `{"filter":[{"value":false}]}`, true))
+	var d = &endlessDeserializer{ctx: ctx}
+	ctx.AudienceMatcher_ = AudienceMatcher{d}
+	assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
+	atomic.StoreInt32(&d.stable, 1)
+	assertAny(nil, ctx.SetAttribute("x", 1), t)
+	assertAny(0, treatmentPeek(t, ctx, "exp_app"), t)
+}
+
 // panicOnceDeserializer panics on its first parse, then parses normally.
 type panicOnceDeserializer struct{ calls int32 }
 
@@ -1034,9 +1076,15 @@ func TestCopyJoiningRefreshAfterClockReplacementIsReadBack(t *testing.T) {
 	var started = ctx.RefreshAsync()
 	var joined = copied.RefreshAsync()
 	assertAny(false, joined.Ready(), t)
+	var seenAtSettle = make(chan bool, 1)
+	joined.Listen(func(future.Value, error) {
+		var _, found = copied.GetExperiment("after")
+		seenAtSettle <- found
+	})
 	close(p.release)
 	assertAny(nil, getWithTimeout(t, started), t)
 	assertAny(nil, getWithTimeout(t, joined), t)
+	assertAny(true, <-seenAtSettle, t)
 	if _, found := copied.GetExperiment("before"); found {
 		t.Error("the copy still finds an experiment the joined refresh removed")
 	}
@@ -1094,6 +1142,7 @@ func TestTemporaryAudienceParseFailureIsNotShared(t *testing.T) {
 	assertAny(0, treatmentPeek(t, ctx, "second"), t)
 	assertAny(int32(2), atomic.LoadInt32(&d.calls), t)
 	var exposed = ctx.GetAssignment("first").Exposed
+	assertAny(false, ctx.GetAssignment("first").AudienceMismatch, t)
 	assertAny(nil, ctx.SetAttribute("x", 1), t)
 	assertAny(1, treatmentPeek(t, ctx, "first"), t)
 	if ctx.GetAssignment("first").Exposed != exposed {

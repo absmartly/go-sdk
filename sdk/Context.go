@@ -1334,10 +1334,10 @@ func (c *Context) RefreshAsync() *future.Future {
 			// future after the data is copied to it.
 			var joined, settle = future.New()
 			active.Listen(func(value future.Value, err error) {
+				defer settle(value, err)
 				if err == nil {
 					receiver.adoptLiveData()
 				}
-				settle(value, err)
 			})
 			return joined
 		}
@@ -1907,14 +1907,15 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string,
 					// Unparseable: the audience is ignored, as v1.1.1 did
 					// when the deserializer failed.
 					entry.failedAudience, entry.failedDeserializer = text, failed.deserializer
-				} else if last {
-					entry.failedAudience, entry.failedDeserializer = text, c.AudienceMatcher_.Deserializer_
-				} else {
+				} else if !last {
 					// The data changed between the unlocked parse and this
 					// lock: parse the new audience unlocked and start over.
 					c.ContextLock_.Unlock()
 					return nil, text
 				}
+				// Otherwise (the last attempt, with new data installed during
+				// every parse) the audience is ignored for this build only:
+				// the next revalidation parses it again.
 			}
 
 			if !entry.ruleOverride {
