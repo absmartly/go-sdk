@@ -2646,7 +2646,6 @@ func TestHoldout_HoldoutIdSpellingsDecodeAlike(t *testing.T) {
 func TestHoldout_DuplicateHoldoutDefinitionsAreOrderIndependent(t *testing.T) {
 	var a = hoHoldoutA()
 	var b = hoHoldout(11, "holdout_a", hoUnitType, hoSeedBHi, hoSeedBLo)
-	// A third duplicate never reinstates a conflicting id.
 	for _, holdouts := range [][]jsonmodels.Holdout{{a, b}, {b, a}, {a, b, a}, {a, b, b}} {
 		var h = hoCreateFor(t, hoUID, hoData(holdouts, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 		expectInt(t, hoNormalVariant, h.treatment("exp"))
@@ -3629,4 +3628,68 @@ func TestHoldout_ConcurrentInstallKeepsTheKeySetGate(t *testing.T) {
 	if index := ctx.index_.Load(); index == nil || !index.keyed {
 		t.Fatal("the plain install dropped the key set gate")
 	}
+}
+
+// A refresh between a shared-key read listing its experiments and resolving
+// one of them can install a version that no longer defines the key: that
+// experiment, and its holdout, are not exposed by the read.
+func TestHoldout_SharedKeyReadSkipsACandidateRefreshedWithoutTheKey(t *testing.T) {
+	var a = hoExperiment(1, "a", hoUnitType, 0)
+	a.Split = []float64{1, 0}
+	a.Variants[0].Config = `{"w":"a"}`
+	a.Variants[1].Config = `{"v":"a"}`
+	var b = hoWithVariables(hoExperiment(2, "b", hoUnitType, 0, 12), "v")
+	var refreshed = b
+	refreshed.Iteration = 2
+	refreshed.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"w":"b"}`}, {Name: "B", Config: `{"w":"b"}`}}
+	var holdout = hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{holdout}, a, b))
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{holdout}, a, refreshed))
+		}
+	}
+	defer func() { afterReadResolve = nil }()
+	expectValue(t, "default", h.variable("v"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	for _, exposure := range queuedExposures(h.ctx) {
+		if exposure.Id == 2 || exposure.Id == 12 {
+			t.Fatalf("the refreshed candidate without the key was exposed: %+v", queuedExposures(h.ctx))
+		}
+	}
+}
+
+// A read already holding a missing-unit decision whose claim by another read
+// a close rejected, after the unit arrived, resolves it again with the unit
+// and exposes that decision: the rollback's eviction retires the entry.
+func TestHoldout_ReadHoldingARejectedMissingUnitDecisionResolvesAgain(t *testing.T) {
+	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_user", "user_id", hoSeedBHi, hoSeedBLo)},
+		hoExperiment(1, "exp", "user_id", 2, 11)))
+	h.ctx.GetAssignment("exp")
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			var entry = h.ctx.getAssignment("exp")
+			if !hoClaim(h, entry) {
+				t.Error("the other read did not claim")
+			}
+			h.setUnit("user_id", hoUID)
+			h.ctx.Closing_.Store(true)
+			h.ctx.admitExposure(entry.assignment, entry)
+			h.ctx.Closing_.Store(false)
+		}
+	}
+	defer func() { afterReadResolve = nil }()
+	expectInt(t, 2, h.treatment("exp"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	var own = hoOwn("user_id", 1, "exp", 2)
+	own.FullOn = true
+	h.expectPublished(own, hoExposure("user_id", 11, "holdout_user", 1))
 }

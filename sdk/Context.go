@@ -159,14 +159,9 @@ type contextIndex struct {
 // indexedExperiment is an installed experiment with its parsed assignment
 // rules (nil when it has none) and the holdouts covering it, sorted and
 // unique by id (nil when none), so a read finds them with one lookup.
-// variableKeySet holds, for one installed payload, every variable key each
-// experiment defines in some variant.
-type variableKeySet map[variableKeyOf]struct{}
-
-type variableKeyOf struct {
-	experiment string
-	key        string
-}
+// variableKeySet holds the variable keys one experiment defines in any
+// variant.
+type variableKeySet map[string]struct{}
 
 type indexedExperiment struct {
 	variableKeys variableKeySet
@@ -230,7 +225,7 @@ type cachedAssignment struct {
 	holdouts *assignmentHoldouts
 	// retirement is shared by entries that carry the same Exposed identity.
 	retirement *atomic.Bool
-	// variableKeys is the install's (experiment, key) set, which a variable
+	// variableKeys is the resolved experiment's key set, which a variable
 	// retry checks instead of retaining the definition and its values.
 	variableKeys variableKeySet
 }
@@ -987,7 +982,7 @@ func definesVariable(key string) func(*cachedAssignment) bool {
 			// The context never had holdouts or rules, so nothing was retired.
 			return true
 		}
-		_, defined := e.variableKeys[variableKeyOf{experiment: e.assignment.Name, key: key}]
+		_, defined := e.variableKeys[key]
 		return defined
 	}
 }
@@ -1127,6 +1122,9 @@ func (c *Context) reopenExposure(assignment *Assignment, claimed *cachedAssignme
 	var entry = c.assignmentCache_[assignment.Name]
 	if entry != nil && entry.assignment.Exposed == assignment.Exposed {
 		if _, unitSet := c.Units_[assignment.UnitType]; unitSet && entry.missingUnit() {
+			// Retired, as an eviction is: it stays marked exposed, and a
+			// read already holding it resolves again with the unit.
+			entry.retirement.Store(true)
 			delete(c.assignmentCache_, assignment.Name)
 			delete(c.AssignmentCache, assignment.Name)
 			return
@@ -1365,8 +1363,12 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 			afterReadResolve()
 		}
 		if expose && entry.needsSettling() {
-			// A replacement that no longer defines key is not exposed.
 			var candidate = definesVariable(key)
+			if !candidate(entry) {
+				// Resolved from data a refresh installed after this read
+				// listed the key's experiments.
+				continue
+			}
 			entry = c.settleExposure(experiment.Data.Name, entry, candidate)
 			assignment = entry.assignment
 			if !candidate(entry) {
@@ -2440,30 +2442,30 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 
 	c.Index_ = index
 	var indexed = make(map[string]*indexedExperiment, len(index))
-	// One set of (experiment, key) pairs per install: cached entries keep it
-	// rather than the definitions, so they never retain variant values. Only
-	// a holdout or a SetUnit eviction of a split rule retires an assignment,
-	// so the set is built only once the context has seen holdouts or
-	// assignment rules; payloads with neither cost nothing more.
-	var keys variableKeySet
-	// The index installed now, under the lock: an install that finished
-	// while this one was parsing must not lose its gate.
-	if current := c.index_.Load(); len(holdoutsById) > 0 || len(rules) > 0 || (current != nil && current.keyed) {
-		keys = variableKeySet{}
-	}
+	// Each experiment's key set: cached entries keep it rather than the
+	// definition, so they never retain variant values or other experiments'
+	// keys. Only a holdout or a SetUnit eviction of a split rule retires an
+	// assignment, so the sets are built only once the context has seen
+	// holdouts or assignment rules; payloads with neither cost nothing more.
+	// The index installed now is read under the lock, so an install that
+	// finished while this one was parsing does not lose the gate.
+	var current = c.index_.Load()
+	var keyed = len(holdoutsById) > 0 || len(rules) > 0 || (current != nil && current.keyed)
 	for name, experiment := range index {
-		if keys != nil {
+		var keys variableKeySet
+		if keyed {
+			keys = variableKeySet{}
 			for _, variables := range experiment.Variables {
 				for key := range variables {
-					if _, found := keys[variableKeyOf{experiment: name, key: key}]; !found {
-						keys[variableKeyOf{experiment: name, key: strings.Clone(key)}] = struct{}{}
+					if _, found := keys[key]; !found {
+						keys[strings.Clone(key)] = struct{}{}
 					}
 				}
 			}
 		}
 		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name], holdouts: coverage[name], variableKeys: keys}
 	}
-	c.index_.Store(&contextIndex{experiments: indexed, holdouts: holdoutsById, keyed: keys != nil})
+	c.index_.Store(&contextIndex{experiments: indexed, holdouts: holdoutsById, keyed: keyed})
 	c.ContextCustomFields_ = contextCustomFields
 	c.customFieldErrors_ = customFieldErrors
 	c.indexVariables_ = indexVariables
