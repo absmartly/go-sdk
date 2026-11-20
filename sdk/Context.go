@@ -1043,7 +1043,7 @@ func definesVariable(key string) func(*cachedAssignment) bool {
 			return false
 		}
 		if e.variableKeys == nil {
-			// The context never had holdouts or rules, so nothing was retired.
+			// The context never had holdouts, rules or switchbacks.
 			return true
 		}
 		_, defined := e.variableKeys[key]
@@ -1237,6 +1237,17 @@ func (c *Context) admit(assignment *Assignment, holdouts *assignmentHoldouts, sl
 func (c *Context) reopenExposure(assignment *Assignment, claimed *cachedAssignment) {
 	if claimed != nil && claimed.retirement.Load() {
 		return
+	}
+	if claimed != nil && claimed.switchback != nil && claimed.switchback.serving.status == switchbackAbsent {
+		var indexed = c.indexedExperiment(assignment.Name)
+		if indexed != nil && indexed.switchback != nil {
+			for _, source := range indexed.experiment.Data.SwitchbackClusters {
+				if _, set := c.Units_[source.UnitType]; set {
+					claimed.retirement.Store(true)
+					return
+				}
+			}
+		}
 	}
 	var entry = c.assignmentCache_[assignment.Name]
 	if entry != nil && entry.assignment.Exposed == assignment.Exposed {
@@ -1870,6 +1881,9 @@ func (c *Context) validCachedAssignment(experimentName string, indexed *indexedE
 	if c.switchbackEpochStale(experimentName, indexed) {
 		return entry, nil, assignmentStale
 	}
+	if entry.retirement.Load() {
+		return entry, nil, assignmentStale
+	}
 	var assignment = entry.assignment
 	var custom, cfound = c.Cassignments_[experimentName]
 	var override, ofound = c.Overrides_[experimentName]
@@ -2074,6 +2088,7 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 // getAssignmentAt resolves the assignment at the clock reading at, which is
 // read only for a switchback experiment, and at most once.
 func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cachedAssignment {
+	c = c.live()
 	// A valid cached assignment only needs the read lock, so concurrent reads
 	// of a shared context do not serialise.
 	c.ContextLock_.RLock()
@@ -2653,13 +2668,12 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	var indexed = make(map[string]*indexedExperiment, len(index))
 	// Each experiment's key set: cached entries keep it rather than the
 	// definition, so they never retain variant values or other experiments'
-	// keys. Only a holdout or a SetUnit eviction of a split rule retires an
-	// assignment, so the sets are built only once the context has seen
-	// holdouts or assignment rules; payloads with neither cost nothing more.
+	// keys. Retirement is possible with holdouts, split rules or switchbacks,
+	// so the sets are built only once the context has seen any of them.
 	// The index installed now is read under the lock, so an install that
 	// finished while this one was parsing does not lose the gate.
 	var current = c.index_.Load()
-	var keyed = len(holdoutsById) > 0 || len(rules) > 0 || (current != nil && current.keyed)
+	var keyed = len(holdoutsById) > 0 || len(rules) > 0 || len(switchbacks) > 0 || (current != nil && current.keyed)
 	for name, experiment := range index {
 		var keys variableKeySet
 		if keyed {

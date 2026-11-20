@@ -123,7 +123,6 @@ func (e Evaluator) BooleanConvert(x reflect.Value) bool {
 }
 
 func (e Evaluator) NumberConvert(x reflect.Value) (float64, error) {
-	x = numberValue(x)
 	if x.Kind() == reflect.Bool {
 		if x.Bool() {
 			return 1.0, nil
@@ -205,7 +204,6 @@ var jsonNumberType = reflect.TypeOf(json.Number(""))
 // numberValue is a json.Number (a value decoded with UseNumber) as the
 // float64 it denotes, as the JS SDK holds every JSON number; any other value,
 // and a json.Number that is not a finite number, is returned unchanged.
-// Without it a json.Number, whose kind is string, compared as text.
 func numberValue(x reflect.Value) reflect.Value {
 	if x.IsValid() && x.Type() == jsonNumberType {
 		if f, err := strconv.ParseFloat(x.String(), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {

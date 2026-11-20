@@ -57,7 +57,7 @@ func (w wireContextData) contextData() jsonmodels.ContextData {
 		data.Experiments = make([]jsonmodels.Experiment, len(w.Experiments))
 		for i, experiment := range w.Experiments {
 			data.Experiments[i] = experiment.Experiment
-			data.Experiments[i].AssignmentRules = assignmentRulesText(experiment.AssignmentRules)
+			data.Experiments[i].AssignmentRules = wireScalarText(experiment.AssignmentRules)
 			data.Experiments[i].HoldoutIds = holdoutIds(experiment.HoldoutIds)
 			experiment.switchbackFields(&data.Experiments[i])
 		}
@@ -198,11 +198,9 @@ func holdouts(raw json.RawMessage) []jsonmodels.Holdout {
 	return result
 }
 
-// assignmentRulesText returns the assignmentRules string, or "" (no rules)
-// when the field is omitted, null, an object or an array. Other scalars keep
-// their JSON text, as the Java SDK coerces them; they are not a rules document,
-// so they give no rules either.
-func assignmentRulesText(raw json.RawMessage) string {
+// wireScalarText decodes a JSON string, preserves other scalar spelling,
+// and maps absent, null and container values to empty text.
+func wireScalarText(raw json.RawMessage) string {
 	raw = bytes.TrimSpace(raw)
 	switch {
 	case len(raw) == 0 || bytes.Equal(raw, []byte("null")) || raw[0] == '{' || raw[0] == '[':
@@ -289,15 +287,7 @@ func switchbackClusterValues(raw json.RawMessage) []string {
 	}
 	var values = make([]string, len(entries))
 	for i, entry := range entries {
-		entry = bytes.TrimSpace(entry)
-		switch {
-		case len(entry) == 0 || entry[0] == '{' || entry[0] == '[' || bytes.Equal(entry, []byte("null")):
-			values[i] = ""
-		case entry[0] == '"':
-			values[i] = jsonString(entry)
-		default:
-			values[i] = string(entry)
-		}
+		values[i] = wireScalarText(entry)
 	}
 	return values
 }

@@ -20,9 +20,7 @@ const (
 	// aligned and in [0, 10000-01-01T00:00:00Z).
 	switchbackAnchorAlignmentMs int64 = 3_600_000
 	switchbackMaxAnchorMs       int64 = 253_402_300_800_000
-	// switchbackRetainedPeriods is how many period slots a switchback
-	// experiment keeps cached.
-	switchbackRetainedPeriods = 2
+	switchbackRetainedPeriods         = 2
 	// switchbackRetiredSlots is how many removed slots an experiment keeps
 	// findable for QueueExposure; older ones fail closed.
 	switchbackRetiredSlots = 8
@@ -114,7 +112,6 @@ type switchbackSlot struct {
 	generation uint64
 	period     int64
 	hasPeriod  bool
-	// startAt and periodMs bound the slot's period, for QueueExposure.
 	startAt    int64
 	periodMs   int64
 	resolvedAt int64
@@ -232,12 +229,26 @@ func (c *Context) dropSwitchbackEpoch(experimentName string) {
 	for _, period := range epoch.periods {
 		c.retireSwitchbackSlot(experimentName, switchbackSlotKey(experimentName, period))
 	}
-	c.retireSwitchbackSlot(experimentName, experimentName)
+	if entry := c.assignmentCache_[experimentName]; entry != nil && entry.switchback != nil {
+		c.retireSwitchbackSlot(experimentName, experimentName)
+	}
 }
 
 // afterSwitchbackRetireClaim, when set by a test, runs right after a
 // switchback retirement marks the retired entry exposed.
 var afterSwitchbackRetireClaim func(*cachedAssignment)
+
+// claimRetiredSwitchback retires before claiming so a losing read retries;
+// a claim already taken still commits.
+func (c *Context) claimRetiredSwitchback(entry *cachedAssignment) {
+	c.EventLock_.Lock()
+	entry.retirement.Store(true)
+	c.EventLock_.Unlock()
+	entry.assignment.Exposed.CompareAndSwap(false, true)
+	if afterSwitchbackRetireClaim != nil {
+		afterSwitchbackRetireClaim(entry)
+	}
+}
 
 // retireAcrossRandomization retires a covered decision replaced across the
 // randomization boundary, which the same-key replacement in getAssignmentAt
@@ -248,21 +259,12 @@ var afterSwitchbackRetireClaim func(*cachedAssignment)
 // holding the old one must not publish it beside its replacement. The caller
 // holds ContextLock_ for writing.
 func (c *Context) retireAcrossRandomization(experimentName string, slot assignmentSlot, entry *cachedAssignment) {
-	// Retired under EventLock_ before the claim, as a same-key replacement
-	// does, so an admission in flight commits before this or sees it.
-	var retire = func(old *cachedAssignment) {
-		c.EventLock_.Lock()
-		old.retirement.Store(true)
-		c.EventLock_.Unlock()
-		old.assignment.Exposed.CompareAndSwap(false, true)
-		if afterSwitchbackRetireClaim != nil {
-			afterSwitchbackRetireClaim(old)
-		}
-	}
 	if entry.switchback != nil {
 		if old, found := c.assignmentCache_[experimentName]; found && slot.key != experimentName &&
-			old.switchback == nil && old.holdouts != nil {
-			retire(old)
+			old.switchback == nil {
+			if old.holdouts != nil {
+				c.claimRetiredSwitchback(old)
+			}
 			delete(c.assignmentCache_, experimentName)
 		}
 		return
@@ -274,7 +276,7 @@ func (c *Context) retireAcrossRandomization(experimentName string, slot assignme
 	// getAssignmentAt has already dropped its live slots into the retired
 	// window; only that window can still hold them.
 	for _, old := range c.retiredSwitchbackSlots_[experimentName] {
-		retire(old)
+		c.claimRetiredSwitchback(old)
 	}
 }
 
@@ -301,13 +303,7 @@ func (c *Context) retireSwitchbackSlot(experimentName string, key string) {
 		// the exposure is claimed, and its retirement keeps a rejected
 		// admission from reopening it.
 		for _, expired := range retired[:len(retired)-switchbackRetiredSlots] {
-			c.EventLock_.Lock()
-			expired.retirement.Store(true)
-			c.EventLock_.Unlock()
-			expired.assignment.Exposed.CompareAndSwap(false, true)
-			if afterSwitchbackRetireClaim != nil {
-				afterSwitchbackRetireClaim(expired)
-			}
+			c.claimRetiredSwitchback(expired)
 		}
 		retired = retired[len(retired)-switchbackRetiredSlots:]
 	}
@@ -467,8 +463,6 @@ func (c *Context) resolveSwitchback(entry *cachedAssignment, indexed *indexedExp
 		return
 	}
 	if !slot.hasPeriod {
-		// Before the start or with an unservable schedule there is no draw:
-		// control, and no exposure.
 		assignment.Eligible = false
 		resolved.silent = true
 		return

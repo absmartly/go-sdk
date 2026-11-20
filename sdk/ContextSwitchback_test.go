@@ -1848,7 +1848,6 @@ func TestSwitchback_ReplacementAcrossRandomizationRetiresTheHeldDecision(t *test
 	var switchback = sbData(sbDefault(2, sbHour))
 	switchback.Holdouts = []jsonmodels.Holdout{holdout}
 
-	// Covered unit, then a switchback.
 	var h = sbCreate(t, covered)
 	h.at(sbAnchor + 5)
 	var held = h.ctx.GetAssignment("exp_sb")
@@ -1857,7 +1856,6 @@ func TestSwitchback_ReplacementAcrossRandomizationRetiresTheHeldDecision(t *test
 	h.ctx.QueueExposure(held)
 	h.expectPending(0)
 
-	// A switchback, then a covered unit.
 	h = sbCreate(t, switchback)
 	h.at(sbAnchor + 5)
 	held = h.ctx.GetAssignment("exp_sb")
@@ -2104,5 +2102,93 @@ func TestSwitchback_SetUnitEvictionRetiresBeforeTheClaim(t *testing.T) {
 	afterEvictionClaim = nil
 	if !ran || status != exposureRetired {
 		t.Fatalf("hook ran %v, status %v; want a retired claim", ran, status)
+	}
+}
+
+func TestSwitchback_OrdinaryHeldDecisionSurvivesEpochExpiry(t *testing.T) {
+	var h = sbCreate(t, sbData(sbUnit(sbDefault(2, sbHour))))
+	h.at(sbAnchor + 5)
+	var held = h.ctx.GetAssignment("exp_sb")
+	h.refresh(sbDefault(2, sbHour))
+	h.peek("exp_sb")
+	var changed = sbDefault(2, sbHour)
+	changed.Iteration++
+	h.refresh(changed)
+	for i := int64(1); i < 20; i++ {
+		h.at(sbAnchor + i*sbHour).peek("exp_sb")
+	}
+	h.ctx.QueueExposure(held)
+	h.expectPending(1)
+}
+
+func TestSwitchback_ReadyCopyUsesLiveEpochs(t *testing.T) {
+	var experiment = sbDefault(2, sbHour)
+	experiment.AudienceStrict = true
+	experiment.Audience = sbStrictGoldAudience
+	var h = sbCreateAt(t, sbAnchor-1, map[string]string{sbUnitType: sbUID}, sbData(experiment))
+	var ready = h.ctx.WaitUntilReady()
+	expectInt(t, 0, h.peek("exp_sb"))
+	if entry := h.ctx.getAssignment("exp_sb"); !entry.assignment.AudienceMismatch {
+		t.Fatal("fixture: expected a strict-audience mismatch")
+	}
+	h.refreshData(sbData())
+	var copied, _ = ready.GetTreatment("exp_sb")
+	var live, _ = h.ctx.GetTreatment("exp_sb")
+	expectInt(t, live, copied)
+	var exposures = queuedExposures(h.ctx)
+	for _, exposure := range exposures {
+		if exposure.Id == 1 {
+			t.Fatal("ready copy exposed a removed experiment")
+		}
+	}
+}
+
+func TestSwitchback_RejectedNoUnitOverrideResolvesWithArrivingUnit(t *testing.T) {
+	var experiment = sbDefault(2, sbHour)
+	experiment.SwitchbackClusters = sbClusters("device_id", "city", sbUnitType, "city")
+	var h = sbCreateAt(t, sbAnchor+5, map[string]string{}, sbData(experiment), sbOverride("exp_sb", 1))
+	var entry = h.ctx.getAssignment("exp_sb")
+	if !entry.assignment.Exposed.CompareAndSwap(false, true) {
+		t.Fatal("claim failed")
+	}
+	_ = h.ctx.SetUnit(sbUnitType, sbUID)
+	h.ctx.Closing_.Store(true)
+	expectInt(t, int(exposureRejected), int(h.ctx.admitExposure(entry.assignment, entry)))
+	h.ctx.Closing_.Store(false)
+	expectInt(t, 1, h.treatment("exp_sb"))
+	var exposures = queuedExposures(h.ctx)
+	if len(exposures) != 1 || exposures[0].Unit != sbUnitType {
+		t.Fatalf("exposures %+v", exposures)
+	}
+}
+
+func TestSwitchback_VariableRetrySkipsReplacementWithoutKey(t *testing.T) {
+	for _, lateUnit := range []bool{false, true} {
+		var h = sbCreateAt(t, sbAnchor+5, map[string]string{}, sbData(sbDefault(2, sbHour)), sbOverride("exp_sb", 1))
+		if !lateUnit {
+			_ = h.ctx.SetUnit(sbUnitType, sbUID)
+		}
+		var armed = true
+		beforeSettleClaim = func() {
+			if !armed {
+				return
+			}
+			armed = false
+			var replacement = sbDefault(2, sbHour)
+			for i := range replacement.Variants {
+				replacement.Variants[i].Config = `{"other":1}`
+			}
+			h.refresh(replacement)
+			if lateUnit {
+				_ = h.ctx.SetUnit(sbUnitType, sbUID)
+			} else {
+				for period := int64(1); period <= 20; period++ {
+					h.at(sbAnchor + period*sbHour).peek("exp_sb")
+				}
+			}
+		}
+		expectValue(t, "default", func() interface{} { v, _ := h.ctx.GetVariableValue("sb.arm", "default"); return v }())
+		beforeSettleClaim = nil
+		h.expectPending(0)
 	}
 }

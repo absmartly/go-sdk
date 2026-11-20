@@ -622,7 +622,6 @@ func TestSwitchbackCluster_TypedSliceElementsAreReadAsPublished(t *testing.T) {
 			t.Errorf("%s over %s: %q, want %q", c.path, published, got, c.key)
 		}
 	}
-	// Through a context: the cluster served is the published one.
 	var h = sbCreateBare(t, map[string]string{sbUnitType: sbUID}, sbData(sbAttributeSwitchback("items/0/city")))
 	h.setAttribute("items", []sbPointerCity{"Porto"})
 	expectValue(t, sbExpectedSchedule("Porto"), h.peekSchedule("exp_sb", sbHour, 12))
@@ -751,8 +750,30 @@ func TestSwitchbackCluster_ValidationUsesThePublishedElementEncoding(t *testing.
 	expectValue(t, "Porto", parseSwitchbackPath("geo/city").resolveAttribute(map[string]interface{}{"city": "Porto",
 		"other": map[string]sbFailingPointerCity{"k": "x"}, "arr": [1]sbFailingPointerCity{"x"}}))
 
-	// Through a context: the published key serves.
 	var h = sbCreateBare(t, map[string]string{sbUnitType: sbUID}, sbData(sbAttributeSwitchback("items/0/city")))
 	h.setAttribute("items", valid)
 	expectValue(t, sbExpectedSchedule("Porto"), h.peekSchedule("exp_sb", sbHour, 12))
+}
+
+func TestSwitchbackCluster_AddressableFieldsAndSharedSubslice(t *testing.T) {
+	var valid = []struct{ City sbPointerText }{{City: "Porto"}}
+	var encoded, err = json.Marshal(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectValue(t, `[{"City":"text-Porto"}]`, string(encoded))
+	expectValue(t, "text-Porto", parseSwitchbackPath("items/0/City").resolveAttribute(valid))
+	var failing = []struct{ City sbFailingPointerCity }{{City: "Porto"}}
+	if _, err := json.Marshal(failing); err == nil {
+		t.Fatal("fixture: failing field encoded")
+	}
+	expectValue(t, "", parseSwitchbackPath("items/0/City").resolveAttribute(failing))
+	var items = []interface{}{map[string]string{"city": "Porto"}, nil}
+	items[1] = items[:1]
+	if _, err := json.Marshal(items); err != nil {
+		t.Fatal(err)
+	}
+	expectValue(t, "Porto", parseSwitchbackPath("items/0/city").resolveAttribute(items))
+	items[1] = items
+	expectValue(t, "", parseSwitchbackPath("items/0/city").resolveAttribute(items))
 }

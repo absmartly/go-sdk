@@ -797,9 +797,13 @@ func TestJSONNumberStringCoercionAndFractionalZero(t *testing.T) {
 		if !jsonexpr.EvaluateBooleanExpr(expr, map[string]interface{}{"n": n}) {
 			t.Errorf("match %s", raw)
 		}
-		var inExpr = map[string]interface{}{"in": []interface{}{map[string]interface{}{"var": "hay"}, map[string]interface{}{"value": want}}}
-		if !jsonexpr.EvaluateBooleanExpr(inExpr, map[string]interface{}{"hay": "prefix" + want + "suffix"}) {
+		// A json.Number needle is found in a string haystack by its text.
+		var inExpr = map[string]interface{}{"in": []interface{}{map[string]interface{}{"var": "hay"}, map[string]interface{}{"var": "n"}}}
+		if !jsonexpr.EvaluateBooleanExpr(inExpr, map[string]interface{}{"hay": "prefix" + want + "suffix", "n": n}) {
 			t.Errorf("in %s", raw)
+		}
+		if jsonexpr.EvaluateBooleanExpr(inExpr, map[string]interface{}{"hay": "prefix" + raw + "suffix", "n": n}) && raw != want {
+			t.Errorf("in %s matched its raw spelling", raw)
 		}
 	}
 	for _, raw := range []string{"0.0", "0e0", "-0"} {

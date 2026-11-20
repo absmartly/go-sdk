@@ -138,7 +138,8 @@ func TestSwitchbackDeserialize_StandardDecoderReadsTheModel(t *testing.T) {
 	}
 	expectValue(t, sbClusters("store_id", "store/key", "device_id", "geo/city"), data.Experiments[0].SwitchbackClusters)
 	expectValue(t, int64(3600000), *data.Experiments[0].SwitchbackPeriodMs)
-	if _, ok := reflect.TypeOf(jsonmodels.Experiment{}).MethodByName("UnmarshalJSON"); ok {
+	// The decoder looks up UnmarshalJSON on the pointer's method set.
+	if _, ok := reflect.TypeOf(&jsonmodels.Experiment{}).MethodByName("UnmarshalJSON"); ok {
 		t.Fatal("Experiment has an UnmarshalJSON method")
 	}
 }
@@ -193,7 +194,7 @@ func TestSwitchback_CachedUnitReadsDoNotAllocateMore(t *testing.T) {
 		"GetVariableValue": func() { _, _ = h.ctx.GetVariableValue("color", 1) },
 	}
 	for name, read := range reads {
-		// Two, as on the parent commit: the boxed return values.
+		// The two boxed return values.
 		if n := hoLeastAllocs(read); n > 2 {
 			t.Errorf("%s: %.0f allocations", name, n)
 		}

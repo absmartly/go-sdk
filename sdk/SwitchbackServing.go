@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding"
 	"encoding/json"
-	"math/big"
 	"reflect"
 	"strconv"
 	"strings"
@@ -138,7 +137,7 @@ func (p *switchbackPath) resolveAttribute(root interface{}) string {
 	if root == nil {
 		return ""
 	}
-	if !switchbackEncodable(reflect.ValueOf(root), map[uintptr]bool{}, 0) {
+	if !switchbackEncodable(reflect.ValueOf(root), map[switchbackContainer]bool{}, 0) {
 		return ""
 	}
 	var current = root
@@ -177,7 +176,7 @@ func switchbackStep(current interface{}, key string, index int, isIndex bool) in
 func jsonElement(element reflect.Value) reflect.Value {
 	if element.Kind() != reflect.Ptr && element.Kind() != reflect.Interface && element.CanAddr() {
 		var pointer = element.Addr()
-		if pointer.Type().Implements(jsonMarshalerType) || pointer.Type().Implements(textMarshalerType) {
+		if element.Kind() == reflect.Struct || pointer.Type().Implements(jsonMarshalerType) || pointer.Type().Implements(textMarshalerType) {
 			return pointer
 		}
 	}
@@ -201,7 +200,7 @@ func switchbackJSONView(value reflect.Value) reflect.Value {
 	if !value.IsValid() || !switchbackOpaque(value) {
 		return value
 	}
-	var encoded, err = json.Marshal(value.Interface())
+	var encoded, err = json.Marshal(jsonElement(value).Interface())
 	if err != nil {
 		return reflect.Value{}
 	}
@@ -246,7 +245,12 @@ func switchbackOpaque(value reflect.Value) bool {
 // deep. Elements are checked as encoding/json encodes them (jsonElement).
 // path holds the containers on the current branch only, so a value shared by
 // two siblings is not a cycle.
-func switchbackEncodable(value reflect.Value, path map[uintptr]bool, depth int) bool {
+type switchbackContainer struct {
+	pointer uintptr
+	length  int
+}
+
+func switchbackEncodable(value reflect.Value, path map[switchbackContainer]bool, depth int) bool {
 	for hops := 0; value.IsValid() && (value.Kind() == reflect.Ptr || value.Kind() == reflect.Interface) && !switchbackOpaque(value); hops++ {
 		if value.IsNil() {
 			return true
@@ -262,7 +266,7 @@ func switchbackEncodable(value reflect.Value, path map[uintptr]bool, depth int) 
 		return true
 	}
 	if switchbackOpaque(value) {
-		var _, err = json.Marshal(value.Interface())
+		var _, err = json.Marshal(jsonElement(value).Interface())
 		return err == nil
 	}
 	switch value.Kind() {
@@ -271,7 +275,7 @@ func switchbackEncodable(value reflect.Value, path map[uintptr]bool, depth int) 
 		return false
 	case reflect.Float32, reflect.Float64:
 		// NaN and the infinities have no JSON encoding.
-		var _, err = json.Marshal(value.Interface())
+		var _, err = json.Marshal(jsonElement(value).Interface())
 		return err == nil
 	default:
 		return true
@@ -279,17 +283,20 @@ func switchbackEncodable(value reflect.Value, path map[uintptr]bool, depth int) 
 	if depth >= switchbackMaxDepth {
 		return false
 	}
-	var pointer uintptr
+	var container switchbackContainer
 	if value.Kind() != reflect.Array {
 		if value.IsNil() {
 			return true
 		}
-		pointer = value.Pointer()
-		if path[pointer] {
+		container.pointer = value.Pointer()
+		if value.Kind() == reflect.Slice {
+			container.length = value.Len()
+		}
+		if path[container] {
 			return false
 		}
-		path[pointer] = true
-		defer delete(path, pointer)
+		path[container] = true
+		defer delete(path, container)
 	}
 	if value.Kind() == reflect.Map {
 		var it = value.MapRange()
@@ -355,14 +362,10 @@ func integerNumberText(number string) string {
 	if len(digits) == 0 || (digits[0] == '0' && len(digits) > 1) || strings.Trim(digits, "0123456789") != "" {
 		return ""
 	}
-	if value, err := strconv.ParseInt(number, 10, 64); err == nil {
-		return strconv.FormatInt(value, 10)
+	if number == "-0" {
+		return "0"
 	}
-	var value, ok = new(big.Int).SetString(number, 10)
-	if !ok {
-		return ""
-	}
-	return value.String()
+	return number
 }
 
 // Serving statuses of a switchback experiment, as the Collector's
