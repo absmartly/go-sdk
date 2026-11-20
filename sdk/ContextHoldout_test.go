@@ -3893,3 +3893,55 @@ func TestHoldout_TakenClaimIsHonouredAfterTheKeyIsDropped(t *testing.T) {
 		t.Fatalf("exposures %+v, want the taken claim's decision", exposures)
 	}
 }
+
+func TestHoldout_EligibilityClaimCASStaysUnderTheContextLock(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")))
+	var ran = false
+	immediatelyBeforeEligibleCAS = func() {
+		ran = true
+		if h.ctx.ContextLock_.TryLock() {
+			h.ctx.ContextLock_.Unlock()
+			t.Error("the claim is outside the context lock")
+		}
+	}
+	defer func() { immediatelyBeforeEligibleCAS = nil }()
+	h.variable("v")
+	if !ran {
+		t.Fatal("the CAS hook did not run")
+	}
+}
+
+func TestHoldout_ReadinessCopyVariableExposureUsesTheLiveQueue(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")))
+	var cp = h.ctx.WaitUntilReady()
+	if _, err := cp.GetVariableValue("v", "default"); err != nil {
+		t.Fatal(err)
+	}
+	var exposures = queuedExposures(h.ctx)
+	if len(exposures) != 2 || exposures[0].Id != 1 || exposures[1].Id != 11 {
+		t.Fatalf("live exposures %+v", exposures)
+	}
+}
+
+func TestHoldout_VariableRetryRejectsAnOverrideWithoutVariables(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")))
+	h.ctx.GetAssignment("e")
+	var armed = true
+	beforeSettleClaim = func() {
+		if armed {
+			armed = false
+			if err := h.ctx.SetOverride("e", 5); err != nil {
+				t.Error(err)
+			}
+			h.ctx.GetAssignment("e")
+		}
+	}
+	defer func() { beforeSettleClaim = nil }()
+	expectValue(t, "default", h.variable("v"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	if exposures := queuedExposures(h.ctx); len(exposures) != 0 {
+		t.Fatalf("nil-variable replacement was exposed: %+v", exposures)
+	}
+}

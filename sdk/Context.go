@@ -979,6 +979,9 @@ func (c *Context) queueEligibleExposure(entry *cachedAssignment, eligible func(*
 		c.ContextLock_.RUnlock()
 		return exposureIneligible
 	}
+	if immediatelyBeforeEligibleCAS != nil {
+		immediatelyBeforeEligibleCAS()
+	}
 	var claimed = entry.assignment.Exposed.CompareAndSwap(false, true)
 	c.ContextLock_.RUnlock()
 	if !claimed {
@@ -1038,8 +1041,9 @@ var (
 // beforeEligibleClaim runs inside a read's eligibility check, under
 // ContextLock_, before the check.
 var (
-	beforeSettleClaim   func()
-	beforeEligibleClaim func()
+	immediatelyBeforeEligibleCAS func()
+	beforeSettleClaim            func()
+	beforeEligibleClaim          func()
 )
 
 // QueueExposure queues the assignment's exposure once, then the exposures of
@@ -2342,7 +2346,6 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 			if len(installed[i].Split) == 0 {
 				continue
 			}
-			installed[i].Split = append([]float64(nil), installed[i].Split...)
 			if seen, found := holdoutsById[installed[i].Id]; found {
 				if seen != nil && !sameHoldoutDraw(seen, &installed[i]) {
 					holdoutsById[installed[i].Id] = nil
@@ -2350,6 +2353,7 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 				}
 				continue
 			}
+			installed[i].Split = append([]float64(nil), installed[i].Split...)
 			holdoutsById[installed[i].Id] = &installed[i]
 		}
 		if conflicts {
@@ -2476,9 +2480,9 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 
 	c.Index_ = index
 	var indexed = make(map[string]*indexedExperiment, len(index))
-	// Each experiment's key set: cached entries keep it rather than the
-	// definition, so they never retain variant values or other experiments'
-	// keys. Only a holdout or a SetUnit eviction of a split rule retires an
+	// Each installed experiment's key set is owned by the index, not by
+	// cached assignments, so old decisions retain neither variant values
+	// nor key sets. Only a holdout or a SetUnit eviction of a split rule retires an
 	// assignment, so the sets are built only once the context has seen
 	// holdouts or assignment rules; payloads with neither cost nothing more.
 	// The index installed now is read under the lock, so an install that
