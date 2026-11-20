@@ -3947,3 +3947,47 @@ func TestHoldout_VariableRetryRejectsAnOverrideWithoutVariables(t *testing.T) {
 		t.Fatalf("nil-variable replacement was exposed: %+v", exposures)
 	}
 }
+
+// The eligibility check and the claim are one critical section: a refresh
+// that queues on the lock at the check cannot install before the claim, even
+// if the lock were released and taken again between the two.
+func TestHoldout_CheckAndClaimAreOneCriticalSection(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
+	var without = hoExperiment(1, "e", hoUnitType, 0, 11)
+	var seen *contextIndex
+	var done = make(chan struct{})
+	var armed = true
+	beforeEligibleClaim = func() {
+		if !armed {
+			return
+		}
+		armed = false
+		seen = h.ctx.index_.Load()
+		go func() {
+			defer close(done)
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, without))
+		}()
+		var deadline = time.Now().Add(5 * time.Second)
+		// A queued writer makes TryRLock fail.
+		for h.ctx.ContextLock_.TryRLock() {
+			h.ctx.ContextLock_.RUnlock()
+			if time.Now().After(deadline) {
+				t.Fatal("the refresh never queued on the lock")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	afterEligibleCAS = func() {
+		select {
+		case <-done:
+		case <-time.After(20 * time.Millisecond):
+		}
+		if h.ctx.index_.Load() != seen {
+			t.Error("a refresh installed between the eligibility check and the claim")
+		}
+	}
+	defer func() { beforeEligibleClaim, afterEligibleCAS = nil, nil }()
+	h.variable("v")
+	<-done
+}
