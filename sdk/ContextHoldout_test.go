@@ -4155,3 +4155,37 @@ func TestHoldout_ExposedOverrideIsKeptAcrossAnIdentityRefresh(t *testing.T) {
 		}
 	}
 }
+
+// A context with assignment rules but no holdouts also rebuilds an unclaimed
+// override after its experiment's id or iteration changes, so it serves and
+// exposes the current definition.
+func TestHoldout_RulesOnlyUnclaimedOverrideResolvesCurrentIdentity(t *testing.T) {
+	for _, changeID := range []bool{false, true} {
+		var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+		var r = hoExperiment(2, "r", hoUnitType, 0)
+		r.AssignmentRules = hoUSRule
+		var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+		if !hoKeyed(h.ctx) {
+			t.Fatal("a context with rules is not keyed")
+		}
+		if err := h.ctx.SetOverride("e", 0); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.ctx.PeekVariableValue("v", "default"); err != nil {
+			t.Fatal(err)
+		}
+		var fresh = e
+		if changeID {
+			fresh.Id = 3
+		} else {
+			fresh.Iteration++
+		}
+		fresh.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"v":"new"}`}, {Name: "B", Config: `{"v":"other"}`}}
+		h.ctx.SetData(hoData(nil, fresh, r))
+		expectValue(t, "new", h.variable("v"))
+		var exposures = queuedExposures(h.ctx)
+		if len(exposures) != 1 || exposures[0].Id != fresh.Id || !exposures[0].Overridden {
+			t.Fatalf("idChange=%v: exposures %+v", changeID, exposures)
+		}
+	}
+}
