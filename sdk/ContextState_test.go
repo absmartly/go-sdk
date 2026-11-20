@@ -1698,6 +1698,59 @@ func TestAudienceRetryIsBounded(t *testing.T) {
 	assertAny(int32(maxAudienceAttempts), atomic.LoadInt32(&d.calls), t)
 }
 
+// A literal's treatments can be read while the caller holds DataLock, as in
+// v1.1.1, whose assignment path never took it.
+func TestLiteralReadWhileHoldingDataLock(t *testing.T) {
+	for _, write := range []bool{true, false} {
+		var manual = audienceLiteral(audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true))
+		if write {
+			manual.DataLock.Lock()
+		} else {
+			manual.DataLock.RLock()
+		}
+		var done = make(chan int, 1)
+		go func() {
+			var variant, _ = manual.PeekTreatment("exp_app")
+			done <- variant
+		}()
+		select {
+		case variant := <-done:
+			assertAny(1, variant, t)
+		case <-time.After(5 * time.Second):
+			t.Fatal("PeekTreatment on a literal hung while the caller held DataLock")
+		}
+	}
+}
+
+// Editing one literal Index_ entry keeps the others, and keeps the rules
+// SetData parsed for an entry while its assignmentRules text is unchanged.
+func TestLiteralIndexEditKeepsRulesAndOtherEntries(t *testing.T) {
+	var manual = audienceLiteral(audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true))
+	var ruled = ruleExperiment("ruled", rulesJSON(`{"type":"assign","variant":2}`))
+	manual.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+		audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true), ruled}})
+	assertAny(2, treatmentPeek(t, manual, "ruled"), t)
+
+	// Same rules text, new iteration: the rules still apply.
+	var next = ruled
+	next.Iteration = 2
+	manual.Index_["ruled"] = ExperimentVariables{Data: next, Variables: manual.Index_["ruled"].Variables}
+	assertAny(2, treatmentPeek(t, manual, "ruled"), t)
+	// The other entry is kept, though Index_ was not read for it.
+	var _, _, stillThere = manual.state().experimentAndRules("exp_app")
+	assertAny(true, stillThere, t)
+
+	// Changed rules text: an edited literal entry has no rules, as v1.1.1.
+	next.Iteration = 3
+	next.AssignmentRules = rulesJSON(`{"type":"assign","variant":1}`)
+	manual.Index_["ruled"] = ExperimentVariables{Data: next, Variables: manual.Index_["ruled"].Variables}
+	var _ = treatmentPeek(t, manual, "ruled")
+	var _, rules, _ = manual.state().experimentAndRules("ruled")
+	if rules != nil {
+		t.Fatal("an edited literal entry with new assignmentRules kept the old rules")
+	}
+}
+
 // funcDeserializer is a func-typed adapter, whose values Go cannot hash or
 // compare.
 type funcDeserializer func(b []byte, offset, length int) (map[string]interface{}, error)

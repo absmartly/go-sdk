@@ -2074,49 +2074,57 @@ func (st *contextState) hasAudience(text string) bool {
 }
 
 // syncLiteralExperiment makes the private index entry of a context built as
-// a literal match its Index_ entry, which a caller may edit, so it reads
-// Index_ as v1.1.1 did. Rules for a changed assignmentRules text are parsed
-// before any lock is taken. Contexts the SDK created keep their own index.
+// a literal follow its Index_ entry, which a caller may edit, so its
+// assignments read Index_ as v1.1.1 did. Like v1.1.1's GetExperiment it reads
+// Index_ without DataLock, so a caller holding DataLock can still read
+// treatments. No customer code runs here: an edited entry keeps the rules
+// SetData parsed for it only while its assignmentRules text is unchanged,
+// and otherwise has none, as an entry present at the first read has none
+// (v1.1.1 had no rules). Contexts the SDK created keep their own index.
 func (c *Context) syncLiteralExperiment(st *contextState, experimentName string) {
-	var readIndex = func() (ExperimentVariables, bool) {
-		if c.DataLock != nil {
-			c.DataLock.RLock()
-			defer c.DataLock.RUnlock()
+	var experiment, found = c.Index_[experimentName]
+	for {
+		var previous = st.loadIndex()
+		var current, rules, installed = st.experimentAndRules(experimentName)
+		if found == installed && (!found || sameLiteralEntry(current, experiment)) {
+			return
 		}
-		var experiment, found = c.Index_[experimentName]
-		return experiment, found
-	}
-	var experiment, found = readIndex()
-	var current, rules, installed = st.experimentAndRules(experimentName)
-	if found == installed && (!found || reflect.DeepEqual(current, experiment)) {
-		return
-	}
-	if found && len(experiment.Data.AssignmentRules) > 0 {
-		rules = c.experimentRulesFor(rules, experiment.Data.AssignmentRules)
-	} else {
-		rules = nil
-	}
-	if c.DataLock != nil {
-		c.DataLock.Lock()
-		defer c.DataLock.Unlock()
-	}
-	if again, foundAgain := c.Index_[experimentName]; foundAgain != found || (found && !reflect.DeepEqual(again, experiment)) {
-		// Index_ changed while the rules were parsed: the next read syncs.
-		return
-	}
-	var previous = st.loadIndex()
-	var indexed = map[string]*indexedExperiment{}
-	if previous != nil {
-		for name, entry := range previous.experiments {
-			indexed[name] = entry
+		var indexed = map[string]*indexedExperiment{}
+		if previous != nil {
+			for name, entry := range previous.experiments {
+				indexed[name] = entry
+			}
+		}
+		if !installed || current.Data.AssignmentRules != experiment.Data.AssignmentRules {
+			rules = nil
+		}
+		if found {
+			indexed[experimentName] = &indexedExperiment{experiment: experiment, rules: rules}
+		} else {
+			delete(indexed, experimentName)
+		}
+		// Publish only over the index this was built from, so a concurrent
+		// SetData is never overwritten; on a race, compare again.
+		if st.index_.CompareAndSwap(previous, &contextIndex{experiments: indexed}) {
+			return
 		}
 	}
-	if found {
-		indexed[experimentName] = &indexedExperiment{experiment: experiment, rules: rules}
-	} else {
-		delete(indexed, experimentName)
-	}
-	st.index_.Store(&contextIndex{experiments: indexed})
+}
+
+// sameLiteralEntry reports whether an Index_ entry still matches the private
+// copy in the fields an assignment reads, without reflection on the cached
+// read path. Slices compare by identity: an entry copied from Index_ shares
+// them, and a replaced one has new ones.
+func sameLiteralEntry(a, b ExperimentVariables) bool {
+	var x, y = a.Data, b.Data
+	return x.Id == y.Id && x.Name == y.Name && x.UnitType == y.UnitType && x.Iteration == y.Iteration &&
+		x.SeedHi == y.SeedHi && x.SeedLo == y.SeedLo && x.TrafficSeedHi == y.TrafficSeedHi &&
+		x.TrafficSeedLo == y.TrafficSeedLo && x.FullOnVariant == y.FullOnVariant &&
+		x.Audience == y.Audience && x.AudienceStrict == y.AudienceStrict &&
+		sameSplit(x.Split, y.Split) && sameSplit(x.TrafficSplit, y.TrafficSplit) &&
+		x.AssignmentRules == y.AssignmentRules &&
+		len(x.Variants) == len(y.Variants) && (len(x.Variants) == 0 || &x.Variants[0] == &y.Variants[0]) &&
+		len(a.Variables) == len(b.Variables) && (len(a.Variables) == 0 || &a.Variables[0] == &b.Variables[0])
 }
 
 // experimentAndRules is GetExperiment plus the experiment's parsed assignment
