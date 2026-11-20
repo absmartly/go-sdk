@@ -672,3 +672,34 @@ func TestSwitchbackCluster_StructFieldsAreReadFromTheirEncoding(t *testing.T) {
 	expectValue(t, "", parseSwitchbackPath("geo/City").resolveAttribute(map[string]interface{}{"City": 3.0}))
 	expectValue(t, "", parseSwitchbackPath("geo").resolveAttribute(3.0))
 }
+
+// Changing a cluster attribute mid-period is not supported: the arm cached
+// at the period's first read stays for the period, even when that read was
+// a peek with no exposure yet, or when its exposure was rejected and is
+// queued again. The change takes effect from the next period.
+func TestSwitchbackCluster_FirstReadFixesThePeriodsArmBeforeAnyExposure(t *testing.T) {
+	var lisboa, faro = sbDraw("Lisboa", 0, sbClusterArms), sbDraw("Faro", 0, sbClusterArms)
+	if lisboa == faro {
+		t.Fatal("fixture: Lisboa and Faro agree in period 0")
+	}
+	// A peek fixes the arm before the exposure.
+	var h = sbCreateBare(t, map[string]string{sbUnitType: sbUID}, sbData(sbAttributeSwitchback("city")))
+	h.at(sbAnchor+10).setAttribute("city", "Lisboa")
+	expectInt(t, lisboa, h.peek("exp_sb"))
+	h.at(sbAnchor+20).setAttribute("city", "Faro")
+	expectInt(t, lisboa, h.treatment("exp_sb"))
+	h.expectPublished(sbClusterExposure(lisboa, sbAnchor+20, true, false))
+	expectInt(t, sbDraw("Faro", 1, sbClusterArms), h.at(sbAnchor+sbHour).peek("exp_sb"))
+
+	// An exposure rejected by a close, queued again after the change, keeps
+	// the arm.
+	h = sbCreateBare(t, map[string]string{sbUnitType: sbUID}, sbData(sbAttributeSwitchback("city")))
+	h.at(sbAnchor+10).setAttribute("city", "Lisboa")
+	h.ctx.Closing_.Store(true)
+	h.ctx.QueueExposure(h.ctx.GetAssignment("exp_sb"))
+	h.ctx.Closing_.Store(false)
+	h.expectPending(0)
+	h.at(sbAnchor+20).setAttribute("city", "Faro")
+	expectInt(t, lisboa, h.treatment("exp_sb"))
+	h.expectPublished(sbClusterExposure(lisboa, sbAnchor+20, true, false))
+}

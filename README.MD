@@ -621,8 +621,12 @@ for the full rules):
   unit experiment's; the cluster attributes are published with their
   timestamps as before.
 
-The cluster of a period is read once: a `SetAttribute` later in the same
-period takes effect from the next period. Payloads without switchback
+The cluster of a period is read once, at the period's first read (a peek
+included). Changing a cluster attribute mid-period is not supported, even
+before the exposure is published or while a rejected exposure is queued again:
+the arm cached at the first read stays for the rest of the period, and the
+change takes effect from the next period. Set the cluster attributes before
+the first read of each period. Payloads without switchback
 experiments are served and published exactly as before, and cached reads and
 exposures allocate as before (the decoded experiment structs are a little
 wider). An attribute value with its own `MarshalJSON` or `MarshalText` is read
