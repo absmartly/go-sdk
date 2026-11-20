@@ -245,6 +245,10 @@ type cachedAssignment struct {
 	// retirement is shared by entries that carry the same Exposed identity.
 	retirement *atomic.Bool
 	switchback *switchbackSlot
+	// resolvedId and resolvedIteration identify the definition used to resolve
+	// this entry, including overrides whose public Iteration stays zero.
+	resolvedId        int
+	resolvedIteration int
 }
 
 type loggerGoroutines struct {
@@ -1048,6 +1052,9 @@ func claimEligible(entry *cachedAssignment, eligible func(*cachedAssignment) boo
 	if entry.assignment.Exposed.Load().(bool) && !entry.retirement.Load() {
 		return exposureQueued
 	}
+	if entry.retirement.Load() {
+		return exposureRetired
+	}
 	if !eligible(entry) {
 		return exposureIneligible
 	}
@@ -1087,7 +1094,8 @@ func (c *Context) variableEligible(experimentName string, key string) func(*cach
 			return true
 		}
 		var indexed = index.experiments[experimentName]
-		if indexed == nil {
+		if indexed == nil || indexed.experiment.Data.Id != e.resolvedId ||
+			indexed.experiment.Data.Iteration != e.resolvedIteration {
 			return false
 		}
 		_, defined := indexed.variableKeys[key]
@@ -1940,6 +1948,12 @@ func (c *Context) validCachedAssignment(experimentName string, indexed *indexedE
 		// (experiment == null || holdoutSetMatches). The switchback identity
 		// is checked too, so a grid change, or the removal of a switchback,
 		// resolves an overridden slot again like any other.
+		// A still-unclaimed override needs current variables and resolved
+		// identity before a variable read can claim it in the new epoch.
+		if efound && !assignment.Exposed.Load().(bool) && c.index_.Load().keyed &&
+			(entry.resolvedId != experiment.Data.Id || entry.resolvedIteration != experiment.Data.Iteration) {
+			return entry, rules, assignmentStale
+		}
 		if assignment.Overridden && assignment.Variant == override.(int) && (!efound ||
 			holdoutSetMatches(holdouts, entry.holdouts) && (entry.holdouts == nil || entry.holdouts.unitType == unitTypeOf(experiment))) &&
 			switchbackSlotMatches(indexed, entry) {
@@ -2184,6 +2198,10 @@ func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cach
 	assignment.Name = experimentName
 	assignment.Eligible = true
 	var entry = &cachedAssignment{assignment: assignment, rules: rules, attrsSeq: atomic.LoadInt32(&c.AttrsSeq_), retirement: &atomic.Bool{}}
+	if efound {
+		entry.resolvedId = experiment.Data.Id
+		entry.resolvedIteration = experiment.Data.Iteration
+	}
 
 	// Resolved for overrides and rule wins too: the holdouts' exposures fire
 	// whatever chose the variant.
