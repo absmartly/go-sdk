@@ -243,7 +243,7 @@ func TestContextLiteralHonoursAssignmentCacheAndIndexVariables(t *testing.T) {
 }
 
 // reentrantDeserializer calls back into the context from inside an audience
-// evaluation, which runs while ContextLock_ is held.
+// parse.
 type reentrantDeserializer struct {
 	ctx   *Context
 	calls int32
@@ -264,9 +264,8 @@ func (d *reentrantDeserializer) Deserialize(bytes []byte, offset int, length int
 // A deserializer that reads the context during an evaluation must not
 // deadlock after Clock_ is replaced, as it does not with the original clock.
 func TestReentrantDeserializerAfterClockReplacementDoesNotDeadlock(t *testing.T) {
-	// "build" reaches the deserializer while rebuilding the assignment under
-	// the write lock; "revalidate" while revalidating a cached one after an
-	// unrelated attribute change, under the read lock.
+	// "build" reaches the deserializer while rebuilding the assignment;
+	// "revalidate" while revalidating a cached one after an attribute change.
 	for _, path := range []string{"build", "revalidate"} {
 		for _, replace := range []bool{false, true} {
 			var deserializer = &reentrantDeserializer{}
@@ -284,8 +283,10 @@ func TestReentrantDeserializerAfterClockReplacementDoesNotDeadlock(t *testing.T)
 			var ctx = abs.CreateContextWith(config, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
 				audienceExperiment("exp_app", appFilter, true)}})
 			ctx.WaitUntilReady()
+			var cached *atomic.Value
 			if path == "revalidate" {
 				assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
+				cached = ctx.GetAssignment("exp_app").Exposed
 			}
 			if replace {
 				ctx.Clock_ = internal.FixedClock{Millis_: 1}
@@ -295,8 +296,6 @@ func TestReentrantDeserializerAfterClockReplacementDoesNotDeadlock(t *testing.T)
 			go func() {
 				var variant int
 				if path == "revalidate" {
-					// Text only, then an attribute change: the cached
-					// assignment is revalidated against the new audience.
 					variant, _ = revalidateAudience(ctx)
 				} else {
 					variant, _ = reparseAudience(ctx)
@@ -310,6 +309,11 @@ func TestReentrantDeserializerAfterClockReplacementDoesNotDeadlock(t *testing.T)
 				t.Fatalf("PeekTreatment deadlocked (%s, Clock_ replaced: %v)", path, replace)
 			}
 			assertAny(int32(1), atomic.LoadInt32(&deserializer.calls), t)
+			if cached != nil && ctx.GetAssignment("exp_app").Exposed != cached {
+				// Same outcome: the cached assignment is revalidated and kept,
+				// with its exposure state, not rebuilt.
+				t.Errorf("revalidation rebuilt the assignment (Clock_ replaced: %v)", replace)
+			}
 		}
 	}
 }
@@ -711,7 +715,7 @@ func TestAttributeWrittenThroughCopyIsEvaluated(t *testing.T) {
 }
 
 // queueingDeserializer queues an exposure it already holds from inside an
-// audience evaluation, which runs while ContextLock_ is held.
+// audience parse.
 type queueingDeserializer struct {
 	ctx      *Context
 	retained *Assignment
@@ -763,13 +767,37 @@ func TestQueueExposureFromInsideEvaluationDoesNotDeadlock(t *testing.T) {
 // Data installed through a value copy is what every read through that copy,
 // and through the original, returns.
 func TestCopySetDataIsReadBackConsistently(t *testing.T) {
-	var before, after = ruleExperiment("before", ""), ruleExperiment("after", "")
-	after.Id = 9
-	after.CustomFieldValues = []jsonmodels.CustomFieldValue{{Name: "f", Type: "string", Value: "v"}}
-	var ctx, _ = newRuleContext(t, "production", withUnit(), before)
-	var copied = *ctx
-	copied.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{after}})
-	for name, c := range map[string]*Context{"copy": &copied, "original": ctx} {
+	for _, replace := range []bool{false, true} {
+		var before, after = ruleExperiment("before", ""), ruleExperiment("after", "")
+		after.Id = 9
+		after.CustomFieldValues = []jsonmodels.CustomFieldValue{{Name: "f", Type: "string", Value: "v"}}
+		after.Variants[1].Config = `{"after_key":1}`
+		var ctx, _ = newRuleContext(t, "production", withUnit(), before)
+		if replace {
+			// Replacing the clock before copying leaves the copy without a
+			// state carrier; it still acts on the original's state.
+			ctx.Clock_ = internal.FixedClock{Millis_: 1}
+		}
+		var copied = *ctx
+		copied.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{after}})
+		checkCopySetData(t, replace, &copied, ctx)
+	}
+}
+
+func checkCopySetData(t *testing.T, replace bool, copied *Context, ctx *Context) {
+	t.Helper()
+	for name, c := range map[string]*Context{"copy": copied, "original": ctx} {
+		var label = fmt.Sprintf("%s (Clock_ replaced: %v)", name, replace)
+		assertAny(9, c.GetAssignment("after").Id, t)
+		if experiment, found := c.GetExperiment("after"); !found || experiment.Data.Id != 9 {
+			t.Errorf("%s: GetExperiment does not see the installed data", label)
+		}
+		if _, found := c.GetExperiment("before"); found {
+			t.Errorf("%s: GetExperiment still sees the replaced data", label)
+		}
+		if experiment, err := c.GetVariableExperiment("after_key"); err != nil || experiment.Data.Id != 9 {
+			t.Errorf("%s: GetVariableExperiment = %v, %v", label, experiment.Data.Id, err)
+		}
 		var names, err = c.GetExperiments()
 		assertAny(nil, err, t)
 		assertAny([]string{"after"}, names, t)
@@ -782,9 +810,6 @@ func TestCopySetDataIsReadBackConsistently(t *testing.T) {
 		assertAny([]string{"f"}, keys, t)
 		assertAny("v", c.GetCustomFieldValue("after", "f"), t)
 		assertAny("string", c.GetCustomFieldValueType("after", "f"), t)
-		if _, found := c.GetExperiment("after"); !found {
-			t.Errorf("%s: GetExperiment does not see the installed data", name)
-		}
 	}
 }
 
@@ -1476,9 +1501,8 @@ func (d *waitingDeserializer) Deserialize(b []byte, offset, length int) (map[str
 }
 
 // A deserializer may call WaitUntilReady during the first read after a load
-// that is still pending elsewhere, and Refresh while a refresh with a changed
-// audience is installing (as in v1.1.1, the deserializer runs at the read,
-// not during the data install).
+// that is still pending elsewhere, and Refresh after a refresh that changed
+// the audience.
 func TestDeserializerCallsDuringLoadAndRefreshDoNotHang(t *testing.T) {
 	var d = &waitingDeserializer{}
 	var client = &systemAttrClient{application: "website", environment: "production"}
@@ -1837,7 +1861,6 @@ func TestLiteralIndexEditsArePickedUp(t *testing.T) {
 func TestLiteralAudienceEditIsEvaluated(t *testing.T) {
 	var manual = audienceLiteral(audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true))
 	assertAny(1, treatmentPeek(t, manual, "exp_app"), t)
-	// Change only the audience text, keeping every other field and slice.
 	var entry = manual.Index_["exp_app"]
 	entry.Data.Audience = `{"filter":[{"value":false}]}`
 	manual.Index_["exp_app"] = entry

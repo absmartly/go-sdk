@@ -495,26 +495,28 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 		var tmp = &cntx
 		var tempFuture, readyFutureDone = future.New()
 		cntx.setReadyFuture(tempFuture)
+		// fail reports a failed initial load. It settles the failed future
+		// before clearing it, so a waiter that arrives in between joins it
+		// and sees the error. Nothing after it reads Clock_.
+		var fail = func(err error, diagnostics []bufferedEvent) {
+			tmp.SetDataFailed(err)
+			tmp.dispatchDiagnostics(diagnostics)
+			tmp.LogError(err)
+			readyFutureDone(nil, err)
+			cntx.setReadyFutureWith(state, nil)
+		}
 		dataFuture.Listen(func(val future.Value, err error) {
 			atomic.StoreUint64(state.readyDeliverer_, goroutineID())
 			defer atomic.StoreUint64(state.readyDeliverer_, 0)
 			if err == nil {
 				result, ok := val.(jsonmodels.ContextData)
 				if !ok {
-					err = &TypeError{Expected: "jsonmodels.ContextData", Actual: val}
-					tmp.SetDataFailed(err)
-					tmp.LogError(err)
-					readyFutureDone(nil, err)
-					cntx.setReadyFutureWith(state, nil)
+					fail(&TypeError{Expected: "jsonmodels.ContextData", Actual: val}, nil)
 					return
 				}
 				var diagnostics, panicErr = tmp.applyRefreshedData(result)
 				if panicErr != nil {
-					tmp.SetDataFailed(panicErr)
-					tmp.dispatchDiagnostics(diagnostics)
-					tmp.LogError(panicErr)
-					readyFutureDone(nil, panicErr)
-					cntx.setReadyFutureWith(state, nil)
+					fail(panicErr, diagnostics)
 					return
 				}
 				// Log before settling, so WaitUntilReady returns after the
@@ -531,13 +533,7 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 				cntx.setReadyFutureWith(state, nil)
 				readyFutureDone(result, nil)
 			} else {
-				tmp.SetDataFailed(err)
-				tmp.LogError(err)
-				// Settle the failed future before clearing it, so a waiter
-				// that arrives in between joins it and sees the error. Nothing
-				// below reads Clock_, so the order is safe here.
-				readyFutureDone(nil, err)
-				cntx.setReadyFutureWith(state, nil)
+				fail(err, nil)
 			}
 
 		})
@@ -640,6 +636,10 @@ func (c *Context) snapshot() Context {
 	return cp
 }
 
+// live returns the context SetData installs data on: the root of a copy or
+// snapshot of an SDK-created context (also after its Clock_ was replaced),
+// or c itself for a literal. Data, attribute and experiment getters read it,
+// so reads through a copy agree with assignment evaluation.
 func (c *Context) live() *Context {
 	if clock := c.ownClock(); clock != nil {
 		return clock.root
@@ -653,7 +653,6 @@ func (c *Context) live() *Context {
 }
 
 func (c *Context) GetExperiments() ([]string, error) {
-	// SetData installs data on the live context; read it from there.
 	c = c.live()
 	var err = c.CheckReady(true)
 	if err != nil {
@@ -672,7 +671,6 @@ func (c *Context) GetExperiments() ([]string, error) {
 }
 
 func (c *Context) GetData() (jsonmodels.ContextData, error) {
-	// SetData installs data on the live context; read it from there.
 	c = c.live()
 	var err = c.CheckReady(true)
 	if err != nil {
@@ -1000,14 +998,18 @@ func (c *Context) QueueExposure(assignment *Assignment) {
 	var st = c.state()
 	// A copy returned by GetAssignment shares the cached assignment's exposed
 	// flag. Every rule-selected assignment's flag is recorded in
-	// ruleIdentities, which has its own lock, so this takes no ContextLock_:
-	// an AudienceDeserializer may call QueueExposure from inside an
-	// evaluation, which holds it.
-	c.queueExposure(assignment, st.ruleIdentities.contains(assignment.Exposed))
+	// ruleIdentities, which has its own lock, so this takes no ContextLock_
+	// and a caller holding it (an event logger, for one) cannot deadlock.
+	c.queueLiveExposure(assignment, st.ruleIdentities.contains(assignment.Exposed))
 }
 
 func (c *Context) queueExposure(assignment *Assignment, ruleOverride bool) {
-	c = c.live()
+	c.live().queueLiveExposure(assignment, ruleOverride)
+}
+
+// queueLiveExposure queues the exposure on c, which is already the live
+// context.
+func (c *Context) queueLiveExposure(assignment *Assignment, ruleOverride bool) {
 	if assignment.Exposed.CompareAndSwap(false, true) {
 		var exposure = jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
 			Variant: assignment.Variant, ExposedAt: c.Clock_.Millis(), Assigned: assignment.Assigned,
@@ -1127,7 +1129,6 @@ func removeDuplicateValues(intSlice []string) []string {
 }
 
 func (c *Context) GetCustomFieldValueKeys() ([]string, error) {
-	// SetData installs data on the live context; read it from there.
 	c = c.live()
 	var err = c.CheckReady(true)
 	if err != nil {
@@ -1162,7 +1163,6 @@ func (c *Context) GetCustomFieldValue(experimentName string, key string) interfa
 
 // GetCustomFieldValueE returns a custom field value or the context read error.
 func (c *Context) GetCustomFieldValueE(experimentName string, key string) (interface{}, error) {
-	// SetData installs data on the live context; read it from there.
 	c = c.live()
 	var err = c.CheckReady(true)
 	if err != nil {
@@ -1184,7 +1184,6 @@ func (c *Context) GetCustomFieldValueE(experimentName string, key string) (inter
 }
 
 func (c *Context) GetCustomFieldValueType(experimentName string, key string) string {
-	// SetData installs data on the live context; read it from there.
 	c = c.live()
 	c.DataLock.Lock()
 	defer c.DataLock.Unlock()
@@ -1863,7 +1862,7 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string,
 
 				var parsed, ok = c.cachedAudience(st, experiment.Data.Audience)
 				if !ok && last {
-					parsed, ok = parsedAudience{text: experiment.Data.Audience, err: errors.New("can't evaluate data")}, true
+					parsed, ok = parsedAudience{err: errors.New("can't evaluate data")}, true
 				}
 				if !ok {
 					// The data changed between the unlocked parse and this
@@ -1948,13 +1947,14 @@ func (c *Context) ClearRefreshTimer() {
 
 // GetExperiment returns the experiment from the installed context data. It
 // reads the index setData published atomically, so a refresh installing new
-// data cannot race it, and it takes no lock.
+// data cannot race it.
 //
-// A context with no state carrier of its own (a literal, or one whose Clock_
-// was replaced) reads Index_, as v1.1.1 did. That path takes no ContextLock_,
-// so an AudienceDeserializer that calls GetExperiment during an evaluation,
-// which holds ContextLock_, does not deadlock; setData keeps Index_ current.
+// It reads the live context, where SetData installs data, so a copy agrees
+// with the original and with assignment evaluation. A live context with no
+// state carrier (a literal, or one whose Clock_ was replaced) reads Index_,
+// as v1.1.1 did; setData keeps it current.
 func (c *Context) GetExperiment(experimentName string) (ExperimentVariables, bool) {
+	c = c.live()
 	if c.ownClock() == nil {
 		if c.DataLock != nil {
 			c.DataLock.RLock()
@@ -2014,7 +2014,7 @@ func (c *Context) parseAudienceUnlocked(st *contextState, text string) parsedAud
 	var parsed = func() (parsed parsedAudience) {
 		defer func() {
 			if panicked = recover(); panicked != nil {
-				parsed = parsedAudience{text: text, err: errors.New("can't evaluate data")}
+				parsed = parsedAudience{err: errors.New("can't evaluate data")}
 			}
 		}()
 		return AudienceMatcher{deserializer}.parseAudience(text)
@@ -2507,16 +2507,9 @@ func (c *Context) Flush() *future.Future {
 			event.PublishedAt = c.Clock_.Millis()
 
 			c.ContextLock_.Lock()
-			var entrySet []interface{}
+			event.Units = make([]jsonmodels.Unit, 0, len(c.Units_))
 			for key, value := range c.Units_ {
-				entrySet = append(entrySet, Pair{a: key, b: value})
-			}
-
-			var mapper = liveFlushMapper{ctx: c}
-			var temp = MapSetToArray(entrySet, make([]interface{}, 0), mapper)
-			event.Units = make([]jsonmodels.Unit, 0)
-			for _, value := range temp {
-				event.Units = append(event.Units, value.(jsonmodels.Unit))
+				event.Units = append(event.Units, flushUnit(c, key, value))
 			}
 			if len(c.Attributes_) == 0 {
 				event.Attributes = make([]jsonmodels.Attribute, 0)
@@ -2672,26 +2665,15 @@ type FlushMapper struct {
 }
 
 func (f FlushMapper) Apply(value interface{}) interface{} {
-	return flushUnit(&f.Context, value)
+	return flushUnit(&f.Context, value.(Pair).a, value.(Pair).b)
 }
 
-// liveFlushMapper is FlushMapper for the live context the SDK flushes, which
-// must not be copied: it holds the locks the flush takes.
-type liveFlushMapper struct {
-	ctx *Context
-}
-
-func (f liveFlushMapper) Apply(value interface{}) interface{} {
-	return flushUnit(f.ctx, value)
-}
-
-func flushUnit(cntx *Context, value interface{}) interface{} {
-	var key = value.(Pair).a
-	var val = value.(Pair).b
+// flushUnit is a published unit: its type and hashed UID. Flush calls it on
+// the live context directly, which must not be copied into a FlushMapper.
+func flushUnit(cntx *Context, unitType string, uid string) jsonmodels.Unit {
 	var data [22]byte
-	var uid = cntx.GetUnitHash(key, val, data[:], false)
-	var res = asciiOnly(string(uid))
-	return jsonmodels.Unit{Type: value.(Pair).a, Uid: res}
+	var hash = cntx.GetUnitHash(unitType, uid, data[:], false)
+	return jsonmodels.Unit{Type: unitType, Uid: asciiOnly(string(hash))}
 }
 
 func asciiOnly(s string) string {
@@ -2807,9 +2789,10 @@ func legacyIndexVariables(index map[string][]ExperimentVariables) map[interface{
 }
 
 func (c *Context) GetVariableExperiment(key string) (ExperimentVariables, error) {
+	c = c.live()
 	if c.ownClock() == nil {
 		// As GetExperiment: read the v1.1.1 field, which setData keeps
-		// current, without ContextLock_.
+		// current.
 		if c.DataLock != nil {
 			c.DataLock.RLock()
 			defer c.DataLock.RUnlock()

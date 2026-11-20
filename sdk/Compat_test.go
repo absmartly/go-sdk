@@ -42,7 +42,7 @@ func TestV111FlushMapperValueContext(t *testing.T) {
 	var context = CreateTestContext(config, dataFutureReady)
 
 	var byValue = FlushMapper{Context: *context}.Apply(Pair{a: "session_id", b: units["session_id"]})
-	var byPointer = liveFlushMapper{ctx: context}.Apply(Pair{a: "session_id", b: units["session_id"]})
+	var byPointer interface{} = flushUnit(context, "session_id", units["session_id"])
 	assertAny(byPointer, byValue, t)
 }
 

@@ -36,7 +36,6 @@ func (am AudienceMatcher) Evaluate(audience string, attributes map[string]interf
 // be evaluated against attributes. Parsing runs customer code, so the context
 // does it before taking its locks; evaluating runs only SDK code.
 type parsedAudience struct {
-	text   string
 	filter interface{}
 	err    error
 }
@@ -44,9 +43,9 @@ type parsedAudience struct {
 func (am AudienceMatcher) parseAudience(audience string) parsedAudience {
 	result, err := am.deserializer().Deserialize([]byte(audience), 0, len(audience))
 	if err != nil {
-		return parsedAudience{text: audience, err: errors.New("can't evaluate data")}
+		return parsedAudience{err: errors.New("can't evaluate data")}
 	}
-	return parsedAudience{text: audience, filter: result["filter"]}
+	return parsedAudience{filter: result["filter"]}
 }
 
 func (p parsedAudience) evaluate(attributes map[string]interface{}) (Result, error) {
