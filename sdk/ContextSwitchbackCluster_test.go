@@ -671,6 +671,8 @@ func TestSwitchbackCluster_StructFieldsAreReadFromTheirEncoding(t *testing.T) {
 	expectValue(t, "", parseSwitchbackPath("geo/City").resolveAttribute(geo{City: 3.5}))
 	expectValue(t, "", parseSwitchbackPath("geo/City").resolveAttribute(map[string]interface{}{"City": 3.0}))
 	expectValue(t, "", parseSwitchbackPath("geo").resolveAttribute(3.0))
+	// A map with non-string keys is encoded with string keys.
+	expectValue(t, "Porto", parseSwitchbackPath("geo/'1'").resolveAttribute(map[int]string{1: "Porto"}))
 }
 
 // Changing a cluster attribute mid-period is not supported: the arm cached
