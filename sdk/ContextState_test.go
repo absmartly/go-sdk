@@ -1470,6 +1470,14 @@ func TestDeserializerCallsDuringLoadAndRefreshDoNotHang(t *testing.T) {
 
 // A v1.1.1-style literal with a hand-filled Index_ evaluates its audiences.
 func TestContextLiteralIndexEvaluatesAudiences(t *testing.T) {
+	var manual = audienceLiteral(audienceExperiment("exp_app", `{"filter":[{"eq":[{"var":"country"},{"value":"US"}]}]}`, true))
+	var variant, err = manual.PeekTreatment("exp_app")
+	assertAny(nil, err, t)
+	assertAny(0, variant, t) // strict audience, no country: variant 0, as in v1.1.1
+}
+
+// audienceLiteral is a v1.1.1-style Context literal with a hand-filled Index_.
+func audienceLiteral(experiment jsonmodels.Experiment) *Context {
 	var boolValue = func(value bool) *atomic.Value {
 		var result = &atomic.Value{}
 		result.Store(value)
@@ -1477,13 +1485,12 @@ func TestContextLiteralIndexEvaluatesAudiences(t *testing.T) {
 	}
 	var count = &atomic.Value{}
 	count.Store(int32(0))
-	var experiment = audienceExperiment("exp_app", `{"filter":[{"eq":[{"var":"country"},{"value":"US"}]}]}`, true)
-	var manual = Context{
+	return &Context{
 		PublishDelay_: -1, RefreshInterval_: -1, VariableParser_: DefaultVariableParser{},
 		AudienceMatcher_: AudienceMatcher{DefaultAudienceDeserializer{}},
 		Units_:           map[string]string{"session_id": ruleUnit}, Failed_: boolValue(false), Ready_: boolValue(true),
 		DataLock: &sync.RWMutex{}, ContextLock_: &sync.RWMutex{},
-		Index_:          map[string]ExperimentVariables{"exp_app": {Data: experiment, Variables: []map[string]interface{}{{}, {}}}},
+		Index_:          map[string]ExperimentVariables{experiment.Name: {Data: experiment, Variables: []map[string]interface{}{{}, {}}}},
 		IndexVariables_: map[interface{}]interface{}{},
 		HashedUnits_:    map[interface{}]interface{}{}, Assigners_: map[interface{}]interface{}{},
 		AssignmentCache: map[string]Assignment{}, EventLock_: &sync.Mutex{},
@@ -1492,9 +1499,139 @@ func TestContextLiteralIndexEvaluatesAudiences(t *testing.T) {
 		Refreshing_: boolValue(false), TimeoutLock_: &sync.Mutex{},
 		Clock_: internal.FixedClock{Millis_: 1},
 	}
-	var variant, err = manual.PeekTreatment("exp_app")
+}
+
+// Editing a literal's Index_ after its first read neither recurses nor
+// crashes: the unlocked parse and the locked evaluation read the same index.
+func TestEditedLiteralIndexDoesNotRecurse(t *testing.T) {
+	var manual = audienceLiteral(audienceExperiment("exp_other", `{"filter":[{"value":true}]}`, true))
+	manual.Index_["exp_app"] = ExperimentVariables{Data: audienceExperiment("exp_app", `{"filter":[{"value":1}]}`, true), Variables: []map[string]interface{}{{}, {}}}
+	assertAny(1, treatmentPeek(t, manual, "exp_other"), t)
+	manual.DataLock.Lock()
+	manual.Index_["exp_app"] = ExperimentVariables{Data: audienceExperiment("exp_app", `{"filter":[{"value":false}]}`, true), Variables: []map[string]interface{}{{}, {}}}
+	manual.DataLock.Unlock()
+	var _, err = manual.PeekTreatment("exp_app")
 	assertAny(nil, err, t)
-	assertAny(0, variant, t) // strict audience, no country: variant 0, as in v1.1.1
+}
+
+// funcDeserializer is a func-typed adapter, whose values Go cannot hash or
+// compare.
+type funcDeserializer func(b []byte, offset, length int) (map[string]interface{}, error)
+
+func (f funcDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	return f(b, offset, length)
+}
+
+// mapDeserializer is a value struct holding a map: not comparable either.
+type mapDeserializer struct{ seen map[string]int }
+
+func (d mapDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	d.seen[string(b[offset:offset+length])]++
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+// A deserializer of a non-comparable type works as in v1.1.1, and is still
+// called once per audience text.
+func TestUncomparableDeserializerDoesNotPanic(t *testing.T) {
+	var calls int32
+	var seen = map[string]int{}
+	for _, d := range []AudienceDeserializer{
+		funcDeserializer(func(b []byte, offset, length int) (map[string]interface{}, error) {
+			atomic.AddInt32(&calls, 1)
+			return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+		}),
+		mapDeserializer{seen},
+	} {
+		var ctx, _ = newSystemAttrContext("website", "production", audienceExperiment("exp_app", appFilter, true))
+		ctx.AudienceMatcher_ = AudienceMatcher{d}
+		assertAny(nil, ctx.SetAttribute("x", 1), t)
+		assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
+		assertAny(nil, ctx.SetAttribute("x", 2), t)
+		assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
+	}
+	assertAny(int32(1), atomic.LoadInt32(&calls), t)
+	assertAny(map[string]int{appFilter: 1}, seen, t)
+}
+
+// SetData that changes only the audience text keeps the cached assignment, as
+// in v1.1.1, until an attribute change revalidates it: the new text is then
+// parsed and evaluated.
+func TestAudienceTextChangeIsEvaluatedAfterSetAttribute(t *testing.T) {
+	var ctx, _ = newSystemAttrContext("website", "production",
+		audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true))
+	assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
+	ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+		audienceExperiment("exp_app", `{"filter":[{"value":false}]}`, true)}})
+	assertAny(nil, ctx.SetAttribute("x", 1), t)
+	assertAny(0, treatmentPeek(t, ctx, "exp_app"), t)
+}
+
+// installingDeserializer installs new data, with a new audience text, while
+// it parses: the evaluation that follows must parse that text too, with no
+// lock held, and use it.
+type installingDeserializer struct {
+	mu    sync.Mutex
+	ctx   *Context
+	next  []string
+	calls []string
+}
+
+func (d *installingDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	d.mu.Lock()
+	d.calls = append(d.calls, string(b[offset:offset+length]))
+	var ctx, next = d.ctx, ""
+	if len(d.next) > 0 {
+		next, d.next = d.next[0], d.next[1:]
+	}
+	d.mu.Unlock()
+	if ctx != nil && next != "" {
+		ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{audienceExperiment("exp_app", next, true)}})
+	}
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+func TestDataInstalledDuringParseIsParsedBeforeEvaluation(t *testing.T) {
+	var ctx, _ = newSystemAttrContext("website", "production",
+		audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true))
+	var d = &installingDeserializer{ctx: ctx, next: []string{`{"filter":[{"value":false}]}`, `{"filter":[{"value":1}]}`}}
+	ctx.AudienceMatcher_ = AudienceMatcher{d}
+	var done = make(chan int, 1)
+	go func() { done <- treatmentPeek(t, ctx, "exp_app") }()
+	select {
+	case variant := <-done:
+		// The last installed audience ({"value":1}) matches.
+		assertAny(1, variant, t)
+	case <-time.After(5 * time.Second):
+		t.Fatal("evaluation did not finish")
+	}
+	assertAny([]string{`{"filter":[{"value":true}]}`, `{"filter":[{"value":false}]}`, `{"filter":[{"value":1}]}`}, d.calls, t)
+}
+
+// A cached assignment whose audience text is replaced between the unlocked
+// parse and the lock is revalidated against the new text, not kept.
+func TestAudienceReplacedBeforeRevalidationIsEvaluated(t *testing.T) {
+	var ctx, _ = newSystemAttrContext("website", "production",
+		audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true))
+	var d = &installingDeserializer{ctx: ctx, next: []string{"", `{"filter":[{"value":false}]}`}}
+	ctx.AudienceMatcher_ = AudienceMatcher{d}
+	assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
+	ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+		audienceExperiment("exp_app", `{"filter":[{"value":1}]}`, true)}})
+	assertAny(nil, ctx.SetAttribute("x", 1), t)
+	assertAny(0, treatmentPeek(t, ctx, "exp_app"), t)
+}
+
+// The parse cache keeps only the installed audience texts.
+func TestAudienceCacheIsPrunedOnInstall(t *testing.T) {
+	var ctx, _ = newSystemAttrContext("website", "production", audienceExperiment("exp_app", appFilter, true))
+	for i := 0; i < 5; i++ {
+		var _, _ = reparseAudience(ctx)
+		assertAny(nil, ctx.SetAttribute("round", i), t) // revalidates, so the new text is parsed
+		var _ = treatmentPeek(t, ctx, "exp_app")
+	}
+	var n = 0
+	ctx.state().audiences.Range(func(_, _ interface{}) bool { n++; return true })
+	assertAny(1, n, t)
 }
 
 // Replacing AudienceMatcher_ after creation takes effect, as in v1.1.1.

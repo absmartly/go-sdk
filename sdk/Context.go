@@ -132,7 +132,7 @@ type contextState struct {
 	assignmentCache_ map[string]*cachedAssignment
 	ruleIdentities   *ruleAssignmentIdentities
 
-	// audiences caches parsed audiences by matcher and audience text. A parse
+	// audiences caches parsed audiences (*audienceEntry) by audience text. A parse
 	// runs the AudienceDeserializer, which is customer code, so it is done on
 	// the reading goroutine before any lock is taken (as v1.1.1 called it
 	// without a lock), and never while ContextLock_ is held.
@@ -1772,10 +1772,32 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 
 	// The assignment will be evaluated. Parse the experiment's audience now,
 	// holding no lock: the deserializer is customer code and may call back
-	// into the context.
-	if experiment, found := c.GetExperiment(experimentName); found && len(experiment.Data.Audience) > 0 {
+	// into the context. The text is read from the index the locked
+	// evaluation reads, so the two agree unless new data is installed
+	// meanwhile.
+	if experiment, _, found := st.experimentAndRules(experimentName); found && len(experiment.Data.Audience) > 0 {
 		c.parseAudienceUnlocked(st, experiment.Data.Audience)
 	}
+	return c.buildAssignment(st, experimentName)
+}
+
+// buildAssignment validates or rebuilds experimentName's assignment under the
+// write lock. When new data installed an audience that is not parsed yet, it
+// releases the lock, parses that text and tries again (a loop, so data
+// changing on every attempt cannot grow the stack).
+func (c *Context) buildAssignment(st *contextState, experimentName string) *cachedAssignment {
+	for {
+		var entry, unparsed = c.buildAssignmentLocked(st, experimentName)
+		if unparsed == "" {
+			return entry
+		}
+		c.parseAudienceUnlocked(st, unparsed)
+	}
+}
+
+// buildAssignmentLocked returns the assignment, or the audience text that has
+// to be parsed (with no lock held) before it can be built.
+func (c *Context) buildAssignmentLocked(st *contextState, experimentName string) (*cachedAssignment, string) {
 
 	// Cache miss, out of date, or revalidated. Check again under the write
 	// lock: another goroutine may have rebuilt the assignment meanwhile, and
@@ -1784,7 +1806,7 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 	var previous, validated, state = c.validCachedAssignment(st, experimentName)
 	if state == assignmentValid {
 		c.ContextLock_.Unlock()
-		return previous
+		return previous, ""
 	}
 	if state == assignmentRevalidated {
 		// Still the same outcome: acknowledge the rules and attributes it was
@@ -1796,7 +1818,7 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 		previous.rules = validated
 		previous.attrsSeq = atomic.LoadInt32(&st.attrsSeq_)
 		c.ContextLock_.Unlock()
-		return previous
+		return previous, ""
 	}
 
 	var custom, cfound = c.Cassignments_[experimentName]
@@ -1837,9 +1859,9 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 				var parsed, ok = c.cachedAudience(st, experiment.Data.Audience)
 				if !ok {
 					// The data changed between the unlocked parse and this
-					// lock: start over, parsing the new audience unlocked.
+					// lock: parse the new audience unlocked and start over.
 					c.ContextLock_.Unlock()
-					return c.assignmentEntry(experimentName)
+					return nil, experiment.Data.Audience
 				}
 				var match, err = parsed.evaluate(attrs)
 				if err == nil {
@@ -1902,7 +1924,7 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 	st.assignmentCache_[experimentName] = entry
 	c.AssignmentCache[experimentName] = *assignment
 	c.ContextLock_.Unlock()
-	return entry
+	return entry, ""
 }
 
 func (c *Context) ClearRefreshTimer() {
@@ -1941,25 +1963,38 @@ func (st *contextState) loadIndex() *contextIndex {
 	return st.index_.Load().(*contextIndex)
 }
 
-// experimentAndRules is GetExperiment plus the experiment's parsed assignment
-// rules, read from the same installed index.
-// audienceKey identifies a parse: the same text through a different matcher
-// (a caller may replace AudienceMatcher_) is parsed again.
-type audienceKey struct {
-	matcher AudienceMatcher
-	text    string
+// audienceEntry is a cached parse and the deserializer that made it: the same
+// text through a replaced AudienceMatcher_ is parsed again.
+type audienceEntry struct {
+	deserializer AudienceDeserializer
+	parsed       parsedAudience
+}
+
+// sameDeserializer reports whether a cached parse was made by d. A
+// deserializer whose type is not comparable (a func, or a struct holding a
+// map) cannot be compared without panicking, so any value of the same type
+// counts as the same deserializer.
+func sameDeserializer(a, b AudienceDeserializer) bool {
+	var ta, tb = reflect.TypeOf(a), reflect.TypeOf(b)
+	if ta != tb {
+		return false
+	}
+	if ta == nil || !ta.Comparable() {
+		return true
+	}
+	return a == b
 }
 
 // parseAudienceUnlocked returns the parsed audience for text, running the
-// AudienceDeserializer if this matcher has not parsed it yet. The caller holds
+// AudienceDeserializer if it has not parsed this text yet. The caller holds
 // no context lock, so the deserializer may call back into the context. A
 // deserializer panic is reported to the event logger and counts as an
 // unparseable audience; v1.1.1 let it escape the read.
 func (c *Context) parseAudienceUnlocked(st *contextState, text string) parsedAudience {
-	var key = audienceKey{c.AudienceMatcher_, text}
-	if parsed, ok := st.audiences.Load(key); ok {
-		return parsed.(parsedAudience)
+	if parsed, ok := c.cachedAudience(st, text); ok {
+		return parsed
 	}
+	var deserializer = c.AudienceMatcher_.Deserializer_
 	var parsed = func() (parsed parsedAudience) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -1967,22 +2002,46 @@ func (c *Context) parseAudienceUnlocked(st *contextState, text string) parsedAud
 				c.LogError(fmt.Errorf("AudienceDeserializer panicked: %v", r))
 			}
 		}()
-		return c.AudienceMatcher_.parseAudience(text)
+		return AudienceMatcher{deserializer}.parseAudience(text)
 	}()
-	st.audiences.Store(key, parsed)
+	st.audiences.Store(text, &audienceEntry{deserializer: deserializer, parsed: parsed})
 	return parsed
 }
 
-// cachedAudience returns a parse made earlier by parseAudienceUnlocked. It is
-// called with ContextLock_ held, so it never runs the deserializer; it reports
-// false when the audience was not parsed yet.
+// cachedAudience returns a parse made earlier by parseAudienceUnlocked with
+// the current deserializer. It is called with ContextLock_ held, so it never
+// runs the deserializer; it reports false when the audience was not parsed
+// yet.
 func (c *Context) cachedAudience(st *contextState, text string) (parsedAudience, bool) {
-	if parsed, ok := st.audiences.Load(audienceKey{c.AudienceMatcher_, text}); ok {
-		return parsed.(parsedAudience), true
+	if entry, ok := st.audiences.Load(text); ok {
+		var entry = entry.(*audienceEntry)
+		if sameDeserializer(entry.deserializer, c.AudienceMatcher_.Deserializer_) {
+			return entry.parsed, true
+		}
 	}
 	return parsedAudience{}, false
 }
 
+// pruneAudiences drops the parses of audience texts the installed data no
+// longer has, so the cache does not grow with every refresh.
+func (st *contextState) pruneAudiences() {
+	var index = st.loadIndex()
+	var live = map[string]bool{}
+	if index != nil {
+		for _, entry := range index.experiments {
+			live[entry.experiment.Data.Audience] = true
+		}
+	}
+	st.audiences.Range(func(text, _ interface{}) bool {
+		if !live[text.(string)] {
+			st.audiences.Delete(text)
+		}
+		return true
+	})
+}
+
+// experimentAndRules is GetExperiment plus the experiment's parsed assignment
+// rules, read from the same installed index.
 func (st *contextState) experimentAndRules(experimentName string) (ExperimentVariables, *experimentRules, bool) {
 	var index = st.loadIndex()
 	if index == nil {
@@ -2222,6 +2281,7 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name]}
 	}
 	st.index_.Store(&contextIndex{experiments: indexed})
+	st.pruneAudiences()
 	c.ContextCustomFields_ = contextCustomFields
 	st.indexVariables_ = indexVariables
 	c.IndexVariables_ = legacyIndexVariables(indexVariables)
