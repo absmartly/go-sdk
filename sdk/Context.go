@@ -1647,8 +1647,8 @@ func (c *Context) audienceMatches(st *contextState, data jsonmodels.Experiment, 
 	}
 	var parsed, ok = c.cachedAudience(st, data.Audience)
 	if !ok {
-		// Not parsed yet (the audience text changed): report a change, so the
-		// caller parses it with no lock held and rebuilds the assignment.
+		// Not parsed yet: report a change, so the caller's rebuild asks for
+		// the parse with no lock held and validates again.
 		return false
 	}
 	var match, err = parsed.evaluate(c.evaluationAttributesWithState(st))
@@ -1761,6 +1761,9 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 			c = st.manualRoot
 		}
 	}
+	if st.manualRoot == nil && c.ownClock() == nil {
+		c.syncLiteralExperiment(st, experimentName)
+	}
 	// A valid cached assignment only needs the read lock, so concurrent reads
 	// of a shared context do not serialise.
 	c.ContextLock_.RLock()
@@ -1770,25 +1773,18 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 	}
 	c.ContextLock_.RUnlock()
 
-	// The assignment will be evaluated. Parse the experiment's audience now,
-	// holding no lock: the deserializer is customer code and may call back
-	// into the context. The text is read from the index the locked
-	// evaluation reads, so the two agree unless new data is installed
-	// meanwhile.
-	if experiment, _, found := st.experimentAndRules(experimentName); found && len(experiment.Data.Audience) > 0 {
-		c.parseAudienceUnlocked(st, experiment.Data.Audience)
-	}
 	return c.buildAssignment(st, experimentName)
 }
 
 // buildAssignment validates or rebuilds experimentName's assignment under the
-// write lock. When new data installed an audience that is not parsed yet, it
-// releases the lock, parses that text and tries again. Only data installed
-// again during each parse makes it retry, and it gives up
-// after maxAudienceAttempts: the audience then counts as unparseable for
-// this evaluation.
+// write lock. The audience is parsed only when the assignment needs it (an
+// override or a matching assignment rule skips it, as in v1.1.1): the locked
+// path then releases the lock, the text is parsed with no lock held, and it
+// tries again. Only new data installed during each parse makes it parse
+// again; after maxAudienceAttempts parses the audience counts as
+// unparseable for this evaluation.
 func (c *Context) buildAssignment(st *contextState, experimentName string) *cachedAssignment {
-	for attempt := 1; ; attempt++ {
+	for attempt := 0; ; attempt++ {
 		var entry, unparsed = c.buildAssignmentLocked(st, experimentName, attempt >= maxAudienceAttempts)
 		if unparsed == "" {
 			return entry
@@ -2010,16 +2006,26 @@ func (c *Context) parseAudienceUnlocked(st *contextState, text string) parsedAud
 		return parsed
 	}
 	var deserializer = c.AudienceMatcher_.Deserializer_
+	var panicked interface{}
 	var parsed = func() (parsed parsedAudience) {
 		defer func() {
-			if r := recover(); r != nil {
+			if panicked = recover(); panicked != nil {
 				parsed = parsedAudience{text: text, err: errors.New("can't evaluate data")}
-				c.LogError(fmt.Errorf("AudienceDeserializer panicked: %v", r))
 			}
 		}()
 		return AudienceMatcher{deserializer}.parseAudience(text)
 	}()
 	st.audiences.Store(text, &audienceEntry{deserializer: deserializer, parsed: parsed})
+	if !st.hasAudience(text) {
+		// New data without this text was installed, and pruned, during the
+		// parse: don't keep the parse past that prune.
+		st.audiences.Delete(text)
+	}
+	if panicked != nil {
+		// Logged after the parse is cached, so a logger that reads the
+		// experiment uses it rather than calling the deserializer again.
+		c.LogError(fmt.Errorf("AudienceDeserializer panicked: %v", panicked))
+	}
 	return parsed
 }
 
@@ -2053,6 +2059,64 @@ func (st *contextState) pruneAudiences() {
 		}
 		return true
 	})
+}
+
+// hasAudience reports whether an installed experiment has audience text.
+func (st *contextState) hasAudience(text string) bool {
+	if index := st.loadIndex(); index != nil {
+		for _, entry := range index.experiments {
+			if entry.experiment.Data.Audience == text {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// syncLiteralExperiment makes the private index entry of a context built as
+// a literal match its Index_ entry, which a caller may edit, so it reads
+// Index_ as v1.1.1 did. Rules for a changed assignmentRules text are parsed
+// before any lock is taken. Contexts the SDK created keep their own index.
+func (c *Context) syncLiteralExperiment(st *contextState, experimentName string) {
+	var readIndex = func() (ExperimentVariables, bool) {
+		if c.DataLock != nil {
+			c.DataLock.RLock()
+			defer c.DataLock.RUnlock()
+		}
+		var experiment, found = c.Index_[experimentName]
+		return experiment, found
+	}
+	var experiment, found = readIndex()
+	var current, rules, installed = st.experimentAndRules(experimentName)
+	if found == installed && (!found || reflect.DeepEqual(current, experiment)) {
+		return
+	}
+	if found && len(experiment.Data.AssignmentRules) > 0 {
+		rules = c.experimentRulesFor(rules, experiment.Data.AssignmentRules)
+	} else {
+		rules = nil
+	}
+	if c.DataLock != nil {
+		c.DataLock.Lock()
+		defer c.DataLock.Unlock()
+	}
+	if again, foundAgain := c.Index_[experimentName]; foundAgain != found || (found && !reflect.DeepEqual(again, experiment)) {
+		// Index_ changed while the rules were parsed: the next read syncs.
+		return
+	}
+	var previous = st.loadIndex()
+	var indexed = map[string]*indexedExperiment{}
+	if previous != nil {
+		for name, entry := range previous.experiments {
+			indexed[name] = entry
+		}
+	}
+	if found {
+		indexed[experimentName] = &indexedExperiment{experiment: experiment, rules: rules}
+	} else {
+		delete(indexed, experimentName)
+	}
+	st.index_.Store(&contextIndex{experiments: indexed})
 }
 
 // experimentAndRules is GetExperiment plus the experiment's parsed assignment

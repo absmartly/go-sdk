@@ -1049,7 +1049,7 @@ func TestDeserializerCanPublishQueuedEvents(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatalf("Publish deadlocked, logger=%v async=%v", withLogger, async)
 			}
-			assertAny(nil, <-result, t)
+			assertAny(nil, deserializerResult(t, result), t)
 			assertAny(1, len(publisher.publishEvents), t)
 			assertAny("goal", publisher.publishEvents[0].Goals[0].Name, t)
 			if withLogger {
@@ -1062,6 +1062,19 @@ func TestDeserializerCanPublishQueuedEvents(t *testing.T) {
 				assertAny(1, n, t)
 			}
 		}
+	}
+}
+
+// deserializerResult returns what the deserializer reported. The read that
+// called it has returned, so a missing result means it was never called.
+func deserializerResult(t *testing.T, result chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	default:
+		t.Fatal("the read returned without calling the deserializer")
+		return nil
 	}
 }
 
@@ -1106,7 +1119,7 @@ func TestDeserializerFailingPublishLogsErrorAndKeepsEvents(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("a failing Publish from a deserializer with a logger deadlocked")
 	}
-	assertAny(failure, <-result, t)
+	assertAny(failure, deserializerResult(t, result), t)
 	var errors_ = 0
 	for _, e := range logger.GetEvents() {
 		if e.EventType == Error {
@@ -1278,6 +1291,9 @@ func reparseAudience(ctx *Context) (int, error) {
 	for i := range experiments {
 		if experiments[i].Name == "exp_app" {
 			experiments[i].Audience = fmt.Sprintf(`{"filter":[{"eq":[{"var":"application"},{"value":"website"}]},{"value":%d}]}`, round)
+			// A new iteration invalidates the cached assignment, so the read
+			// evaluates the new audience and calls the deserializer.
+			experiments[i].Iteration += int(round)
 		}
 	}
 	ctx.SetData(jsonmodels.ContextData{Experiments: experiments})
@@ -1318,7 +1334,8 @@ func (d *refreshingDeserializer) Deserialize(b []byte, offset, length int) (map[
 func TestDeserializerRefreshJoinsAPendingRefresh(t *testing.T) {
 	var p = &pendingProvider{release: make(chan struct{}),
 		data: jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{audienceExperiment("exp_app", appFilter, true)}}}
-	var d = &refreshingDeserializer{}
+	var joined = make(chan *future.Future, 1)
+	var d = &callingDeserializer{}
 	var client = &systemAttrClient{application: "website", environment: "production"}
 	var cc = CreateDefaultContextConfig()
 	cc.Units_, cc.PublishDelay_, cc.RefreshInterval_ = withUnit(), -1, -1
@@ -1328,12 +1345,29 @@ func TestDeserializerRefreshJoinsAPendingRefresh(t *testing.T) {
 	var pending = ctx.RefreshAsync()
 	d.mu.Lock()
 	d.ctx = ctx
+	d.call = func(c *Context) {
+		d.mu.Lock()
+		d.ctx = nil
+		d.mu.Unlock()
+		// Report the joined future before waiting on it, so the test can
+		// check the refresh is still pending when the deserializer joins.
+		var f = c.RefreshAsync()
+		joined <- f
+		c.Refresh()
+	}
 	d.mu.Unlock()
 	var done = make(chan struct{})
 	go func() {
-		_, _ = reparseAudience(ctx)
+		_, _ = ctx.PeekTreatment("exp_app")
 		close(done)
 	}()
+	select {
+	case f := <-joined:
+		assertAny(false, f.Ready(), t)
+		assertAny(true, f == pending, t)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the deserializer was not called")
+	}
 	close(p.release)
 	select {
 	case <-done:
@@ -1393,7 +1427,7 @@ func TestDeserializerPublishWithTrackingLoggerCompletes(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("a publish whose logger calls Track deadlocked")
 	}
-	assertAny(nil, <-result, t)
+	assertAny(nil, deserializerResult(t, result), t)
 	assertAny(1, len(publisher.publishEvents), t)
 	assertAny(int32(1), ctx.GetPendingCount(), t)
 }
@@ -1434,11 +1468,26 @@ func TestDeserializerCallsDuringLoadAndRefreshDoNotHang(t *testing.T) {
 		var variant, _ = ctx.PeekTreatment("exp_app")
 		done <- variant
 	}()
-	settle(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{audienceExperiment("exp_app", appFilter, true)}}, nil)
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("WaitUntilReady from a deserializer during the first load hung")
+	var settled = make(chan struct{})
+	go func() {
+		settle(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{audienceExperiment("exp_app", appFilter, true)}}, nil)
+		close(settled)
+	}()
+	var deadline = time.After(5 * time.Second)
+	for _, step := range []chan struct{}{settled, nil} {
+		if step != nil {
+			select {
+			case <-step:
+			case <-deadline:
+				t.Fatal("settling the first load hung")
+			}
+			continue
+		}
+		select {
+		case <-done:
+		case <-deadline:
+			t.Fatal("WaitUntilReady from a deserializer during the first load hung")
+		}
 	}
 
 	var r = &refreshingDeserializer{}
@@ -1512,20 +1561,27 @@ func TestEditedLiteralIndexDoesNotRecurse(t *testing.T) {
 	manual.DataLock.Lock()
 	manual.Index_["exp_app"] = ExperimentVariables{Data: audienceExperiment("exp_app", `{"filter":[{"value":false}]}`, true), Variables: []map[string]interface{}{{}, {}}}
 	manual.DataLock.Unlock()
-	var done = make(chan error, 1)
-	go func() {
-		var _, err = manual.PeekTreatment("exp_app")
-		done <- err
-	}()
+	var done = make(chan int, 1)
+	go func() { done <- treatmentPeek(t, manual, "exp_app") }()
 	select {
-	case err := <-done:
-		assertAny(nil, err, t)
+	case variant := <-done:
+		// As in v1.1.1, the read uses the edited Index_ entry: the strict
+		// audience does not match.
+		assertAny(0, variant, t)
 	case <-time.After(5 * time.Second):
 		t.Fatal("PeekTreatment after an Index_ edit did not return")
 	}
-	// The unlocked parse reads the text the locked evaluation reads, so each
-	// audience is parsed exactly once.
-	assertAny([]string{`{"filter":[{"value":true}]}`, `{"filter":[{"value":1}]}`}, counter.texts(), t)
+	// Only the audiences the reads evaluated are parsed, each once.
+	assertAny([]string{`{"filter":[{"value":true}]}`, `{"filter":[{"value":false}]}`}, counter.texts(), t)
+
+	// Editing an entry already assigned is picked up as in v1.1.1: a changed
+	// iteration is a different experiment.
+	var edited = audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true)
+	edited.Iteration = 2
+	manual.DataLock.Lock()
+	manual.Index_["exp_app"] = ExperimentVariables{Data: edited, Variables: []map[string]interface{}{{}, {}}}
+	manual.DataLock.Unlock()
+	assertAny(1, treatmentPeek(t, manual, "exp_app"), t)
 }
 
 // countingDeserializer records the audience texts it parses.
@@ -1747,6 +1803,115 @@ func TestAudienceReplacedBeforeRevalidationIsEvaluated(t *testing.T) {
 		audienceExperiment("exp_app", `{"filter":[{"value":1}]}`, true)}})
 	assertAny(nil, ctx.SetAttribute("x", 1), t)
 	assertAny(0, treatmentPeek(t, ctx, "exp_app"), t)
+}
+
+// An override or a matching assignment rule decides the variant without the
+// audience, so, as in v1.1.1, the deserializer is not called for it.
+func TestOverrideAndRuleSkipTheAudienceParse(t *testing.T) {
+	var counter = &countingDeserializer{}
+	var ruled = ruleExperiment("ruled", rulesJSON(`{"type":"assign","variant":2}`))
+	ruled.Audience = `{"filter":[{"value":"ruled"}]}`
+	var ctx, _ = newSystemAttrContext("website", "production",
+		audienceExperiment("exp_app", `{"filter":[{"value":"overridden"}]}`, true), ruled)
+	ctx.AudienceMatcher_ = AudienceMatcher{counter}
+	assertAny(nil, ctx.SetOverride("exp_app", 1), t)
+	assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
+	assertAny(2, treatmentPeek(t, ctx, "ruled"), t)
+	assertAny(nil, ctx.SetAttribute("x", 1), t)
+	assertAny(2, treatmentPeek(t, ctx, "ruled"), t)
+	assertAny(0, len(counter.texts()), t)
+}
+
+// readingLogger reads a treatment from inside the Error event.
+type readingLogger struct {
+	mu       sync.Mutex
+	ctx      *Context
+	errors   int
+	variants []int
+}
+
+func (l *readingLogger) HandleEvent(context Context, event EventType, data interface{}) {
+	if event != Error {
+		return
+	}
+	l.mu.Lock()
+	l.errors++
+	var ctx = l.ctx
+	l.mu.Unlock()
+	if ctx != nil {
+		var variant, _ = ctx.PeekTreatment("exp_app")
+		l.mu.Lock()
+		l.variants = append(l.variants, variant)
+		l.mu.Unlock()
+	}
+}
+
+// countingPanicDeserializer panics on every call and counts them.
+type countingPanicDeserializer struct{ calls int32 }
+
+func (d *countingPanicDeserializer) Deserialize([]byte, int, int) (map[string]interface{}, error) {
+	atomic.AddInt32(&d.calls, 1)
+	panic("deserializer bug")
+}
+
+// A logger that reads the experiment while the panic is being reported uses
+// the cached failed parse instead of calling the deserializer again.
+func TestPanicLoggerReadingTheExperimentUsesTheCachedParse(t *testing.T) {
+	var logger = &readingLogger{}
+	var d = &countingPanicDeserializer{}
+	var client = &systemAttrClient{application: "website", environment: "production"}
+	var cc = CreateDefaultContextConfig()
+	cc.Units_, cc.PublishDelay_, cc.RefreshInterval_ = withUnit(), -1, -1
+	var ctx = Create(ABsmartlyConfig{Client_: client,
+		ContextDataProvider_:  DefaultContextDataProvider{client_: client},
+		ContextEventHandler_:  DefaultContextEventHandler{client_: client},
+		AudienceDeserializer_: d, ContextEventLogger_: logger}).CreateContextWith(cc,
+		jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{audienceExperiment("exp_app", appFilter, true)}})
+	ctx.WaitUntilReady()
+	logger.mu.Lock()
+	logger.ctx = ctx
+	logger.mu.Unlock()
+	var done = make(chan int, 1)
+	go func() { done <- treatmentPeek(t, ctx, "exp_app") }()
+	select {
+	case variant := <-done:
+		assertAny(1, variant, t)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the read did not return")
+	}
+	assertAny(int32(1), atomic.LoadInt32(&d.calls), t)
+	logger.mu.Lock()
+	defer logger.mu.Unlock()
+	assertAny(1, logger.errors, t)
+	assertAny([]int{1}, logger.variants, t)
+}
+
+// removingDeserializer installs data without the audience it is parsing.
+type removingDeserializer struct {
+	once sync.Once
+	ctx  *Context
+}
+
+func (d *removingDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	d.once.Do(func() {
+		d.ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+			audienceExperiment("exp_app", `{"filter":[{"value":1}]}`, true)}})
+	})
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+// A parse that finishes after new data removed its audience is not kept.
+func TestParseOfRemovedAudienceIsNotCached(t *testing.T) {
+	var ctx, _ = newSystemAttrContext("website", "production",
+		audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true))
+	ctx.AudienceMatcher_ = AudienceMatcher{&removingDeserializer{ctx: ctx}}
+	assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
+	var texts []string
+	ctx.state().audiences.Range(func(text, _ interface{}) bool {
+		texts = append(texts, text.(string))
+		return true
+	})
+	assertAny([]string{`{"filter":[{"value":1}]}`}, texts, t)
 }
 
 // The parse cache keeps only the installed audience texts.
