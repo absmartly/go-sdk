@@ -1505,13 +1505,129 @@ func audienceLiteral(experiment jsonmodels.Experiment) *Context {
 // crashes: the unlocked parse and the locked evaluation read the same index.
 func TestEditedLiteralIndexDoesNotRecurse(t *testing.T) {
 	var manual = audienceLiteral(audienceExperiment("exp_other", `{"filter":[{"value":true}]}`, true))
+	var counter = &countingDeserializer{}
+	manual.AudienceMatcher_ = AudienceMatcher{counter}
 	manual.Index_["exp_app"] = ExperimentVariables{Data: audienceExperiment("exp_app", `{"filter":[{"value":1}]}`, true), Variables: []map[string]interface{}{{}, {}}}
 	assertAny(1, treatmentPeek(t, manual, "exp_other"), t)
 	manual.DataLock.Lock()
 	manual.Index_["exp_app"] = ExperimentVariables{Data: audienceExperiment("exp_app", `{"filter":[{"value":false}]}`, true), Variables: []map[string]interface{}{{}, {}}}
 	manual.DataLock.Unlock()
-	var _, err = manual.PeekTreatment("exp_app")
-	assertAny(nil, err, t)
+	var done = make(chan error, 1)
+	go func() {
+		var _, err = manual.PeekTreatment("exp_app")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		assertAny(nil, err, t)
+	case <-time.After(5 * time.Second):
+		t.Fatal("PeekTreatment after an Index_ edit did not return")
+	}
+	// The unlocked parse reads the text the locked evaluation reads, so each
+	// audience is parsed exactly once.
+	assertAny([]string{`{"filter":[{"value":true}]}`, `{"filter":[{"value":1}]}`}, counter.texts(), t)
+}
+
+// countingDeserializer records the audience texts it parses.
+type countingDeserializer struct {
+	mu     sync.Mutex
+	parsed []string
+}
+
+func (d *countingDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	d.mu.Lock()
+	d.parsed = append(d.parsed, string(b[offset:offset+length]))
+	d.mu.Unlock()
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+func (d *countingDeserializer) texts() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.parsed...)
+}
+
+// wrappingDeserializer is comparable by type but holds an interface whose
+// value may not be (a func adapter), so == on it panics.
+type wrappingDeserializer struct{ inner AudienceDeserializer }
+
+func (d wrappingDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	return d.inner.Deserialize(b, offset, length)
+}
+
+// nanDeserializer is comparable but never equal to itself.
+type nanDeserializer struct {
+	weight float64
+	inner  *countingDeserializer
+}
+
+func (d nanDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	return d.inner.Deserialize(b, offset, length)
+}
+
+// Deserializers whose values panic on == or never equal themselves are used
+// as in v1.1.1: no panic, no hang, and a strict audience is evaluated.
+func TestDeserializerComparisonNeverPanicsOrSpins(t *testing.T) {
+	var counter = &countingDeserializer{}
+	var adapter = funcDeserializer(counter.Deserialize)
+	for _, d := range []AudienceDeserializer{wrappingDeserializer{adapter}, nanDeserializer{math.NaN(), counter}} {
+		var ctx, _ = newSystemAttrContext("website", "production",
+			audienceExperiment("exp_app", `{"filter":[{"value":false}]}`, true),
+			audienceExperiment("exp_two", `{"filter":[{"value":true}]}`, true))
+		ctx.AudienceMatcher_ = AudienceMatcher{d}
+		var done = make(chan [2]int, 1)
+		go func() {
+			var first = treatmentPeek(t, ctx, "exp_app")
+			_ = ctx.SetAttribute("x", 1)
+			var second = treatmentPeek(t, ctx, "exp_two")
+			_ = ctx.SetAttribute("x", 2)
+			assertAny(0, treatmentPeek(t, ctx, "exp_app"), t)
+			done <- [2]int{first, second}
+		}()
+		select {
+		case got := <-done:
+			assertAny([2]int{0, 1}, got, t)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%T: reads did not return", d)
+		}
+		// Each audience is parsed once; the reads after SetAttribute reuse it.
+		assertAny(2, len(counter.texts()), t)
+		counter.mu.Lock()
+		counter.parsed = nil
+		counter.mu.Unlock()
+	}
+}
+
+// restlessDeserializer installs a new audience text on every parse.
+type restlessDeserializer struct {
+	ctx   *Context
+	calls int32
+}
+
+func (d *restlessDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	var n = atomic.AddInt32(&d.calls, 1)
+	d.ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+		audienceExperiment("exp_app", fmt.Sprintf(`{"filter":[{"value":true},{"value":%d}]}`, n), true)}})
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+// Data changing during every parse cannot keep a read retrying: after a few
+// attempts the audience counts as unparseable and, as an audience the
+// deserializer rejects in v1.1.1, is ignored.
+func TestAudienceRetryIsBounded(t *testing.T) {
+	var ctx, _ = newSystemAttrContext("website", "production",
+		audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true))
+	var d = &restlessDeserializer{ctx: ctx}
+	ctx.AudienceMatcher_ = AudienceMatcher{d}
+	var done = make(chan int, 1)
+	go func() { done <- treatmentPeek(t, ctx, "exp_app") }()
+	select {
+	case variant := <-done:
+		assertAny(1, variant, t)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the read kept retrying")
+	}
+	assertAny(int32(maxAudienceAttempts), atomic.LoadInt32(&d.calls), t)
 }
 
 // funcDeserializer is a func-typed adapter, whose values Go cannot hash or
@@ -1659,8 +1775,8 @@ func (panicDeserializer) Deserialize([]byte, int, int) (map[string]interface{}, 
 }
 
 // A deserializer panic is reported to the event logger and the audience is
-// treated as unparseable (a strict audience gives variant 0), instead of
-// crashing the read.
+// treated as unparseable (ignored, as an audience the deserializer rejects),
+// instead of crashing the read.
 func TestDeserializerPanicIsReportedAndTreatedAsUnparseable(t *testing.T) {
 	var logger = &MockEventLogger{}
 	var client = &systemAttrClient{application: "website", environment: "production"}

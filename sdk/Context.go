@@ -1783,11 +1783,13 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 
 // buildAssignment validates or rebuilds experimentName's assignment under the
 // write lock. When new data installed an audience that is not parsed yet, it
-// releases the lock, parses that text and tries again (a loop, so data
-// changing on every attempt cannot grow the stack).
+// releases the lock, parses that text and tries again. Only data installed
+// again during each parse makes it retry, and it gives up
+// after maxAudienceAttempts: the audience then counts as unparseable for
+// this evaluation.
 func (c *Context) buildAssignment(st *contextState, experimentName string) *cachedAssignment {
-	for {
-		var entry, unparsed = c.buildAssignmentLocked(st, experimentName)
+	for attempt := 1; ; attempt++ {
+		var entry, unparsed = c.buildAssignmentLocked(st, experimentName, attempt >= maxAudienceAttempts)
 		if unparsed == "" {
 			return entry
 		}
@@ -1795,9 +1797,12 @@ func (c *Context) buildAssignment(st *contextState, experimentName string) *cach
 	}
 }
 
+const maxAudienceAttempts = 4
+
 // buildAssignmentLocked returns the assignment, or the audience text that has
-// to be parsed (with no lock held) before it can be built.
-func (c *Context) buildAssignmentLocked(st *contextState, experimentName string) (*cachedAssignment, string) {
+// to be parsed (with no lock held) before it can be built. On the last
+// attempt a text not parsed yet counts as unparseable.
+func (c *Context) buildAssignmentLocked(st *contextState, experimentName string, last bool) (*cachedAssignment, string) {
 
 	// Cache miss, out of date, or revalidated. Check again under the write
 	// lock: another goroutine may have rebuilt the assignment meanwhile, and
@@ -1857,6 +1862,9 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string)
 				var attrs = c.evaluationAttributesWithState(st)
 
 				var parsed, ok = c.cachedAudience(st, experiment.Data.Audience)
+				if !ok && last {
+					parsed, ok = parsedAudience{text: experiment.Data.Audience, err: errors.New("can't evaluate data")}, true
+				}
 				if !ok {
 					// The data changed between the unlocked parse and this
 					// lock: parse the new audience unlocked and start over.
@@ -1970,11 +1978,13 @@ type audienceEntry struct {
 	parsed       parsedAudience
 }
 
-// sameDeserializer reports whether a cached parse was made by d. A
-// deserializer whose type is not comparable (a func, or a struct holding a
-// map) cannot be compared without panicking, so any value of the same type
-// counts as the same deserializer.
-func sameDeserializer(a, b AudienceDeserializer) bool {
+// sameDeserializer reports whether a cached parse was made by b. Values of a
+// type Go cannot compare (a func, a struct holding a map) or that compare
+// unequal to themselves (a struct holding a NaN, an interface field holding
+// a func) cannot be told apart, so for those any value of the same type
+// counts as the same deserializer. It never panics: it runs under
+// ContextLock_.
+func sameDeserializer(a, b AudienceDeserializer) (same bool) {
 	var ta, tb = reflect.TypeOf(a), reflect.TypeOf(b)
 	if ta != tb {
 		return false
@@ -1982,7 +1992,12 @@ func sameDeserializer(a, b AudienceDeserializer) bool {
 	if ta == nil || !ta.Comparable() {
 		return true
 	}
-	return a == b
+	defer func() {
+		if recover() != nil {
+			same = true
+		}
+	}()
+	return a == b || b != b
 }
 
 // parseAudienceUnlocked returns the parsed audience for text, running the
