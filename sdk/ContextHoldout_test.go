@@ -3340,8 +3340,7 @@ func TestHoldout_VariableEligibilityIsJudgedByTheInstalledDefinition(t *testing.
 		{`{"v":"x"}`, `{"w":"y"}`, false},
 		{`{"w":"y"}`, `{"v":"x"}`, true},
 	} {
-		var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, version(1, c.resolved)))
-		h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, version(2, c.later)))
+		var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, version(2, c.later)))
 		if got := hoInstalledDefines(h.ctx, "a", "v"); got != c.eligible {
 			t.Errorf("resolved %s, later %s: eligible %v, want %v", c.resolved, c.later, got, c.eligible)
 		}
@@ -3362,9 +3361,12 @@ func hoKeyed(ctx *Context) bool {
 func hoInstalledDefines(ctx *Context, name string, key string) bool {
 	ctx.ContextLock_.RLock()
 	defer ctx.ContextLock_.RUnlock()
-	var exposed = &atomic.Value{}
-	exposed.Store(false)
-	return ctx.variableEligible(name, key)(&cachedAssignment{assignment: &Assignment{Variables: map[string]interface{}{}, Exposed: exposed}})
+	var entry = &cachedAssignment{assignment: &Assignment{Variables: map[string]interface{}{}}}
+	if indexed := ctx.indexedExperiment(name); indexed != nil {
+		entry.resolvedId = indexed.experiment.Data.Id
+		entry.resolvedIteration = indexed.experiment.Data.Iteration
+	}
+	return ctx.variableEligible(name, key)(entry)
 }
 
 // A variable read whose assignment is replaced, before its claim, by a
@@ -3797,7 +3799,6 @@ func TestHoldout_RefreshRightBeforeTheClaimIsChecked(t *testing.T) {
 		beforeSettleClaim = func() {
 			claims++
 			if retry && claims == 1 {
-				// A new iteration that keeps the key retires the entry.
 				h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, kept, f))
 				h.ctx.GetAssignment("e")
 			} else if claims == 1 || (retry && claims == 2) {
@@ -3993,4 +3994,52 @@ func TestHoldout_CheckAndClaimAreOneCriticalSection(t *testing.T) {
 		t.Fatal("the read never reached the claim")
 	}
 	<-done
+}
+
+// Restoring a key in a newer iteration cannot authorize a new claim for the
+// intermediate iteration that did not define it, even without a replacement
+// lookup between the final install and the claim.
+func TestHoldout_RestoredKeyDoesNotAuthorizeAnIntermediateIteration(t *testing.T) {
+	for _, override := range []bool{false, true} {
+		var first = hoWithVariables(hoExperiment(2, "b", hoUnitType, 0, 11), "v")
+		var middle = hoWithVariables(hoExperiment(2, "b", hoUnitType, 0, 11), "w")
+		middle.Iteration = 2
+		var last = hoWithVariables(hoExperiment(2, "b", hoUnitType, 0, 11), "v")
+		last.Iteration = 3
+		var intermediate = hoHoldoutA()
+		intermediate.Iteration = 2
+		intermediate.Name = "intermediate_holdout"
+		var restored = hoHoldoutA()
+		restored.Iteration = 3
+		restored.Name = "restored_holdout"
+		var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, first))
+		if override {
+			if err := h.ctx.SetOverride("b", 0); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var armed = true
+		afterReadResolve = func() {
+			if armed {
+				armed = false
+				h.ctx.SetData(hoData([]jsonmodels.Holdout{intermediate}, middle))
+				h.ctx.GetAssignment("b")
+			}
+		}
+		var claims = 0
+		beforeSettleClaim = func() {
+			claims++
+			if claims == 2 {
+				h.ctx.SetData(hoData([]jsonmodels.Holdout{restored}, last))
+			}
+		}
+		h.variable("v")
+		afterReadResolve, beforeSettleClaim = nil, nil
+		if armed || claims < 2 {
+			t.Fatal("the intermediate decision was not retried")
+		}
+		if exposures := queuedExposures(h.ctx); len(exposures) != 0 {
+			t.Fatalf("override=%v: wrong iteration exposed: %+v", override, exposures)
+		}
+	}
 }
