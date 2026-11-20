@@ -166,15 +166,29 @@ type Context struct {
 type contextIndex struct {
 	experiments map[string]*indexedExperiment
 	holdouts    map[int]*jsonmodels.Holdout
+	// keyed is set once any install had holdouts or assignment rules: from
+	// then on every install builds its variable key set, since an entry
+	// resolved under them may be retired by any later replacement.
+	keyed bool
 }
 
 // indexedExperiment is an installed experiment with its parsed assignment
 // rules (nil when it has none) and the holdouts covering it, sorted and
 // unique by id (nil when none), so a read finds them with one lookup.
+// variableKeySet holds, for one installed payload, every variable key each
+// experiment defines in some variant.
+type variableKeySet map[variableKeyOf]struct{}
+
+type variableKeyOf struct {
+	experiment string
+	key        string
+}
+
 type indexedExperiment struct {
-	experiment ExperimentVariables
-	rules      *experimentRules
-	holdouts   []*jsonmodels.Holdout
+	variableKeys variableKeySet
+	experiment   ExperimentVariables
+	rules        *experimentRules
+	holdouts     []*jsonmodels.Holdout
 	// switchback is set for a switchback experiment only. Holdouts never
 	// cover one.
 	switchback *switchbackDefinition
@@ -235,6 +249,9 @@ type cachedAssignment struct {
 	holdouts *assignmentHoldouts
 	// retirement is shared by entries that carry the same Exposed identity.
 	retirement *atomic.Bool
+	// variableKeys is the install's (experiment, key) set, which a variable
+	// retry checks instead of retaining the definition and its values.
+	variableKeys variableKeySet
 	// switchback is set for a switchback experiment's slot, nil otherwise.
 	// Never modified once the entry is installed.
 	switchback *switchbackSlot
@@ -784,10 +801,8 @@ func (c *Context) evictAssignmentsMissingUnit(unitType string) {
 		}
 		// Retired before the exposed flag is set, as a replacement does,
 		// so a read whose claim loses to this eviction always sees the
-		// retirement and resolves again with the unit. Both under
-		// EventLock_, so an admission commits before or sees it. An exposed
-		// assignment is kept, and stays unretired.
-		c.EventLock_.Lock()
+		// retirement and resolves again with the unit. An exposed or
+		// claimed assignment is kept, and stays unretired.
 		var evict = !assignment.Exposed.Load().(bool)
 		if evict {
 			entry.retirement.Store(true)
@@ -804,7 +819,6 @@ func (c *Context) evictAssignmentsMissingUnit(unitType string) {
 				entry.retirement.Store(false)
 			}
 		}
-		c.EventLock_.Unlock()
 		if evict {
 			delete(c.assignmentCache_, name)
 			delete(c.AssignmentCache, name)
@@ -967,33 +981,38 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 	}
 	var at = clockReading{clock: c.Clock_}
 	var entry = c.getAssignmentAt(experimentName, &at)
-	if !entry.assignment.Exposed.Load().(bool) {
-		entry = c.settleExposureAt(experimentName, entry, &at)
+	if afterReadResolve != nil {
+		afterReadResolve()
+	}
+	if entry.needsSettling() {
+		entry = c.settleExposureAt(experimentName, entry, nil, &at)
 	}
 	return entry.assignment.Variant, nil
 }
 
 // maxExposureAttempts bounds how many assignments a read tries to expose when
-// each is retired by a concurrent replacement before its admission commits, as
+// each is retired by a concurrent replacement before the read claims it, as
 // in the Java SDK.
 const maxExposureAttempts = 3
 
-// settleExposure exposes entry on a read. If a replacement retired the claimed
-// assignment before the admission committed, nothing of it was published, so
-// the current assignment is resolved again and exposed instead, up to
+// settleExposure exposes entry on a read. If a replacement or an eviction
+// retired the assignment before the read claimed it, nothing of it was
+// published, so the current assignment is resolved again and exposed instead, up to
 // maxExposureAttempts times. It returns the entry the read must serve: the
 // replacement that was exposed, or on exhaustion the last one tried. It holds
 // no lock itself, so loggers run after admit released its locks.
-func (c *Context) settleExposure(experimentName string, entry *cachedAssignment) *cachedAssignment {
+func (c *Context) settleExposure(experimentName string, entry *cachedAssignment,
+	candidate func(*cachedAssignment) bool) *cachedAssignment {
 	var at = clockReading{clock: c.Clock_}
-	return c.settleExposureAt(experimentName, entry, &at)
+	return c.settleExposureAt(experimentName, entry, candidate, &at)
 }
 
 // settleExposureAt is settleExposure for an entry resolved at the clock
 // reading at, which stamps a switchback exposure. Each retry after a
 // retirement resolves at a fresh reading and exposes at it, as in the Java
 // SDK.
-func (c *Context) settleExposureAt(experimentName string, entry *cachedAssignment, at *clockReading) *cachedAssignment {
+func (c *Context) settleExposureAt(experimentName string, entry *cachedAssignment,
+	candidate func(*cachedAssignment) bool, at *clockReading) *cachedAssignment {
 	for attempt := 1; ; attempt++ {
 		if beforeSettleClaim != nil {
 			beforeSettleClaim()
@@ -1003,17 +1022,50 @@ func (c *Context) settleExposureAt(experimentName string, entry *cachedAssignmen
 		}
 		at = &clockReading{clock: c.Clock_}
 		entry = c.getAssignmentAt(experimentName, at)
+		if candidate != nil && !candidate(entry) {
+			return entry
+		}
+	}
+}
+
+// needsSettling reports whether an exposing read must settle the entry's
+// exposure: it is not exposed yet, or it was retired (marked exposed by a
+// replacement or an eviction without being recorded). A warmed, exposed,
+// unretired read skips settling, as before holdouts.
+func (e *cachedAssignment) needsSettling() bool {
+	return !e.assignment.Exposed.Load().(bool) || e.retirement.Load()
+}
+
+// definesVariable is the variable read's candidate check: a replacement is
+// exposed by the read only if it has variables (its experiment was not
+// removed) and the experiment definition it was resolved from defines key in
+// some variant. The entry's own definition is checked, never newer data, so
+// a later refresh cannot reject an entry that defines key or accept one
+// that does not.
+func definesVariable(key string) func(*cachedAssignment) bool {
+	return func(e *cachedAssignment) bool {
+		if e.assignment.Variables == nil {
+			return false
+		}
+		if e.variableKeys == nil {
+			// The context never had holdouts or rules, so nothing was retired.
+			return true
+		}
+		_, defined := e.variableKeys[variableKeyOf{experiment: e.assignment.Name, key: key}]
+		return defined
 	}
 }
 
 // afterEvictionClaim, when set by a test, runs right after an eviction marks
-// an entry exposed, with EventLock_ held; beforeEvictionClaim runs between
-// its retirement store and that claim. afterReplacementClaim runs right after
-// a replacement marks the replaced entry exposed.
+// an entry exposed; beforeEvictionClaim runs between
+// its retirement store and that claim. beforeReplacementClaim and
+// afterReplacementClaim do the same for a replacement.
 var (
-	afterEvictionClaim    func(*cachedAssignment)
-	beforeEvictionClaim   func(*cachedAssignment)
-	afterReplacementClaim func(*cachedAssignment)
+	afterReadResolve       func()
+	afterEvictionClaim     func(*cachedAssignment)
+	beforeEvictionClaim    func(*cachedAssignment)
+	beforeReplacementClaim func(*cachedAssignment)
+	afterReplacementClaim  func(*cachedAssignment)
 )
 
 // beforeSettleClaim, when set by a test, runs before each claim in
@@ -1075,9 +1127,9 @@ const (
 	exposureQueued exposureStatus = iota
 	// exposureRejected: a close rejected it.
 	exposureRejected
-	// exposureRetired: a replacement retired the claimed assignment before the
-	// admission committed, so nothing of it was published and the claim stays
-	// consumed.
+	// exposureRetired: the claim failed because a replacement or an eviction
+	// retired the assignment and marked it exposed; nothing of it was
+	// published, so the read must resolve again.
 	exposureRetired
 )
 
@@ -1102,7 +1154,7 @@ func (c *Context) queueExposureAt(assignment *Assignment, entry *cachedAssignmen
 }
 
 // admitExposure queues a claimed decision or rolls it back after a rejected
-// close. The retained entry carries retirement even across later replacements.
+// close. The entry supplies the pinned holdouts and its retirement.
 func (c *Context) admitExposure(assignment *Assignment, entry *cachedAssignment) exposureStatus {
 	return c.admitExposureAt(assignment, entry, nil)
 }
@@ -1113,11 +1165,7 @@ func (c *Context) admitExposureAt(assignment *Assignment, entry *cachedAssignmen
 	if entry != nil {
 		holdouts, slot = entry.holdouts, entry.switchback
 	}
-	var retirement *atomic.Bool
-	if entry != nil {
-		retirement = entry.retirement
-	}
-	var status = c.admit(assignment, holdouts, retirement, slot, at)
+	var status = c.admit(assignment, holdouts, slot, at)
 	if status == exposureRejected {
 		c.ContextLock_.Lock()
 		c.reopenExposure(assignment, entry)
@@ -1126,21 +1174,23 @@ func (c *Context) admitExposureAt(assignment *Assignment, entry *cachedAssignmen
 	return status
 }
 
-// admit queues the claimed exposures. It reports exposureRejected when a close
-// rejected them, and exposureRetired for a claim whose assignment a
-// replacement retired before the admission took EventLock_: that publishes
-// nothing and stays exposed (consumed), so a superseded decision never appears
-// beside its replacement's.
+// admit queues the claimed exposures, and reports exposureRejected when a
+// close rejected them. A claim always commits, even if a replacement retired
+// its assignment meanwhile, as in the Java SDK: another read may already be
+// serving that decision because the claim marked it exposed.
 //
 // slot and at are the switchback slot (nil for a unit experiment) and the
 // reading that resolved it: a silent switchback resolution publishes
 // nothing, and a switchback exposure carries the reading of its period.
-func (c *Context) admit(assignment *Assignment, holdouts *assignmentHoldouts, retirement *atomic.Bool, slot *switchbackSlot, at *clockReading) exposureStatus {
+func (c *Context) admit(assignment *Assignment, holdouts *assignmentHoldouts, slot *switchbackSlot, at *clockReading) exposureStatus {
 	if holdouts == nil {
 		if slot.isSilent() {
 			return exposureQueued
 		}
-		return c.enqueueRetirable(assignment, retirement, c.exposedAt(slot, at))
+		if !c.enqueueExposure(assignment, c.exposedAt(slot, at)) {
+			return exposureRejected
+		}
+		return exposureQueued
 	}
 
 	var exposedAt = c.Clock_.Millis()
@@ -1151,10 +1201,6 @@ func (c *Context) admit(assignment *Assignment, holdouts *assignmentHoldouts, re
 	if c.CheckNotClosed() != nil {
 		c.EventLock_.Unlock()
 		return exposureRejected
-	}
-	if retirement != nil && retirement.Load() {
-		c.EventLock_.Unlock()
-		return exposureRetired
 	}
 	var exposures []jsonmodels.Exposure
 	if !holdouts.isSuppressed() {
@@ -1177,8 +1223,9 @@ func (c *Context) admit(assignment *Assignment, holdouts *assignmentHoldouts, re
 	return exposureQueued
 }
 
-// reopenExposure rolls back a rejected admission unless its exact identity
-// was retired by a covered replacement. A decision resolved without its unit
+// reopenExposure rolls back a rejected admission unless a replacement retired
+// its assignment meanwhile: the replacement, not the superseded decision, is
+// exposed by the next read. A decision resolved without its unit
 // is resolved again instead if the unit arrived meanwhile. The caller holds
 // ContextLock_ for writing.
 func (c *Context) reopenExposure(assignment *Assignment, claimed *cachedAssignment) {
@@ -1238,13 +1285,6 @@ func (c *Context) exposedAt(slot *switchbackSlot, at *clockReading) int64 {
 // exposed. When the context is closed it reports false, and the caller
 // clears the mark so a later read can retry.
 func (c *Context) enqueueExposure(assignment *Assignment, exposedAt int64) bool {
-	return c.enqueueRetirable(assignment, nil, exposedAt) != exposureRejected
-}
-
-// enqueueRetirable is enqueueExposure for a claim that a replacement may
-// retire: if it was retired before the append, it publishes nothing and
-// reports exposureRetired (the claim is consumed).
-func (c *Context) enqueueRetirable(assignment *Assignment, retirement *atomic.Bool, exposedAt int64) exposureStatus {
 	var exposure = jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
 		Variant: assignment.Variant, ExposedAt: exposedAt, Assigned: assignment.Assigned,
 		Eligible: assignment.Eligible, Overridden: assignment.Overridden, FullOn: assignment.FullOn,
@@ -1256,11 +1296,7 @@ func (c *Context) enqueueRetirable(assignment *Assignment, retirement *atomic.Bo
 	// or rejected after it, never stranded behind it.
 	if c.CheckNotClosed() != nil {
 		c.EventLock_.Unlock()
-		return exposureRejected
-	}
-	if retirement != nil && retirement.Load() {
-		c.EventLock_.Unlock()
-		return exposureRetired
+		return false
 	}
 	c.PendingCount_.Store(c.PendingCount_.Load().(int32) + 1)
 	c.Exposures_ = append(c.Exposures_, exposure)
@@ -1269,7 +1305,7 @@ func (c *Context) enqueueRetirable(assignment *Assignment, retirement *atomic.Bo
 	c.LogEvent(Exposure, exposure)
 
 	c.SetTimeout()
-	return exposureQueued
+	return true
 }
 
 func (c *Context) PeekTreatment(experimentName string) (int, error) {
@@ -1450,12 +1486,15 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 			continue
 		}
 
-		if expose && !assignment.Exposed.Load().(bool) {
-			// A claim retired before it committed is exposed again on the
-			// replacement, whose variables are the ones served.
-			entry = c.settleExposureAt(experiment.Data.Name, entry, &at)
+		if expose && afterReadResolve != nil {
+			afterReadResolve()
+		}
+		if expose && entry.needsSettling() {
+			// A replacement that no longer defines key is not exposed.
+			var candidate = definesVariable(key)
+			entry = c.settleExposureAt(experiment.Data.Name, entry, candidate, &at)
 			assignment = entry.assignment
-			if assignment.Variables == nil {
+			if !candidate(entry) {
 				continue
 			}
 		}
@@ -2078,6 +2117,9 @@ func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cach
 	assignment.Name = experimentName
 	assignment.Eligible = true
 	var entry = &cachedAssignment{assignment: assignment, rules: rules, attrsSeq: atomic.LoadInt32(&c.AttrsSeq_), retirement: &atomic.Bool{}}
+	if indexed != nil {
+		entry.variableKeys = indexed.variableKeys
+	}
 
 	// Resolved for overrides and rule wins too: the holdouts' exposures fire
 	// whatever chose the variant.
@@ -2183,13 +2225,15 @@ func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cach
 	}
 	if previous != nil && (previous.holdouts != nil || entry.holdouts != nil) && previous.assignment.Exposed != assignment.Exposed {
 		// Retire the replaced assignment, as eviction does: a caller still
-		// holding it must not publish a decision, or holdout arms, that the
-		// replacement has superseded, also when its admission is in flight.
-		// Under EventLock_, so an admission either commits before this or
-		// sees the retirement (lock order ContextLock_, EventLock_).
-		c.EventLock_.Lock()
+		// holding it must not claim a decision, or holdout arms, that the
+		// replacement has superseded. Retired before it is marked exposed,
+		// so a claim losing to this, or a read finding it exposed, sees the
+		// retirement and resolves again. A claim already taken still
+		// commits: the decision is served by the read that claimed it.
 		previous.retirement.Store(true)
-		c.EventLock_.Unlock()
+		if beforeReplacementClaim != nil {
+			beforeReplacementClaim(previous)
+		}
 		previous.assignment.Exposed.CompareAndSwap(false, true)
 		if afterReplacementClaim != nil {
 			afterReplacementClaim(previous)
@@ -2446,25 +2490,29 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		// depends on the entries' order; duplicates that draw the same arm
 		// count as one (the first one's name is published). The collector
 		// never sends duplicates.
-		var conflicting map[int]bool
+		// A conflicting id is kept as a nil sentinel until the end, so a later
+		// duplicate can never reinstate it.
+		var conflicts = false
 		for i := range installed {
 			if len(installed[i].Split) == 0 {
 				continue
 			}
 			installed[i].Split = append([]float64(nil), installed[i].Split...)
 			if seen, found := holdoutsById[installed[i].Id]; found {
-				if !sameHoldoutDraw(seen, &installed[i]) {
-					if conflicting == nil {
-						conflicting = map[int]bool{}
-					}
-					conflicting[installed[i].Id] = true
+				if seen != nil && !sameHoldoutDraw(seen, &installed[i]) {
+					holdoutsById[installed[i].Id] = nil
+					conflicts = true
 				}
 				continue
 			}
 			holdoutsById[installed[i].Id] = &installed[i]
 		}
-		for id := range conflicting {
-			delete(holdoutsById, id)
+		if conflicts {
+			for id, holdout := range holdoutsById {
+				if holdout == nil {
+					delete(holdoutsById, id)
+				}
+			}
 		}
 	}
 	var coverage map[string][]*jsonmodels.Holdout
@@ -2590,8 +2638,28 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 
 	c.Index_ = index
 	var indexed = make(map[string]*indexedExperiment, len(index))
+	// One set of (experiment, key) pairs per install: cached entries keep it
+	// rather than the definitions, so they never retain variant values. Only
+	// a holdout or a SetUnit eviction of a split rule retires an assignment,
+	// so the set is built only once the context has seen holdouts or
+	// assignment rules; payloads with neither cost nothing more.
+	var keys variableKeySet
+	// The index installed now, under the lock: an install that finished
+	// while this one was parsing must not lose its gate.
+	if current := c.index_.Load(); len(holdoutsById) > 0 || len(rules) > 0 || (current != nil && current.keyed) {
+		keys = variableKeySet{}
+	}
 	for name, experiment := range index {
-		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name], holdouts: coverage[name],
+		if keys != nil {
+			for _, variables := range experiment.Variables {
+				for key := range variables {
+					if _, found := keys[variableKeyOf{experiment: name, key: key}]; !found {
+						keys[variableKeyOf{experiment: name, key: strings.Clone(key)}] = struct{}{}
+					}
+				}
+			}
+		}
+		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name], holdouts: coverage[name], variableKeys: keys,
 			switchback: switchbacks[name]}
 	}
 	if switchbacks != nil {
@@ -2599,7 +2667,7 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		// replaces, whatever other setData ran meanwhile.
 		c.assignSwitchbackGenerations(c.index_.Load(), indexed)
 	}
-	c.index_.Store(&contextIndex{experiments: indexed, holdouts: holdoutsById})
+	c.index_.Store(&contextIndex{experiments: indexed, holdouts: holdoutsById, keyed: keys != nil})
 	c.ContextCustomFields_ = contextCustomFields
 	c.customFieldErrors_ = customFieldErrors
 	c.indexVariables_ = indexVariables
@@ -2703,7 +2771,11 @@ func (c *Context) SetDataFailed(err error) {
 	defer c.ContextLock_.Unlock()
 	c.DataLock.Lock()
 	c.Index_ = map[string]ExperimentVariables{}
-	c.index_.Store(&contextIndex{})
+	var keyed = false
+	if previous := c.index_.Load(); previous != nil {
+		keyed = previous.keyed
+	}
+	c.index_.Store(&contextIndex{keyed: keyed})
 	c.indexVariables_ = map[string][]ExperimentVariables{}
 	c.IndexVariables_ = map[interface{}]interface{}{}
 	c.customFieldErrors_ = nil

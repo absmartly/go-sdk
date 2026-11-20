@@ -1975,7 +1975,7 @@ func TestSwitchback_SetUnitBeforeTheClaimExposesTheReplacement(t *testing.T) {
 }
 
 // A covered decision replaced by a switchback is retired before it is
-// claimed: a claim replayed right after the replacement's reports retired.
+// marked exposed: a claim losing to the replacement reports retired.
 func TestSwitchback_ReplacementAcrossRandomizationRetiresBeforeTheClaim(t *testing.T) {
 	var holdout = jsonmodels.Holdout{Id: 11, Name: "holdout_a", UnitType: sbUnitType, Iteration: 1, SeedHi: 13, SeedLo: 111,
 		Split: []float64{0, 1}}
@@ -1990,9 +1990,9 @@ func TestSwitchback_ReplacementAcrossRandomizationRetiresBeforeTheClaim(t *testi
 	var entry = h.ctx.getAssignment("exp_sb")
 	var status = exposureQueued
 	var ran = false
-	// The read claims between the retirement and the replacement's claim: it
+	// The read's claim is replayed right after the replacement's claim: it
 	// must see the retirement.
-	beforeSwitchbackRetireClaim = func(replaced *cachedAssignment) {
+	afterSwitchbackRetireClaim = func(replaced *cachedAssignment) {
 		if replaced == entry {
 			ran = true
 			status = h.ctx.queueExposure(entry.assignment, entry)
@@ -2000,21 +2000,21 @@ func TestSwitchback_ReplacementAcrossRandomizationRetiresBeforeTheClaim(t *testi
 	}
 	h.refreshData(switchback)
 	h.ctx.GetAssignment("exp_sb")
-	beforeSwitchbackRetireClaim = nil
+	afterSwitchbackRetireClaim = nil
 	if !ran || status != exposureRetired {
 		t.Fatalf("hook ran %v, status %v; want a retired claim", ran, status)
 	}
 }
 
 // A slot that ages out of the retired window is retired before it is
-// claimed: a claim replayed right after reports retired.
+// marked exposed: a claim losing to the expiry reports retired.
 func TestSwitchback_ExpiredSlotRetiresBeforeTheClaim(t *testing.T) {
 	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
 	h.at(sbAnchor + 5)
 	var entry = h.ctx.getAssignment("exp_sb")
 	var status = exposureQueued
 	var ran = false
-	beforeSwitchbackRetireClaim = func(expired *cachedAssignment) {
+	afterSwitchbackRetireClaim = func(expired *cachedAssignment) {
 		if expired == entry {
 			ran = true
 			status = h.ctx.queueExposure(entry.assignment, entry)
@@ -2023,7 +2023,7 @@ func TestSwitchback_ExpiredSlotRetiresBeforeTheClaim(t *testing.T) {
 	for i := int64(1); i < 20 && !ran; i++ {
 		h.at(sbAnchor + i*sbHour).ctx.GetAssignment("exp_sb")
 	}
-	beforeSwitchbackRetireClaim = nil
+	afterSwitchbackRetireClaim = nil
 	if !ran || status != exposureRetired {
 		t.Fatalf("hook ran %v, status %v; want a retired claim", ran, status)
 	}
