@@ -968,29 +968,38 @@ func (c *Context) queueEligibleExposure(entry *cachedAssignment, eligible func(*
 	}
 	c = c.live()
 	c.ContextLock_.RLock()
+	var status = claimEligible(entry, eligible)
+	c.ContextLock_.RUnlock()
+	if status != exposureClaimed {
+		return status
+	}
+	return c.admitExposure(entry.assignment, entry)
+}
+
+// claimEligible checks eligibility and claims the exposure in one step; the
+// caller holds ContextLock_ across the whole call, so no refresh can land
+// between the check and the claim. A claim already taken is honoured.
+func claimEligible(entry *cachedAssignment, eligible func(*cachedAssignment) bool) exposureStatus {
 	if beforeEligibleClaim != nil {
 		beforeEligibleClaim()
 	}
 	if entry.assignment.Exposed.Load().(bool) && !entry.retirement.Load() {
-		c.ContextLock_.RUnlock()
 		return exposureQueued
 	}
 	if !eligible(entry) {
-		c.ContextLock_.RUnlock()
 		return exposureIneligible
 	}
-	if immediatelyBeforeEligibleCAS != nil {
-		immediatelyBeforeEligibleCAS()
-	}
 	var claimed = entry.assignment.Exposed.CompareAndSwap(false, true)
-	c.ContextLock_.RUnlock()
-	if !claimed {
-		if entry.retirement.Load() {
-			return exposureRetired
-		}
-		return exposureQueued
+	if afterEligibleCAS != nil {
+		afterEligibleCAS()
 	}
-	return c.admitExposure(entry.assignment, entry)
+	if claimed {
+		return exposureClaimed
+	}
+	if entry.retirement.Load() {
+		return exposureRetired
+	}
+	return exposureQueued
 }
 
 // needsSettling reports whether an exposing read must settle the entry's
@@ -1038,12 +1047,12 @@ var (
 
 // beforeSettleClaim, when set by a test, runs before each claim in
 // settleExposure, between resolving the assignment and claiming its exposure.
-// beforeEligibleClaim runs inside a read's eligibility check, under
-// ContextLock_, before the check.
+// beforeEligibleClaim and afterEligibleCAS run in claimEligible, under
+// ContextLock_, before the eligibility check and right after the claim.
 var (
-	immediatelyBeforeEligibleCAS func()
-	beforeSettleClaim            func()
-	beforeEligibleClaim          func()
+	afterEligibleCAS    func()
+	beforeSettleClaim   func()
+	beforeEligibleClaim func()
 )
 
 // QueueExposure queues the assignment's exposure once, then the exposures of
@@ -1079,6 +1088,8 @@ const (
 	// exposureIneligible: the read's eligibility check failed, so nothing was
 	// claimed.
 	exposureIneligible
+	// exposureClaimed: claimEligible took the claim; the caller admits it.
+	exposureClaimed
 	// exposureRetired: the claim failed because a replacement or an eviction
 	// retired the assignment and marked it exposed; nothing of it was
 	// published, so the read must resolve again.

@@ -3894,17 +3894,19 @@ func TestHoldout_TakenClaimIsHonouredAfterTheKeyIsDropped(t *testing.T) {
 	}
 }
 
+// The claim's compare-and-swap runs under ContextLock_ too: right after it
+// no refresh can take the lock, so none can land between check and claim.
 func TestHoldout_EligibilityClaimCASStaysUnderTheContextLock(t *testing.T) {
 	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")))
 	var ran = false
-	immediatelyBeforeEligibleCAS = func() {
+	afterEligibleCAS = func() {
 		ran = true
 		if h.ctx.ContextLock_.TryLock() {
 			h.ctx.ContextLock_.Unlock()
 			t.Error("the claim is outside the context lock")
 		}
 	}
-	defer func() { immediatelyBeforeEligibleCAS = nil }()
+	defer func() { afterEligibleCAS = nil }()
 	h.variable("v")
 	if !ran {
 		t.Fatal("the CAS hook did not run")
