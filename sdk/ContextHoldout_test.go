@@ -3989,5 +3989,8 @@ func TestHoldout_CheckAndClaimAreOneCriticalSection(t *testing.T) {
 	}
 	defer func() { beforeEligibleClaim, afterEligibleCAS = nil, nil }()
 	h.variable("v")
+	if armed {
+		t.Fatal("the read never reached the claim")
+	}
 	<-done
 }
