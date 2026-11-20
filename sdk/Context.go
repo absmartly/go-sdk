@@ -1804,6 +1804,12 @@ func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignmen
 	if ofound {
 		// A removed experiment keeps its override, as in the JS SDK
 		// (experiment == null || holdoutSetMatches).
+		// A still-unclaimed override needs current variables and resolved
+		// identity before a variable read can claim it in the new epoch.
+		if efound && !assignment.Exposed.Load().(bool) &&
+			(entry.resolvedId != experiment.Data.Id || entry.resolvedIteration != experiment.Data.Iteration) {
+			return entry, rules, assignmentStale
+		}
 		if assignment.Overridden && assignment.Variant == override.(int) && (!efound ||
 			holdoutSetMatches(holdouts, entry.holdouts) && (entry.holdouts == nil || entry.holdouts.unitType == experiment.Data.UnitType)) {
 			return entry, rules, assignmentValid

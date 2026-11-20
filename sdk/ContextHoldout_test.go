@@ -4043,3 +4043,66 @@ func TestHoldout_RestoredKeyDoesNotAuthorizeAnIntermediateIteration(t *testing.T
 		}
 	}
 }
+
+func TestHoldout_UnclaimedOverrideRefreshResolvesCurrentIdentity(t *testing.T) {
+	for _, changeID := range []bool{false, true} {
+		var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")
+		var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
+		if err := h.ctx.SetOverride("e", 0); err != nil {
+			t.Fatal(err)
+		}
+		h.ctx.PeekVariableValue("v", "default")
+		var fresh = e
+		if changeID {
+			fresh.Id++
+		} else {
+			fresh.Iteration++
+		}
+		fresh.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"v":"refreshed"}`}, {Name: "B", Config: `{"v":"other"}`}}
+		h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, fresh))
+		for i := 0; i < 3; i++ {
+			expectValue(t, "refreshed", h.variable("v"))
+		}
+		var exposures = queuedExposures(h.ctx)
+		if len(exposures) != 2 || exposures[0].Id != fresh.Id || !exposures[0].Overridden || exposures[1].Id != 11 {
+			t.Fatalf("idChange=%v: exposures %+v", changeID, exposures)
+		}
+	}
+}
+
+func TestHoldout_IdentityChangeAtVariableClaimIsRejected(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
+	h.peek("e")
+	var armed = true
+	beforeSettleClaim = func() {
+		if armed {
+			armed = false
+			e.Id++
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
+		}
+	}
+	defer func() { beforeSettleClaim = nil }()
+	expectValue(t, "default", h.variable("v"))
+	if armed {
+		t.Fatal("the claim hook did not run")
+	}
+	if exposures := queuedExposures(h.ctx); len(exposures) != 0 {
+		t.Fatalf("old identity exposed: %+v", exposures)
+	}
+}
+
+func TestHoldout_FreshOverrideVariableClaimHasResolvedIdentity(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")))
+	if err := h.ctx.SetOverride("e", 0); err != nil {
+		t.Fatal(err)
+	}
+	expectValue(t, "control", h.variable("v"))
+	if got := h.ctx.GetAssignment("e").Iteration; got != 0 {
+		t.Fatalf("public override iteration %d, want 0", got)
+	}
+	var exposures = queuedExposures(h.ctx)
+	if len(exposures) != 2 || exposures[0].Id != 1 || !exposures[0].Overridden || exposures[0].Variant != 0 || exposures[1].Id != 11 {
+		t.Fatalf("override exposures %+v", exposures)
+	}
+}
