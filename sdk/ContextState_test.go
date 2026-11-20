@@ -1805,6 +1805,41 @@ func TestLiteralIndexEditsArePickedUp(t *testing.T) {
 	assertAny(0, treatmentPeek(t, manual, "ruled"), t)
 }
 
+// An edited audience in a literal's Index_ entry is evaluated at the next
+// rebuild.
+func TestLiteralAudienceEditIsEvaluated(t *testing.T) {
+	var manual = audienceLiteral(audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true))
+	assertAny(1, treatmentPeek(t, manual, "exp_app"), t)
+	// Change only the audience text, keeping every other field and slice.
+	var entry = manual.Index_["exp_app"]
+	entry.Data.Audience = `{"filter":[{"value":false}]}`
+	manual.Index_["exp_app"] = entry
+	assertAny(nil, manual.SetAttribute("x", 1), t)
+	assertAny(0, treatmentPeek(t, manual, "exp_app"), t)
+}
+
+// Literal reads racing SetDataFailed are race-free (run with -race).
+func TestLiteralReadsRacingSetDataFailed(t *testing.T) {
+	var manual = audienceLiteral(audienceExperiment("exp_app", "", false))
+	var stop int32
+	var wg sync.WaitGroup
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for atomic.LoadInt32(&stop) == 0 {
+				var _, _ = manual.PeekTreatment("exp_app")
+			}
+		}()
+	}
+	runtime.Gosched()
+	manual.SetDataFailed(errors.New("load failed"))
+	atomic.StoreInt32(&stop, 1)
+	wg.Wait()
+	var _, _, found = manual.state().experimentAndRules("exp_app")
+	assertAny(false, found, t)
+}
+
 // A literal read racing a SetData that changes the rules never leaves the
 // private index with the new data but without its rules.
 func TestLiteralSyncDoesNotOverwriteConcurrentSetData(t *testing.T) {
