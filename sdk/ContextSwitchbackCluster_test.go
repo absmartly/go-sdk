@@ -659,3 +659,16 @@ func TestSwitchbackCluster_PointerTextMarshalerSliceUsesPublishedShape(t *testin
 	expectValue(t, `{"items":["text-Porto"]}`, string(encoded))
 	expectValue(t, "", parseSwitchbackPath("geo/items/0/City").resolveAttribute(value))
 }
+
+// A value with its own JSON encoding is read from that encoding, as the
+// collector reads the published attribute: a struct's whole float64 field
+// is published as 3 and keys a cluster, while the same float in a map or as
+// the attribute itself is a float and gives none.
+func TestSwitchbackCluster_StructFieldsAreReadFromTheirEncoding(t *testing.T) {
+	type geo struct{ City float64 }
+	expectValue(t, "3", parseSwitchbackPath("geo/City").resolveAttribute(geo{City: 3}))
+	expectValue(t, "3", parseSwitchbackPath("geo/0/City").resolveAttribute([]geo{{City: 3}}))
+	expectValue(t, "", parseSwitchbackPath("geo/City").resolveAttribute(geo{City: 3.5}))
+	expectValue(t, "", parseSwitchbackPath("geo/City").resolveAttribute(map[string]interface{}{"City": 3.0}))
+	expectValue(t, "", parseSwitchbackPath("geo").resolveAttribute(3.0))
+}

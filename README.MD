@@ -599,7 +599,11 @@ for the full rules):
   number it denotes); plain `encoding/json` decodes every
   number as a `float64`, which gives no value. Prefer integer or string
   attributes: a whole `float64` is published as `3`, which the collector
-  reads back as an integer when it re-resolves the cluster.
+  reads back as an integer when it re-resolves the cluster. A value with its
+  own JSON encoding (a struct, a `json.Marshaler` or `encoding.TextMarshaler`,
+  `[]byte`, a map with non-string keys) is read from that encoding, as the
+  collector reads the published attribute, so a whole `float64` field of a
+  struct (written as `3`) keys a cluster.
 - With no unit of a linked type set, the experiment does not apply. When no
   unit yields a value, linked units disagree, or the value is not in
   `Experiment.SwitchbackClusterValues`, the unit gets variant `0` and no
