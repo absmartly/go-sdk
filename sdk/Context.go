@@ -225,9 +225,6 @@ type cachedAssignment struct {
 	holdouts *assignmentHoldouts
 	// retirement is shared by entries that carry the same Exposed identity.
 	retirement *atomic.Bool
-	// variableKeys is the resolved experiment's key set, which a variable
-	// retry checks instead of retaining the definition and its values.
-	variableKeys variableKeySet
 }
 
 type loggerGoroutines struct {
@@ -927,7 +924,7 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 		afterReadResolve()
 	}
 	if entry.needsSettling() {
-		entry = c.settleExposure(experimentName, entry, nil)
+		entry, _ = c.settleExposure(experimentName, entry, nil)
 	}
 	return entry.assignment.Variant, nil
 }
@@ -939,24 +936,58 @@ const maxExposureAttempts = 3
 
 // settleExposure exposes entry on a read. If a replacement or an eviction
 // retired the assignment before the read claimed it, nothing of it was
-// published, so the current assignment is resolved again and exposed instead, up to
-// maxExposureAttempts times. It returns the entry the read must serve: the
-// replacement that was exposed, or on exhaustion the last one tried. It holds
-// no lock itself, so loggers run after admit released its locks.
+// published, so the current assignment is resolved again and exposed
+// instead, up to maxExposureAttempts times. It returns the entry the read
+// must serve: the replacement that was exposed, or on exhaustion the last
+// one tried. A non-nil eligible is checked with each new claim, atomically
+// with it; when it fails nothing is claimed and settleExposure reports false.
+// Loggers run after admit released its locks.
 func (c *Context) settleExposure(experimentName string, entry *cachedAssignment,
-	candidate func(*cachedAssignment) bool) *cachedAssignment {
+	eligible func(*cachedAssignment) bool) (*cachedAssignment, bool) {
 	for attempt := 1; ; attempt++ {
 		if beforeSettleClaim != nil {
 			beforeSettleClaim()
 		}
-		if c.queueExposure(entry.assignment, entry) != exposureRetired || attempt >= maxExposureAttempts {
-			return entry
+		var status = c.queueEligibleExposure(entry, eligible)
+		if status == exposureIneligible {
+			return entry, false
+		}
+		if status != exposureRetired || attempt >= maxExposureAttempts {
+			return entry, true
 		}
 		entry = c.getAssignment(experimentName)
-		if candidate != nil && !candidate(entry) {
-			return entry
-		}
 	}
+}
+
+// queueEligibleExposure is queueExposure for a read: a non-nil eligible is
+// checked under ContextLock_ together with the claim, so a refresh can never
+// land between the check and the claim. A claim already taken is honoured.
+func (c *Context) queueEligibleExposure(entry *cachedAssignment, eligible func(*cachedAssignment) bool) exposureStatus {
+	if eligible == nil {
+		return c.queueExposure(entry.assignment, entry)
+	}
+	c = c.live()
+	c.ContextLock_.RLock()
+	if beforeEligibleClaim != nil {
+		beforeEligibleClaim()
+	}
+	if entry.assignment.Exposed.Load().(bool) && !entry.retirement.Load() {
+		c.ContextLock_.RUnlock()
+		return exposureQueued
+	}
+	if !eligible(entry) {
+		c.ContextLock_.RUnlock()
+		return exposureIneligible
+	}
+	var claimed = entry.assignment.Exposed.CompareAndSwap(false, true)
+	c.ContextLock_.RUnlock()
+	if !claimed {
+		if entry.retirement.Load() {
+			return exposureRetired
+		}
+		return exposureQueued
+	}
+	return c.admitExposure(entry.assignment, entry)
 }
 
 // needsSettling reports whether an exposing read must settle the entry's
@@ -967,35 +998,27 @@ func (e *cachedAssignment) needsSettling() bool {
 	return !e.assignment.Exposed.Load().(bool) || e.retirement.Load()
 }
 
-// definesVariable is the variable read's candidate check: a replacement is
-// exposed by the read only if it has variables (its experiment was not
-// removed) and the experiment definition it was resolved from defines key in
-// some variant. The entry's own definition is checked, never newer data, so
-// a later refresh cannot reject an entry that defines key or accept one
-// that does not.
-func definesVariable(key string) func(*cachedAssignment) bool {
+// variableEligible is the variable read's claim check: once the context has
+// seen holdouts or assignment rules (the only sources of retirement), a read
+// of key claims an exposure only for an experiment that, as installed now,
+// still exists and defines key in some variant. Contexts with neither keep
+// the released behaviour. The caller holds ContextLock_.
+func (c *Context) variableEligible(experimentName string, key string) func(*cachedAssignment) bool {
 	return func(e *cachedAssignment) bool {
 		if e.assignment.Variables == nil {
 			return false
 		}
-		if e.variableKeys == nil {
-			// The context never had holdouts or rules, so nothing was retired.
+		var index = c.index_.Load()
+		if index == nil || !index.keyed {
 			return true
 		}
-		_, defined := e.variableKeys[key]
+		var indexed = index.experiments[experimentName]
+		if indexed == nil {
+			return false
+		}
+		_, defined := indexed.variableKeys[key]
 		return defined
 	}
-}
-
-// installedDefines reports whether the experiment as installed now defines
-// key in any variant.
-func (c *Context) installedDefines(experimentName string, key string) bool {
-	var indexed = c.indexedExperiment(experimentName)
-	if indexed == nil {
-		return false
-	}
-	_, defined := indexed.variableKeys[key]
-	return defined
 }
 
 // afterEvictionClaim, when set by a test, runs right after an eviction marks
@@ -1012,7 +1035,12 @@ var (
 
 // beforeSettleClaim, when set by a test, runs before each claim in
 // settleExposure, between resolving the assignment and claiming its exposure.
-var beforeSettleClaim func()
+// beforeEligibleClaim runs inside a read's eligibility check, under
+// ContextLock_, before the check.
+var (
+	beforeSettleClaim   func()
+	beforeEligibleClaim func()
+)
 
 // QueueExposure queues the assignment's exposure once, then the exposures of
 // the holdouts covering it that are not exposed yet, in holdout id order. A
@@ -1044,6 +1072,9 @@ const (
 	exposureQueued exposureStatus = iota
 	// exposureRejected: a close rejected it.
 	exposureRejected
+	// exposureIneligible: the read's eligibility check failed, so nothing was
+	// claimed.
+	exposureIneligible
 	// exposureRetired: the claim failed because a replacement or an eviction
 	// retired the assignment and marked it exposed; nothing of it was
 	// published, so the read must resolve again.
@@ -1374,17 +1405,12 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 			afterReadResolve()
 		}
 		if expose && entry.needsSettling() {
-			if entry.variableKeys != nil && !c.installedDefines(experiment.Data.Name, key) {
-				// A refresh after this read listed the key's experiments
-				// installed a version without it.
+			var eligible bool
+			entry, eligible = c.settleExposure(experiment.Data.Name, entry, c.variableEligible(experiment.Data.Name, key))
+			if !eligible {
 				continue
 			}
-			var candidate = definesVariable(key)
-			entry = c.settleExposure(experiment.Data.Name, entry, candidate)
 			assignment = entry.assignment
-			if !candidate(entry) {
-				continue
-			}
 		}
 
 		if value, exist := assignment.Variables[key]; exist && (assignment.Assigned || assignment.Overridden || assignment.RuleOverride) {
@@ -1962,9 +1988,6 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 	assignment.Name = experimentName
 	assignment.Eligible = true
 	var entry = &cachedAssignment{assignment: assignment, rules: rules, attrsSeq: atomic.LoadInt32(&c.AttrsSeq_), retirement: &atomic.Bool{}}
-	if indexed != nil {
-		entry.variableKeys = indexed.variableKeys
-	}
 
 	// Resolved for overrides and rule wins too: the holdouts' exposures fire
 	// whatever chose the variant.

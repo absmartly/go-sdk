@@ -143,7 +143,7 @@ func holdoutSplit(raw json.RawMessage) ([]float64, bool) {
 // an unknown field would.
 type wireHoldout struct {
 	jsonmodels.Holdout
-	Split       json.RawMessage `json:"split"` // see holdoutSplit
+	Split       json.RawMessage `json:"split"`
 	Id          json.RawMessage `json:"id"`
 	Iteration   json.RawMessage `json:"iteration"`
 	SeedHi      json.RawMessage `json:"seedHi"`
