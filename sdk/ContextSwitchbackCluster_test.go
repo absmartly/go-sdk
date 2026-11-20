@@ -821,3 +821,24 @@ func TestSwitchbackCluster_AdjacentInvalidBytesAndPublishedMemberNames(t *testin
 	expectValue(t, "", parseSwitchbackPath("geo/cit�").resolveAttribute(map[string]string{"cit�": "Porto", "cit\xfe": "Lisboa"}))
 	expectValue(t, "0", parseSwitchbackPath("city").resolveAttribute(json.Number("")))
 }
+
+// A root attribute name matches as the collector reads it: the published
+// name (invalid UTF-8 bytes become U+FFFD), trimmed like Java's
+// String.trim, which removes control characters and spaces but not a
+// non-breaking space.
+func TestSwitchbackCluster_RootAttributeNamesMatchAsPublished(t *testing.T) {
+	for name, match := range map[string]bool{"cit\xff": true, " cit\xff\t": true, "\x00cit\xff": true, " cit\xff": false} {
+		var h = sbCreateBare(t, map[string]string{sbUnitType: sbUID}, sbData(sbAttributeSwitchback("cit�")))
+		h.setAttribute(name, "Lisboa")
+		var want = 0
+		if match {
+			want = sbDraw("Lisboa", 0, sbClusterArms)
+		}
+		expectInt(t, want, h.at(sbAnchor+5).treatment("exp_sb"))
+		if match {
+			h.expectPending(1)
+		} else {
+			h.expectPending(0)
+		}
+	}
+}

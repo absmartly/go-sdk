@@ -4,7 +4,6 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
-	"strings"
 
 	"github.com/absmartly/go-sdk/sdk/internal"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
@@ -386,9 +385,22 @@ func (c *Context) resolveSwitchbackServing(indexed *indexedExperiment, now int64
 		})
 }
 
+// javaTrim is Java's String.trim: leading and trailing characters at or
+// below U+0020 are removed, and nothing else (a non-breaking space stays).
+func javaTrim(s string) string {
+	var start, end = 0, len(s)
+	for start < end && s[start] <= ' ' {
+		start++
+	}
+	for end > start && s[end-1] <= ' ' {
+		end--
+	}
+	return s[start:end]
+}
+
 // latestAttribute is the attribute the Collector records with an exposure at
 // now (ContextAPI.extractAttributes): among the attributes set at or before
-// now whose trimmed name matches, the greatest setAt wins, and a tie goes to
+// now whose published, trimmed name matches, the greatest setAt wins, and a tie goes to
 // the one set last. Only attributes set on the context are read, never the
 // system attributes. The caller holds ContextLock_.
 func (c *Context) latestAttribute(name string, now int64) (jsonmodels.Attribute, bool) {
@@ -396,7 +408,7 @@ func (c *Context) latestAttribute(name string, now int64) (jsonmodels.Attribute,
 	var found = false
 	for _, value := range c.Attributes_ {
 		var attribute, ok = value.(jsonmodels.Attribute)
-		if ok && attribute.SetAt <= now && strings.TrimSpace(attribute.Name) == name && (!found || attribute.SetAt >= selected.SetAt) {
+		if ok && attribute.SetAt <= now && javaTrim(publishedString(attribute.Name)) == name && (!found || attribute.SetAt >= selected.SetAt) {
 			selected, found = attribute, true
 		}
 	}
