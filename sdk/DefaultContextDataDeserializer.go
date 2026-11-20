@@ -15,10 +15,8 @@ type DefaultContextDataDeserializer struct {
 
 func (d DefaultContextDataDeserializer) Deserialize(bytes []byte) (jsonmodels.ContextData, error) {
 	var wire wireContextData
-	if err := json.Unmarshal(bytes, &wire); err != nil {
-		return wire.contextData(), err
-	}
-	return wire.contextData(), nil
+	var err = json.Unmarshal(bytes, &wire)
+	return wire.contextData(), err
 }
 
 // wireContextData is the context payload as the default deserializer decodes
@@ -155,7 +153,7 @@ func holdoutSplit(raw json.RawMessage) ([]float64, bool) {
 // an unknown field would.
 type wireHoldout struct {
 	jsonmodels.Holdout
-	Split       json.RawMessage `json:"split"` // see holdoutSplit
+	Split       json.RawMessage `json:"split"`
 	Id          json.RawMessage `json:"id"`
 	Iteration   json.RawMessage `json:"iteration"`
 	SeedHi      json.RawMessage `json:"seedHi"`
@@ -180,20 +178,22 @@ func holdouts(raw json.RawMessage) []jsonmodels.Holdout {
 		if trimmed := bytes.TrimSpace(entry); len(trimmed) == 0 || trimmed[0] != '{' || json.Unmarshal(entry, &holdout) != nil {
 			continue
 		}
+		var id, validID = holdoutId(holdout.Id)
+		if !validID {
+			continue
+		}
 		var split, ok = holdoutSplit(holdout.Split)
 		if !ok {
 			continue
 		}
 		holdout.Holdout.Split = split
-		if id, ok := holdoutId(holdout.Id); ok {
-			holdout.Holdout.Id = id
-			holdout.Holdout.Iteration, _ = holdoutId(holdout.Iteration)
-			holdout.Holdout.SeedHi = holdoutSeed(holdout.SeedHi)
-			holdout.Holdout.SeedLo = holdoutSeed(holdout.SeedLo)
-			_ = json.Unmarshal(holdout.HoldoutType, &holdout.Holdout.HoldoutType)
-			_ = json.Unmarshal(holdout.UnitType, &holdout.Holdout.UnitType)
-			result = append(result, holdout.Holdout)
-		}
+		holdout.Holdout.Id = id
+		holdout.Holdout.Iteration, _ = holdoutId(holdout.Iteration)
+		holdout.Holdout.SeedHi = holdoutSeed(holdout.SeedHi)
+		holdout.Holdout.SeedLo = holdoutSeed(holdout.SeedLo)
+		_ = json.Unmarshal(holdout.HoldoutType, &holdout.Holdout.HoldoutType)
+		_ = json.Unmarshal(holdout.UnitType, &holdout.Holdout.UnitType)
+		result = append(result, holdout.Holdout)
 	}
 	return result
 }

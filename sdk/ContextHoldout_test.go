@@ -3321,11 +3321,11 @@ func TestHoldout_VariableRetryDoesNotExposeAnExperimentWithoutTheKey(t *testing.
 	}
 }
 
-// The variable read's candidate check judges an entry by the definition it
-// was resolved from, not by data a later refresh installed: an entry that
-// defines the key stays a candidate after a refresh drops the key, and one
-// that does not define it stays rejected after a refresh adds it back.
-func TestHoldout_VariableCandidateIsJudgedByTheEntrysOwnDefinition(t *testing.T) {
+// The variable read's claim check judges an experiment by its definition as
+// installed now: a refresh that drops the key makes it ineligible, one that
+// adds the key makes it eligible, and an experiment that is not installed is
+// never eligible.
+func TestHoldout_VariableEligibilityIsJudgedByTheInstalledDefinition(t *testing.T) {
 	var version = func(iteration int, config string) jsonmodels.Experiment {
 		var experiment = hoExperiment(1, "a", hoUnitType, 0, 11)
 		experiment.Iteration = iteration
@@ -3335,24 +3335,36 @@ func TestHoldout_VariableCandidateIsJudgedByTheEntrysOwnDefinition(t *testing.T)
 	}
 	for _, c := range []struct {
 		resolved, later string
-		candidate       bool
+		eligible        bool
 	}{
-		{`{"v":"x"}`, `{"w":"y"}`, true},
-		{`{"w":"y"}`, `{"v":"x"}`, false},
+		{`{"v":"x"}`, `{"w":"y"}`, false},
+		{`{"w":"y"}`, `{"v":"x"}`, true},
 	} {
 		var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, version(1, c.resolved)))
-		var entry = h.ctx.getAssignment("a")
 		h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, version(2, c.later)))
-		if got := definesVariable("v")(entry); got != c.candidate {
-			t.Errorf("resolved %s, later %s: candidate %v, want %v", c.resolved, c.later, got, c.candidate)
+		if got := hoInstalledDefines(h.ctx, "a", "v"); got != c.eligible {
+			t.Errorf("resolved %s, later %s: eligible %v, want %v", c.resolved, c.later, got, c.eligible)
 		}
 	}
-	// An entry with no definition (the experiment was not in the data) is
-	// never a candidate.
-	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil))
-	if definesVariable("v")(h.ctx.getAssignment("a")) {
-		t.Error("an entry of an unknown experiment is a candidate")
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}))
+	if hoInstalledDefines(h.ctx, "a", "v") {
+		t.Error("an experiment that is not installed is eligible")
 	}
+}
+
+// hoKeyed reports whether the installed index builds key sets, and
+// hoInstalledDefines whether experiment name as installed now defines key.
+func hoKeyed(ctx *Context) bool {
+	var index = ctx.index_.Load()
+	return index != nil && index.keyed
+}
+
+func hoInstalledDefines(ctx *Context, name string, key string) bool {
+	ctx.ContextLock_.RLock()
+	defer ctx.ContextLock_.RUnlock()
+	var exposed = &atomic.Value{}
+	exposed.Store(false)
+	return ctx.variableEligible(name, key)(&cachedAssignment{assignment: &Assignment{Variables: map[string]interface{}{}, Exposed: exposed}})
 }
 
 // A variable read whose assignment is replaced, before its claim, by a
@@ -3391,29 +3403,24 @@ func TestHoldout_VariableRetryChecksTheKeyOnTheSameExperiment(t *testing.T) {
 	}
 }
 
-// The install's key set is per experiment: a key one experiment defines in
-// any variant does not make another experiment that lacks it a candidate,
-// and the set stays valid after a refresh removes the experiments.
+// The installed key set is per experiment: a key one experiment defines in
+// any variant does not make another experiment that lacks it eligible.
 func TestHoldout_VariableKeySetIsPerExperiment(t *testing.T) {
 	var a = hoExperiment(1, "a", hoUnitType, 0, 11)
-	a.Split = []float64{1, 0}
 	a.Variants[0].Config = `{"v":"selected"}`
 	a.Variants[1].Config = `{"other":"unselected"}`
 	var b = hoExperiment(2, "b", hoUnitType, 0)
 	b.Variants[0].Config = `{"w":"b"}`
 	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, a, b))
-	var entryA, entryB = h.ctx.getAssignment("a"), h.ctx.getAssignment("b")
-	h.ctx.SetData(hoData(nil))
 	for _, c := range []struct {
-		entry *cachedAssignment
-		key   string
-		want  bool
+		name, key string
+		want      bool
 	}{
-		{entryA, "v", true}, {entryA, "other", true}, {entryA, "w", false},
-		{entryB, "w", true}, {entryB, "v", false}, {entryA, "missing", false},
+		{"a", "v", true}, {"a", "other", true}, {"a", "w", false},
+		{"b", "w", true}, {"b", "v", false}, {"a", "missing", false},
 	} {
-		if got := definesVariable(c.key)(c.entry); got != c.want {
-			t.Errorf("%s defines %s: %v, want %v", c.entry.assignment.Name, c.key, got, c.want)
+		if got := hoInstalledDefines(h.ctx, c.name, c.key); got != c.want {
+			t.Errorf("%s defines %s: %v, want %v", c.name, c.key, got, c.want)
 		}
 	}
 }
@@ -3468,9 +3475,6 @@ func TestHoldout_CachedEntryReleasesTheOldDefinition(t *testing.T) {
 		var entry = ctx.getAssignment("a")
 		ctx.SetData(hoData(nil))
 		var retained = int64(heap()) - int64(before)
-		if !definesVariable("v")(entry) {
-			t.Fatalf("%s: lost the key snapshot", c.name)
-		}
 		runtime.KeepAlive(entry)
 		runtime.KeepAlive(ctx)
 		if retained > 2<<20 {
@@ -3486,7 +3490,7 @@ func TestHoldout_CachedEntryReleasesTheOldDefinition(t *testing.T) {
 func TestHoldout_VariableKeySetOnceHoldoutsWereSeen(t *testing.T) {
 	var experiment = hoWithVariables(hoExperiment(1, "a", hoUnitType, 0), "v")
 	var plain = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, experiment))
-	if plain.ctx.getAssignment("a").variableKeys != nil {
+	if hoKeyed(plain.ctx) {
 		t.Fatal("a context without holdouts built a key set")
 	}
 	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
@@ -3495,9 +3499,8 @@ func TestHoldout_VariableKeySetOnceHoldoutsWereSeen(t *testing.T) {
 		next.Iteration = i
 		h.ctx.SetData(hoData(nil, next))
 	}
-	var entry = h.ctx.getAssignment("a")
-	if entry.variableKeys == nil || !definesVariable("v")(entry) || definesVariable("w")(entry) {
-		t.Fatalf("key set after holdouts left: %v", entry.variableKeys)
+	if !hoKeyed(h.ctx) || !hoInstalledDefines(h.ctx, "a", "v") || hoInstalledDefines(h.ctx, "a", "w") {
+		t.Fatal("key set lost after holdouts left")
 	}
 }
 
@@ -3538,14 +3541,13 @@ func TestHoldout_SetDataFailedKeepsTheKeySetGate(t *testing.T) {
 	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
 	h.ctx.SetDataFailed(errors.New("boom"))
 	h.ctx.SetData(hoData(nil, experiment))
-	if h.ctx.getAssignment("a").variableKeys == nil {
+	if !hoKeyed(h.ctx) {
 		t.Fatal("SetDataFailed reset the key set gate")
 	}
-	// A context that never had holdouts or rules still builds none.
 	var plain = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, experiment))
 	plain.ctx.SetDataFailed(errors.New("boom"))
 	plain.ctx.SetData(hoData(nil, experiment))
-	if plain.ctx.getAssignment("a").variableKeys != nil {
+	if hoKeyed(plain.ctx) {
 		t.Fatal("SetDataFailed turned the key set gate on")
 	}
 }
@@ -3669,7 +3671,6 @@ func TestHoldout_SharedKeyReadSkipsACandidateRefreshedWithoutTheKey(t *testing.T
 		}
 	}
 	defer func() { afterReadResolve = nil }()
-	// The read goes on to the next experiment defining the key.
 	expectValue(t, "control", h.variable("v"))
 	var served = false
 	for _, exposure := range queuedExposures(h.ctx) {
@@ -3790,4 +3791,221 @@ func TestHoldout_SharedKeyReadSkipsAnExperimentRefreshedAway(t *testing.T) {
 	if len(exposures) != 1 || exposures[0].Id != 2 {
 		t.Fatalf("exposures %+v, want only experiment 2", exposures)
 	}
+}
+
+// A refresh that removes the key right before the read's claim, on the first
+// attempt or on a retry, makes the read skip that experiment and its holdout:
+// eligibility is checked with the claim, against the data installed then.
+func TestHoldout_RefreshRightBeforeTheClaimIsChecked(t *testing.T) {
+	for _, retry := range []bool{false, true} {
+		var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")
+		var kept = e
+		kept.Iteration = 2
+		var dropped = e
+		dropped.Iteration = 3
+		dropped.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"w":"a"}`}, {Name: "B", Config: `{"w":"b"}`}}
+		var f = hoWithVariables(hoExperiment(2, "f", hoUnitType, 0), "v")
+		f.Split = []float64{1, 0}
+		var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e, f))
+		h.ctx.GetAssignment("e")
+		var claims = 0
+		beforeSettleClaim = func() {
+			claims++
+			if retry && claims == 1 {
+				// A new iteration that keeps the key retires the entry.
+				h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, kept, f))
+				h.ctx.GetAssignment("e")
+			} else if claims == 1 || (retry && claims == 2) {
+				h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, dropped, f))
+			}
+		}
+		var got = h.variable("v")
+		beforeSettleClaim = nil
+		expectValue(t, "control", got)
+		var exposures = queuedExposures(h.ctx)
+		if len(exposures) != 1 || exposures[0].Id != 2 {
+			t.Fatalf("retry=%v: exposures %+v, want only experiment 2", retry, exposures)
+		}
+	}
+}
+
+// The read's eligibility check runs under ContextLock_, so no refresh can
+// install new data between the check and the claim.
+func TestHoldout_EligibilityIsCheckedUnderTheContextLock(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")))
+	var ran = false
+	beforeEligibleClaim = func() {
+		ran = true
+		if h.ctx.ContextLock_.TryLock() {
+			h.ctx.ContextLock_.Unlock()
+			t.Error("a refresh could take the lock during the check")
+		}
+	}
+	defer func() { beforeEligibleClaim = nil }()
+	h.variable("v")
+	if !ran {
+		t.Fatal("the check did not run")
+	}
+}
+
+// An entry cached from a plain payload, before the context had holdouts, is
+// checked like any other once holdouts are installed: a refresh that removes
+// its experiment after the read resolved it exposes neither it nor anything
+// it no longer names.
+func TestHoldout_EntryCachedBeforeHoldoutsIsChecked(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+	var f = hoWithVariables(hoExperiment(2, "f", hoUnitType, 0), "v")
+	f.Split = []float64{1, 0}
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, f))
+	h.peek("e")
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, f))
+		}
+	}
+	defer func() { afterReadResolve = nil }()
+	expectValue(t, "control", h.variable("v"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	var exposures = queuedExposures(h.ctx)
+	if len(exposures) != 1 || exposures[0].Id != 2 {
+		t.Fatalf("exposures %+v, want only experiment 2", exposures)
+	}
+}
+
+// A claim another read already took is honoured even if a refresh then drops
+// the key: a read reaching its claim finds the entry exposed and serves the
+// decision that claim publishes, instead of skipping it as ineligible.
+func TestHoldout_TakenClaimIsHonouredAfterTheKeyIsDropped(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")
+	var dropped = hoExperiment(1, "e", hoUnitType, 0, 11)
+	dropped.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"w":"a"}`}, {Name: "B", Config: `{"w":"b"}`}}
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
+	var entry = h.ctx.getAssignment("e")
+	var armed = true
+	beforeSettleClaim = func() {
+		if armed {
+			armed = false
+			if !hoClaim(h, entry) {
+				t.Error("the other read did not claim")
+			}
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, dropped))
+		}
+	}
+	defer func() { beforeSettleClaim = nil }()
+	expectValue(t, "control", h.variable("v"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	if got := h.ctx.admitExposure(entry.assignment, entry); got != exposureQueued {
+		t.Fatalf("the taken claim reported %v", got)
+	}
+	var exposures = queuedExposures(h.ctx)
+	if len(exposures) != 2 || exposures[0].Id != 1 {
+		t.Fatalf("exposures %+v, want the taken claim's decision", exposures)
+	}
+}
+
+// The claim's compare-and-swap runs under ContextLock_ too: right after it
+// no refresh can take the lock, so none can land between check and claim.
+func TestHoldout_EligibilityClaimCASStaysUnderTheContextLock(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")))
+	var ran = false
+	afterEligibleCAS = func() {
+		ran = true
+		if h.ctx.ContextLock_.TryLock() {
+			h.ctx.ContextLock_.Unlock()
+			t.Error("the claim is outside the context lock")
+		}
+	}
+	defer func() { afterEligibleCAS = nil }()
+	h.variable("v")
+	if !ran {
+		t.Fatal("the CAS hook did not run")
+	}
+}
+
+func TestHoldout_ReadinessCopyVariableExposureUsesTheLiveQueue(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")))
+	var cp = h.ctx.WaitUntilReady()
+	if _, err := cp.GetVariableValue("v", "default"); err != nil {
+		t.Fatal(err)
+	}
+	var exposures = queuedExposures(h.ctx)
+	if len(exposures) != 2 || exposures[0].Id != 1 || exposures[1].Id != 11 {
+		t.Fatalf("live exposures %+v", exposures)
+	}
+}
+
+func TestHoldout_VariableRetryRejectsAnOverrideWithoutVariables(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")))
+	h.ctx.GetAssignment("e")
+	var armed = true
+	beforeSettleClaim = func() {
+		if armed {
+			armed = false
+			if err := h.ctx.SetOverride("e", 5); err != nil {
+				t.Error(err)
+			}
+			h.ctx.GetAssignment("e")
+		}
+	}
+	defer func() { beforeSettleClaim = nil }()
+	expectValue(t, "default", h.variable("v"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	if exposures := queuedExposures(h.ctx); len(exposures) != 0 {
+		t.Fatalf("nil-variable replacement was exposed: %+v", exposures)
+	}
+}
+
+// The eligibility check and the claim are one critical section: a refresh
+// that queues on the lock at the check cannot install before the claim, even
+// if the lock were released and taken again between the two.
+func TestHoldout_CheckAndClaimAreOneCriticalSection(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
+	var without = hoExperiment(1, "e", hoUnitType, 0, 11)
+	var seen *contextIndex
+	var done = make(chan struct{})
+	var armed = true
+	beforeEligibleClaim = func() {
+		if !armed {
+			return
+		}
+		armed = false
+		seen = h.ctx.index_.Load()
+		go func() {
+			defer close(done)
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, without))
+		}()
+		var deadline = time.Now().Add(5 * time.Second)
+		// A queued writer makes TryRLock fail.
+		for h.ctx.ContextLock_.TryRLock() {
+			h.ctx.ContextLock_.RUnlock()
+			if time.Now().After(deadline) {
+				t.Fatal("the refresh never queued on the lock")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	afterEligibleCAS = func() {
+		select {
+		case <-done:
+		case <-time.After(20 * time.Millisecond):
+		}
+		if h.ctx.index_.Load() != seen {
+			t.Error("a refresh installed between the eligibility check and the claim")
+		}
+	}
+	defer func() { beforeEligibleClaim, afterEligibleCAS = nil, nil }()
+	h.variable("v")
+	if armed {
+		t.Fatal("the read never reached the claim")
+	}
+	<-done
 }
