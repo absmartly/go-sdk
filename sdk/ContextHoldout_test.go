@@ -3642,17 +3642,27 @@ func TestHoldout_SharedKeyReadSkipsACandidateRefreshedWithoutTheKey(t *testing.T
 	var refreshed = b
 	refreshed.Iteration = 2
 	refreshed.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"w":"b"}`}, {Name: "B", Config: `{"w":"b"}`}}
+	var c = hoWithVariables(hoExperiment(3, "c", hoUnitType, 0), "v")
+	c.Split = []float64{1, 0}
 	var holdout = hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)
-	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{holdout}, a, b))
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{holdout}, a, b, c))
 	var armed = true
 	afterReadResolve = func() {
 		if armed {
 			armed = false
-			h.ctx.SetData(hoData([]jsonmodels.Holdout{holdout}, a, refreshed))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{holdout}, a, refreshed, c))
 		}
 	}
 	defer func() { afterReadResolve = nil }()
-	expectValue(t, "default", h.variable("v"))
+	// The read goes on to the next experiment defining the key.
+	expectValue(t, "control", h.variable("v"))
+	var served = false
+	for _, exposure := range queuedExposures(h.ctx) {
+		served = served || exposure.Id == 3
+	}
+	if !served {
+		t.Fatalf("the experiment serving the value was not exposed: %+v", queuedExposures(h.ctx))
+	}
 	if armed {
 		t.Fatal("the hook did not run")
 	}
@@ -3692,4 +3702,52 @@ func TestHoldout_ReadHoldingARejectedMissingUnitDecisionResolvesAgain(t *testing
 	var own = hoOwn("user_id", 1, "exp", 2)
 	own.FullOn = true
 	h.expectPublished(own, hoExposure("user_id", 11, "holdout_user", 1))
+}
+
+// A cached, unexposed experiment that a refresh gave the key, without
+// changing its assignment, is still exposed by a read of that key.
+func TestHoldout_SharedKeyReadExposesACachedExperimentRefreshedWithTheKey(t *testing.T) {
+	var before = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "x")
+	var after = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, before))
+	h.peek("e")
+	h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, after))
+	h.variable("v")
+	var exposed = false
+	for _, exposure := range queuedExposures(h.ctx) {
+		exposed = exposed || exposure.Id == 1
+	}
+	if !exposed {
+		t.Fatalf("the experiment listed for the key was not exposed: %+v", queuedExposures(h.ctx))
+	}
+}
+
+// A suppressed experiment whose retry lands on a replacement without the key
+// is skipped, so it does not take the suppressed fallback from a later
+// suppressed experiment that defines the key.
+func TestHoldout_SkippedRetryDoesNotTakeTheSuppressedFallback(t *testing.T) {
+	var a = hoExperiment(1, "a", hoUnitType, 0, 11)
+	a.Variants[0].Config = `{"v":"a0"}`
+	a.Variants[1].Config = `{"v":"a1"}`
+	var replacement = a
+	replacement.Iteration = 2
+	replacement.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"w":"a0"}`}, {Name: "B", Config: `{"w":"a1"}`}}
+	var b = hoExperiment(2, "b", hoUnitType, 0, 11)
+	b.Variants[0].Config = `{"v":"b0"}`
+	b.Variants[1].Config = `{"v":"b1"}`
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, a, b))
+	h.ctx.GetAssignment("a")
+	var armed = true
+	beforeSettleClaim = func() {
+		if armed {
+			armed = false
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement, b))
+			h.ctx.GetAssignment("a")
+		}
+	}
+	defer func() { beforeSettleClaim = nil }()
+	expectValue(t, "b0", h.variable("v"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
 }

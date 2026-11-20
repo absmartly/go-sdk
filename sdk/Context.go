@@ -987,6 +987,17 @@ func definesVariable(key string) func(*cachedAssignment) bool {
 	}
 }
 
+// installedDefines reports whether the experiment as installed now defines
+// key in any variant.
+func (c *Context) installedDefines(experimentName string, key string) bool {
+	var indexed = c.indexedExperiment(experimentName)
+	if indexed == nil {
+		return false
+	}
+	_, defined := indexed.variableKeys[key]
+	return defined
+}
+
 // afterEvictionClaim, when set by a test, runs right after an eviction marks
 // an entry exposed; beforeEvictionClaim runs between
 // its retirement store and that claim. beforeReplacementClaim and
@@ -1363,12 +1374,12 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 			afterReadResolve()
 		}
 		if expose && entry.needsSettling() {
-			var candidate = definesVariable(key)
-			if !candidate(entry) {
-				// Resolved from data a refresh installed after this read
-				// listed the key's experiments.
+			if entry.variableKeys != nil && !c.installedDefines(experiment.Data.Name, key) {
+				// A refresh after this read listed the key's experiments
+				// installed a version without it.
 				continue
 			}
+			var candidate = definesVariable(key)
 			entry = c.settleExposure(experiment.Data.Name, entry, candidate)
 			assignment = entry.assignment
 			if !candidate(entry) {
