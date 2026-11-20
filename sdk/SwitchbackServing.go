@@ -157,7 +157,7 @@ func switchbackStep(current interface{}, key string, index int, isIndex bool) in
 	}
 	if isIndex {
 		if (value.Kind() == reflect.Slice || value.Kind() == reflect.Array) && index < value.Len() {
-			return jsonElement(value.Index(index))
+			return jsonElement(value.Index(index)).Interface()
 		}
 		return nil
 	}
@@ -174,14 +174,14 @@ func switchbackStep(current interface{}, key string, index int, isIndex bool) in
 // addressable element (a slice's) whose pointer type has a JSON or text
 // marshaler is encoded through that marshaler, so the element is read
 // through its address.
-func jsonElement(element reflect.Value) interface{} {
+func jsonElement(element reflect.Value) reflect.Value {
 	if element.Kind() != reflect.Ptr && element.Kind() != reflect.Interface && element.CanAddr() {
 		var pointer = element.Addr()
 		if pointer.Type().Implements(jsonMarshalerType) || pointer.Type().Implements(textMarshalerType) {
-			return pointer.Interface()
+			return pointer
 		}
 	}
-	return element.Interface()
+	return element
 }
 
 // switchbackJSONView is the value as a JSON reader would see it: pointers
@@ -243,7 +243,7 @@ func switchbackOpaque(value reflect.Value) bool {
 
 // switchbackEncodable reports whether the value has a JSON encoding without
 // a container cycle and with containers nested at most switchbackMaxDepth
-// deep. path holds the containers on the current branch only, so a value
+// deep. Elements are checked as encoding/json encodes them (jsonElement). path holds the containers on the current branch only, so a value
 // shared by two siblings is not a cycle.
 func switchbackEncodable(value reflect.Value, path map[uintptr]bool, depth int) bool {
 	for hops := 0; value.IsValid() && (value.Kind() == reflect.Ptr || value.Kind() == reflect.Interface) && !switchbackOpaque(value); hops++ {
@@ -300,7 +300,7 @@ func switchbackEncodable(value reflect.Value, path map[uintptr]bool, depth int) 
 		return true
 	}
 	for i := 0; i < value.Len(); i++ {
-		if !switchbackEncodable(value.Index(i), path, depth+1) {
+		if !switchbackEncodable(jsonElement(value.Index(i)), path, depth+1) {
 			return false
 		}
 	}

@@ -6,6 +6,7 @@ package sdk
 
 import (
 	"encoding/json"
+	"errors"
 	"math"
 	"math/big"
 	"reflect"
@@ -704,4 +705,54 @@ func TestSwitchbackCluster_FirstReadFixesThePeriodsArmBeforeAnyExposure(t *testi
 	h.at(sbAnchor+20).setAttribute("city", "Faro")
 	expectInt(t, lisboa, h.treatment("exp_sb"))
 	h.expectPublished(sbClusterExposure(lisboa, sbAnchor+20, true, false))
+}
+
+// sbFuncCity cannot be encoded as itself (a func field), but its pointer
+// marshaler encodes it, as encoding/json does for an addressable element.
+type sbFuncCity struct {
+	Name string
+	Hook func()
+}
+
+func (c *sbFuncCity) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]string{"city": c.Name})
+}
+
+// sbFailingPointerCity encodes as itself, but its pointer marshaler fails,
+// so a slice holding it cannot be published.
+type sbFailingPointerCity string
+
+func (c *sbFailingPointerCity) MarshalJSON() ([]byte, error) {
+	return nil, errors.New("unencodable")
+}
+
+// Validation reads an addressable element through its pointer marshaler,
+// as encoding/json publishes it: an element encodable only through that
+// marshaler yields its key, and an element whose marshaler fails makes the
+// whole attribute unencodable, so it yields none.
+func TestSwitchbackCluster_ValidationUsesThePublishedElementEncoding(t *testing.T) {
+	var valid = []sbFuncCity{{Name: "Porto", Hook: func() {}}}
+	if _, err := json.Marshal(valid); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	expectValue(t, "Porto", parseSwitchbackPath("items/0/city").resolveAttribute(valid))
+	expectValue(t, "Porto", parseSwitchbackPath("geo/items/0/city").resolveAttribute(map[string]interface{}{"items": valid}))
+	expectValue(t, "Porto", parseSwitchbackPath("geo/Items/0/city").resolveAttribute(&struct{ Items []sbFuncCity }{valid}))
+
+	var failing = []interface{}{"Porto", []sbFailingPointerCity{"x"}}
+	if _, err := json.Marshal(failing); err == nil {
+		t.Fatal("fixture: the failing element encoded")
+	}
+	expectValue(t, "", parseSwitchbackPath("items/0").resolveAttribute(failing))
+	expectValue(t, "", parseSwitchbackPath("geo/city").resolveAttribute(map[string]interface{}{"city": "Porto",
+		"other": []sbFailingPointerCity{"x"}}))
+	// Not addressable, so encoded as itself: a map value or an array held in
+	// an interface.
+	expectValue(t, "Porto", parseSwitchbackPath("geo/city").resolveAttribute(map[string]interface{}{"city": "Porto",
+		"other": map[string]sbFailingPointerCity{"k": "x"}, "arr": [1]sbFailingPointerCity{"x"}}))
+
+	// Through a context: the published key serves.
+	var h = sbCreateBare(t, map[string]string{sbUnitType: sbUID}, sbData(sbAttributeSwitchback("items/0/city")))
+	h.setAttribute("items", valid)
+	expectValue(t, sbExpectedSchedule("Porto"), h.peekSchedule("exp_sb", sbHour, 12))
 }

@@ -117,7 +117,7 @@ type switchbackSlot struct {
 	// startAt and periodMs bound the slot's period, for QueueExposure.
 	startAt  int64
 	periodMs int64
-	// resolvedAt is the clock reading that resolved the slot.
+
 	resolvedAt int64
 	// silent is set for a resolution the Collector records nothing for: no
 	// linked unit, an ineligible cluster, or no period to draw in.
@@ -216,7 +216,6 @@ type switchbackEpoch struct {
 // switchback, or of another generation. The caller holds ContextLock_.
 func (c *Context) switchbackEpochStale(experimentName string, indexed *indexedExperiment) bool {
 	if c.switchbackEpochs_ == nil {
-		// No switchback slot was ever cached.
 		return false
 	}
 	var epoch = c.switchbackEpochs_[experimentName]
