@@ -1084,7 +1084,12 @@ func TestCopyJoiningRefreshAfterClockReplacementIsReadBack(t *testing.T) {
 	close(p.release)
 	assertAny(nil, getWithTimeout(t, started), t)
 	assertAny(nil, getWithTimeout(t, joined), t)
-	assertAny(true, <-seenAtSettle, t)
+	select {
+	case seen := <-seenAtSettle:
+		assertAny(true, seen, t)
+	case <-time.After(5 * time.Second):
+		t.Fatal("joined refresh listener did not run")
+	}
 	if _, found := copied.GetExperiment("before"); found {
 		t.Error("the copy still finds an experiment the joined refresh removed")
 	}
