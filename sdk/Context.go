@@ -131,6 +131,12 @@ type contextState struct {
 	// ContextLock_: entries are only written under the write lock.
 	assignmentCache_ map[string]*cachedAssignment
 	ruleIdentities   *ruleAssignmentIdentities
+
+	// audiences caches parsed audiences by matcher and audience text. A parse
+	// runs the AudienceDeserializer, which is customer code, so it is done on
+	// the reading goroutine before any lock is taken (as v1.1.1 called it
+	// without a lock), and never while ContextLock_ is held.
+	audiences sync.Map
 }
 
 // contextClock carries private state in an existing interface field without
@@ -281,11 +287,6 @@ type contextIndex struct {
 type indexedExperiment struct {
 	experiment ExperimentVariables
 	rules      *experimentRules
-	// audience is the experiment's audience, already run through the
-	// AudienceDeserializer when the data was installed: that is customer code,
-	// and assignment evaluation holds ContextLock_, so it must not run there
-	// (a deserializer that calls back into the context would deadlock).
-	audience parsedAudience
 }
 
 // experimentRules is an experiment's assignmentRules text and its parsed
@@ -1644,7 +1645,13 @@ func (c *Context) audienceMatches(st *contextState, data jsonmodels.Experiment, 
 	if entry.ruleOverride || len(data.Audience) == 0 {
 		return true
 	}
-	var match, err = st.audienceOf(data.Name).evaluate(c.evaluationAttributesWithState(st))
+	var parsed, ok = c.cachedAudience(st, data.Audience)
+	if !ok {
+		// Not parsed yet (the audience text changed): report a change, so the
+		// caller parses it with no lock held and rebuilds the assignment.
+		return false
+	}
+	var match, err = parsed.evaluate(c.evaluationAttributesWithState(st))
 	var newAudienceMismatch = false
 	if err == nil {
 		newAudienceMismatch = !match.Get()
@@ -1763,6 +1770,13 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 	}
 	c.ContextLock_.RUnlock()
 
+	// The assignment will be evaluated. Parse the experiment's audience now,
+	// holding no lock: the deserializer is customer code and may call back
+	// into the context.
+	if experiment, found := c.GetExperiment(experimentName); found && len(experiment.Data.Audience) > 0 {
+		c.parseAudienceUnlocked(st, experiment.Data.Audience)
+	}
+
 	// Cache miss, out of date, or revalidated. Check again under the write
 	// lock: another goroutine may have rebuilt the assignment meanwhile, and
 	// replacing it would lose its exposed flag and queue a second exposure.
@@ -1820,7 +1834,14 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 			if !entry.ruleOverride && len(experiment.Data.Audience) > 0 {
 				var attrs = c.evaluationAttributesWithState(st)
 
-				var match, err = st.audienceOf(experimentName).evaluate(attrs)
+				var parsed, ok = c.cachedAudience(st, experiment.Data.Audience)
+				if !ok {
+					// The data changed between the unlocked parse and this
+					// lock: start over, parsing the new audience unlocked.
+					c.ContextLock_.Unlock()
+					return c.assignmentEntry(experimentName)
+				}
+				var match, err = parsed.evaluate(attrs)
 				if err == nil {
 					assignment.AudienceMismatch = !match.Get()
 				}
@@ -1922,14 +1943,44 @@ func (st *contextState) loadIndex() *contextIndex {
 
 // experimentAndRules is GetExperiment plus the experiment's parsed assignment
 // rules, read from the same installed index.
-// audienceOf returns the experiment's pre-parsed audience.
-func (st *contextState) audienceOf(experimentName string) parsedAudience {
-	if index := st.loadIndex(); index != nil {
-		if entry, found := index.experiments[experimentName]; found {
-			return entry.audience
-		}
+// audienceKey identifies a parse: the same text through a different matcher
+// (a caller may replace AudienceMatcher_) is parsed again.
+type audienceKey struct {
+	matcher AudienceMatcher
+	text    string
+}
+
+// parseAudienceUnlocked returns the parsed audience for text, running the
+// AudienceDeserializer if this matcher has not parsed it yet. The caller holds
+// no context lock, so the deserializer may call back into the context. A
+// deserializer panic is reported to the event logger and counts as an
+// unparseable audience; v1.1.1 let it escape the read.
+func (c *Context) parseAudienceUnlocked(st *contextState, text string) parsedAudience {
+	var key = audienceKey{c.AudienceMatcher_, text}
+	if parsed, ok := st.audiences.Load(key); ok {
+		return parsed.(parsedAudience)
 	}
-	return parsedAudience{}
+	var parsed = func() (parsed parsedAudience) {
+		defer func() {
+			if r := recover(); r != nil {
+				parsed = parsedAudience{text: text, err: errors.New("can't evaluate data")}
+				c.LogError(fmt.Errorf("AudienceDeserializer panicked: %v", r))
+			}
+		}()
+		return c.AudienceMatcher_.parseAudience(text)
+	}()
+	st.audiences.Store(key, parsed)
+	return parsed
+}
+
+// cachedAudience returns a parse made earlier by parseAudienceUnlocked. It is
+// called with ContextLock_ held, so it never runs the deserializer; it reports
+// false when the audience was not parsed yet.
+func (c *Context) cachedAudience(st *contextState, text string) (parsedAudience, bool) {
+	if parsed, ok := st.audiences.Load(audienceKey{c.AudienceMatcher_, text}); ok {
+		return parsed.(parsedAudience), true
+	}
+	return parsedAudience{}, false
 }
 
 func (st *contextState) experimentAndRules(experimentName string) (ExperimentVariables, *experimentRules, bool) {
@@ -2081,7 +2132,6 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	var indexVariables = map[string][]ExperimentVariables{}
 	var contextCustomFields = map[string]map[string]ContextCustomFieldValue{}
 	var rules = map[string]*experimentRules{}
-	var audiences = map[string]parsedAudience{}
 	var previous = st.loadIndex()
 	var previousRules = func(name string) *experimentRules {
 		if previous != nil {
@@ -2146,9 +2196,6 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		if len(experiment.AssignmentRules) > 0 {
 			rules[experiment.Name] = c.experimentRulesFor(previousRules(experiment.Name), experiment.AssignmentRules)
 		}
-		if len(experiment.Audience) > 0 {
-			audiences[experiment.Name] = c.parsedAudienceFor(previous, experiment.Name, experiment.Audience)
-		}
 
 		contextCustomFields[experiment.Name] = experimentCustomFields
 		index[experiment.Name] = experiemntVariables
@@ -2172,7 +2219,7 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	c.Index_ = index
 	var indexed = make(map[string]*indexedExperiment, len(index))
 	for name, experiment := range index {
-		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name], audience: audiences[name]}
+		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name]}
 	}
 	st.index_.Store(&contextIndex{experiments: indexed})
 	c.ContextCustomFields_ = contextCustomFields
@@ -2197,24 +2244,6 @@ func (c *Context) experimentRulesFor(previous *experimentRules, text string) *ex
 	}
 	var parsed, _ = c.AudienceMatcher_.parseRules(text)
 	return &experimentRules{text: text, parsed: parsed}
-}
-
-// parsedAudienceFor runs an experiment's audience through the
-// AudienceDeserializer, or reuses the previous parse when a refresh left the
-// text unchanged. A deserializer panic counts as an unparseable audience, as
-// a deserializer error does.
-func (c *Context) parsedAudienceFor(previous *contextIndex, name string, text string) (parsed parsedAudience) {
-	if previous != nil {
-		if entry, found := previous.experiments[name]; found && entry.audience.text == text {
-			return entry.audience
-		}
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			parsed = parsedAudience{text: text, err: errors.New("can't evaluate data")}
-		}
-	}()
-	return c.AudienceMatcher_.parseAudience(text)
 }
 
 // LogEvent and LogError pass an event to the event logger. A logger is an
