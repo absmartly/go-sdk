@@ -981,12 +981,125 @@ func TestCopySetDataRacingReadsAfterClockReplacement(t *testing.T) {
 	var experiment, found = copied.GetExperiment("after")
 	assertAny(true, found, t)
 	assertAny(20, experiment.Data.Iteration, t)
-	// The copy's other v1.1.1 data fields follow too.
 	copied.DataLock.RLock()
 	defer copied.DataLock.RUnlock()
 	assertAny(20, copied.Data_.Experiments[0].Iteration, t)
 	var _, hasFields = copied.ContextCustomFields_["after"]
 	assertAny(true, hasFields, t)
+}
+
+// panicOnceDeserializer panics on its first parse, then parses normally.
+type panicOnceDeserializer struct{ calls int32 }
+
+func (d *panicOnceDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	if atomic.AddInt32(&d.calls, 1) == 1 {
+		panic("temporary")
+	}
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+// A panicked parse is reused only while its Error is logged: another
+// experiment with the same audience text later asks the recovered
+// deserializer and evaluates its strict audience.
+func TestTemporaryAudiencePanicIsNotShared(t *testing.T) {
+	var exclude = `{"filter":[{"value":false}]}`
+	var first, second = audienceExperiment("first", exclude, true), audienceExperiment("second", exclude, true)
+	second.Id = 2
+	var d = &panicOnceDeserializer{}
+	var ctx, _ = newSystemAttrContext("website", "production", first, second)
+	ctx.AudienceMatcher_ = AudienceMatcher{d}
+	assertAny(1, treatmentPeek(t, ctx, "first"), t)
+	assertAny(0, treatmentPeek(t, ctx, "second"), t)
+	assertAny(int32(2), atomic.LoadInt32(&d.calls), t)
+}
+
+// A copy of a clock-replaced context that joins a refresh started elsewhere
+// reads the refreshed experiments once its joined refresh succeeds.
+func TestCopyJoiningRefreshAfterClockReplacementIsReadBack(t *testing.T) {
+	var before, after = ruleExperiment("before", ""), ruleExperiment("after", "")
+	before.Variants[1].Config = `{"before_key":1}`
+	after.Id = 9
+	after.Variants[1].Config = `{"after_key":1}`
+	var p = &pendingProvider{release: make(chan struct{}),
+		data: jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{after}}}
+	var client = &systemAttrClient{application: "website", environment: "production"}
+	var cc = CreateDefaultContextConfig()
+	cc.Units_, cc.PublishDelay_, cc.RefreshInterval_ = withUnit(), -1, -1
+	var ctx = Create(ABsmartlyConfig{Client_: client, ContextDataProvider_: p,
+		ContextEventHandler_: DefaultContextEventHandler{client_: client}}).CreateContextWith(cc,
+		jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{before}})
+	ctx.WaitUntilReady()
+	ctx.Clock_ = internal.FixedClock{Millis_: 1}
+	var copied = *ctx
+	var started = ctx.RefreshAsync()
+	var joined = copied.RefreshAsync()
+	assertAny(false, joined.Ready(), t)
+	close(p.release)
+	assertAny(nil, getWithTimeout(t, started), t)
+	assertAny(nil, getWithTimeout(t, joined), t)
+	if _, found := copied.GetExperiment("before"); found {
+		t.Error("the copy still finds an experiment the joined refresh removed")
+	}
+	if experiment, found := copied.GetExperiment("after"); !found || experiment.Data.Id != 9 {
+		t.Error("the copy does not find the experiment the joined refresh installed")
+	}
+	if experiment, err := copied.GetVariableExperiment("after_key"); err != nil || experiment.Data.Id != 9 {
+		t.Errorf("GetVariableExperiment through the copy = %v, %v", experiment.Data.Id, err)
+	}
+	assertAny(9, copied.GetAssignment("after").Id, t)
+}
+
+// SetDataFailed through a copy of a clock-replaced context clears the copy's
+// own experiment and variable lookups too.
+func TestCopySetDataFailedAfterClockReplacementClearsLookups(t *testing.T) {
+	var before = ruleExperiment("before", "")
+	before.Variants[1].Config = `{"before_key":1}`
+	var ctx, _ = newRuleContext(t, "production", withUnit(), before)
+	ctx.Clock_ = internal.FixedClock{Millis_: 1}
+	var copied = *ctx
+	copied.SetDataFailed(errors.New("load failed"))
+	assertAny(true, copied.IsFailed(), t)
+	for name, c := range map[string]*Context{"copy": &copied, "original": ctx} {
+		if _, found := c.GetExperiment("before"); found {
+			t.Errorf("%s: GetExperiment still finds invalidated data", name)
+		}
+		if _, err := c.GetVariableExperiment("before_key"); err == nil {
+			t.Errorf("%s: GetVariableExperiment still finds invalidated data", name)
+		}
+	}
+}
+
+// recoveringDeserializer fails its first parse, then parses normally.
+type recoveringDeserializer struct{ calls int32 }
+
+func (d *recoveringDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	if atomic.AddInt32(&d.calls, 1) == 1 {
+		return nil, errors.New("temporary")
+	}
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+// A temporary parse failure for one experiment is not reused for another
+// with the same audience text: the second asks the recovered deserializer
+// and evaluates its strict audience, as v1.1.1 did. The first keeps its
+// own unparseable outcome through revalidation, without a new parse.
+func TestTemporaryAudienceParseFailureIsNotShared(t *testing.T) {
+	var exclude = `{"filter":[{"value":false}]}`
+	var first, second = audienceExperiment("first", exclude, true), audienceExperiment("second", exclude, true)
+	second.Id = 2
+	var d = &recoveringDeserializer{}
+	var ctx, _ = newSystemAttrContext("website", "production", first, second)
+	ctx.AudienceMatcher_ = AudienceMatcher{d}
+	assertAny(1, treatmentPeek(t, ctx, "first"), t)
+	assertAny(0, treatmentPeek(t, ctx, "second"), t)
+	assertAny(int32(2), atomic.LoadInt32(&d.calls), t)
+	var exposed = ctx.GetAssignment("first").Exposed
+	assertAny(nil, ctx.SetAttribute("x", 1), t)
+	assertAny(1, treatmentPeek(t, ctx, "first"), t)
+	if ctx.GetAssignment("first").Exposed != exposed {
+		t.Error("revalidating an assignment built with a failed parse rebuilt it")
+	}
+	assertAny(int32(2), atomic.LoadInt32(&d.calls), t)
 }
 
 // Refresh through a copy of a context whose Clock_ was replaced updates the
@@ -1086,7 +1199,7 @@ func TestDeserializerThatLogsEventsWithLoggerDoesNotDeadlock(t *testing.T) {
 						defer wg.Done()
 						for i := 0; i < 8; i++ {
 							_, _ = reparseAudience(ctx)
-							_ = ctx.SetAttribute("round", g*100+i) // forces revalidation
+							_ = ctx.SetAttribute("round", g*100+i)
 						}
 					}(g)
 				}
@@ -1146,8 +1259,7 @@ func (p syncDataProvider) GetContextData() *future.Future {
 }
 
 // v1.1.1: a custom deserializer with no logger could call WaitUntilReady and
-// Refresh from inside an evaluation. (With a provider that settles on another
-// goroutine, Refresh from a deserializer hangs; see CHANGELOG Known issues.)
+// Refresh from inside an evaluation.
 func TestDeserializerWithoutLoggerCanWaitAndRefresh(t *testing.T) {
 	var d = &snapshotCallingDeserializer{}
 	var client = &systemAttrClient{application: "website", environment: "production"}
@@ -1383,8 +1495,8 @@ func TestChangedTrafficSplitInvalidatesCachedAssignment(t *testing.T) {
 	assertAny([]float64{1, 0}, after.TrafficSplit, t)
 }
 
-// lockProbeDeserializer records whether ContextLock_ was free (could be taken
-// for writing) when the AudienceDeserializer ran.
+// lockProbeDeserializer counts its calls and those made with ContextLock_
+// free.
 type lockProbeDeserializer struct {
 	mu    sync.Mutex
 	ctx   *Context
@@ -1467,8 +1579,8 @@ func TestAudienceDeserializerRunsOutsideTheContextLock(t *testing.T) {
 }
 
 // reparseAudience installs the context's data again with a new audience text
-// for exp_app, so the AudienceDeserializer runs (it runs when data is
-// installed), then reads the treatment.
+// and iteration for exp_app, then reads the treatment, so the
+// AudienceDeserializer parses the new text.
 var reparseRound int32
 
 // revalidateAudience changes only exp_app's audience text, which keeps its
