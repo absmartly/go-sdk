@@ -1040,9 +1040,8 @@ func (d *panicOnceDeserializer) Deserialize(b []byte, offset, length int) (map[s
 	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
 }
 
-// A panicked parse is reused only while its Error is logged: another
-// experiment with the same audience text later asks the recovered
-// deserializer and evaluates its strict audience.
+// A panicked parse is local to its experiment: another experiment with the
+// same audience text asks the recovered deserializer and evaluates its audience.
 func TestTemporaryAudiencePanicIsNotShared(t *testing.T) {
 	var exclude = `{"filter":[{"value":false}]}`
 	var first, second = audienceExperiment("first", exclude, true), audienceExperiment("second", exclude, true)
@@ -1053,6 +1052,316 @@ func TestTemporaryAudiencePanicIsNotShared(t *testing.T) {
 	assertAny(1, treatmentPeek(t, ctx, "first"), t)
 	assertAny(0, treatmentPeek(t, ctx, "second"), t)
 	assertAny(int32(2), atomic.LoadInt32(&d.calls), t)
+}
+
+type callbackEventLogger func(Context, EventType, interface{})
+
+func (l callbackEventLogger) HandleEvent(c Context, event EventType, data interface{}) {
+	l(c, event, data)
+}
+
+// A panic logger may read the failing experiment without recursion, but a
+// different experiment must parse the same text with the recovered deserializer.
+func TestAudiencePanicLoggerReadsDifferentExperiment(t *testing.T) {
+	var exclude = `{"filter":[{"value":false}]}`
+	var first, second = audienceExperiment("first", exclude, true), audienceExperiment("second", exclude, true)
+	second.Id = 2
+	var ctx, _ = newSystemAttrContext("website", "production", first, second)
+	var d = &panicOnceDeserializer{}
+	ctx.AudienceMatcher_ = AudienceMatcher{d}
+	var seen = make(chan []int, 1)
+	var errorsLogged int32
+	ctx.EventLogger_ = callbackEventLogger(func(c Context, event EventType, _ interface{}) {
+		if event != Error {
+			return
+		}
+		if atomic.AddInt32(&errorsLogged, 1) > 2 {
+			return // Bound a regression that recursively logs the same panic.
+		}
+		var own, _ = c.PeekTreatment("first")
+		var other, _ = c.PeekTreatment("second")
+		seen <- []int{own, other}
+	})
+	var done = make(chan int, 1)
+	go func() { v, _ := ctx.PeekTreatment("first"); done <- v }()
+	select {
+	case variant := <-done:
+		assertAny(1, variant, t)
+	case <-time.After(5 * time.Second):
+		t.Fatal("panic logger reading treatments did not return")
+	}
+	select {
+	case variants := <-seen:
+		assertAny([]int{1, 0}, variants, t)
+	case <-time.After(5 * time.Second):
+		t.Fatal("panic logger did not read both experiments")
+	}
+	assertAny(int32(1), atomic.LoadInt32(&errorsLogged), t)
+	assertAny(int32(2), atomic.LoadInt32(&d.calls), t)
+	assertAny(nil, ctx.SetAttribute("x", 1), t)
+	assertAny(1, treatmentPeek(t, ctx, "first"), t)
+	assertAny(0, treatmentPeek(t, ctx, "second"), t)
+	assertAny(int32(2), atomic.LoadInt32(&d.calls), t)
+}
+
+// A recovered parse from inside the logger must not replace the original
+// build's failed outcome, even when no nested read has cached that assignment.
+func TestAudiencePanicLoggerRecoveryKeepsOriginalFallback(t *testing.T) {
+	var exclude = `{"filter":[{"value":false}]}`
+	var first, second = audienceExperiment("first", exclude, true), audienceExperiment("second", exclude, true)
+	second.Id = 2
+	var ctx, _ = newSystemAttrContext("website", "production", first, second)
+	var d = &panicOnceDeserializer{}
+	ctx.AudienceMatcher_ = AudienceMatcher{d}
+	var seen = make(chan int, 1)
+	ctx.EventLogger_ = callbackEventLogger(func(c Context, event EventType, _ interface{}) {
+		if event == Error {
+			var other, _ = c.PeekTreatment("second")
+			seen <- other
+		}
+	})
+	var done = make(chan int, 1)
+	go func() { v, _ := ctx.PeekTreatment("first"); done <- v }()
+	select {
+	case variant := <-done:
+		assertAny(1, variant, t)
+	case <-time.After(5 * time.Second):
+		t.Fatal("panic logger recovery did not return")
+	}
+	select {
+	case variant := <-seen:
+		assertAny(0, variant, t)
+	case <-time.After(5 * time.Second):
+		t.Fatal("panic logger did not read the recovered experiment")
+	}
+	assertAny(int32(2), atomic.LoadInt32(&d.calls), t)
+	assertAny(0, len(ctx.state().audiencePanics), t)
+	assertAny(nil, ctx.SetAttribute("x", 1), t)
+	assertAny(1, treatmentPeek(t, ctx, "first"), t)
+	assertAny(int32(2), atomic.LoadInt32(&d.calls), t)
+}
+
+// A document with no usable filter is a local failure, not a shared success.
+func TestUnusableAudienceDocumentIsNotShared(t *testing.T) {
+	for _, document := range []string{`{}`, `null`, `{"filter":null}`, `{"filter":false}`, `{"filter":5}`, `{"filter":"invalid"}`} {
+		t.Run(document, func(t *testing.T) {
+			var exclude = `{"filter":[{"value":false}]}`
+			var first, second = audienceExperiment("first", exclude, true), audienceExperiment("second", exclude, true)
+			second.Id = 2
+			var ctx, _ = newSystemAttrContext("website", "production", first, second)
+			var calls int32
+			ctx.AudienceMatcher_ = AudienceMatcher{funcDeserializer(func(b []byte, offset, length int) (map[string]interface{}, error) {
+				if atomic.AddInt32(&calls, 1) == 1 {
+					return DefaultAudienceDeserializer{}.Deserialize([]byte(document), 0, len(document))
+				}
+				return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+			})}
+			assertAny(1, treatmentPeek(t, ctx, "first"), t)
+			assertAny(0, treatmentPeek(t, ctx, "second"), t)
+			assertAny(int32(2), atomic.LoadInt32(&calls), t)
+			assertAny(nil, ctx.SetAttribute("x", 1), t)
+			assertAny(1, treatmentPeek(t, ctx, "first"), t)
+			assertAny(0, treatmentPeek(t, ctx, "second"), t)
+			assertAny(int32(2), atomic.LoadInt32(&calls), t)
+		})
+	}
+}
+
+type controlledRefreshProvider struct {
+	result *future.Future
+	calls  int32
+}
+
+func (p *controlledRefreshProvider) GetContextData() *future.Future {
+	atomic.AddInt32(&p.calls, 1)
+	return p.result
+}
+
+// An earlier listener must be able to wait for a joining copy, independently
+// of listener registration order. All copies adopt before success is visible.
+func TestOriginalRefreshListenerCanWaitForJoiningCopies(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("error=%v", fail), func(t *testing.T) {
+			var before, after = ruleExperiment("before", ""), ruleExperiment("after", "")
+			var ctx, _ = newRuleContext(t, "production", withUnit(), before)
+			ctx.Clock_ = internal.FixedClock{Millis_: 1}
+			var first, second = *ctx, *ctx
+			var pending, settle = future.New()
+			var provider = &controlledRefreshProvider{result: pending}
+			ctx.DataProvider_ = provider
+			var expected error
+			if fail {
+				expected = errors.New("refresh failed")
+			}
+			var started = ctx.RefreshAsync()
+			var joined, another *future.Future
+			var seen = make(chan error, 1)
+			started.Listen(func(_ future.Value, err error) {
+				var wait, cancel = context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				if _, got := joined.Get(wait); got != expected {
+					seen <- fmt.Errorf("joined Get = %v, want %v", got, expected)
+					return
+				}
+				if _, got := another.Get(wait); got != expected {
+					seen <- fmt.Errorf("second joined Get = %v, want %v", got, expected)
+					return
+				}
+				for _, copy := range []*Context{&first, &second} {
+					var _, found = copy.GetExperiment("after")
+					if found == fail {
+						seen <- fmt.Errorf("copy adopted=%v, failure=%v", found, fail)
+						return
+					}
+				}
+				seen <- err
+			})
+			joined = first.RefreshAsync()
+			another = second.RefreshAsync()
+			assertAny(false, joined.Ready(), t)
+			var completed = make(chan struct{})
+			go func() {
+				defer close(completed)
+				settle(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{after}}, expected)
+			}()
+			select {
+			case got := <-seen:
+				assertAny(expected, got, t)
+			case <-time.After(5 * time.Second):
+				t.Fatal("original refresh listener did not return")
+			}
+			select {
+			case <-completed:
+			case <-time.After(5 * time.Second):
+				t.Fatal("refresh completion did not return")
+			}
+			assertAny(expected, getWithTimeout(t, joined), t)
+			assertAny(expected, getWithTimeout(t, another), t)
+			assertAny(int32(1), atomic.LoadInt32(&provider.calls), t)
+		})
+	}
+}
+
+// Adoption and operation cleanup precede logger reentry, on success and error.
+// Reentry must not wait for the operation whose event it is delivering.
+func TestRefreshCompletionAllowsLoggerReentryWithJoiningCopy(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("error=%v", fail), func(t *testing.T) {
+			var before, after, latest = ruleExperiment("before", ""), ruleExperiment("after", ""), ruleExperiment("latest", "")
+			var ctx, _ = newRuleContext(t, "production", withUnit(), before)
+			ctx.Clock_ = internal.FixedClock{Millis_: 1}
+			var copied = *ctx
+			var pending, settle = future.New()
+			ctx.DataProvider_ = &controlledRefreshProvider{result: pending}
+			var expected error
+			var event = Refresh
+			if fail {
+				expected, event = errors.New("refresh failed"), Error
+			}
+			var entered int32
+			var seen = make(chan error, 1)
+			ctx.EventLogger_ = callbackEventLogger(func(_ Context, kind EventType, _ interface{}) {
+				if kind != event || !atomic.CompareAndSwapInt32(&entered, 0, 1) {
+					return
+				}
+				var name = "after"
+				if fail {
+					name = "before"
+				}
+				if _, found := copied.GetExperiment(name); !found {
+					seen <- fmt.Errorf("logger did not observe copy's %s data", name)
+					return
+				}
+				ctx.DataProvider_ = syncDataProvider{jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{latest}}}
+				var nested = ctx.RefreshAsync()
+				var wait, cancel = context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				var _, err = nested.Get(wait)
+				seen <- err
+			})
+			var started = ctx.RefreshAsync()
+			var joined = copied.RefreshAsync()
+			var completed = make(chan struct{})
+			go func() {
+				defer close(completed)
+				settle(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{after}}, expected)
+			}()
+			select {
+			case err := <-seen:
+				assertAny(nil, err, t)
+			case <-time.After(5 * time.Second):
+				t.Fatal("refresh logger reentry did not return")
+			}
+			select {
+			case <-completed:
+			case <-time.After(5 * time.Second):
+				t.Fatal("outer refresh completion did not return")
+			}
+			assertAny(expected, getWithTimeout(t, started), t)
+			assertAny(expected, getWithTimeout(t, joined), t)
+			var _, found = ctx.GetExperiment("latest")
+			assertAny(true, found, t)
+		})
+	}
+}
+
+// A registrant that already captured an operation may reach it after completion.
+func TestRefreshOperationLateCopyRegistration(t *testing.T) {
+	for _, success := range []bool{false, true} {
+		var before, after = ruleExperiment("before", ""), ruleExperiment("after", "")
+		var ctx, _ = newRuleContext(t, "production", withUnit(), before)
+		ctx.Clock_ = internal.FixedClock{Millis_: 1}
+		var copied = *ctx
+		var op = &refreshOperation{receivers: map[*Context]struct{}{}}
+		ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{after}})
+		op.complete(ctx, success)
+		op.join(&copied, ctx)
+		var _, found = copied.GetExperiment("after")
+		assertAny(success, found, t)
+		assertAny(0, len(op.receivers), t)
+	}
+}
+
+// Registering copies concurrently with completion cannot lose an adoption.
+func TestRefreshOperationConcurrentCopyRegistration(t *testing.T) {
+	var before, after = ruleExperiment("before", ""), ruleExperiment("after", "")
+	var ctx, _ = newRuleContext(t, "production", withUnit(), before)
+	ctx.Clock_ = internal.FixedClock{Millis_: 1}
+	var copies = make([]Context, 32)
+	for i := range copies {
+		copies[i] = *ctx
+	}
+	ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{after}})
+	var op = &refreshOperation{receivers: map[*Context]struct{}{}}
+	var start = make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range copies {
+		var receiver = &copies[i]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			op.join(receiver, ctx)
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		op.complete(ctx, true)
+	}()
+	var done = make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	close(start)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent copy registration did not return")
+	}
+	for i := range copies {
+		var _, found = copies[i].GetExperiment("after")
+		assertAny(true, found, t)
+	}
 }
 
 // A copy of a clock-replaced context that joins a refresh started elsewhere
@@ -2401,9 +2710,8 @@ func (d *countingPanicDeserializer) Deserialize([]byte, int, int) (map[string]in
 	panic("deserializer bug")
 }
 
-// A logger that reads the experiment while the panic is being reported uses
-// the cached failed parse instead of calling the deserializer again.
-func TestPanicLoggerReadingTheExperimentUsesTheCachedParse(t *testing.T) {
+// A same-experiment logger read uses its local failure without another parse.
+func TestPanicLoggerReadingTheExperimentDoesNotReparse(t *testing.T) {
 	var logger = &readingLogger{}
 	var d = &countingPanicDeserializer{}
 	var client = &systemAttrClient{application: "website", environment: "production"}

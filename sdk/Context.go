@@ -83,8 +83,9 @@ type contextState struct {
 	// atomic for syncLiteralExperiment. It is taken last, with no other lock
 	// taken inside it.
 	indexLock_ sync.Mutex
-	// stateLock_ guards ReadyFuture_, RefreshFuture_, ClosingFuture_, RefreshTimer_ and closeStarted_.
+	// stateLock_ guards ReadyFuture_, RefreshFuture_, ClosingFuture_, RefreshTimer_, refresh_ and closeStarted_.
 	stateLock_ *sync.Mutex
+	refresh_   *refreshOperation
 	// inflight_ holds the publishes that have been sent and not yet settled. Guarded by stateLock_.
 	inflight_ []*future.Future
 
@@ -136,11 +137,11 @@ type contextState struct {
 	assignmentCache_ map[string]*cachedAssignment
 	ruleIdentities   *ruleAssignmentIdentities
 
-	// audiences caches parsed audiences (*audienceEntry) by audience text. A parse
-	// runs the AudienceDeserializer, which is customer code, so it is done on
-	// the reading goroutine before any lock is taken (as v1.1.1 called it
-	// without a lock), and never while ContextLock_ is held.
-	audiences sync.Map
+	// audiences shares only usable parsed filters. Customer deserializers run
+	// without context locks. audiencePanics guards same-experiment logger reads
+	// while a panic is reported; it is protected by ContextLock_.
+	audiences      sync.Map
+	audiencePanics map[string][]*failedParse
 }
 
 // contextClock carries private state in an existing interface field without
@@ -320,19 +321,9 @@ type cachedAssignment struct {
 	// experiment's unit was not set, so the variant is the experiment's
 	// no-unit result rather than a hash of the unit.
 	ruleMissingUnit bool
-	// failedAudience is the audience text, and failedDeserializer the
-	// deserializer, whose parse failed when this assignment was built. Failed
-	// parses are not shared between experiments; revalidating this one
-	// treats the same text as unparseable again rather than parsing it.
-	failedAudience     string
-	failedDeserializer AudienceDeserializer
-}
-
-// audienceFailedFor reports whether entry was built with a failed parse of
-// text by the current deserializer.
-func (c *Context) audienceFailedFor(entry *cachedAssignment, text string) bool {
-	return entry.failedAudience == text && text != "" &&
-		sameDeserializer(entry.failedDeserializer, c.AudienceMatcher_.Deserializer_)
+	// failed is assignment-local: revalidation keeps the original fallback,
+	// but another experiment (or deserializer) gets its own parse.
+	failed *failedParse
 }
 
 type loggerGoroutines struct {
@@ -1312,6 +1303,42 @@ func (c *Context) GetPendingCount() int32 {
 	return c.PendingCount_.Load().(int32)
 }
 
+// refreshOperation owns copy adoption independently of Future's user listeners.
+// Its mutex is never held while invoking customer code or taking stateLock_.
+// A late join adopts synchronously, before RefreshAsync returns its future.
+// Every caller shares that future, so listeners can wait on other joiners.
+type refreshOperation struct {
+	mu        sync.Mutex
+	receivers map[*Context]struct{}
+	completed bool
+	succeeded bool
+}
+
+func (op *refreshOperation) join(receiver, root *Context) {
+	if !receiver.needsLiveDataFrom(root) {
+		return
+	}
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	if !op.completed {
+		op.receivers[receiver] = struct{}{}
+	} else if op.succeeded {
+		receiver.adoptLiveDataFrom(root)
+	}
+}
+
+func (op *refreshOperation) complete(root *Context, succeeded bool) {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	if succeeded {
+		for receiver := range op.receivers {
+			receiver.adoptLiveDataFrom(root)
+		}
+	}
+	op.receivers = nil
+	op.completed, op.succeeded = true, succeeded
+}
+
 func (c *Context) RefreshAsync() *future.Future {
 	var receiver = c
 	c = c.live()
@@ -1323,25 +1350,14 @@ func (c *Context) RefreshAsync() *future.Future {
 		return tempfuture
 	}
 
-	// Decide and publish under one lock so a concurrent caller that sees the
-	// refresh as running also sees its future.
 	st.stateLock_.Lock()
 	if c.Refreshing_.Load().(bool) {
-		var active = c.RefreshFuture_
+		var active, op = c.RefreshFuture_, st.refresh_
 		st.stateLock_.Unlock()
-		if active != nil && receiver.needsLiveData() {
-			// A copy that joins the refresh reads its result too: settle its
-			// future after the data is copied to it.
-			var joined, settle = future.New()
-			active.Listen(func(value future.Value, err error) {
-				defer settle(value, err)
-				if err == nil {
-					receiver.adoptLiveData()
-				}
-			})
-			return joined
-		}
 		if active != nil {
+			if op != nil {
+				op.join(receiver, c)
+			}
 			return active
 		}
 		var tempfuture, donefun = future.New()
@@ -1350,13 +1366,13 @@ func (c *Context) RefreshAsync() *future.Future {
 	}
 	c.Refreshing_.Store(true)
 	var tempfuture, donefun = future.New()
-	c.RefreshFuture_ = tempfuture
+	var op = &refreshOperation{receivers: map[*Context]struct{}{}}
+	c.RefreshFuture_, st.refresh_ = tempfuture, op
 	st.stateLock_.Unlock()
+	op.join(receiver, c)
 
 	var loaded = c.callDataProvider()
 	var complete = func(value future.Value, err error) {
-		// Whatever happens below, the refresh ends: Refreshing_ is cleared and
-		// the future settles, so later refreshes are not blocked for ever.
 		var outcome = err
 		var result jsonmodels.ContextData
 		var diagnostics []bufferedEvent
@@ -1370,16 +1386,21 @@ func (c *Context) RefreshAsync() *future.Future {
 				diagnostics, panicErr = c.applyRefreshedData(result)
 				if panicErr != nil {
 					outcome = panicErr
-				} else {
-					receiver.adoptLiveData()
 				}
 			}
 		}
+		// Adopt every registered copy before loggers or future listeners can
+		// observe success. Registration racing completion adopts on its caller.
+		op.complete(c, outcome == nil)
+		st.stateLock_.Lock()
 		c.Refreshing_.Store(false)
+		if st.refresh_ == op {
+			st.refresh_ = nil
+		}
+		st.stateLock_.Unlock()
 
-		// The load is over, so a logger that calls Refresh starts a new one.
-		// Log before settling the future, so a caller that waits on Refresh
-		// returns after the logger has seen the refresh or error event.
+		// A logger may start another refresh. Keep this operation's future and
+		// settlement local, and preserve logger-before-return ordering.
 		c.dispatchDiagnostics(diagnostics)
 		if outcome == nil {
 			c.LogEvent(Refresh, result)
@@ -1672,7 +1693,7 @@ func (c *Context) audienceMatches(st *contextState, data jsonmodels.Experiment, 
 	if entry.ruleOverride || len(data.Audience) == 0 {
 		return true
 	}
-	if c.audienceFailedFor(entry, data.Audience) {
+	if entry.failed.matches(data.Audience, c.AudienceMatcher_.Deserializer_) {
 		// Unparseable when built, so the audience was ignored. It stays
 		// ignored for this assignment, as v1.1.1's single assignment kept
 		// its fallback, while other experiments parse the text again.
@@ -1818,7 +1839,7 @@ func (c *Context) buildAssignment(st *contextState, experimentName string) *cach
 			return entry
 		}
 		failed = nil
-		if parsed, deserializer := c.parseAudienceUnlocked(st, unparsed); parsed.err != nil {
+		if parsed, deserializer := c.parseAudienceUnlocked(st, experimentName, unparsed); parsed.err != nil {
 			failed = &failedParse{text: unparsed, deserializer: deserializer}
 		}
 	}
@@ -1829,6 +1850,21 @@ func (c *Context) buildAssignment(st *contextState, experimentName string) *cach
 type failedParse struct {
 	text         string
 	deserializer AudienceDeserializer
+}
+
+func (f *failedParse) matches(text string, deserializer AudienceDeserializer) bool {
+	return f != nil && f.text == text && text != "" && sameDeserializer(f.deserializer, deserializer)
+}
+
+// audiencePanic is called with ContextLock_ held. It prevents a logger's read
+// of the experiment reporting a panic from recursively invoking its parser.
+func (st *contextState) audiencePanic(name, text string, deserializer AudienceDeserializer) *failedParse {
+	for _, failed := range st.audiencePanics[name] {
+		if failed.matches(text, deserializer) {
+			return failed
+		}
+	}
+	return nil
 }
 
 const maxAudienceAttempts = 4
@@ -1897,16 +1933,16 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string,
 				var attrs = c.evaluationAttributesWithState(st)
 
 				var text = experiment.Data.Audience
-				if parsed, ok := c.cachedAudience(st, text); ok {
+				if guarded := st.audiencePanic(experimentName, text, c.AudienceMatcher_.Deserializer_); guarded != nil {
+					entry.failed = guarded
+				} else if failed.matches(text, c.AudienceMatcher_.Deserializer_) {
+					entry.failed = failed
+				} else if parsed, ok := c.cachedAudience(st, text); ok {
 					if match, err := parsed.evaluate(attrs); err == nil {
 						assignment.AudienceMismatch = !match.Get()
 					} else {
-						entry.failedAudience, entry.failedDeserializer = text, c.AudienceMatcher_.Deserializer_
+						entry.failed = &failedParse{text: text, deserializer: c.AudienceMatcher_.Deserializer_}
 					}
-				} else if failed != nil && failed.text == text && sameDeserializer(failed.deserializer, c.AudienceMatcher_.Deserializer_) {
-					// Unparseable: the audience is ignored, as v1.1.1 did
-					// when the deserializer failed.
-					entry.failedAudience, entry.failedDeserializer = text, failed.deserializer
 				} else if !last {
 					// The data changed between the unlocked parse and this
 					// lock: parse the new audience unlocked and start over.
@@ -1994,7 +2030,7 @@ func (c *Context) ClearRefreshTimer() {
 // A context with no state carrier (a literal, or a copy of a context whose
 // Clock_ was replaced) reads its own Index_ under DataLock, as v1.1.1 read
 // it, without ContextLock_. SetData and Refresh keep it current, including
-// through such a copy (see adoptLiveData).
+// through such a copy (see adoptLiveDataFrom).
 func (c *Context) GetExperiment(experimentName string) (ExperimentVariables, bool) {
 	var clock = c.ownClock()
 	if clock == nil {
@@ -2042,16 +2078,9 @@ func sameDeserializer(a, b AudienceDeserializer) (same bool) {
 	return a == b || b != b
 }
 
-// parseAudienceUnlocked parses text with the current AudienceDeserializer,
-// unless it already parsed it, and returns the parse and the deserializer.
-// The caller holds no context lock, so the deserializer may call back into
-// the context. Only successful parses are cached for other experiments; a
-// failed one is for the requesting build alone, so a deserializer that
-// recovers is asked again for the next experiment. A panic is reported to
-// the event logger (v1.1.1 let it escape the read); while it is logged the
-// failure is cached, so a logger that reads the experiment does not call the
-// deserializer again.
-func (c *Context) parseAudienceUnlocked(st *contextState, text string) (parsedAudience, AudienceDeserializer) {
+// parseAudienceUnlocked runs customer code without context locks. Only usable
+// filters enter the shared cache; failures belong to the requesting assignment.
+func (c *Context) parseAudienceUnlocked(st *contextState, name, text string) (parsedAudience, AudienceDeserializer) {
 	var deserializer = c.AudienceMatcher_.Deserializer_
 	if parsed, ok := c.cachedAudience(st, text); ok {
 		return parsed, deserializer
@@ -2065,23 +2094,44 @@ func (c *Context) parseAudienceUnlocked(st *contextState, text string) (parsedAu
 		}()
 		return AudienceMatcher{deserializer}.parseAudience(text)
 	}()
-	if parsed.err != nil && panicked == nil {
+	if panicked != nil {
+		c.logAudiencePanic(st, name, &failedParse{text: text, deserializer: deserializer}, panicked)
+	}
+	if parsed.err != nil {
 		return parsed, deserializer
 	}
-	var entry = &audienceEntry{deserializer: deserializer, parsed: parsed}
-	st.audiences.Store(text, entry)
+	st.audiences.Store(text, &audienceEntry{deserializer: deserializer, parsed: parsed})
 	if !st.hasAudience(text) {
-		// New data without this text was installed, and pruned, during the
-		// parse: don't keep the parse past that prune.
+		// Data installed during parsing may already have pruned this text.
 		st.audiences.Delete(text)
 	}
-	if panicked != nil {
-		c.LogError(fmt.Errorf("AudienceDeserializer panicked: %v", panicked))
-		if current, ok := st.audiences.Load(text); ok && current == entry {
-			st.audiences.Delete(text)
-		}
-	}
 	return parsed, deserializer
+}
+
+func (c *Context) logAudiencePanic(st *contextState, name string, failed *failedParse, panicked interface{}) {
+	c.ContextLock_.Lock()
+	if st.audiencePanics == nil {
+		st.audiencePanics = map[string][]*failedParse{}
+	}
+	st.audiencePanics[name] = append(st.audiencePanics[name], failed)
+	c.ContextLock_.Unlock()
+	defer func() {
+		c.ContextLock_.Lock()
+		defer c.ContextLock_.Unlock()
+		var active = st.audiencePanics[name]
+		for i, entry := range active {
+			if entry == failed {
+				active = append(active[:i], active[i+1:]...)
+				break
+			}
+		}
+		if len(active) == 0 {
+			delete(st.audiencePanics, name)
+		} else {
+			st.audiencePanics[name] = active
+		}
+	}()
+	c.LogError(fmt.Errorf("AudienceDeserializer panicked: %v", panicked))
 }
 
 // cachedAudience returns a parse made earlier by parseAudienceUnlocked with
@@ -2283,22 +2333,21 @@ func (c *Context) CheckReady(expectNotClosed bool) error {
 }
 
 func (c *Context) SetData(data jsonmodels.ContextData) {
+	var receiver, root = c, c.live()
 	var buffer = &diagnosticBuffer{}
-	c.setData(data, buffer)
-	c.adoptLiveData()
-	c.dispatchDiagnostics(buffer.take())
+	root.setData(data, buffer)
+	receiver.adoptLiveDataFrom(root)
+	receiver.dispatchDiagnostics(buffer.take())
 }
 
-// adoptLiveData copies the data setData installed on the live context into
-// c's own v1.1.1 data fields when c is a copy without a state carrier (a copy
-// of a context whose Clock_ was replaced), so GetExperiment and
-// GetVariableExperiment through c, which read those fields without
-// ContextLock_, agree with the data and assignments read through it.
-func (c *Context) adoptLiveData() {
-	if !c.needsLiveData() {
+// adoptLiveDataFrom copies the data installed on root into c's own v1.1.1
+// data fields when c is a copy without a state carrier, so its direct index
+// lookups agree with reads through the live context. Resolve root before
+// taking DataLock: live may take ContextLock_ on a clock-replaced context.
+func (c *Context) adoptLiveDataFrom(root *Context) {
+	if !c.needsLiveDataFrom(root) {
 		return
 	}
-	var root = c.live()
 	c.DataLock.Lock()
 	c.Index_ = root.Index_
 	c.IndexVariables_ = root.IndexVariables_
@@ -2307,10 +2356,8 @@ func (c *Context) adoptLiveData() {
 	c.DataLock.Unlock()
 }
 
-// needsLiveData reports whether c is a copy without a state carrier whose
-// v1.1.1 data fields must be copied from the live context after a load.
-func (c *Context) needsLiveData() bool {
-	return c.ownClock() == nil && c.ContextLock_ != nil && c.live() != c
+func (c *Context) needsLiveDataFrom(root *Context) bool {
+	return c != root && c.ownClock() == nil && c.ContextLock_ != nil
 }
 
 // diagnosticBuffer collects the events the parser and SetData emit while a
@@ -2529,7 +2576,7 @@ func (c *Context) SetDataFailed(err error) {
 	c.Ready_.Store(true)
 	c.Failed_.Store(true)
 	c.DataLock.Unlock()
-	receiver.adoptLiveData()
+	receiver.adoptLiveDataFrom(c)
 }
 
 func (c *Context) Flush() *future.Future {

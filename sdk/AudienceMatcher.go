@@ -45,7 +45,13 @@ func (am AudienceMatcher) parseAudience(audience string) parsedAudience {
 	if err != nil {
 		return parsedAudience{err: errors.New("can't evaluate data")}
 	}
-	return parsedAudience{filter: result["filter"]}
+	var filter = result["filter"]
+	switch reflect.ValueOf(filter).Kind() {
+	case reflect.Map, reflect.Slice, reflect.Array:
+		return parsedAudience{filter: filter}
+	default:
+		return parsedAudience{err: errors.New("can't evaluate data")}
+	}
 }
 
 func (p parsedAudience) evaluate(attributes map[string]interface{}) (Result, error) {
