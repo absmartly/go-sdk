@@ -859,6 +859,156 @@ func TestFailedLoadSettlesReadyFutureBeforeClearingIt(t *testing.T) {
 	}
 }
 
+// loggingPanicParser logs a diagnostic through the context it is given, then
+// panics.
+type loggingPanicParser struct{}
+
+func (loggingPanicParser) Parse(ctx Context, experimentName string, _ string, _ string) map[string]interface{} {
+	ctx.LogEvent(Exposure, "diagnostic from "+experimentName)
+	panic("parser panic")
+}
+
+// A failed initial load delivers the diagnostics its parser logged before
+// the Error event, as a failed refresh does.
+func TestFailedInitialLoadDeliversDiagnosticsBeforeTheError(t *testing.T) {
+	setUp()
+	var logger = &MockEventLogger{}
+	var config = CreateDefaultContextConfig()
+	config.Units_ = units
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = 0
+	config.EventLogger_ = logger
+	var pending, settle = future.New()
+	var ctx = createTrackedContext(clock, config, pending, dataProvider, eventHandler, logger, loggingPanicParser{}, audienceMatcher)
+	settle(data, nil)
+	ctx.WaitUntilReady()
+	assertAny(true, ctx.IsFailed(), t)
+	var kinds []EventType
+	for _, e := range logger.GetEvents() {
+		kinds = append(kinds, e.EventType)
+	}
+	assertAny([]EventType{Exposure, Error}, kinds, t)
+}
+
+// Exposures queued through a copy of a context whose Clock_ was replaced are
+// queued on the original, through QueueExposure and through GetTreatment.
+func TestCopyAfterClockReplacementQueuesExposuresOnTheOriginal(t *testing.T) {
+	for _, path := range []string{"QueueExposure", "GetTreatment"} {
+		var ctx, _ = newRuleContext(t, "production", withUnit(), ruleExperiment("exp", ""))
+		ctx.Clock_ = internal.FixedClock{Millis_: 1}
+		var copied = *ctx
+		if path == "QueueExposure" {
+			copied.QueueExposure(copied.GetAssignment("exp"))
+		} else {
+			var _, _ = copied.GetTreatment("exp")
+		}
+		// The copy shares the pending count; the queue itself is a field, so
+		// the exposure must be in the original's.
+		ctx.EventLock_.Lock()
+		var queued = len(ctx.Exposures_)
+		ctx.EventLock_.Unlock()
+		assertAny(1, queued, t)
+	}
+}
+
+// GetExperiment and GetVariableExperiment never take ContextLock_, as in
+// v1.1.1: a caller holding it (for reading or writing) still gets an answer,
+// for a literal, an SDK-created context and one whose Clock_ was replaced.
+func TestExperimentGettersDoNotTakeContextLock(t *testing.T) {
+	var experiment = ruleExperiment("exp", "")
+	experiment.Variants[1].Config = `{"key":1}`
+	var sdkCtx, _ = newRuleContext(t, "production", withUnit(), experiment)
+	var replaced, _ = newRuleContext(t, "production", withUnit(), experiment)
+	replaced.Clock_ = internal.FixedClock{Millis_: 1}
+	var literal = audienceLiteral(experiment)
+	literal.IndexVariables_ = map[interface{}]interface{}{"key": literal.Index_["exp"]}
+	for name, c := range map[string]*Context{"sdk": sdkCtx, "replaced": replaced, "literal": literal} {
+		for _, write := range []bool{false, true} {
+			if write {
+				c.ContextLock_.Lock()
+			} else {
+				c.ContextLock_.RLock()
+			}
+			var done = make(chan bool, 1)
+			go func() {
+				var _, found = c.GetExperiment("exp")
+				var _, err = c.GetVariableExperiment("key")
+				done <- found && err == nil
+			}()
+			select {
+			case ok := <-done:
+				assertAny(true, ok, t)
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%s: an experiment getter took ContextLock_ (write: %v)", name, write)
+			}
+			if write {
+				c.ContextLock_.Unlock()
+			} else {
+				c.ContextLock_.RUnlock()
+			}
+		}
+	}
+}
+
+// SetData through a copy of a context whose Clock_ was replaced, racing
+// reads through the copy and the original, is race-free (run with -race).
+func TestCopySetDataRacingReadsAfterClockReplacement(t *testing.T) {
+	var before, after = ruleExperiment("before", ""), ruleExperiment("after", "")
+	var ctx, _ = newRuleContext(t, "production", withUnit(), before)
+	ctx.Clock_ = internal.FixedClock{Millis_: 1}
+	var copied = *ctx
+	var stop int32
+	var wg sync.WaitGroup
+	for _, c := range []*Context{&copied, ctx} {
+		var c = c
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for atomic.LoadInt32(&stop) == 0 {
+				var _, _ = c.GetExperiment("after")
+				var _, _ = c.GetVariableExperiment("key")
+				var _, _ = c.PeekTreatment("after")
+			}
+		}()
+	}
+	for i := 0; i < 20; i++ {
+		var next = after
+		next.Iteration = i + 1
+		copied.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{next}})
+	}
+	atomic.StoreInt32(&stop, 1)
+	wg.Wait()
+	var experiment, found = copied.GetExperiment("after")
+	assertAny(true, found, t)
+	assertAny(20, experiment.Data.Iteration, t)
+}
+
+// Refresh through a copy of a context whose Clock_ was replaced updates the
+// experiments read through that copy, as SetData does.
+func TestCopyRefreshAfterClockReplacementIsReadBack(t *testing.T) {
+	var before, after = ruleExperiment("before", ""), ruleExperiment("after", "")
+	after.Id = 9
+	var p = &pendingProvider{release: make(chan struct{}),
+		data: jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{after}}}
+	close(p.release)
+	var client = &systemAttrClient{application: "website", environment: "production"}
+	var cc = CreateDefaultContextConfig()
+	cc.Units_, cc.PublishDelay_, cc.RefreshInterval_ = withUnit(), -1, -1
+	var ctx = Create(ABsmartlyConfig{Client_: client, ContextDataProvider_: p,
+		ContextEventHandler_: DefaultContextEventHandler{client_: client}}).CreateContextWith(cc,
+		jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{before}})
+	ctx.WaitUntilReady()
+	ctx.Clock_ = internal.FixedClock{Millis_: 1}
+	var copied = *ctx
+	copied.Refresh()
+	for name, c := range map[string]*Context{"copy": &copied, "original": ctx} {
+		assertAny(9, c.GetAssignment("after").Id, t)
+		if _, found := c.GetExperiment("after"); !found {
+			t.Errorf("%s: GetExperiment does not see the refreshed data", name)
+		}
+	}
+}
+
 // callingDeserializer runs call (once per evaluation, from inside it) while
 // the context evaluates an audience.
 type callingDeserializer struct {

@@ -1304,6 +1304,7 @@ func (c *Context) GetPendingCount() int32 {
 }
 
 func (c *Context) RefreshAsync() *future.Future {
+	var receiver = c
 	c = c.live()
 	var st = c.state()
 	var err = c.CheckNotClosed()
@@ -1348,6 +1349,8 @@ func (c *Context) RefreshAsync() *future.Future {
 				diagnostics, panicErr = c.applyRefreshedData(result)
 				if panicErr != nil {
 					outcome = panicErr
+				} else {
+					receiver.adoptLiveData()
 				}
 			}
 		}
@@ -1949,12 +1952,11 @@ func (c *Context) ClearRefreshTimer() {
 // reads the index setData published atomically, so a refresh installing new
 // data cannot race it.
 //
-// It reads the live context, where SetData installs data, so a copy agrees
-// with the original and with assignment evaluation. A live context with no
-// state carrier (a literal, or one whose Clock_ was replaced) reads Index_,
-// as v1.1.1 did; setData keeps it current.
+// A context with no state carrier (a literal, or a copy of a context whose
+// Clock_ was replaced) reads its own Index_ under DataLock, as v1.1.1 read
+// it, without ContextLock_. SetData and Refresh keep it current, including
+// through such a copy (see adoptLiveData).
 func (c *Context) GetExperiment(experimentName string) (ExperimentVariables, bool) {
-	c = c.live()
 	if c.ownClock() == nil {
 		if c.DataLock != nil {
 			c.DataLock.RLock()
@@ -2234,7 +2236,29 @@ func (c *Context) CheckReady(expectNotClosed bool) error {
 func (c *Context) SetData(data jsonmodels.ContextData) {
 	var buffer = &diagnosticBuffer{}
 	c.setData(data, buffer)
+	c.adoptLiveData()
 	c.dispatchDiagnostics(buffer.take())
+}
+
+// adoptLiveData copies the data setData installed on the live context into
+// c's own v1.1.1 data fields when c is a copy without a state carrier (a copy
+// of a context whose Clock_ was replaced), so GetExperiment and
+// GetVariableExperiment through c, which read those fields without
+// ContextLock_, agree with the data and assignments read through it.
+func (c *Context) adoptLiveData() {
+	if c.ownClock() != nil || c.ContextLock_ == nil {
+		return
+	}
+	var root = c.live()
+	if root == c {
+		return
+	}
+	c.DataLock.Lock()
+	c.Index_ = root.Index_
+	c.IndexVariables_ = root.IndexVariables_
+	c.Data_ = root.Data_
+	c.ContextCustomFields_ = root.ContextCustomFields_
+	c.DataLock.Unlock()
 }
 
 // diagnosticBuffer collects the events the parser and SetData emit while a
@@ -2789,7 +2813,6 @@ func legacyIndexVariables(index map[string][]ExperimentVariables) map[interface{
 }
 
 func (c *Context) GetVariableExperiment(key string) (ExperimentVariables, error) {
-	c = c.live()
 	if c.ownClock() == nil {
 		// As GetExperiment: read the v1.1.1 field, which setData keeps
 		// current.
