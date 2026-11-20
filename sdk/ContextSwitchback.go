@@ -115,9 +115,8 @@ type switchbackSlot struct {
 	period     int64
 	hasPeriod  bool
 	// startAt and periodMs bound the slot's period, for QueueExposure.
-	startAt  int64
-	periodMs int64
-
+	startAt    int64
+	periodMs   int64
 	resolvedAt int64
 	// silent is set for a resolution the Collector records nothing for: no
 	// linked unit, an ineligible cluster, or no period to draw in.

@@ -243,8 +243,9 @@ func switchbackOpaque(value reflect.Value) bool {
 
 // switchbackEncodable reports whether the value has a JSON encoding without
 // a container cycle and with containers nested at most switchbackMaxDepth
-// deep. Elements are checked as encoding/json encodes them (jsonElement). path holds the containers on the current branch only, so a value
-// shared by two siblings is not a cycle.
+// deep. Elements are checked as encoding/json encodes them (jsonElement).
+// path holds the containers on the current branch only, so a value shared by
+// two siblings is not a cycle.
 func switchbackEncodable(value reflect.Value, path map[uintptr]bool, depth int) bool {
 	for hops := 0; value.IsValid() && (value.Kind() == reflect.Ptr || value.Kind() == reflect.Interface) && !switchbackOpaque(value); hops++ {
 		if value.IsNil() {
