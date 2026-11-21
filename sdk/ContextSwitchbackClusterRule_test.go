@@ -120,7 +120,10 @@ func crExpectIneligible(t *testing.T, experiment jsonmodels.Experiment, attribut
 func TestSwitchbackClusterRule_MissingOrUnreadableClusterConfigurationReturnsOnlyLegacyIneligibleControl(t *testing.T) {
 	var attributes = map[string]interface{}{"geo": map[string]interface{}{"city": "Porto"}, "geo.city": "Faro", "session_store": "s-1"}
 	for _, clusters := range []jsonmodels.SwitchbackClusters{nil, {}, sbClusters(crSession, "'geo"), sbClusters(crSession, "geo.city"),
-		sbClusters(crSession, "'geo.city'"), sbClusters(crSession, `"geo.city"`)} {
+		sbClusters(crSession, "'geo.city'"), sbClusters(crSession, `"geo.city"`),
+		// One unsupported path among readable ones makes the whole map unreadable,
+		// in either order.
+		sbClusters(crSession, "session_store", crUser, "'geo"), sbClusters(crUser, "'geo", crSession, "session_store")} {
 		var experiment = crExperiment(clusters)
 		// The declared unit (user_id) only identifies an ineligible control.
 		crExpectIneligible(t, experiment, attributes, crUser, map[string]string{crSession: "x1", crUser: "u1"})
