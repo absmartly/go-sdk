@@ -1868,11 +1868,15 @@ func (c *Context) validEntry(experimentName string, entry *cachedAssignment, ign
 		if !c.ExperimentMatches(experiment.Data, *assignment) || !holdoutSetMatches(holdouts, entry.holdouts) {
 			return rules, assignmentStale
 		}
-		if ignoreCustom && (entry.resolvedAudience != experiment.Data.Audience ||
-			entry.resolvedAudienceStrict != experiment.Data.AudienceStrict) {
-			// The claim judges the decision against the audience it would be
-			// evaluated with now, so a definition that made it strict, or
-			// changed it, cannot authorize the earlier decision.
+		if (ignoreCustom || !assignment.Exposed.Load().(bool) && c.index_.Load().keyed) &&
+			(entry.resolvedAudience != experiment.Data.Audience ||
+				entry.resolvedAudienceStrict != experiment.Data.AudienceStrict) {
+			// An unexposed decision in a keyed context is judged against the
+			// audience it would be evaluated with now, by the cache and the
+			// claim alike, so a definition that made it strict, or changed it,
+			// rebuilds it rather than letting a variable read claim it. An
+			// exposed decision, and every decision in other contexts, keeps
+			// the released behaviour.
 			return rules, assignmentStale
 		}
 		if rules == entry.rules && atomic.LoadInt32(&c.AttrsSeq_) <= entry.attrsSeq {

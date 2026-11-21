@@ -4557,3 +4557,101 @@ func TestHoldout_ClaimReleasesTheLockOnPanic(t *testing.T) {
 	}
 	h.ctx.ContextLock_.Unlock()
 }
+
+// In a keyed context a refresh that edits an unexposed decision's audience
+// (the expression or its strictness) rebuilds the decision, so the next
+// variable read claims and exposes it once instead of finding it stale on
+// every attempt.
+func TestHoldout_AudienceEditRebuildsAnUnexposedKeyedDecision(t *testing.T) {
+	var gb = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+	var us = `{"filter":[{"eq":[{"var":"country"},{"value":"US"}]}]}`
+	for _, c := range []struct {
+		name   string
+		edit   func(*jsonmodels.Experiment)
+		strict bool
+	}{
+		{"expression", func(e *jsonmodels.Experiment) { e.Audience = us }, false},
+		{"strictness", func(e *jsonmodels.Experiment) { e.AudienceStrict = true }, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+			e.Audience = gb
+			var r = hoExperiment(2, "r", hoUnitType, 0)
+			r.AssignmentRules = hoUSRule
+			var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+			h.setAttribute("country", "GB")
+			h.peek("e")
+			var edited = e
+			c.edit(&edited)
+			h.ctx.SetData(hoData(nil, edited, r))
+			for i := 0; i < 3; i++ {
+				h.variable("v")
+			}
+			h.expectPending(1)
+		})
+	}
+}
+
+// A restored key cannot authorize a decision whose audience expression
+// changed (strictness unchanged and strict throughout) since it was resolved.
+func TestHoldout_RestoredKeyDoesNotAuthorizeADecisionBeforeAnAudienceEdit(t *testing.T) {
+	var three = hoThreeArm(11, "three_arm", hoThreeArm1Lo)
+	var first = hoWithVariables(hoExperiment(2, "b", hoUnitType, 1, 11), "v")
+	first.AudienceStrict = true
+	var middle = hoWithVariables(hoExperiment(2, "b", hoUnitType, 1, 11), "w")
+	middle.AudienceStrict = true
+	middle.TrafficSplit = []float64{0, 1, 0}
+	var last = middle
+	last.Variants = first.Variants
+	last.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{three}, first))
+	t.Cleanup(func() { afterReadResolve, beforeSettleClaim = nil, nil })
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{three}, middle))
+			h.ctx.GetAssignment("b")
+		}
+	}
+	var claims = 0
+	beforeSettleClaim = func() {
+		claims++
+		if claims == 2 {
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{three}, last))
+		}
+	}
+	h.variable("v")
+	afterReadResolve, beforeSettleClaim = nil, nil
+	if armed || claims < 2 {
+		t.Fatal("the middle decision was not retried")
+	}
+	for _, exposure := range queuedExposures(h.ctx) {
+		if exposure.Id == 2 && (exposure.FullOn || exposure.Assigned) {
+			t.Fatalf("the pre-edit full-on decision was exposed: %+v", queuedExposures(h.ctx))
+		}
+	}
+}
+
+// An exposed decision keeps the released behaviour across an audience edit
+// that leaves rules and attributes alone: it is not rebuilt, so it is not
+// exposed a second time.
+func TestHoldout_AudienceEditKeepsAnExposedKeyedDecision(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+	e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	h.setAttribute("country", "GB")
+	h.variable("v")
+	var before = h.ctx.getAssignment("e")
+	var edited = e
+	edited.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"US"}]}]}`
+	h.ctx.SetData(hoData(nil, edited, r))
+	h.variable("v")
+	h.treatment("e")
+	if h.ctx.getAssignment("e") != before {
+		t.Fatal("the exposed decision was rebuilt")
+	}
+	h.expectPending(1)
+}
