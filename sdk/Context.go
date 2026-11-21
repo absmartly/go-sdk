@@ -1370,19 +1370,12 @@ func (op *refreshOperation) join(receiver, root *Context) {
 	op.mu.Lock()
 	defer op.mu.Unlock()
 	if !op.settled {
-		// Until the future settles, register: settle adopts after the
-		// completion logger, which may install newer data. complete has
-		// already adopted the earlier joiners, so adopt this one now too.
 		if op.receivers == nil {
 			op.receivers = map[*Context]struct{}{}
 		}
 		op.receivers[receiver] = struct{}{}
-		if op.completed {
-			receiver.adoptLiveDataFrom(root)
-		}
-	} else {
-		// A copy joining after settlement adopts the live data itself,
-		// whatever the outcome, as settle does for earlier joiners.
+	}
+	if op.completed {
 		receiver.adoptLiveDataFrom(root)
 	}
 }
@@ -1775,8 +1768,6 @@ func (c *Context) audienceMatches(st *contextState, data jsonmodels.Experiment, 
 	}
 	var parsed, ok = c.cachedAudience(st, data.Audience)
 	if !ok {
-		// Not parsed yet: report a change, so the caller's rebuild asks for
-		// the parse with no lock held and validates again.
 		return false
 	}
 	var match, err = parsed.evaluate(c.evaluationAttributesWithState(st))

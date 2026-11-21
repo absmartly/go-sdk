@@ -1406,8 +1406,6 @@ func keyedExperiment(name, key string) jsonmodels.Experiment {
 	return experiment
 }
 
-// assertCopyReadsOnly checks that c's experiment and variable-key lookups find
-// want and want_key, and no longer find gone and gone_key.
 func assertCopyReadsOnly(t *testing.T, c *Context, want, gone string) {
 	t.Helper()
 	if _, found := c.GetExperiment(want); !found {
@@ -3119,7 +3117,6 @@ func TestParseOfRemovedAudienceIsNotCached(t *testing.T) {
 	assertAny([]string{`{"filter":[{"value":1}]}`}, texts, t)
 }
 
-// The parse cache keeps only the installed audience texts.
 func TestAudienceCacheIsPrunedOnInstall(t *testing.T) {
 	var ctx, _ = newSystemAttrContext("website", "production", audienceExperiment("exp_app", appFilter, true))
 	for i := 0; i < 5; i++ {
