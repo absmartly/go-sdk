@@ -144,6 +144,52 @@ type contextState struct {
 	// reads while a panic is reported; it is protected by ContextLock_.
 	audiences      sync.Map
 	audiencePanics map[string][]*audienceParse
+
+	// customAudiences serialises, within this context, each custom
+	// deserializer call with the locked evaluation of its result, as v1.1.1
+	// did by holding ContextLock_ across both. It is taken with no context
+	// lock held and released after ContextLock_ is, and is reentrant for its
+	// owner, so a deserializer or a panic logger can read other experiments
+	// (a deserializer reusing storage across such nested calls on its own
+	// goroutine is not protected). See buildAssignment.
+	customAudiences reentrantGate
+}
+
+// reentrantGate is a mutex that the goroutine holding it may take again.
+type reentrantGate struct {
+	mu    sync.Mutex
+	free  sync.Cond
+	owner uint64
+	depth int
+}
+
+// lock takes the gate, waiting while another goroutine holds it unless wait
+// is false, in which case it reports false instead of waiting.
+func (g *reentrantGate) lock(wait bool) bool {
+	var id = goroutineID()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.free.L == nil {
+		g.free.L = &g.mu
+	}
+	for g.depth > 0 && g.owner != id {
+		if !wait {
+			return false
+		}
+		g.free.Wait()
+	}
+	g.owner = id
+	g.depth++
+	return true
+}
+
+func (g *reentrantGate) unlock() {
+	g.mu.Lock()
+	if g.depth--; g.depth == 0 {
+		g.owner = 0
+		g.free.Signal()
+	}
+	g.mu.Unlock()
 }
 
 // contextClock carries private state in an existing interface field without
@@ -1789,7 +1835,11 @@ func (c *Context) audienceMatches(st *contextState, data jsonmodels.Experiment, 
 		return !assignment.AudienceMismatch
 	}
 	var parsed parsedAudience
-	if parse.matches(data, c.AudienceMatcher_.Deserializer_) {
+	if guarded := st.audiencePanic(data.Name, data, c.AudienceMatcher_.Deserializer_); guarded != nil {
+		// A logger is reporting this experiment's panic: revalidate with that
+		// failure, as the read that hit it does, rather than rebuilding.
+		parsed = guarded.parsed
+	} else if parse.matches(data, c.AudienceMatcher_.Deserializer_) {
 		// A fresh failure evaluates as an error, so the audience is ignored,
 		// as a rebuild would ignore it; an assignment that already ignored
 		// it is kept.
@@ -1926,12 +1976,33 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 // tries again with that parse. Only new data installed during each parse
 // makes it parse again; after maxAudienceAttempts parses the audience counts
 // as unparseable for this evaluation.
+//
+// A custom deserializer's parse holds st.customAudiences from before the call
+// until the locked attempt that evaluates it returns, so on one context no
+// other custom parse runs while a result may still be in use, as in v1.1.1.
+// The built-in deserializer's parses, whose results are fresh, skip it. A
+// read from an event logger never waits for another goroutine's parse: that
+// deserializer may be waiting for the logger (a Refresh or WaitUntilReady
+// whose event it is delivering), so the read parses without the gate.
 func (c *Context) buildAssignment(st *contextState, experimentName string) *cachedAssignment {
 	var parse *audienceParse
+	var gated bool
+	defer func() {
+		if gated {
+			st.customAudiences.unlock()
+		}
+	}()
 	for attempt := 0; ; attempt++ {
 		var entry, unparsed = c.buildAssignmentLocked(st, experimentName, attempt >= maxAudienceAttempts, parse)
+		if gated {
+			gated = false
+			st.customAudiences.unlock()
+		}
 		if unparsed == nil {
 			return entry
+		}
+		if !builtinDeserializer(c.AudienceMatcher_.Deserializer_) {
+			gated = st.customAudiences.lock(st.loggers_ == nil || !st.loggers_.current())
 		}
 		parse = c.parseAudienceUnlocked(st, experimentName, *unparsed)
 	}

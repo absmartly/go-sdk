@@ -3203,7 +3203,8 @@ func TestPanicLoggerReadingTheExperimentDoesNotReparse(t *testing.T) {
 	assertAny([]int{1}, logger.variants, t)
 }
 
-// removingDeserializer installs data without the audience it is parsing.
+// removingDeserializer installs data without the audience it is parsing: the
+// same experiment run (id and iteration) with an audience that excludes.
 type removingDeserializer struct {
 	once sync.Once
 	ctx  *Context
@@ -3212,7 +3213,7 @@ type removingDeserializer struct {
 func (d *removingDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
 	d.once.Do(func() {
 		d.ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
-			audienceExperiment("exp_app", `{"filter":[{"value":1}]}`, true)}})
+			audienceExperiment("exp_app", `{"filter":[{"value":false}]}`, true)}})
 	})
 	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
 }
@@ -3228,11 +3229,13 @@ func TestParseOfRemovedAudienceIsNotCached(t *testing.T) {
 		return texts
 	}
 	// A custom deserializer that installs data while parsing: the read uses
-	// the new audience, and neither parse is stored.
+	// the new audience, which excludes where the old one included (the parse
+	// of the old text is not used for the same run with another text), and
+	// neither parse is stored.
 	var ctx, _ = newSystemAttrContext("website", "production",
 		audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true))
 	ctx.AudienceMatcher_ = AudienceMatcher{&removingDeserializer{ctx: ctx}}
-	assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
+	assertAny(0, treatmentPeek(t, ctx, "exp_app"), t)
 	assertAny([]string(nil), cachedTexts(ctx), t)
 
 	// The built-in deserializer's parse of a text no longer installed is

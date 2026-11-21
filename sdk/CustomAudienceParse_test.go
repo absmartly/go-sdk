@@ -3,7 +3,11 @@ package sdk
 import (
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
 
 // pointerOperandDeserializer decodes {"n": k} into a fresh filter
@@ -212,4 +216,227 @@ func TestCustomDeserializerCallsOnWarmReadsAndRevalidation(t *testing.T) {
 	}
 	assertAny(6, len(counter.texts()), t)
 	assertAny(int32(1), ctx.GetPendingCount(), t)
+}
+
+// panicOnRevalidationDeserializer parses normally, except that call number
+// panicAt panics.
+type panicOnRevalidationDeserializer struct {
+	calls   int32
+	panicAt int32
+}
+
+func (d *panicOnRevalidationDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	if atomic.AddInt32(&d.calls, 1) == d.panicAt {
+		panic("temporary")
+	}
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+// A panic logger that peeks at the experiment whose revalidation panicked
+// neither replaces the exposed assignment (no second exposure) nor makes the
+// failure persist: the next attribute change asks the recovered deserializer
+// again, as it does without a logger.
+func TestPanicLoggerPeekDuringRevalidationKeepsTheExposure(t *testing.T) {
+	for _, withLogger := range []bool{false, true} {
+		var ctx, _ = newSystemAttrContext("website", "production",
+			audienceExperiment("exp_app", `{"filter":[{"eq":[{"var":"country"},{"value":"US"}]}]}`, true))
+		var d = &panicOnRevalidationDeserializer{panicAt: 2}
+		ctx.AudienceMatcher_ = AudienceMatcher{d}
+		assertAny(nil, ctx.SetAttribute("country", "US"), t)
+		var variant, err = ctx.GetTreatment("exp_app")
+		assertAny(nil, err, t)
+		assertAny(1, variant, t)
+		var peeks int32
+		if withLogger {
+			ctx.EventLogger_ = callbackEventLogger(func(c Context, event EventType, _ interface{}) {
+				if event == Error && atomic.AddInt32(&peeks, 1) == 1 {
+					var _, _ = c.PeekTreatment("exp_app")
+				}
+			})
+		}
+		assertAny(nil, ctx.SetAttribute("unrelated", 1), t)
+		variant, err = ctx.GetTreatment("exp_app")
+		assertAny(nil, err, t)
+		assertAny(1, variant, t)
+		assertAny(int32(1), ctx.GetPendingCount(), t)
+		// Leaving the audience is seen by the recovered deserializer.
+		assertAny(nil, ctx.SetAttribute("country", "FR"), t)
+		variant, _ = ctx.PeekTreatment("exp_app")
+		assertAny(0, variant, t)
+		if withLogger {
+			assertAny(int32(1), atomic.LoadInt32(&peeks), t)
+		}
+	}
+}
+
+// Within one context a custom parse and the evaluation of its result are
+// serialised, as v1.1.1 serialised them under ContextLock_: two concurrent
+// cold reads of different strict audiences, through a deserializer that
+// reuses one *int operand (written under its own mutex) for every result,
+// each see their own audience.
+func TestConcurrentColdReadsOfReusedPointerOperandAudiences(t *testing.T) {
+	var d = &pointerOperandDeserializer{}
+	for round := 0; round < 100; round++ {
+		var excluded = audienceExperiment("excluded", `{"n":0}`, true)
+		var included = audienceExperiment("included", `{"n":1}`, true)
+		included.Id = 2
+		var ctx, _ = newSystemAttrContext("website", "production", excluded, included)
+		ctx.AudienceMatcher_ = AudienceMatcher{d}
+		var start = make(chan struct{})
+		var wg sync.WaitGroup
+		var variants [2]int
+		var errs [2]error
+		for i, name := range []string{"excluded", "included"} {
+			wg.Add(1)
+			go func(i int, name string) {
+				defer wg.Done()
+				<-start
+				variants[i], errs[i] = ctx.PeekTreatment(name)
+			}(i, name)
+		}
+		close(start)
+		wg.Wait()
+		assertAny([2]error{}, errs, t)
+		if variants != [2]int{0, 1} {
+			t.Fatalf("round %d: variants %v, want [0 1]", round, variants)
+		}
+	}
+}
+
+// peekingDeserializer decodes with the built-in deserializer; while parsing
+// an audience with a "peek" key, it first reads that experiment of the same
+// context, whose audience is custom too.
+type peekingDeserializer struct {
+	mu    sync.Mutex
+	ctx   *Context
+	peeks []int
+}
+
+func (d *peekingDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	var doc struct{ Peek string }
+	_ = json.Unmarshal(b[offset:offset+length], &doc)
+	d.mu.Lock()
+	var ctx = d.ctx
+	d.mu.Unlock()
+	if ctx != nil && doc.Peek != "" {
+		var variant, _ = ctx.PeekTreatment(doc.Peek)
+		d.mu.Lock()
+		d.peeks = append(d.peeks, variant)
+		d.mu.Unlock()
+	}
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+// A deserializer that, while parsing one experiment, reads another custom
+// audience of the same context re-enters the per-context custom-audience
+// serialisation on its own goroutine without deadlocking, while other
+// goroutines' cold reads wait their turn; every result is correct.
+func TestDeserializerReadingAnotherCustomAudienceDoesNotDeadlock(t *testing.T) {
+	for round := 0; round < 20; round++ {
+		var a = audienceExperiment("a", `{"peek":"b","filter":[{"value":true}]}`, true)
+		var b = audienceExperiment("b", `{"filter":[{"value":false}]}`, true)
+		var c = audienceExperiment("c", `{"filter":[{"value":true}]}`, true)
+		b.Id, c.Id = 2, 3
+		var ctx, _ = newSystemAttrContext("website", "production", a, b, c)
+		var d = &peekingDeserializer{ctx: ctx}
+		ctx.AudienceMatcher_ = AudienceMatcher{d}
+		var done = make(chan [3]int, 1)
+		go func() {
+			var results [3]int
+			var wg sync.WaitGroup
+			for i, name := range []string{"a", "b", "c"} {
+				wg.Add(1)
+				go func(i int, name string) {
+					defer wg.Done()
+					results[i], _ = ctx.PeekTreatment(name)
+				}(i, name)
+			}
+			wg.Wait()
+			done <- results
+		}()
+		select {
+		case results := <-done:
+			assertAny([3]int{1, 0, 1}, results, t)
+		case <-time.After(5 * time.Second):
+			t.Fatal("a deserializer reading another custom audience deadlocked")
+		}
+		d.mu.Lock()
+		assertAny([]int{0}, d.peeks, t)
+		d.mu.Unlock()
+	}
+}
+
+// panickingDeserializer panics on audiences with a "panic" key and otherwise
+// decodes with the built-in deserializer.
+type panickingDeserializer struct{}
+
+func (panickingDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	var doc struct{ Panic bool }
+	_ = json.Unmarshal(b[offset:offset+length], &doc)
+	if doc.Panic {
+		panic("broken")
+	}
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+// A logger reporting a deserializer panic, logged while the custom-audience
+// serialisation is held, can read another custom audience of the context.
+func TestPanicLoggerReadingAnotherCustomAudienceDoesNotDeadlock(t *testing.T) {
+	var a = audienceExperiment("a", `{"panic":true}`, true)
+	var b = audienceExperiment("b", `{"filter":[{"value":false}]}`, true)
+	b.Id = 2
+	var ctx, _ = newSystemAttrContext("website", "production", a, b)
+	ctx.AudienceMatcher_ = AudienceMatcher{panickingDeserializer{}}
+	var peeked = make(chan int, 1)
+	ctx.EventLogger_ = callbackEventLogger(func(c Context, event EventType, _ interface{}) {
+		if event == Error {
+			var variant, _ = c.PeekTreatment("b")
+			peeked <- variant
+		}
+	})
+	var done = make(chan int, 1)
+	go func() { v, _ := ctx.PeekTreatment("a"); done <- v }()
+	select {
+	case v := <-done:
+		assertAny(1, v, t) // unparseable, so ignored
+	case <-time.After(5 * time.Second):
+		t.Fatal("a panic logger reading another custom audience deadlocked")
+	}
+	assertAny(0, <-peeked, t)
+}
+
+// A deserializer that refreshes through an asynchronous provider waits for
+// the Refresh event, logged on another goroutine; a logger reading another
+// custom audience from that event does not wait for the deserializer's
+// parse, so neither deadlocks.
+func TestRefreshLoggerReadingCustomAudienceDuringDeserializerRefresh(t *testing.T) {
+	var other = audienceExperiment("other", appFilter, true)
+	other.Id = 2
+	var client = &fetchClient{systemAttrClient: systemAttrClient{application: "website", environment: "production"},
+		data: jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{audienceExperiment("exp_app", appFilter, true), other}}}
+	var peeked = make(chan int, 4)
+	var d = &snapshotCallingDeserializer{}
+	var cc = CreateDefaultContextConfig()
+	cc.Units_, cc.PublishDelay_, cc.RefreshInterval_ = withUnit(), -1, -1
+	var ctx = Create(ABSmartlyConfig{Client_: client, ContextDataProvider_: DefaultContextDataProvider{client_: client},
+		ContextEventHandler_: DefaultContextEventHandler{client_: client}, AudienceDeserializer_: d,
+		ContextEventLogger_: callbackEventLogger(func(c Context, event EventType, _ interface{}) {
+			if event == Refresh {
+				var variant, _ = c.PeekTreatment("other")
+				peeked <- variant
+			}
+		})}).CreateContextWith(cc, client.data)
+	ctx.WaitUntilReady()
+	d.mu.Lock()
+	d.ctx = ctx
+	d.mu.Unlock()
+	var done = make(chan int, 1)
+	go func() { v, _ := ctx.PeekTreatment("exp_app"); done <- v }()
+	select {
+	case v := <-done:
+		assertAny(1, v, t)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a Refresh logger reading a custom audience during a deserializer's Refresh deadlocked")
+	}
+	assertAny(1, <-peeked, t)
 }
