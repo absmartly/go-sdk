@@ -4655,3 +4655,25 @@ func TestHoldout_AudienceEditKeepsAnExposedKeyedDecision(t *testing.T) {
 	}
 	h.expectPending(1)
 }
+
+// A context with neither holdouts nor rules keeps the released behaviour across
+// an audience edit: the unexposed decision is not rebuilt, and one variable
+// read exposes it once.
+func TestHoldout_AudienceEditKeepsAPlainUnexposedDecision(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+	e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e))
+	if hoKeyed(h.ctx) {
+		t.Fatal("a plain context is keyed")
+	}
+	h.peek("e")
+	var before = h.ctx.getAssignment("e")
+	var strict = e
+	strict.AudienceStrict = true
+	h.ctx.SetData(hoData(nil, strict))
+	h.variable("v")
+	if h.ctx.getAssignment("e") != before {
+		t.Fatal("the plain unexposed decision was rebuilt")
+	}
+	h.expectPending(1)
+}
