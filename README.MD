@@ -537,6 +537,40 @@ Older SDK versions ignore assignment rules, so their units fall through to
 normal assignment and are analysed. Use this version or later where rules must
 apply.
 
+### Holdouts
+
+A holdout keeps a share of units out of a group of experiments, so their
+combined effect can be measured. The context payload lists the holdouts
+(`ContextData.Holdouts`) and each experiment names the holdouts covering it
+(`Experiment.HoldoutIds`). Nothing needs to be configured: the SDK applies
+them as the JavaScript SDK does.
+
+- Each holdout puts the unit in an arm, drawn with the covered experiment's
+  unit. Arm 0 holds the unit out. In a three-arm holdout (three values in its
+  split) arm 1 holds the unit out of experiments that are not full-on, and a
+  full-on experiment is served as usual.
+- A unit held out by any of the holdouts covering an experiment gets
+  variant `0` and the control variant's variables, and the experiment
+  publishes no exposure of its own. An override (`SetOverride`) or a matching
+  assignment rule still wins; custom assignments, audiences, traffic and
+  full-on do not.
+- Every `GetTreatment` or `GetVariableValue` on a covered experiment also
+  publishes each covering holdout's exposure, once per holdout and unit type,
+  whatever the arm. `PeekTreatment` and `PeekVariableValue` publish nothing.
+- When experiments share a variable key, a held-out experiment never wins it
+  over one the unit is assigned to; if none is, the held-out experiment's
+  control value is returned rather than the default.
+
+A unit keeps its arm until the holdout's iteration changes. Holdouts add
+nothing to the publish payload of experiments without holdouts (the
+`ruleOverride` flag every exposure now carries comes with assignment rules),
+and warmed cached reads and exposures allocate nothing more. Creating a
+context and rebuilding an assignment each allocate one small extra object.
+
+`ContextData` gained a `Holdouts` field and `Experiment` a `HoldoutIds` field,
+so unkeyed (positional) literals of `jsonmodels.ContextData` must become keyed
+(`jsonmodels.ContextData{Experiments: experiments}`), as for `Experiment`.
+
 ### Custom Assignments
 
 Sometimes it may be necessary to override the automatic selection of a

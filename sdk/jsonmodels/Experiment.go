@@ -22,4 +22,7 @@ type Experiment struct {
 	// matching rule sets the variant, ahead of the audience, traffic and
 	// custom assignments; only an override beats it.
 	AssignmentRules string `json:"assignmentRules,omitempty"`
+	// HoldoutIds are the ids of the ContextData.Holdouts covering this
+	// experiment. Ids with no matching holdout are ignored.
+	HoldoutIds []int `json:"holdoutIds,omitempty"`
 }
