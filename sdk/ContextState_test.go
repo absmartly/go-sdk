@@ -347,6 +347,32 @@ func TestLiteralVariableValueFollowsIndexVariables(t *testing.T) {
 	}
 }
 
+// On a literal, as in v1.1.1, a variable value is returned whenever the
+// assignment's variables have the key, even when the unit is not assigned:
+// with its unit type unset, or outside a strict audience, it is variant 0's.
+func TestLiteralVariableValueWhenUnassigned(t *testing.T) {
+	for _, tc := range []string{"missing unit", "strict mismatch"} {
+		var experiment = audienceExperiment("exp", "", false)
+		experiment.FullOnVariant = 0
+		experiment.Variants[0].Config = `{"key":0}`
+		experiment.Variants[1].Config = `{"key":1}`
+		if tc == "strict mismatch" {
+			experiment.Audience = `{"filter":[{"value":false}]}`
+			experiment.AudienceStrict = true
+		}
+		var manual = audienceLiteral(experiment)
+		if tc == "missing unit" {
+			manual.Units_ = map[string]string{}
+		}
+		manual.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{experiment}})
+		var peeked, _ = manual.PeekVariableValue("key", "fallback")
+		assertAny(float64(0), peeked, t)
+		var got, _ = manual.GetVariableValue("key", "fallback")
+		assertAny(float64(0), got, t)
+		assertAny(int32(1), manual.GetPendingCount(), t)
+	}
+}
+
 // The first parse of each distinct audience checks membership against a set
 // built once per installed snapshot, not by walking the catalog each time.
 func TestColdAudienceReadsDoNotRescanTheCatalog(t *testing.T) {
@@ -358,10 +384,11 @@ func TestColdAudienceReadsDoNotRescanTheCatalog(t *testing.T) {
 	}
 	var ctx, _ = newSystemAttrContext("website", "production", experiments...)
 	var index = ctx.state().loadIndex()
+	var builds = atomic.LoadInt64(&audienceSetBuilds)
 	for _, e := range experiments {
 		var _ = treatmentPeek(t, ctx, e.Name)
 	}
-	// The snapshot built its audience set once, and every parse is cached.
+	assertAny(int64(1), atomic.LoadInt64(&audienceSetBuilds)-builds, t)
 	assertAny(true, index == ctx.state().loadIndex(), t)
 	assertAny(200, len(index.audienceTexts()), t)
 	var cached = 0

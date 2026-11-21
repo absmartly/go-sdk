@@ -292,9 +292,13 @@ type contextIndex struct {
 	audiences     map[string]struct{}
 }
 
+// audienceSetBuilds counts audience-set builds, for tests.
+var audienceSetBuilds int64
+
 // audienceTexts returns the snapshot's set of audience texts.
 func (index *contextIndex) audienceTexts() map[string]struct{} {
 	index.audiencesOnce.Do(func() {
+		atomic.AddInt64(&audienceSetBuilds, 1)
 		index.audiences = make(map[string]struct{}, len(index.experiments))
 		for _, entry := range index.experiments {
 			index.audiences[entry.experiment.Data.Audience] = struct{}{}
@@ -1232,27 +1236,27 @@ func (c *Context) PeekVariableValue(key string, defaultValue interface{}) (inter
 // set, so a fall-through still records that the unit saw the earlier
 // experiment. When no experiment along the way assigns the key, the caller's
 // default is returned. v1.1.1 read only the last experiment in the payload.
+//
+// A true Context{...} literal keeps v1.1.1's rule instead: it reads the one
+// experiment its current IndexVariables_ maps the key to, exposes it, and
+// returns the value whenever the assignment's variables have the key.
 func (c *Context) resolveVariableValue(key string, defaultValue interface{}, expose bool) (interface{}, error) {
-	var st = c.state()
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
 	}
-
-	var experiments []ExperimentVariables
-	if c.ownClock() == nil && (c.ContextLock_ == nil || c.literalState().manualRoot == nil) {
-		// A true literal resolves through its current IndexVariables_, as
-		// v1.1.1 did, so a replaced or deleted mapping takes effect.
-		c.DataLock.RLock()
-		if experiment, ok := c.IndexVariables_[key].(ExperimentVariables); ok {
-			experiments = []ExperimentVariables{experiment}
-		}
-		c.DataLock.RUnlock()
-	} else {
-		c.DataLock.RLock()
-		experiments = st.indexVariables_[key]
-		c.DataLock.RUnlock()
+	var st *contextState
+	if clock := c.ownClock(); clock != nil {
+		st = clock.state
+	} else if c.ContextLock_ == nil {
+		return c.resolveLiteralVariableValue(key, defaultValue, expose)
+	} else if st = c.literalState(); st.manualRoot == nil {
+		return c.resolveLiteralVariableValue(key, defaultValue, expose)
 	}
+
+	c.DataLock.RLock()
+	var experiments = st.indexVariables_[key]
+	c.DataLock.RUnlock()
 
 	for _, experiment := range experiments {
 		var entry = c.assignmentEntry(experiment.Data.Name)
@@ -1268,6 +1272,24 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 		if value, exist := assignment.Variables[key]; exist && (assignment.Assigned || assignment.Overridden || entry.ruleOverride) {
 			return value, nil
 		}
+	}
+	return defaultValue, nil
+}
+
+// resolveLiteralVariableValue is v1.1.1's GetVariableValue/PeekVariableValue
+// for a Context{...} literal.
+func (c *Context) resolveLiteralVariableValue(key string, defaultValue interface{}, expose bool) (interface{}, error) {
+	var experiment, err = c.GetVariableExperiment(key)
+	if err != nil {
+		return defaultValue, nil
+	}
+	var entry = c.assignmentEntry(experiment.Data.Name)
+	var assignment = entry.assignment
+	if expose && !assignment.Exposed.Load().(bool) {
+		c.queueExposure(assignment, entry.ruleOverride)
+	}
+	if value, exist := assignment.Variables[key]; exist {
+		return value, nil
 	}
 	return defaultValue, nil
 }
