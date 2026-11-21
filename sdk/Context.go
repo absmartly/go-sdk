@@ -2200,7 +2200,8 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 		c.index_.Load().keyed && !previous.resolvedExperimentMatches(experiment.Data)
 	// An unexposed keyed decision rebuilt because its audience was edited is
 	// superseded the same way: a caller still holding it must not publish it.
-	var rebuiltAudience = previous != nil && efound && c.index_.Load().keyed && previous.audienceChanged(experiment.Data)
+	var rebuiltAudience = previous != nil && !previous.assignment.Exposed.Load().(bool) && efound &&
+		c.index_.Load().keyed && previous.audienceChanged(experiment.Data)
 	if previous != nil && (previous.holdouts != nil || entry.holdouts != nil || rebuiltOverride || rebuiltAudience) &&
 		previous.assignment.Exposed != assignment.Exposed {
 		// Retire the replaced assignment, as eviction does: a caller still

@@ -4775,3 +4775,29 @@ func TestHoldout_AudienceEditKeepsARuleWin(t *testing.T) {
 	}
 	h.expectPending(1)
 }
+
+func TestHoldout_AudienceRebuildKeepsAnAlreadyExposedRead(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 1), "v")
+	e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	expectInt(t, 1, h.treatment("e"))
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			var strict = e
+			strict.Iteration++
+			strict.AudienceStrict = true
+			h.ctx.SetData(hoData(nil, strict, r))
+			h.peek("e")
+		}
+	}
+	defer func() { afterReadResolve = nil }()
+	expectInt(t, 1, h.treatment("e"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	expectInt(t, 0, h.treatment("e"))
+}
