@@ -4166,8 +4166,8 @@ func TestHoldout_ExposedOverrideIsKeptAcrossAnIdentityRefresh(t *testing.T) {
 }
 
 // A context with assignment rules but no holdouts also rebuilds an unclaimed
-// override after its experiment's id or iteration changes, so it serves and
-// exposes the current definition.
+// override after its experiment's id, iteration or unit type changes, so it
+// serves and exposes the current definition.
 func TestHoldout_RulesOnlyUnclaimedOverrideResolvesCurrentIdentity(t *testing.T) {
 	for _, identity := range []string{"iteration", "id", "unitType"} {
 		t.Run(identity, func(t *testing.T) {
