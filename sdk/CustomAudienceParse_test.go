@@ -190,3 +190,26 @@ func TestOnlyTheBuiltInDeserializerParseIsCached(t *testing.T) {
 		t.Error("revalidating with the same outcome rebuilt the assignment")
 	}
 }
+
+// A custom deserializer is called once per evaluation: not for warm reads,
+// and once per attribute change that revalidates the cached assignment,
+// which keeps its single exposure.
+func TestCustomDeserializerCallsOnWarmReadsAndRevalidation(t *testing.T) {
+	var counter = &countingDeserializer{}
+	var ctx, _ = newSystemAttrContext("website", "production", audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true))
+	ctx.AudienceMatcher_ = AudienceMatcher{counter}
+	for i := 0; i < 50; i++ {
+		var variant, err = ctx.GetTreatment("exp_app")
+		assertAny(nil, err, t)
+		assertAny(1, variant, t)
+	}
+	assertAny(1, len(counter.texts()), t)
+	for change := 0; change < 5; change++ {
+		assertAny(nil, ctx.SetAttribute("round", change), t)
+		for i := 0; i < 10; i++ {
+			var _, _ = ctx.GetTreatment("exp_app")
+		}
+	}
+	assertAny(6, len(counter.texts()), t)
+	assertAny(int32(1), ctx.GetPendingCount(), t)
+}
