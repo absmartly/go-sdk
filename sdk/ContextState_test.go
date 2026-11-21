@@ -1476,8 +1476,9 @@ func TestRefreshOperationLateCopyRegistration(t *testing.T) {
 		ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{after}})
 		op.complete(ctx, success)
 		op.join(&copied, ctx)
+		// The copy agrees with the live data whatever the outcome.
 		var _, found = copied.GetExperiment("after")
-		assertAny(success, found, t)
+		assertAny(true, found, t)
 		assertAny(0, len(op.receivers), t)
 	}
 }

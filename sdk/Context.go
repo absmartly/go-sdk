@@ -1311,7 +1311,6 @@ type refreshOperation struct {
 	mu        sync.Mutex
 	receivers map[*Context]struct{}
 	completed bool
-	succeeded bool
 }
 
 func (op *refreshOperation) join(receiver, root *Context) {
@@ -1325,7 +1324,9 @@ func (op *refreshOperation) join(receiver, root *Context) {
 			op.receivers = map[*Context]struct{}{}
 		}
 		op.receivers[receiver] = struct{}{}
-	} else if op.succeeded {
+	} else {
+		// A copy joining after completion adopts the live data itself,
+		// whatever the outcome, as settle does for earlier joiners.
 		receiver.adoptLiveDataFrom(root)
 	}
 }
@@ -1338,7 +1339,7 @@ func (op *refreshOperation) complete(root *Context, succeeded bool) {
 			receiver.adoptLiveDataFrom(root)
 		}
 	}
-	op.completed, op.succeeded = true, succeeded
+	op.completed = true
 }
 
 // settle re-adopts the live data into every joined copy just before the
