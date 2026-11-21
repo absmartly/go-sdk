@@ -386,9 +386,6 @@ func TestLiteralLoggerVariableReadsFollowIndexVariables(t *testing.T) {
 	manual.LogEvent(Goal, nil)
 	assertAny(reads{"fallback", "fallback", "", map[string]string{}, map[string][]string{}}, <-seen, t)
 
-	// The logger context reads the literal itself, not its own copy of the
-	// fields: replacing the literal's IndexVariables_ map from inside the
-	// callback is seen by that callback's next read.
 	var inside = make(chan []interface{}, 1)
 	manual.EventLogger_ = callbackEventLogger(func(c Context, event EventType, _ interface{}) {
 		if event != Goal {
@@ -459,6 +456,71 @@ func TestLiteralVariableValueExposureKeepsRuleFlag(t *testing.T) {
 	defer manual.EventLock_.Unlock()
 	assertAny(1, len(manual.Exposures_), t)
 	assertAny(true, manual.Exposures_[0].RuleOverride, t)
+}
+
+// scratchDeserializer decodes every audience into the same reused maps, which
+// the AudienceDeserializer interface allows.
+type scratchDeserializer struct {
+	mu      sync.Mutex
+	scratch map[string]interface{}
+}
+
+func (d *scratchDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	var decoded, err = DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+	if err != nil {
+		return nil, err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.scratch == nil {
+		d.scratch = map[string]interface{}{"filter": []interface{}{nil}}
+	}
+	// Overwrite the reused filter slot in place with this audience's filter.
+	d.scratch["filter"].([]interface{})[0] = decoded["filter"].([]interface{})[0]
+	return d.scratch, nil
+}
+
+// A deserializer that reuses its result maps cannot change an earlier
+// audience's cached filter: after another audience is parsed and an attribute
+// change revalidates, the excluded experiment still gives control and
+// exposes it with AudienceMismatch, as in v1.1.1.
+func TestReusedDeserializerOutputDoesNotOverwriteCachedAudience(t *testing.T) {
+	var excluded = audienceExperiment("excluded", `{"filter":[{"value":false}]}`, true)
+	var included = audienceExperiment("included", `{"filter":[{"value":true}]}`, true)
+	included.Id = 2
+	var ctx, _ = newSystemAttrContext("website", "production", excluded, included)
+	ctx.AudienceMatcher_ = AudienceMatcher{&scratchDeserializer{}}
+	assertAny(0, treatmentPeek(t, ctx, "excluded"), t)
+	assertAny(1, treatmentPeek(t, ctx, "included"), t)
+	assertAny(nil, ctx.SetAttribute("x", 1), t)
+	var variant, err = ctx.GetTreatment("excluded")
+	assertAny(nil, err, t)
+	assertAny(0, variant, t)
+	ctx.EventLock_.Lock()
+	defer ctx.EventLock_.Unlock()
+	assertAny(1, len(ctx.Exposures_), t)
+	assertAny(true, ctx.Exposures_[0].AudienceMismatch, t)
+}
+
+// copyFilter keeps each container's type and value, and shares nothing
+// mutable with the original.
+func TestCopyFilterIsDeepAndTypePreserving(t *testing.T) {
+	var original = map[string]interface{}{
+		"and": []interface{}{
+			map[string]interface{}{"eq": []interface{}{map[string]interface{}{"var": "a"}, map[string]interface{}{"value": 1.5}}},
+			[]interface{}{"x", true, nil},
+		},
+		"typed": map[string]string{"k": "v"},
+		"array": [2]interface{}{map[string]interface{}{"m": 1}, "s"},
+	}
+	var copied = copyFilter(reflect.ValueOf(original)).Interface().(map[string]interface{})
+	assertAny(true, reflect.DeepEqual(original, copied), t)
+	original["and"].([]interface{})[0].(map[string]interface{})["eq"] = "changed"
+	original["typed"].(map[string]string)["k"] = "changed"
+	assertAny(false, reflect.DeepEqual(original, copied), t)
+	assertAny("v", copied["typed"].(map[string]string)["k"], t)
+	var eq = copied["and"].([]interface{})[0].(map[string]interface{})["eq"]
+	assertAny(true, reflect.TypeOf(eq).Kind() == reflect.Slice, t)
 }
 
 // The first parse of each distinct audience checks membership against a set

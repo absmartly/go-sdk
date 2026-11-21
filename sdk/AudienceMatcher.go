@@ -50,9 +50,54 @@ func (am AudienceMatcher) parseAudience(audience string) parsedAudience {
 	var filter = result["filter"]
 	switch reflect.ValueOf(filter).Kind() {
 	case reflect.Map, reflect.Slice, reflect.Array:
-		return parsedAudience{filter: filter}
+		// The context caches this parse, and a custom deserializer may reuse
+		// its result maps for the next audience: keep an SDK-owned copy.
+		return parsedAudience{filter: copyFilter(reflect.ValueOf(filter)).Interface()}
 	default:
 		return parsedAudience{err: errAudienceUnparseable}
+	}
+}
+
+// copyFilter deep-copies the maps, slices and arrays of a decoded filter,
+// keeping each container's own type, so the evaluator sees the same values.
+// Scalars and other values are shared: the evaluator never mutates them.
+func copyFilter(value reflect.Value) reflect.Value {
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return value
+		}
+		var inner = copyFilter(value.Elem())
+		var boxed = reflect.New(value.Type()).Elem()
+		boxed.Set(inner)
+		return boxed
+	case reflect.Map:
+		if value.IsNil() {
+			return value
+		}
+		var out = reflect.MakeMapWithSize(value.Type(), value.Len())
+		var iter = value.MapRange()
+		for iter.Next() {
+			out.SetMapIndex(iter.Key(), copyFilter(iter.Value()))
+		}
+		return out
+	case reflect.Slice:
+		if value.IsNil() {
+			return value
+		}
+		var out = reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		for i := 0; i < value.Len(); i++ {
+			out.Index(i).Set(copyFilter(value.Index(i)))
+		}
+		return out
+	case reflect.Array:
+		var out = reflect.New(value.Type()).Elem()
+		for i := 0; i < value.Len(); i++ {
+			out.Index(i).Set(copyFilter(value.Index(i)))
+		}
+		return out
+	default:
+		return value
 	}
 }
 

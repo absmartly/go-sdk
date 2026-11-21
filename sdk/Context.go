@@ -3009,7 +3009,6 @@ func legacyIndexVariables(index map[string][]ExperimentVariables) map[interface{
 func (c *Context) GetVariableExperiment(key string) (ExperimentVariables, error) {
 	var clock = c.ownClock()
 	if clock != nil && clock.state.manualRoot == nil {
-		// A snapshot of a literal reads the literal's current mapping.
 		c, clock = clock.root, nil
 	}
 	if clock == nil {
