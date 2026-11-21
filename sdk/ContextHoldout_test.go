@@ -1171,7 +1171,6 @@ func TestHoldout_SetDataDoesNotModifyTheCallersData(t *testing.T) {
 	expectInt(t, 0, h.treatment("exp_no_mutate_in"))
 	expectInt(t, hoNormalVariant, h.treatment("exp_no_mutate_not_covered"))
 	expectValue(t, []int{12, 11}, ids)
-	// Reusing the slice after it was installed does not move the pinned arm.
 	holdouts[0].Iteration = 5
 	holdouts[0].Id = 99
 	expectInt(t, 0, h.treatment("exp_no_mutate_in"))
@@ -1474,9 +1473,6 @@ func TestHoldout_PublishWithoutHoldoutsIsUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got = hoPublishProbe(t, data)
-	if os.Getenv("WRITE_GOLDEN") != "" {
-		_ = os.WriteFile("testAssets/publish-no-holdouts.golden", []byte(got), 0o644)
-	}
 	var want, _ = os.ReadFile("testAssets/publish-no-holdouts.golden")
 	if got != string(want) {
 		t.Fatalf("publish changed without holdouts:\n got %s\nwant %s", got, want)
@@ -2226,7 +2222,6 @@ func TestHoldout_RejectedMissingUnitDecisionIsResolvedAgain(t *testing.T) {
 	h.ctx.Closing_.Store(true)
 	h.ctx.admitExposure(assignment, entry)
 	h.ctx.Closing_.Store(false)
-	// The evicted decision stays retired for a caller still holding it.
 	h.ctx.QueueExposure(assignment)
 	h.expectPending(0)
 	expectInt(t, 2, h.treatment("exp"))
@@ -2653,7 +2648,6 @@ func TestHoldout_DuplicateHoldoutDefinitionsAreOrderIndependent(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{a, a}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 	expectInt(t, 0, h.treatment("exp"))
 	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
-	// A refresh that only reorders conflicting duplicates changes nothing.
 	var r = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{a, b}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 	expectInt(t, hoNormalVariant, r.treatment("exp"))
 	r.refresh(hoData([]jsonmodels.Holdout{b, a}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
@@ -2920,8 +2914,6 @@ func TestHoldout_ReadReplacedAfterItsClaimServesItsClaim(t *testing.T) {
 			if armed {
 				t.Fatal("the clock was not read during the admission")
 			}
-			// The claimed decision, once: its own exposure, and the
-			// holdout's when it was covered.
 			var exposures = queuedExposures(ctx)
 			var claimed = 1
 			if covered {
@@ -3229,7 +3221,6 @@ func TestHoldout_VariableRetryDoesNotExposeARemovedExperiment(t *testing.T) {
 	}
 }
 
-// A warmed, exposed, unretired read does not settle.
 func TestHoldout_NeedsSettling(t *testing.T) {
 	var exposed = &atomic.Value{}
 	exposed.Store(true)
@@ -3365,6 +3356,7 @@ func hoInstalledDefines(ctx *Context, name string, key string) bool {
 	if indexed := ctx.indexedExperiment(name); indexed != nil {
 		entry.resolvedId = indexed.experiment.Data.Id
 		entry.resolvedIteration = indexed.experiment.Data.Iteration
+		entry.resolvedUnitType = indexed.experiment.Data.UnitType
 		entry.holdouts = &assignmentHoldouts{holdouts: indexed.holdouts}
 	}
 	return ctx.variableEligible(name, key)(entry)
@@ -4021,25 +4013,29 @@ func TestHoldout_CheckAndClaimAreOneCriticalSection(t *testing.T) {
 // A restored key cannot authorize a new claim on an intermediate experiment
 // or holdout epoch, even without a replacement lookup after the final install.
 func TestHoldout_RestoredKeyDoesNotAuthorizeAnIntermediateIteration(t *testing.T) {
-	for _, epoch := range []string{"experiment", "holdout"} {
+	// Each case changes exactly one part of the decision's identity.
+	for _, epoch := range []string{"experiment", "holdout", "unitType"} {
 		t.Run(epoch, func(t *testing.T) {
 			for _, override := range []bool{false, true} {
 				var first = hoWithVariables(hoExperiment(2, "b", hoUnitType, 0, 11), "v")
 				var middle = hoWithVariables(hoExperiment(2, "b", hoUnitType, 0, 11), "w")
-				if epoch == "experiment" {
-					middle.Iteration = 2
-				}
 				var last = hoWithVariables(hoExperiment(2, "b", hoUnitType, 0, 11), "v")
-				if epoch == "experiment" {
-					last.Iteration = 3
-				}
 				var intermediate = hoHoldoutA()
-				intermediate.Iteration = 2
 				intermediate.Name = "intermediate_holdout"
 				var restored = hoHoldoutA()
-				restored.Iteration = 3
 				restored.Name = "restored_holdout"
-				var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, first))
+				switch epoch {
+				case "experiment":
+					middle.Iteration = 2
+					last.Iteration = 3
+				case "holdout":
+					intermediate.Iteration = 2
+					restored.Iteration = 3
+				case "unitType":
+					middle.UnitType = "user_id"
+				}
+				var h = hoCreate(t, map[string]string{hoUnitType: hoUIDNotHeldOut, "user_id": hoUID},
+					hoData([]jsonmodels.Holdout{hoHoldoutA()}, first))
 				if override {
 					if err := h.ctx.SetOverride("b", 0); err != nil {
 						t.Fatal(err)
@@ -4185,15 +4181,15 @@ func TestHoldout_ExposedOverrideIsKeptAcrossAnIdentityRefresh(t *testing.T) {
 }
 
 // A context with assignment rules but no holdouts also rebuilds an unclaimed
-// override after its experiment's id or iteration changes, so it serves and
-// exposes the current definition.
+// override after its experiment's id, iteration or unit type changes, so it
+// serves and exposes the current definition.
 func TestHoldout_RulesOnlyUnclaimedOverrideResolvesCurrentIdentity(t *testing.T) {
-	for _, identity := range []string{"iteration", "id"} {
+	for _, identity := range []string{"iteration", "id", "unitType"} {
 		t.Run(identity, func(t *testing.T) {
 			var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
 			var r = hoExperiment(2, "r", hoUnitType, 0)
 			r.AssignmentRules = hoUSRule
-			var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+			var h = hoCreate(t, map[string]string{hoUnitType: hoUIDNotHeldOut, "user_id": hoUID}, hoData(nil, e, r))
 			if !hoKeyed(h.ctx) {
 				t.Fatal("a context with rules is not keyed")
 			}
@@ -4206,17 +4202,20 @@ func TestHoldout_RulesOnlyUnclaimedOverrideResolvesCurrentIdentity(t *testing.T)
 			var old = h.ctx.GetAssignment("e")
 			var retainedCopy = *old
 			var fresh = e
-			if identity == "id" {
+			switch identity {
+			case "id":
 				fresh.Id = 3
-			} else {
+			case "iteration":
 				fresh.Iteration++
+			case "unitType":
+				fresh.UnitType = "user_id"
 			}
 			fresh.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"v":"new"}`}, {Name: "B", Config: `{"v":"other"}`}}
 			h.ctx.SetData(hoData(nil, fresh, r))
 			expectValue(t, "new", h.variable("v"))
 			h.ctx.QueueExposure(old)
 			h.ctx.QueueExposure(&retainedCopy)
-			var want = hoOwn(hoUnitType, fresh.Id, "e", 0)
+			var want = hoOwn(fresh.UnitType, fresh.Id, "e", 0)
 			want.Assigned, want.Overridden = false, true
 			h.expectPublished(want)
 		})

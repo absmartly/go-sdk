@@ -246,14 +246,16 @@ type cachedAssignment struct {
 	// retirement is shared by entries that carry the same Exposed identity.
 	retirement *atomic.Bool
 	switchback *switchbackSlot
-	// resolvedId and resolvedIteration identify the definition used to resolve
-	// this entry, including overrides whose public Iteration stays zero.
+	// resolvedId, resolvedIteration and resolvedUnitType identify the
+	// definition used to resolve this entry, including overrides whose public
+	// Iteration stays zero.
 	resolvedId        int
 	resolvedIteration int
+	resolvedUnitType  string
 }
 
 func (e *cachedAssignment) resolvedExperimentMatches(data jsonmodels.Experiment) bool {
-	return e.resolvedId == data.Id && e.resolvedIteration == data.Iteration
+	return e.resolvedId == data.Id && e.resolvedIteration == data.Iteration && e.resolvedUnitType == data.UnitType
 }
 
 type loggerGoroutines struct {
@@ -1065,9 +1067,9 @@ func (e *cachedAssignment) needsSettling() bool {
 // variableEligible is the variable read's claim check: once the context has
 // seen holdouts, assignment rules or switchbacks (sources of retirement), a read
 // of key claims an exposure only for an experiment that, as installed now,
-// still exists, defines key in some variant and has the same resolved experiment
-// and holdout epochs. Contexts with none of them keep the released behaviour. The
-// caller holds ContextLock_.
+// still exists, defines key in some variant and has the same resolved
+// experiment identity (id, iteration, unit type) and holdout epochs. Contexts
+// with none of them keep the released behaviour. The caller holds ContextLock_.
 func (c *Context) variableEligible(experimentName string, key string) func(*cachedAssignment) bool {
 	return func(e *cachedAssignment) bool {
 		if e.assignment.Variables == nil {
@@ -2177,6 +2179,7 @@ func (c *Context) resolveAssignmentLocked(experimentName string, at *clockReadin
 	if efound {
 		entry.resolvedId = experiment.Data.Id
 		entry.resolvedIteration = experiment.Data.Iteration
+		entry.resolvedUnitType = experiment.Data.UnitType
 	}
 
 	// Resolved for overrides and rule wins too: the holdouts' exposures fire
