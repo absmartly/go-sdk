@@ -2293,3 +2293,28 @@ func TestSwitchback_VariableReadIgnoresAUnitTypeOnlyRefresh(t *testing.T) {
 	expectValue(t, sbExpected2Arms[0], h.variable("sb.arm"))
 	h.expectPending(1)
 }
+
+// A switchback variable read whose experiment is refreshed to another
+// iteration between resolving its slot and claiming the exposure serves the
+// default and exposes nothing: the superseded slot's arm is never claimed.
+func TestSwitchback_VariableClaimDeclinesAnIterationRefreshedSlot(t *testing.T) {
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+	h.at(sbAnchor + sbHour + 5)
+	h.peek("exp_sb")
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			var refreshed = sbDefault(2, sbHour)
+			refreshed.Iteration++
+			refreshed.SwitchbackStartAt = sbInt64(sbAnchor + sbHour)
+			h.refresh(refreshed)
+		}
+	}
+	defer func() { afterReadResolve = nil }()
+	expectValue(t, -1, h.variable("sb.arm"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	h.expectPending(0)
+}
