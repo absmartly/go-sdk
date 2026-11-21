@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"runtime"
@@ -4426,17 +4427,12 @@ func TestHoldout_VariableReadServesTheLastDecisionWhenRetriesRunOut(t *testing.T
 	var claims = 0
 	beforeSettleClaim = func() {
 		claims++
-		// Each attempt installs a split serving a different variant, so the
-		// value served names the attempt that produced it.
 		var next = e
 		next.Split = []float64{0, 0, 0, 0}
 		next.Split[(claims%3)+1] = 1
 		next.TrafficSplit = []float64{0, 1, float64(claims)}
 		h.ctx.SetData(hoData(nil, next, r))
 	}
-	// Attempt 1 serves the initial split (b), attempt 2 the one installed
-	// before claim 1 (c), attempt 3 the one installed before claim 2 (d);
-	// the install before claim 3 makes that last decision stale too.
 	expectValue(t, "d", h.variable("v"))
 	beforeSettleClaim = nil
 	expectInt(t, maxExposureAttempts, claims)
@@ -4840,4 +4836,284 @@ func TestHoldout_AudienceRebuildKeepsAnAlreadyExposedRead(t *testing.T) {
 		t.Fatal("the hook did not run")
 	}
 	expectInt(t, 0, h.treatment("e"))
+}
+
+// The installed definition rolls back to the read's run, but the cache still
+// contains another run with an identical wire record. Neither an existing nor
+// an open claim on that cache entry belongs to the paused read.
+func TestHoldout_VariableClaimDoesNotBorrowAnotherIteration(t *testing.T) {
+	for _, claimed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cached_claimed=%v", claimed), func(t *testing.T) {
+			var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 1), "v")
+			var r = hoExperiment(2, "r", hoUnitType, 0)
+			r.AssignmentRules = hoUSRule
+			var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+			var served = h.ctx.getAssignment("e")
+			var copy = *served.assignment
+			var cached *cachedAssignment
+			afterReadResolve = func() {
+				afterReadResolve = nil
+				var next = e
+				next.Iteration++
+				h.ctx.SetData(hoData(nil, next, r))
+				if claimed {
+					expectInt(t, 1, h.treatment("e"))
+				} else {
+					expectInt(t, 1, h.peek("e"))
+				}
+				cached = h.ctx.assignmentCache_["e"]
+				h.ctx.SetData(hoData(nil, e, r))
+			}
+			t.Cleanup(func() { afterReadResolve = nil })
+			expectValue(t, "treatment", h.variable("v"))
+			if cached == nil || cached.resolvedIteration != 2 || served.resolvedIteration != 1 {
+				t.Fatal("the read did not span the two experiment runs")
+			}
+			if !copy.Exposed.Load().(bool) || cached.assignment.Exposed.Load().(bool) != claimed {
+				t.Fatal("the read claimed another iteration instead of its retained assignment")
+			}
+			h.ctx.QueueExposure(&copy)
+			var own = hoOwn(hoUnitType, 1, "e", 1)
+			own.FullOn = true
+			if claimed {
+				h.expectPublished(own, own)
+			} else {
+				h.expectPublished(own)
+			}
+		})
+	}
+}
+
+func TestHoldout_EquivalentRebuildSharesTheServedAssignmentCopies(t *testing.T) {
+	for _, covered := range []bool{false, true} {
+		t.Run(fmt.Sprintf("covered=%v", covered), func(t *testing.T) {
+			var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 1), "v")
+			var r = hoExperiment(2, "r", hoUnitType, 0)
+			r.AssignmentRules = hoUSRule
+			var holdouts []jsonmodels.Holdout
+			if covered {
+				e.HoldoutIds = []int{11}
+				holdouts = []jsonmodels.Holdout{hoHoldoutA()}
+			}
+			var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(holdouts, e, r), hoCustom("e", 0))
+			var served *cachedAssignment
+			var copy Assignment
+			afterReadResolve = func() {
+				afterReadResolve = nil
+				served = h.ctx.assignmentCache_["e"]
+				copy = *served.assignment
+			}
+			var rebuilt *cachedAssignment
+			var claims = 0
+			beforeSettleClaim = func() {
+				claims++
+				h.peek("e")
+				rebuilt = h.ctx.assignmentCache_["e"]
+			}
+			t.Cleanup(func() { beforeSettleClaim, afterReadResolve = nil, nil })
+			expectValue(t, "treatment", h.variable("v"))
+			beforeSettleClaim = nil
+			expectInt(t, 1, claims)
+			if rebuilt == served || rebuilt.assignment.Exposed != copy.Exposed || rebuilt.retirement != served.retirement {
+				t.Error("the equivalent rebuild did not share claim and retirement identity")
+			}
+			if !copy.Exposed.Load().(bool) {
+				t.Error("the served assignment copy was left open")
+			}
+			h.ctx.QueueExposure(served.assignment)
+			h.ctx.QueueExposure(&copy)
+			var own = hoOwn(hoUnitType, 1, "e", 1)
+			own.FullOn = true
+			if covered {
+				h.expectPublished(own, hoExposure(hoUnitType, 11, "holdout_a", 1))
+			} else {
+				h.expectPublished(own)
+			}
+		})
+	}
+}
+
+func TestHoldout_AudienceRebuildRetiresOlderEquivalentCopies(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 1), "v")
+	e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r), hoCustom("e", 0))
+	var retained []*cachedAssignment
+	var copies []Assignment
+	for i := 0; i < 3; i++ {
+		var entry = h.ctx.getAssignment("e")
+		retained = append(retained, entry)
+		copies = append(copies, *entry.assignment)
+		if entry.assignment.Exposed.Load().(bool) {
+			t.Fatal("the equivalent decision was claimed before supersession")
+		}
+	}
+	if retained[0] == retained[1] || retained[1] == retained[2] {
+		t.Fatal("the unapplied custom assignment did not rebuild")
+	}
+	var strict = e
+	strict.AudienceStrict = true
+	h.ctx.SetData(hoData(nil, strict, r))
+	expectValue(t, "default", h.variable("v"))
+	for i, entry := range retained {
+		if !entry.retirement.Load() {
+			t.Errorf("retained entry %d escaped audience retirement", i)
+		}
+		h.ctx.QueueExposure(entry.assignment)
+		h.ctx.QueueExposure(&copies[i])
+	}
+	var own = hoOwn(hoUnitType, 1, "e", 0)
+	own.Assigned = false
+	own.AudienceMismatch = true
+	h.expectPublished(own)
+}
+
+// Sharing retirement must not revoke an exposure already claimed by a read.
+func TestHoldout_EquivalentAudienceRebuildHonorsATakenClaim(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 1), "v")
+	e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r), hoCustom("e", 0))
+	var served = h.ctx.getAssignment("e")
+	h.peek("e")
+	var status, claim = h.ctx.claimEligible(served, h.ctx.variableEligible("e", "v"))
+	if status != exposureClaimed || claim != served {
+		t.Fatal("the retained read did not claim its own decision")
+	}
+	var strict = e
+	strict.AudienceStrict = true
+	h.ctx.SetData(hoData(nil, strict, r))
+	expectValue(t, "default", h.variable("v"))
+	if got := h.ctx.admitExposure(claim.assignment, claim); got != exposureQueued {
+		t.Fatalf("taken claim rejected: %v", got)
+	}
+	h.ctx.QueueExposure(served.assignment)
+	var fresh = hoOwn(hoUnitType, 1, "e", 0)
+	fresh.Assigned = false
+	fresh.AudienceMismatch = true
+	var old = hoOwn(hoUnitType, 1, "e", 1)
+	old.FullOn = true
+	old.AudienceMismatch = true
+	h.expectPublished(fresh, old)
+}
+
+func TestHoldout_EquivalentRebuildRefreshesVariablesAndRuleStamps(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 1), "v")
+	e.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e), hoCustom("e", 0))
+	var first = h.ctx.getAssignment("e")
+	var copy = *first.assignment
+	var next = e
+	next.AssignmentRules = " " + hoUSRule
+	next.Variants = []jsonmodels.ExperimentVariant{{Name: "A"}, {Name: "B", Config: `{"v":"updated","added":42}`}}
+	h.ctx.SetData(hoData(nil, next))
+	h.peek("e")
+	var rebuilt = h.ctx.assignmentCache_["e"]
+	if rebuilt == first || rebuilt.rules == first.rules || rebuilt.assignment.Exposed != copy.Exposed {
+		t.Fatal("the equivalent rebuild lost sharing or did not refresh rule stamps")
+	}
+	if err := h.ctx.SetCustomAssignment("e", 1); err != nil {
+		t.Fatal(err)
+	}
+	expectValue(t, float64(42), h.variable("added"))
+	expectValue(t, "updated", h.variable("v"))
+	h.ctx.QueueExposure(&copy)
+	var own = hoOwn(hoUnitType, 1, "e", 1)
+	own.FullOn = true
+	h.expectPublished(own)
+}
+
+func TestHoldout_RebuildSharingIsScopedToTheExperimentRun(t *testing.T) {
+	for _, overridden := range []bool{false, true} {
+		t.Run(fmt.Sprintf("overridden=%v", overridden), func(t *testing.T) {
+			var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 1), "v")
+			var r = hoExperiment(2, "r", hoUnitType, 0)
+			r.AssignmentRules = hoUSRule
+			var options []hoOption
+			if overridden {
+				options = append(options, hoOverride("e", 1))
+			}
+			var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r), options...)
+			var first = h.ctx.getAssignment("e")
+			var next = e
+			next.Iteration++
+			h.ctx.SetData(hoData(nil, next, r))
+			var second = h.ctx.getAssignment("e")
+			if second.assignment.Exposed == first.assignment.Exposed || second.retirement == first.retirement {
+				t.Fatal("distinct iterations shared exposure identity")
+			}
+			expectInt(t, 1, h.treatment("e"))
+			h.expectPublished(h.ctx.exposureFor(second.assignment, hoMillis))
+		})
+	}
+}
+
+func TestHoldout_SameDecisionComparison(t *testing.T) {
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil))
+	var makeEntry = func() *cachedAssignment {
+		var exposed = &atomic.Value{}
+		exposed.Store(false)
+		return &cachedAssignment{assignment: &Assignment{Id: 1, Iteration: 1, Name: "e", UnitType: hoUnitType,
+			Variant: 1, Assigned: true, Eligible: true, Exposed: exposed}, retirement: &atomic.Bool{},
+			resolvedId: 1, resolvedIteration: 1, resolvedUnitType: hoUnitType}
+	}
+	for _, c := range []struct {
+		name string
+		edit func(*cachedAssignment)
+	}{
+		{"resolved id", func(e *cachedAssignment) { e.resolvedId++ }},
+		{"resolved iteration", func(e *cachedAssignment) { e.resolvedIteration++ }},
+		{"resolved unit", func(e *cachedAssignment) { e.resolvedUnitType = "other" }},
+		{"full on definition", func(e *cachedAssignment) { e.assignment.FullOnVariant++ }},
+		{"traffic definition", func(e *cachedAssignment) { e.assignment.TrafficSplit = []float64{0, 1} }},
+		{"id", func(e *cachedAssignment) { e.assignment.Id++ }},
+		{"name", func(e *cachedAssignment) { e.assignment.Name = "other" }},
+		{"unit", func(e *cachedAssignment) { e.assignment.UnitType = "other" }},
+		{"variant", func(e *cachedAssignment) { e.assignment.Variant = 0 }},
+		{"assigned", func(e *cachedAssignment) { e.assignment.Assigned = false }},
+		{"eligible", func(e *cachedAssignment) { e.assignment.Eligible = false }},
+		{"override", func(e *cachedAssignment) { e.assignment.Overridden = true }},
+		{"full on", func(e *cachedAssignment) { e.assignment.FullOn = true }},
+		{"custom", func(e *cachedAssignment) { e.assignment.Custom = true }},
+		{"audience", func(e *cachedAssignment) { e.assignment.AudienceMismatch = true }},
+		{"rule", func(e *cachedAssignment) { e.assignment.RuleOverride = true }},
+		{"retired", func(e *cachedAssignment) { e.retirement.Store(true) }},
+		{"coverage", func(e *cachedAssignment) { e.holdouts = &assignmentHoldouts{} }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var a, b = makeEntry(), makeEntry()
+			c.edit(a)
+			if h.ctx.sameDecision(a, b) {
+				t.Fatal("different decisions compare equal")
+			}
+		})
+	}
+	var a, b = makeEntry(), makeEntry()
+	a.assignment.Variables = map[string]interface{}{"added": 42}
+	a.rules = &experimentRules{text: "changed"}
+	a.attrsSeq++
+	if !h.ctx.sameDecision(a, b) {
+		t.Fatal("fresh variables or rule stamps changed measurement identity")
+	}
+	var arm = &holdoutArm{assignment: &Assignment{Id: 11}, armCount: 2}
+	a.holdouts = &assignmentHoldouts{arms: []*holdoutArm{arm, nil}}
+	b.holdouts = &assignmentHoldouts{arms: []*holdoutArm{arm, nil}}
+	if !h.ctx.sameDecision(a, b) {
+		t.Fatal("the same pinned arms compare unequal")
+	}
+	b.holdouts.suppressed = true
+	if h.ctx.sameDecision(a, b) {
+		t.Fatal("different suppression compared equal")
+	}
+	b.holdouts.suppressed = false
+	b.holdouts.arms = b.holdouts.arms[:1]
+	if h.ctx.sameDecision(a, b) {
+		t.Fatal("different arm counts compared equal")
+	}
+	b.holdouts.arms = []*holdoutArm{nil, arm}
+	if h.ctx.sameDecision(a, b) {
+		t.Fatal("different pinned arms compared equal")
+	}
 }

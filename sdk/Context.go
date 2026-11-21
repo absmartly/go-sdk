@@ -1020,27 +1020,25 @@ func (c *Context) claimEligible(entry *cachedAssignment, eligible func(*cachedAs
 	if status := eligible(entry); status != exposureClaimed {
 		return status, nil
 	}
-	// A concurrent read may have rebuilt the same decision into a new cache
-	// entry; claim that one, so the decision has a single exposure flag and a
-	// later read of the cached entry does not expose it a second time.
-	var target = entry
-	if cached := c.assignmentCache_[entry.assignment.Name]; cached != nil && cached != entry && sameDecision(cached, entry) {
-		target = cached
-	}
-	var claimed = target.assignment.Exposed.CompareAndSwap(false, true)
+	var claimed = entry.assignment.Exposed.CompareAndSwap(false, true)
 	if afterEligibleCAS != nil {
 		afterEligibleCAS()
 	}
 	if claimed {
-		return exposureClaimed, target
+		return exposureClaimed, entry
 	}
 	return exposureQueued, nil
 }
 
-// sameDecision reports whether two entries publish the same exposures: the
-// same experiment record and the same holdout arms.
-func sameDecision(a *cachedAssignment, b *cachedAssignment) bool {
-	if a.retirement.Load() || decisionRecord(a) != decisionRecord(b) || (a.holdouts == nil) != (b.holdouts == nil) {
+// sameDecision compares the resolved experiment run as well as its exposures:
+// the wire record alone cannot distinguish experiment iterations. Variables
+// may be refreshed without changing the variant or its measurement identity.
+func (c *Context) sameDecision(a *cachedAssignment, b *cachedAssignment) bool {
+	if a.retirement.Load() || a.resolvedId != b.resolvedId || a.resolvedIteration != b.resolvedIteration ||
+		a.resolvedUnitType != b.resolvedUnitType || a.assignment.FullOnVariant != b.assignment.FullOnVariant ||
+		!reflect.DeepEqual(a.assignment.TrafficSplit, b.assignment.TrafficSplit) ||
+		c.exposureFor(a.assignment, 0) != c.exposureFor(b.assignment, 0) ||
+		(a.holdouts == nil) != (b.holdouts == nil) {
 		return false
 	}
 	if a.holdouts == nil {
@@ -1055,15 +1053,6 @@ func sameDecision(a *cachedAssignment, b *cachedAssignment) bool {
 		}
 	}
 	return true
-}
-
-// decisionRecord is an entry's experiment exposure record without its
-// timestamp.
-func decisionRecord(e *cachedAssignment) jsonmodels.Exposure {
-	var a = e.assignment
-	return jsonmodels.Exposure{Id: a.Id, Name: a.Name, Unit: a.UnitType, Variant: a.Variant, Assigned: a.Assigned,
-		Eligible: a.Eligible, Overridden: a.Overridden, FullOn: a.FullOn, Custom: a.Custom,
-		AudienceMismatch: a.AudienceMismatch, RuleOverride: a.RuleOverride}
 }
 
 // needsSettling reports whether an exposing read must settle the entry's
@@ -2196,6 +2185,14 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 
 	if efound {
 		c.keepExposedRuleAssignment(experiment.Data, previous, entry)
+	}
+	// Share before publishing the entry: retained pointers and Assignment copies
+	// must observe the same claim and any later retirement. An already exposed
+	// unapplied custom assignment still starts a new exposure, as in v1.1.1.
+	if previous != nil && c.index_.Load().keyed && !previous.assignment.Exposed.Load().(bool) &&
+		c.sameDecision(previous, entry) {
+		assignment.Exposed = previous.assignment.Exposed
+		entry.retirement = previous.retirement
 	}
 	var rebuiltOverride = previous != nil && previous.assignment.Overridden && efound &&
 		c.index_.Load().keyed && !previous.resolvedExperimentMatches(experiment.Data)
