@@ -4313,25 +4313,33 @@ func TestHoldout_RevalidatedEntryStaysEligible(t *testing.T) {
 }
 
 // In a keyed context an experiment whose custom assignment the build cannot
-// apply (full-on here) is still exposed by a variable read, once, as in
-// v1.1.1: the unapplied custom assignment is not staleness while it is the
-// one the entry was built with.
+// apply (full-on here) is exposed by every variable read, once per read, as in
+// v1.1.1: the claim check does not treat the unapplied custom assignment as a
+// newer decision, so the read neither retries nor skips it.
 func TestHoldout_UnappliedCustomAssignmentIsStillExposed(t *testing.T) {
-	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 1), "v")
-	var r = hoExperiment(2, "r", hoUnitType, 0)
-	r.AssignmentRules = hoUSRule
-	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
-	if err := h.ctx.SetCustomAssignment("e", 0); err != nil {
-		t.Fatal(err)
-	}
-	var claims = 0
-	beforeSettleClaim = func() { claims++ }
-	defer func() { beforeSettleClaim = nil }()
-	expectValue(t, "treatment", h.variable("v"))
-	expectValue(t, "treatment", h.variable("v"))
-	expectInt(t, 1, claims)
-	if exposures := queuedExposures(h.ctx); len(exposures) != 1 || exposures[0].Id != 1 || !exposures[0].FullOn {
-		t.Fatalf("exposures %+v, want exactly one full-on exposure", exposures)
+	for _, keyed := range []bool{false, true} {
+		var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 1), "v")
+		var r = hoExperiment(2, "r", hoUnitType, 0)
+		if keyed {
+			r.AssignmentRules = hoUSRule
+		}
+		var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+		if hoKeyed(h.ctx) != keyed {
+			t.Fatalf("keyed = %v, want %v", hoKeyed(h.ctx), keyed)
+		}
+		if err := h.ctx.SetCustomAssignment("e", 0); err != nil {
+			t.Fatal(err)
+		}
+		var claims = 0
+		beforeSettleClaim = func() { claims++ }
+		expectValue(t, "treatment", h.variable("v"))
+		expectValue(t, "treatment", h.variable("v"))
+		beforeSettleClaim = nil
+		expectInt(t, 2, claims)
+		var exposures = queuedExposures(h.ctx)
+		if len(exposures) != 2 || !exposures[0].FullOn || !exposures[1].FullOn {
+			t.Fatalf("keyed=%v: exposures %+v, want one full-on exposure per read", keyed, exposures)
+		}
 	}
 }
 
