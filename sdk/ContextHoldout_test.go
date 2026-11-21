@@ -3350,14 +3350,19 @@ func hoKeyed(ctx *Context) bool {
 }
 
 func hoInstalledDefines(ctx *Context, name string, key string) bool {
-	ctx.ContextLock_.RLock()
-	defer ctx.ContextLock_.RUnlock()
-	var entry = &cachedAssignment{assignment: &Assignment{Variables: map[string]interface{}{}}}
-	if indexed := ctx.indexedExperiment(name); indexed != nil {
-		entry.resolvedId = indexed.experiment.Data.Id
-		entry.resolvedIteration = indexed.experiment.Data.Iteration
-		entry.resolvedUnitType = indexed.experiment.Data.UnitType
-		entry.holdouts = &assignmentHoldouts{holdouts: indexed.holdouts}
+	var entry = ctx.getAssignment(name)
+	ctx.ContextLock_.Lock()
+	defer ctx.ContextLock_.Unlock()
+	if entry.assignment.Variables == nil {
+		// The eligibility check rejects an entry without variables before
+		// looking at the key; give it an empty map to probe the key alone.
+		var probe = *entry
+		var assignment = *entry.assignment
+		assignment.Variables = map[string]interface{}{}
+		probe.assignment = &assignment
+		ctx.assignmentCache_[name] = &probe
+		defer func() { ctx.assignmentCache_[name] = entry }()
+		return ctx.variableEligible(name, key)(&probe)
 	}
 	return ctx.variableEligible(name, key)(entry)
 }
@@ -4204,5 +4209,42 @@ func TestHoldout_RulesOnlyUnclaimedOverrideResolvesCurrentIdentity(t *testing.T)
 			want.Assigned, want.Overridden = false, true
 			h.expectPublished(want)
 		})
+	}
+}
+
+// A restored key cannot authorize a claim on a different full-on decision.
+// With the unit in arm 1 of a three-arm holdout, the key goes v -> w -> v
+// while FullOnVariant goes 0 -> 1 -> 0, and nothing else in the experiment's
+// or holdout's identity changes: the read retries onto the middle (full-on,
+// not suppressed) decision, and the last refresh lands before it claims.
+func TestHoldout_RestoredKeyDoesNotAuthorizeADifferentFullOnDecision(t *testing.T) {
+	var three = hoThreeArm(11, "three_arm", hoThreeArm1Lo)
+	var first = hoWithVariables(hoExperiment(2, "b", hoUnitType, 0, 11), "v")
+	var middle = hoWithVariables(hoExperiment(2, "b", hoUnitType, 1, 11), "w")
+	var last = hoWithVariables(hoExperiment(2, "b", hoUnitType, 0, 11), "v")
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{three}, first))
+	t.Cleanup(func() { afterReadResolve, beforeSettleClaim = nil, nil })
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{three}, middle))
+			h.ctx.GetAssignment("b")
+		}
+	}
+	var claims = 0
+	beforeSettleClaim = func() {
+		claims++
+		if claims == 2 {
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{three}, last))
+		}
+	}
+	expectValue(t, "default", h.variable("v"))
+	afterReadResolve, beforeSettleClaim = nil, nil
+	if armed || claims < 2 {
+		t.Fatal("the middle decision was not retried")
+	}
+	if exposures := queuedExposures(h.ctx); len(exposures) != 0 {
+		t.Fatalf("a different full-on decision was exposed: %+v", exposures)
 	}
 }

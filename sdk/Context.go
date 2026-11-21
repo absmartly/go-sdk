@@ -192,7 +192,6 @@ type holdoutArm struct {
 type assignmentHoldouts struct {
 	holdouts   []*jsonmodels.Holdout
 	arms       []*holdoutArm
-	unitType   string
 	suppressed bool
 }
 
@@ -1023,9 +1022,11 @@ func (e *cachedAssignment) needsSettling() bool {
 // variableEligible is the variable read's claim check: once the context has
 // seen holdouts or assignment rules (the only sources of retirement), a read
 // of key claims an exposure only for an experiment that, as installed now,
-// still exists, defines key in some variant and has the same resolved
-// experiment identity (id, iteration, unit type) and holdout epochs. Contexts
-// with neither keep the released behaviour. The caller holds ContextLock_.
+// still exists and defines key in some variant, and only while the entry is
+// still the current decision for that definition by the cache's own rules
+// (identity, full-on variant, traffic, holdout epochs, overrides, assignment
+// rules and audience). Contexts with neither keep the released behaviour. The
+// caller holds ContextLock_.
 func (c *Context) variableEligible(experimentName string, key string) func(*cachedAssignment) bool {
 	return func(e *cachedAssignment) bool {
 		if e.assignment.Variables == nil {
@@ -1036,12 +1037,14 @@ func (c *Context) variableEligible(experimentName string, key string) func(*cach
 			return true
 		}
 		var indexed = index.experiments[experimentName]
-		if indexed == nil || !e.resolvedExperimentMatches(indexed.experiment.Data) ||
-			!holdoutSetMatches(indexed.holdouts, e.holdouts) {
+		if indexed == nil {
 			return false
 		}
-		_, defined := indexed.variableKeys[key]
-		return defined
+		if _, defined := indexed.variableKeys[key]; !defined {
+			return false
+		}
+		var current, _, state = c.validCachedAssignment(experimentName)
+		return current == e && state != assignmentStale
 	}
 }
 
@@ -1813,7 +1816,7 @@ func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignmen
 			return entry, rules, assignmentStale
 		}
 		if assignment.Overridden && assignment.Variant == override.(int) && (!efound ||
-			holdoutSetMatches(holdouts, entry.holdouts) && (entry.holdouts == nil || entry.holdouts.unitType == experiment.Data.UnitType)) {
+			holdoutSetMatches(holdouts, entry.holdouts) && (entry.holdouts == nil || entry.resolvedUnitType == experiment.Data.UnitType)) {
 			return entry, rules, assignmentValid
 		}
 	} else if !efound {
@@ -2144,7 +2147,7 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 // when the experiment's unit is not set. The caller holds ContextLock_ for
 // writing.
 func (c *Context) resolveHoldouts(holdouts []*jsonmodels.Holdout, data jsonmodels.Experiment) (*assignmentHoldouts, bool) {
-	var resolved = &assignmentHoldouts{holdouts: holdouts, arms: make([]*holdoutArm, len(holdouts)), unitType: data.UnitType}
+	var resolved = &assignmentHoldouts{holdouts: holdouts, arms: make([]*holdoutArm, len(holdouts))}
 	var held = false
 	for i, holdout := range holdouts {
 		var arm = c.holdoutArm(holdout, data.UnitType)
