@@ -2195,7 +2195,9 @@ func (c *Context) parseAudienceUnlocked(st *contextState, name string, data json
 		c.logAudiencePanic(st, name, failed, panicked)
 		return failed
 	}
-	if parsed.err != nil {
+	// Cache an SDK-owned copy, so a deserializer that reuses its result maps
+	// cannot change this audience when it decodes the next.
+	if parsed = parsed.owned(); parsed.err != nil {
 		return failed
 	}
 	st.audiences.Store(text, &audienceEntry{deserializer: deserializer, parsed: parsed})

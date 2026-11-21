@@ -50,54 +50,105 @@ func (am AudienceMatcher) parseAudience(audience string) parsedAudience {
 	var filter = result["filter"]
 	switch reflect.ValueOf(filter).Kind() {
 	case reflect.Map, reflect.Slice, reflect.Array:
-		// The context caches this parse, and a custom deserializer may reuse
-		// its result maps for the next audience: keep an SDK-owned copy.
-		return parsedAudience{filter: copyFilter(reflect.ValueOf(filter)).Interface()}
+		return parsedAudience{filter: filter}
 	default:
 		return parsedAudience{err: errAudienceUnparseable}
 	}
 }
 
+// owned returns p with an SDK-owned copy of its filter, for caching: a
+// custom deserializer may reuse its result maps for the next audience. A
+// filter that contains itself (only a broken deserializer can produce one)
+// counts as unparseable rather than being copied without end.
+func (p parsedAudience) owned() parsedAudience {
+	if p.err != nil {
+		return p
+	}
+	var copied, ok = copyFilter(reflect.ValueOf(p.filter), map[uintptr]bool{})
+	if !ok {
+		return parsedAudience{err: errAudienceUnparseable}
+	}
+	return parsedAudience{filter: copied.Interface()}
+}
+
 // copyFilter deep-copies the maps, slices and arrays of a decoded filter,
 // keeping each container's own type, so the evaluator sees the same values.
-// Scalars and other values are shared: the evaluator never mutates them.
-func copyFilter(value reflect.Value) reflect.Value {
+// Scalars and other values are shared: the evaluator never mutates them. It
+// reports false when a map or slice contains itself; visiting holds the
+// containers on the current path.
+func copyFilter(value reflect.Value, visiting map[uintptr]bool) (reflect.Value, bool) {
+	var enter = func() (func(), bool) {
+		var ptr = value.Pointer()
+		if ptr == 0 {
+			return func() {}, true
+		}
+		if visiting[ptr] {
+			return nil, false
+		}
+		visiting[ptr] = true
+		return func() { delete(visiting, ptr) }, true
+	}
 	switch value.Kind() {
 	case reflect.Interface:
 		if value.IsNil() {
-			return value
+			return value, true
 		}
-		var inner = copyFilter(value.Elem())
+		var inner, ok = copyFilter(value.Elem(), visiting)
+		if !ok {
+			return value, false
+		}
 		var boxed = reflect.New(value.Type()).Elem()
 		boxed.Set(inner)
-		return boxed
+		return boxed, true
 	case reflect.Map:
 		if value.IsNil() {
-			return value
+			return value, true
 		}
+		var leave, ok = enter()
+		if !ok {
+			return value, false
+		}
+		defer leave()
 		var out = reflect.MakeMapWithSize(value.Type(), value.Len())
 		var iter = value.MapRange()
 		for iter.Next() {
-			out.SetMapIndex(iter.Key(), copyFilter(iter.Value()))
+			var item, ok = copyFilter(iter.Value(), visiting)
+			if !ok {
+				return value, false
+			}
+			out.SetMapIndex(iter.Key(), item)
 		}
-		return out
+		return out, true
 	case reflect.Slice:
 		if value.IsNil() {
-			return value
+			return value, true
 		}
+		var leave, ok = enter()
+		if !ok {
+			return value, false
+		}
+		defer leave()
 		var out = reflect.MakeSlice(value.Type(), value.Len(), value.Len())
 		for i := 0; i < value.Len(); i++ {
-			out.Index(i).Set(copyFilter(value.Index(i)))
+			var item, ok = copyFilter(value.Index(i), visiting)
+			if !ok {
+				return value, false
+			}
+			out.Index(i).Set(item)
 		}
-		return out
+		return out, true
 	case reflect.Array:
 		var out = reflect.New(value.Type()).Elem()
 		for i := 0; i < value.Len(); i++ {
-			out.Index(i).Set(copyFilter(value.Index(i)))
+			var item, ok = copyFilter(value.Index(i), visiting)
+			if !ok {
+				return value, false
+			}
+			out.Index(i).Set(item)
 		}
-		return out
+		return out, true
 	default:
-		return value
+		return value, true
 	}
 }
 

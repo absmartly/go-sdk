@@ -513,14 +513,56 @@ func TestCopyFilterIsDeepAndTypePreserving(t *testing.T) {
 		"typed": map[string]string{"k": "v"},
 		"array": [2]interface{}{map[string]interface{}{"m": 1}, "s"},
 	}
-	var copied = copyFilter(reflect.ValueOf(original)).Interface().(map[string]interface{})
+	var value, ok = copyFilter(reflect.ValueOf(original), map[uintptr]bool{})
+	assertAny(true, ok, t)
+	var copied = value.Interface().(map[string]interface{})
 	assertAny(true, reflect.DeepEqual(original, copied), t)
 	original["and"].([]interface{})[0].(map[string]interface{})["eq"] = "changed"
 	original["typed"].(map[string]string)["k"] = "changed"
+	original["array"].([2]interface{})[0].(map[string]interface{})["m"] = 2
 	assertAny(false, reflect.DeepEqual(original, copied), t)
 	assertAny("v", copied["typed"].(map[string]string)["k"], t)
+	assertAny(1, copied["array"].([2]interface{})[0].(map[string]interface{})["m"], t)
 	var eq = copied["and"].([]interface{})[0].(map[string]interface{})["eq"]
 	assertAny(true, reflect.TypeOf(eq).Kind() == reflect.Slice, t)
+	// A container repeated without a cycle is copied; one that contains
+	// itself is reported instead of being copied without end.
+	var shared = map[string]interface{}{"value": true}
+	_, ok = copyFilter(reflect.ValueOf([]interface{}{shared, shared}), map[uintptr]bool{})
+	assertAny(true, ok, t)
+	var cyclic = map[string]interface{}{}
+	cyclic["self"] = cyclic
+	_, ok = copyFilter(reflect.ValueOf(cyclic), map[uintptr]bool{})
+	assertAny(false, ok, t)
+	var loop = []interface{}{nil}
+	loop[0] = loop
+	_, ok = copyFilter(reflect.ValueOf(loop), map[uintptr]bool{})
+	assertAny(false, ok, t)
+}
+
+// cyclicDeserializer returns a filter that contains itself.
+type cyclicDeserializer struct{}
+
+func (cyclicDeserializer) Deserialize([]byte, int, int) (map[string]interface{}, error) {
+	var filter = map[string]interface{}{}
+	filter["and"] = []interface{}{filter}
+	return map[string]interface{}{"filter": filter}, nil
+}
+
+// A self-referential filter from a broken deserializer is treated as an
+// unparseable audience, not copied without end: a strict audience is ignored,
+// as for any unparseable one.
+func TestCyclicAudienceFilterIsUnparseable(t *testing.T) {
+	var ctx, _ = newSystemAttrContext("website", "production", audienceExperiment("exp_app", appFilter, true))
+	ctx.AudienceMatcher_ = AudienceMatcher{cyclicDeserializer{}}
+	var done = make(chan int, 1)
+	go func() { done <- treatmentPeek(t, ctx, "exp_app") }()
+	select {
+	case variant := <-done:
+		assertAny(1, variant, t)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a cyclic filter did not return")
+	}
 }
 
 // The first parse of each distinct audience checks membership against a set
