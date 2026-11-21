@@ -2184,7 +2184,9 @@ func (c *Context) cachedAudience(st *contextState, text string) (parsedAudience,
 			return entry.parsed, true
 		}
 	}
-	return parsedAudience{}, false
+	// A miss carries the unparseable error, so evaluating it by mistake can
+	// never read a nil filter.
+	return parsedAudience{err: errors.New("can't evaluate data")}, false
 }
 
 // pruneAudiences drops the parses of audience texts the installed data no
