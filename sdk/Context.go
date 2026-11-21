@@ -148,48 +148,139 @@ type contextState struct {
 	// customAudiences serialises, within this context, each custom
 	// deserializer call with the locked evaluation of its result, as v1.1.1
 	// did by holding ContextLock_ across both. It is taken with no context
-	// lock held and released after ContextLock_ is, and is reentrant for its
-	// owner, so a deserializer or a panic logger can read other experiments
-	// (a deserializer reusing storage across such nested calls on its own
-	// goroutine is not protected). See buildAssignment.
+	// lock held and released after ContextLock_ is. It is reentrant for its
+	// holder, so a deserializer or a panic logger can read other experiments,
+	// and it is lent to a Refresh or initial load the holder waits for, so
+	// that operation's variable parser and loggers can read too. Such nested
+	// reads decode before the outer deserializer returns: a deserializer
+	// reusing storage across its own nested calls is responsible for it.
+	// See buildAssignment.
 	customAudiences reentrantGate
+
+	// loadOp_ is the initial load, when it was pending at creation, for
+	// lending customAudiences to it. Set before the context escapes.
+	loadOp_ *gateOperation
 }
 
-// reentrantGate is a mutex that the goroutine holding it may take again.
+// reentrantGate is a mutex that the goroutines holding it may take again.
+// The first goroutine takes it when it is free and holds it until its
+// matching unlock. Another goroutine is admitted only while it is the
+// registered executor of an operation that a holder has lent the gate to
+// (see lend). A holder lends only while it is blocked waiting for that
+// operation, so the executor runs as a nested call of the holder, as v1.1.1
+// ran refresh callbacks on the goroutine joining the refresh. The zero value
+// is ready to use.
 type reentrantGate struct {
-	mu    sync.Mutex
-	free  sync.Cond
-	owner uint64
-	depth int
+	mu   sync.Mutex
+	free sync.Cond
+	// holders counts, per goroutine, the locks it holds; the gate is free
+	// when it is empty. More than one goroutine holds it only through a lend.
+	holders map[uint64]int
+	// lent counts, per operation, the holders currently waiting for it.
+	lent map[*gateOperation]int
 }
 
-// lock takes the gate, waiting while another goroutine holds it unless wait
-// is false, in which case it reports false instead of waiting.
-func (g *reentrantGate) lock(wait bool) bool {
+// gateOperation is an SDK operation (a refresh, or the initial load) that a
+// gate holder can wait for. executor is the goroutine running the
+// operation's completion (installing its data, calling the variable parser
+// and event loggers for it), or 0. It is guarded by the gate's mu.
+type gateOperation struct {
+	executor uint64
+}
+
+func (g *reentrantGate) init() {
+	if g.free.L == nil {
+		g.free.L = &g.mu
+		g.holders = map[uint64]int{}
+		g.lent = map[*gateOperation]int{}
+	}
+}
+
+// admits reports whether goroutine id may take the gate now. g.mu is held.
+func (g *reentrantGate) admits(id uint64) bool {
+	if len(g.holders) == 0 || g.holders[id] > 0 {
+		return true
+	}
+	for op := range g.lent {
+		if op.executor == id {
+			return true
+		}
+	}
+	return false
+}
+
+// lock takes the gate, waiting until it is free, already held by the calling
+// goroutine, or lent to an operation the calling goroutine is executing.
+func (g *reentrantGate) lock() {
 	var id = goroutineID()
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.free.L == nil {
-		g.free.L = &g.mu
-	}
-	for g.depth > 0 && g.owner != id {
-		if !wait {
-			return false
-		}
+	g.init()
+	for !g.admits(id) {
 		g.free.Wait()
 	}
-	g.owner = id
-	g.depth++
-	return true
+	g.holders[id]++
 }
 
 func (g *reentrantGate) unlock() {
+	var id = goroutineID()
 	g.mu.Lock()
-	if g.depth--; g.depth == 0 {
-		g.owner = 0
-		g.free.Signal()
+	if g.holders[id]--; g.holders[id] <= 0 {
+		delete(g.holders, id)
+		if len(g.holders) == 0 {
+			g.free.Broadcast()
+		}
 	}
 	g.mu.Unlock()
+}
+
+// lend is called by a goroutine about to block until op settles. If that
+// goroutine holds the gate, op's executor is admitted until the returned
+// function is called, which the caller does once its wait returns. op
+// settles only after its completion has returned from the parser and every
+// logger it calls, so an admitted executor has released the gate by then.
+// Whether the executor registers before or after the lend, or is already
+// waiting in lock, it is admitted: both sides broadcast under g.mu.
+func (g *reentrantGate) lend(op *gateOperation) (end func()) {
+	var id = goroutineID()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.init()
+	if g.holders[id] == 0 {
+		return func() {}
+	}
+	g.lent[op]++
+	g.free.Broadcast()
+	return func() {
+		g.mu.Lock()
+		if g.lent[op]--; g.lent[op] <= 0 {
+			delete(g.lent, op)
+		}
+		g.mu.Unlock()
+	}
+}
+
+// execute registers the calling goroutine as op's executor until the
+// returned function is first called. It is called at the start of op's
+// completion, whether or not a holder is (or will be) waiting for op, and
+// ended before op's future settles: once it settles the holder resumes, and
+// the future's own listeners, which may run on this goroutine, are not part
+// of the operation.
+func (g *reentrantGate) execute(op *gateOperation) (end func()) {
+	var id = goroutineID()
+	g.mu.Lock()
+	g.init()
+	op.executor = id
+	g.free.Broadcast()
+	g.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			g.mu.Lock()
+			op.executor = 0
+			g.mu.Unlock()
+		})
+	}
 }
 
 // contextClock carries private state in an existing interface field without
@@ -588,6 +679,11 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	} else {
 		var tmp = &cntx
 		var tempFuture, readyFutureDone = future.New()
+		var loadOp = &gateOperation{}
+		state.loadOp_ = loadOp
+		// endLoad ends the load's executor registration before its future
+		// settles; set by the completion below before it can be called.
+		var endLoad = func() {}
 		cntx.setReadyFuture(tempFuture)
 		// fail reports a failed initial load. It settles the failed future
 		// before clearing it, so a waiter that arrives in between joins it
@@ -596,10 +692,14 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 			tmp.SetDataFailed(err)
 			tmp.dispatchDiagnostics(diagnostics)
 			tmp.LogError(err)
+			endLoad()
 			readyFutureDone(nil, err)
 			cntx.setReadyFutureWith(state, nil)
 		}
 		dataFuture.Listen(func(val future.Value, err error) {
+			var executed = state.customAudiences.execute(loadOp)
+			defer executed()
+			endLoad = executed
 			atomic.StoreUint64(state.readyDeliverer_, goroutineID())
 			defer atomic.StoreUint64(state.readyDeliverer_, 0)
 			if err == nil {
@@ -625,6 +725,7 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 					tmp.armTimeout()
 				}
 				cntx.setReadyFutureWith(state, nil)
+				executed()
 				readyFutureDone(result, nil)
 			} else {
 				fail(err, nil)
@@ -668,6 +769,11 @@ func (c *Context) WaitUntilReadyAsync() *future.Future {
 
 func (c *Context) WaitUntilReady() Context {
 	if ft := c.pendingReadyFuture(); ft != nil && !ft.Ready() {
+		// A goroutine holding the custom audience gate (a deserializer
+		// waiting for readiness) lends it to the initial load meanwhile.
+		if op := c.live().state().loadOp_; op != nil {
+			defer c.live().state().customAudiences.lend(op)()
+		}
 		ft.Join(context.Background())
 	}
 	return c.snapshot()
@@ -1423,6 +1529,7 @@ func (c *Context) GetPendingCount() int32 {
 // A late join adopts synchronously, before RefreshAsync returns its future.
 // Every caller shares that future, so listeners can wait on other joiners.
 type refreshOperation struct {
+	gate      gateOperation
 	mu        sync.Mutex
 	receivers map[*Context]struct{}
 	completed bool
@@ -1472,6 +1579,13 @@ func (op *refreshOperation) settle(root *Context) {
 }
 
 func (c *Context) RefreshAsync() *future.Future {
+	var ft, _ = c.refreshAsync()
+	return ft
+}
+
+// refreshAsync is RefreshAsync, also returning the operation the future
+// belongs to, or nil when there is none to wait for.
+func (c *Context) refreshAsync() (*future.Future, *refreshOperation) {
 	var receiver = c
 	c = c.live()
 	var st = c.state()
@@ -1479,7 +1593,7 @@ func (c *Context) RefreshAsync() *future.Future {
 	if err != nil {
 		var tempfuture, donefun = future.New()
 		donefun(nil, err)
-		return tempfuture
+		return tempfuture, nil
 	}
 
 	st.stateLock_.Lock()
@@ -1490,11 +1604,11 @@ func (c *Context) RefreshAsync() *future.Future {
 			if op != nil {
 				op.join(receiver, c)
 			}
-			return active
+			return active, op
 		}
 		var tempfuture, donefun = future.New()
 		donefun(nil, nil)
-		return tempfuture
+		return tempfuture, nil
 	}
 	c.Refreshing_.Store(true)
 	var tempfuture, donefun = future.New()
@@ -1505,6 +1619,11 @@ func (c *Context) RefreshAsync() *future.Future {
 
 	var loaded = c.callDataProvider()
 	var complete = func(value future.Value, err error) {
+		// Register this goroutine as the operation's executor, so a gate
+		// holder waiting for this refresh in Refresh admits its parser and
+		// loggers.
+		var executed = st.customAudiences.execute(&op.gate)
+		defer executed()
 		var outcome = err
 		var result jsonmodels.ContextData
 		var diagnostics []bufferedEvent
@@ -1540,10 +1659,11 @@ func (c *Context) RefreshAsync() *future.Future {
 			c.LogError(outcome)
 		}
 		op.settle(c)
+		executed()
 		donefun(nil, outcome)
 	}
 	loaded.Listen(complete)
-	return tempfuture
+	return tempfuture, op
 }
 
 func (c *Context) applyRefreshedData(data jsonmodels.ContextData) (diagnostics []bufferedEvent, panicErr error) {
@@ -1558,8 +1678,14 @@ func (c *Context) applyRefreshedData(data jsonmodels.ContextData) (diagnostics [
 	return nil, nil
 }
 
+// Refresh waits for the refresh. A goroutine holding the custom audience
+// gate (a deserializer calling Refresh) lends it to that refresh meanwhile.
 func (c *Context) Refresh() {
-	c.RefreshAsync().Join(context.Background())
+	var ft, op = c.refreshAsync()
+	if op != nil && !ft.Ready() {
+		defer c.live().state().customAudiences.lend(&op.gate)()
+	}
+	ft.Join(context.Background())
 }
 
 func (c *Context) CloseAsync() (*future.Future, error) {
@@ -1980,10 +2106,12 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 // A custom deserializer's parse holds st.customAudiences from before the call
 // until the locked attempt that evaluates it returns, so on one context no
 // other custom parse runs while a result may still be in use, as in v1.1.1.
-// The built-in deserializer's parses, whose results are fresh, skip it. A
-// read from an event logger never waits for another goroutine's parse: that
-// deserializer may be waiting for the logger (a Refresh or WaitUntilReady
-// whose event it is delivering), so the read parses without the gate.
+// The built-in deserializer's parses, whose results are fresh, skip it. Any
+// read from another goroutine, an event logger's included, waits for the
+// gate, except the executor of a Refresh or initial load that the holder is
+// waiting for in Refresh or WaitUntilReady: the holder lent it the gate, so
+// that operation's parser and loggers run nested, as v1.1.1 ran refresh
+// callbacks on the joining goroutine.
 func (c *Context) buildAssignment(st *contextState, experimentName string) *cachedAssignment {
 	var entry, unparsed = c.buildAssignmentLocked(st, experimentName, false, nil)
 	for attempt := 0; unparsed != nil; attempt++ {
@@ -1996,8 +2124,8 @@ func (c *Context) buildAssignment(st *contextState, experimentName string) *cach
 // evaluation only. Waiting readers recheck the assignment before decoding:
 // another reader may have installed it while they waited.
 func (c *Context) buildAudienceAttempt(st *contextState, experimentName string, last bool) (*cachedAssignment, *jsonmodels.Experiment) {
-	if !builtinDeserializer(c.AudienceMatcher_.Deserializer_) &&
-		st.customAudiences.lock(st.loggers_ == nil || !st.loggers_.current()) {
+	if !builtinDeserializer(c.AudienceMatcher_.Deserializer_) {
+		st.customAudiences.lock()
 		defer st.customAudiences.unlock()
 	}
 	var entry, unparsed = c.buildAssignmentLocked(st, experimentName, last, nil)
