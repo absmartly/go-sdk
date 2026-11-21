@@ -185,6 +185,13 @@ func assertHandoffB(t *testing.T, ctx *Context, peeked int) {
 // goroutine, whose Refresh event logger reads cold custom B. The holder lent
 // the gate to the refresh, so the logger's read runs nested and both finish.
 // The deserializer fills its result after the nested call, so A is right.
+// The Refresh event is logged before Refresh returns, so B's decode always
+// happens inside A's deserializer call: one that fills its reused map before
+// calling Refresh gets B's filter back for A (v1.1.1 logged after Refresh
+// returned, so B decoded after A was evaluated there). Removing the lend
+// deadlocks this test; it does not distinguish the lend from the former
+// logger bypass, which TestHandoffIndependentLoggerWaitsForParse and
+// TestHandoffUnrelatedRefreshLoggerWaitsForParse do.
 func TestHandoffRefreshLoggerReadsColdAudience(t *testing.T) {
 	var h = newHandoff(t, nil)
 	var peekB = make(chan int, 1)
