@@ -1023,9 +1023,9 @@ func (e *cachedAssignment) needsSettling() bool {
 // variableEligible is the variable read's claim check: once the context has
 // seen holdouts or assignment rules (the only sources of retirement), a read
 // of key claims an exposure only for an experiment that, as installed now,
-// still exists, defines key in some variant and has the same resolved experiment
-// identity (id, iteration, unit type) and holdout epochs. Contexts with neither keep the released behaviour. The
-// caller holds ContextLock_.
+// still exists, defines key in some variant and has the same resolved
+// experiment identity (id, iteration, unit type) and holdout epochs. Contexts
+// with neither keep the released behaviour. The caller holds ContextLock_.
 func (c *Context) variableEligible(experimentName string, key string) func(*cachedAssignment) bool {
 	return func(e *cachedAssignment) bool {
 		if e.assignment.Variables == nil {

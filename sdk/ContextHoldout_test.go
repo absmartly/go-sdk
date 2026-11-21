@@ -4169,12 +4169,12 @@ func TestHoldout_ExposedOverrideIsKeptAcrossAnIdentityRefresh(t *testing.T) {
 // override after its experiment's id or iteration changes, so it serves and
 // exposes the current definition.
 func TestHoldout_RulesOnlyUnclaimedOverrideResolvesCurrentIdentity(t *testing.T) {
-	for _, identity := range []string{"iteration", "id"} {
+	for _, identity := range []string{"iteration", "id", "unitType"} {
 		t.Run(identity, func(t *testing.T) {
 			var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
 			var r = hoExperiment(2, "r", hoUnitType, 0)
 			r.AssignmentRules = hoUSRule
-			var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+			var h = hoCreate(t, map[string]string{hoUnitType: hoUIDNotHeldOut, "user_id": hoUID}, hoData(nil, e, r))
 			if !hoKeyed(h.ctx) {
 				t.Fatal("a context with rules is not keyed")
 			}
@@ -4187,17 +4187,20 @@ func TestHoldout_RulesOnlyUnclaimedOverrideResolvesCurrentIdentity(t *testing.T)
 			var old = h.ctx.GetAssignment("e")
 			var retainedCopy = *old
 			var fresh = e
-			if identity == "id" {
+			switch identity {
+			case "id":
 				fresh.Id = 3
-			} else {
+			case "iteration":
 				fresh.Iteration++
+			case "unitType":
+				fresh.UnitType = "user_id"
 			}
 			fresh.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"v":"new"}`}, {Name: "B", Config: `{"v":"other"}`}}
 			h.ctx.SetData(hoData(nil, fresh, r))
 			expectValue(t, "new", h.variable("v"))
 			h.ctx.QueueExposure(old)
 			h.ctx.QueueExposure(&retainedCopy)
-			var want = hoOwn(hoUnitType, fresh.Id, "e", 0)
+			var want = hoOwn(fresh.UnitType, fresh.Id, "e", 0)
 			want.Assigned, want.Overridden = false, true
 			h.expectPublished(want)
 		})
