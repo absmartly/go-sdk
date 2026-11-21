@@ -230,6 +230,12 @@ type cachedAssignment struct {
 	resolvedId        int
 	resolvedIteration int
 	resolvedUnitType  string
+	// resolvedCustom is the custom assignment present when the entry was
+	// built, if resolvedHasCustom. A custom assignment the build could not
+	// apply (full-on, traffic-ineligible, strict audience mismatch) keeps the
+	// entry current until the custom assignment itself changes.
+	resolvedCustom    int
+	resolvedHasCustom bool
 }
 
 func (e *cachedAssignment) resolvedExperimentMatches(data jsonmodels.Experiment) bool {
@@ -1833,10 +1839,12 @@ func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignmen
 		if !assignment.Assigned && !assignment.RuleOverride {
 			return entry, rules, assignmentValid
 		}
-	} else if assignment.RuleOverride || entry.holdouts.isSuppressed() || !cfound || custom.(int) == assignment.Variant {
+	} else if assignment.RuleOverride || entry.holdouts.isSuppressed() || !cfound || custom.(int) == assignment.Variant ||
+		entry.resolvedHasCustom && custom.(int) == entry.resolvedCustom {
 		// A matching rule wins over a custom assignment, and a holdout
 		// suppression forces control, so a custom assignment that differs
-		// from either variant is not staleness.
+		// from either variant is not staleness; nor is one the build could not
+		// apply, as long as it is the one the entry was built with.
 		if !c.ExperimentMatches(experiment.Data, *assignment) || !holdoutSetMatches(holdouts, entry.holdouts) {
 			return entry, rules, assignmentStale
 		}
@@ -2029,6 +2037,9 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 	assignment.Name = experimentName
 	assignment.Eligible = true
 	var entry = &cachedAssignment{assignment: assignment, rules: rules, attrsSeq: atomic.LoadInt32(&c.AttrsSeq_), retirement: &atomic.Bool{}}
+	if cfound {
+		entry.resolvedCustom, entry.resolvedHasCustom = custom.(int), true
+	}
 	if efound {
 		entry.resolvedId = experiment.Data.Id
 		entry.resolvedIteration = experiment.Data.Iteration

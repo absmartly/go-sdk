@@ -4311,3 +4311,101 @@ func TestHoldout_RevalidatedEntryStaysEligible(t *testing.T) {
 		t.Fatalf("exposures %+v, want exactly the rule-won decision", exposures)
 	}
 }
+
+// In a keyed context an experiment whose custom assignment the build cannot
+// apply (full-on here) is still exposed by a variable read, once, as in
+// v1.1.1: the unapplied custom assignment is not staleness while it is the
+// one the entry was built with.
+func TestHoldout_UnappliedCustomAssignmentIsStillExposed(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 1), "v")
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	if err := h.ctx.SetCustomAssignment("e", 0); err != nil {
+		t.Fatal(err)
+	}
+	var claims = 0
+	beforeSettleClaim = func() { claims++ }
+	defer func() { beforeSettleClaim = nil }()
+	expectValue(t, "treatment", h.variable("v"))
+	expectValue(t, "treatment", h.variable("v"))
+	expectInt(t, 1, claims)
+	if exposures := queuedExposures(h.ctx); len(exposures) != 1 || exposures[0].Id != 1 || !exposures[0].FullOn {
+		t.Fatalf("exposures %+v, want exactly one full-on exposure", exposures)
+	}
+}
+
+// A refresh that replaces the cached entry (a rebuild after a traffic change)
+// between a variable read's resolve and its claim, without retiring it, makes
+// the read resolve again onto the replacement: exactly one exposure in total,
+// even with a following GetTreatment.
+func TestHoldout_ReplacedUnretiredEntryIsResolvedAgain(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+	e.Split = []float64{0, 1}
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	h.peek("e")
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			var traffic = e
+			traffic.TrafficSplit = []float64{0, 1, 0}
+			h.ctx.SetData(hoData(nil, traffic, r))
+			h.ctx.GetAssignment("e")
+		}
+	}
+	defer func() { afterReadResolve = nil }()
+	expectValue(t, "treatment", h.variable("v"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	expectInt(t, 1, h.treatment("e"))
+	if exposures := queuedExposures(h.ctx); len(exposures) != 1 {
+		t.Fatalf("exposures %+v, want exactly one", exposures)
+	}
+}
+
+// When every attempt of a variable read finds its decision stale, the read
+// stops after maxExposureAttempts and serves the last decision it tried,
+// without an exposure, as in the Java SDK; the next read exposes it.
+func TestHoldout_VariableReadServesTheLastDecisionWhenRetriesRunOut(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+	e.Split = []float64{0, 1}
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	h.peek("e")
+	var claims = 0
+	beforeSettleClaim = func() {
+		claims++
+		var traffic = e
+		traffic.TrafficSplit = []float64{0, 1, float64(claims)}
+		h.ctx.SetData(hoData(nil, traffic, r))
+	}
+	expectValue(t, "treatment", h.variable("v"))
+	beforeSettleClaim = nil
+	expectInt(t, maxExposureAttempts, claims)
+	h.expectPending(0)
+	expectValue(t, "treatment", h.variable("v"))
+	h.expectPending(1)
+}
+
+// Changing the custom assignment after a decision was built from it is still
+// a new decision: an applicable new custom variant rebuilds the entry.
+func TestHoldout_ChangedCustomAssignmentStillRebuilds(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	if err := h.ctx.SetCustomAssignment("e", 0); err != nil {
+		t.Fatal(err)
+	}
+	expectInt(t, 0, h.peek("e"))
+	if err := h.ctx.SetCustomAssignment("e", 1); err != nil {
+		t.Fatal(err)
+	}
+	expectInt(t, 1, h.peek("e"))
+	expectValue(t, "treatment", h.variable("v"))
+}
