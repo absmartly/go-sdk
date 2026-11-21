@@ -347,6 +347,46 @@ func TestLiteralVariableValueFollowsIndexVariables(t *testing.T) {
 	}
 }
 
+// The context a literal's event logger receives reads the literal's current
+// IndexVariables_ for every variable getter, as direct reads do: a replaced
+// mapping reads the new experiment and a deleted one returns the default.
+func TestLiteralLoggerVariableReadsFollowIndexVariables(t *testing.T) {
+	var a, b = audienceExperiment("a", "", false), audienceExperiment("b", "", false)
+	a.Variants[1].Config = `{"key":1}`
+	b.Id = 9
+	b.Variants[1].Config = `{"key":2}`
+	type reads struct {
+		peek, get  interface{}
+		experiment string
+		keys       map[string]string
+		all        map[string][]string
+	}
+	var manual = audienceLiteral(a)
+	manual.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{a, b}})
+	manual.IndexVariables_["key"] = manual.Index_["a"]
+	var _, _ = manual.PeekVariableValue("key", "fallback")
+	var seen = make(chan reads, 1)
+	manual.EventLogger_ = callbackEventLogger(func(c Context, event EventType, _ interface{}) {
+		if event != Goal {
+			return
+		}
+		var r reads
+		r.peek, _ = c.PeekVariableValue("key", "fallback")
+		r.get, _ = c.GetVariableValue("key", "fallback")
+		var experiment, _ = c.GetVariableExperiment("key")
+		r.experiment = experiment.Data.Name
+		r.keys, _ = c.GetVariableKeys()
+		r.all, _ = c.GetVariableKeysAll()
+		seen <- r
+	})
+	manual.IndexVariables_["key"] = manual.Index_["b"]
+	manual.LogEvent(Goal, nil)
+	assertAny(reads{float64(2), float64(2), "b", map[string]string{"key": "b"}, map[string][]string{"key": {"b"}}}, <-seen, t)
+	delete(manual.IndexVariables_, "key")
+	manual.LogEvent(Goal, nil)
+	assertAny(reads{"fallback", "fallback", "", map[string]string{}, map[string][]string{}}, <-seen, t)
+}
+
 // On a literal, as in v1.1.1, a variable value is returned whenever the
 // assignment's variables have the key, even when the unit is not assigned:
 // with its unit type unset, or outside a strict audience, it is variant 0's.

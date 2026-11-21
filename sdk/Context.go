@@ -239,6 +239,25 @@ func (c *Context) literalState() *contextState {
 	return state
 }
 
+// legacyVariableReader returns the context whose v1.1.1 IndexVariables_
+// answers variable-key reads, or nil when the private multi-experiment index
+// does: a Context{...} literal reads its own, and a snapshot of a literal (the
+// context its event logger receives) reads the literal it was taken from, so
+// edits to the mapping are seen in callbacks too. SDK-created contexts and
+// their copies use the private index.
+func (c *Context) legacyVariableReader() *Context {
+	if clock := c.ownClock(); clock != nil {
+		if clock.state.manualRoot == nil {
+			return clock.root
+		}
+		return nil
+	}
+	if c.ContextLock_ == nil || c.literalState().manualRoot == nil {
+		return c
+	}
+	return nil
+}
+
 func (c *Context) isSnapshot() bool {
 	var clock = c.ownClock()
 	return clock != nil && clock.snapshot
@@ -299,9 +318,11 @@ var audienceSetBuilds int64
 func (index *contextIndex) audienceTexts() map[string]struct{} {
 	index.audiencesOnce.Do(func() {
 		atomic.AddInt64(&audienceSetBuilds, 1)
-		index.audiences = make(map[string]struct{}, len(index.experiments))
+		index.audiences = map[string]struct{}{}
 		for _, entry := range index.experiments {
-			index.audiences[entry.experiment.Data.Audience] = struct{}{}
+			if text := entry.experiment.Data.Audience; text != "" {
+				index.audiences[text] = struct{}{}
+			}
 		}
 	})
 	return index.audiences
@@ -423,6 +444,11 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	var state = newContextState()
 	state.application_, state.environment_ = application, environment
 	cntx.Clock_ = &contextClock{Clock: clock, state: state, root: &cntx}
+	// manualRoot marks the state as an SDK-created context's (literals have
+	// none) before anything can take a snapshot of it. A caller that later
+	// replaces the exported Clock_ (as v1.1.1 allowed) finds the state through
+	// Assigners_ and keeps the context's rules, caches and lifecycle.
+	state.manualRoot = &cntx
 
 	if config.EventLogger_ != nil {
 		cntx.EventLogger_ = config.EventLogger_
@@ -457,10 +483,6 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	}
 
 	cntx.Assigners_ = map[interface{}]interface{}{}
-	// Also register the state where the literal fallback looks for it, so a
-	// caller that replaces the exported Clock_ (as v1.1.1 allowed) keeps the
-	// context's rules, caches, system attributes and lifecycle.
-	state.manualRoot = &cntx
 	cntx.Assigners_[contextStateKey{}] = state
 	cntx.HashedUnits_ = map[interface{}]interface{}{}
 
@@ -1076,16 +1098,16 @@ func (c *Context) GetVariableKeys() (map[string]string, error) {
 	}
 
 	var variableKeys = map[string]string{}
-	if c.ownClock() == nil && (c.ContextLock_ == nil || c.literalState().manualRoot == nil) {
-		c.DataLock.RLock()
-		for key, value := range c.IndexVariables_ {
+	if literal := c.legacyVariableReader(); literal != nil {
+		literal.DataLock.RLock()
+		for key, value := range literal.IndexVariables_ {
 			if key, ok := key.(string); ok {
 				if experiment, ok := value.(ExperimentVariables); ok {
 					variableKeys[key] = experiment.Data.Name
 				}
 			}
 		}
-		c.DataLock.RUnlock()
+		literal.DataLock.RUnlock()
 		return variableKeys, nil
 	}
 	var st = c.state()
@@ -1109,16 +1131,16 @@ func (c *Context) GetVariableKeysAll() (map[string][]string, error) {
 	}
 
 	var variableKeys = map[string][]string{}
-	if c.ownClock() == nil && (c.ContextLock_ == nil || c.literalState().manualRoot == nil) {
-		c.DataLock.RLock()
-		for key, value := range c.IndexVariables_ {
+	if literal := c.legacyVariableReader(); literal != nil {
+		literal.DataLock.RLock()
+		for key, value := range literal.IndexVariables_ {
 			if key, ok := key.(string); ok {
 				if experiment, ok := value.(ExperimentVariables); ok {
 					variableKeys[key] = []string{experiment.Data.Name}
 				}
 			}
 		}
-		c.DataLock.RUnlock()
+		literal.DataLock.RUnlock()
 		return variableKeys, nil
 	}
 	var st = c.state()
@@ -1245,14 +1267,10 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 	if err != nil {
 		return nil, err
 	}
-	var st *contextState
-	if clock := c.ownClock(); clock != nil {
-		st = clock.state
-	} else if c.ContextLock_ == nil {
-		return c.resolveLiteralVariableValue(key, defaultValue, expose)
-	} else if st = c.literalState(); st.manualRoot == nil {
-		return c.resolveLiteralVariableValue(key, defaultValue, expose)
+	if literal := c.legacyVariableReader(); literal != nil {
+		return literal.resolveLiteralVariableValue(key, defaultValue, expose)
 	}
+	var st = c.state()
 
 	c.DataLock.RLock()
 	var experiments = st.indexVariables_[key]
@@ -2990,6 +3008,10 @@ func legacyIndexVariables(index map[string][]ExperimentVariables) map[interface{
 
 func (c *Context) GetVariableExperiment(key string) (ExperimentVariables, error) {
 	var clock = c.ownClock()
+	if clock != nil && clock.state.manualRoot == nil {
+		// A snapshot of a literal reads the literal's current mapping.
+		c, clock = clock.root, nil
+	}
 	if clock == nil {
 		if c.DataLock != nil {
 			c.DataLock.RLock()
