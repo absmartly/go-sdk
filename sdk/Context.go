@@ -952,7 +952,7 @@ const maxExposureAttempts = 3
 // with it; when it fails nothing is claimed and settleExposure reports false.
 // Loggers run after admit released its locks.
 func (c *Context) settleExposure(experimentName string, entry *cachedAssignment,
-	eligible func(*cachedAssignment) bool) (*cachedAssignment, bool) {
+	eligible func(*cachedAssignment) exposureStatus) (*cachedAssignment, bool) {
 	for attempt := 1; ; attempt++ {
 		if beforeSettleClaim != nil {
 			beforeSettleClaim()
@@ -971,7 +971,7 @@ func (c *Context) settleExposure(experimentName string, entry *cachedAssignment,
 // queueEligibleExposure is queueExposure for a read: a non-nil eligible is
 // checked under ContextLock_ together with the claim, so a refresh can never
 // land between the check and the claim. A claim already taken is honoured.
-func (c *Context) queueEligibleExposure(entry *cachedAssignment, eligible func(*cachedAssignment) bool) exposureStatus {
+func (c *Context) queueEligibleExposure(entry *cachedAssignment, eligible func(*cachedAssignment) exposureStatus) exposureStatus {
 	if eligible == nil {
 		return c.queueExposure(entry.assignment, entry)
 	}
@@ -988,7 +988,7 @@ func (c *Context) queueEligibleExposure(entry *cachedAssignment, eligible func(*
 // claimEligible checks eligibility and claims the exposure in one step; the
 // caller holds ContextLock_ across the whole call, so no refresh can land
 // between the check and the claim. A claim already taken is honoured.
-func claimEligible(entry *cachedAssignment, eligible func(*cachedAssignment) bool) exposureStatus {
+func claimEligible(entry *cachedAssignment, eligible func(*cachedAssignment) exposureStatus) exposureStatus {
 	if beforeEligibleClaim != nil {
 		beforeEligibleClaim()
 	}
@@ -998,8 +998,8 @@ func claimEligible(entry *cachedAssignment, eligible func(*cachedAssignment) boo
 	if entry.assignment.Exposed.Load().(bool) {
 		return exposureQueued
 	}
-	if !eligible(entry) {
-		return exposureIneligible
+	if status := eligible(entry); status != exposureClaimed {
+		return status
 	}
 	var claimed = entry.assignment.Exposed.CompareAndSwap(false, true)
 	if afterEligibleCAS != nil {
@@ -1025,26 +1025,33 @@ func (e *cachedAssignment) needsSettling() bool {
 // still exists and defines key in some variant, and only while the entry is
 // still the current decision for that definition by the cache's own rules
 // (identity, full-on variant, traffic, holdout epochs, overrides, assignment
-// rules and audience). Contexts with neither keep the released behaviour. The
-// caller holds ContextLock_.
-func (c *Context) variableEligible(experimentName string, key string) func(*cachedAssignment) bool {
-	return func(e *cachedAssignment) bool {
+// rules and audience). It reports exposureClaimed when the claim may be taken,
+// exposureIneligible when the experiment is no longer a candidate for key, and
+// exposureRetired when it still is but this decision is no longer current, so
+// the read resolves again. Contexts with neither keep the released behaviour.
+// The caller holds ContextLock_.
+func (c *Context) variableEligible(experimentName string, key string) func(*cachedAssignment) exposureStatus {
+	return func(e *cachedAssignment) exposureStatus {
 		if e.assignment.Variables == nil {
-			return false
+			return exposureIneligible
 		}
 		var index = c.index_.Load()
 		if index == nil || !index.keyed {
-			return true
+			return exposureClaimed
 		}
 		var indexed = index.experiments[experimentName]
 		if indexed == nil {
-			return false
+			return exposureIneligible
 		}
 		if _, defined := indexed.variableKeys[key]; !defined {
-			return false
+			return exposureIneligible
 		}
-		var current, _, state = c.validCachedAssignment(experimentName)
-		return current == e && state != assignmentStale
+		if current, _, state := c.validCachedAssignment(experimentName); current != e || state == assignmentStale {
+			// Still a candidate, but this decision is no longer the current
+			// one: resolve again rather than claim it or skip the experiment.
+			return exposureRetired
+		}
+		return exposureClaimed
 	}
 }
 
