@@ -310,8 +310,6 @@ func TestReentrantDeserializerAfterClockReplacementDoesNotDeadlock(t *testing.T)
 			}
 			assertAny(int32(1), atomic.LoadInt32(&deserializer.calls), t)
 			if cached != nil && ctx.GetAssignment("exp_app").Exposed != cached {
-				// Same outcome: the cached assignment is revalidated and kept,
-				// with its exposure state, not rebuilt.
 				t.Errorf("revalidation rebuilt the assignment (Clock_ replaced: %v)", replace)
 			}
 		}
@@ -1104,6 +1102,77 @@ func TestAudiencePanicLoggerReadsDifferentExperiment(t *testing.T) {
 	assertAny(int32(2), atomic.LoadInt32(&d.calls), t)
 }
 
+// nilPanicOnceDeserializer panics with nil on its first parse, then parses
+// normally. On Go before 1.21, recover returns nil for it.
+type nilPanicOnceDeserializer struct{ calls int32 }
+
+func (d *nilPanicOnceDeserializer) Deserialize(b []byte, offset, length int) (map[string]interface{}, error) {
+	if atomic.AddInt32(&d.calls, 1) == 1 {
+		panic(nil)
+	}
+	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
+}
+
+// A panic(nil) counts as a failed parse, local to the experiment that hit it:
+// another experiment with the same text asks the recovered deserializer, and
+// the panic is reported.
+func TestNilPanicAudienceParseIsNotShared(t *testing.T) {
+	var exclude = `{"filter":[{"value":false}]}`
+	var first, second = audienceExperiment("first", exclude, true), audienceExperiment("second", exclude, true)
+	second.Id = 2
+	var ctx, _ = newSystemAttrContext("website", "production", first, second)
+	var d = &nilPanicOnceDeserializer{}
+	ctx.AudienceMatcher_ = AudienceMatcher{d}
+	var errorsLogged int32
+	ctx.EventLogger_ = callbackEventLogger(func(_ Context, event EventType, _ interface{}) {
+		if event == Error {
+			atomic.AddInt32(&errorsLogged, 1)
+		}
+	})
+	assertAny(1, treatmentPeek(t, ctx, "first"), t)
+	assertAny(0, treatmentPeek(t, ctx, "second"), t)
+	assertAny(int32(2), atomic.LoadInt32(&d.calls), t)
+	assertAny(int32(1), atomic.LoadInt32(&errorsLogged), t)
+}
+
+// A logger reporting a panic that installs a replacement experiment under the
+// same name (new id and iteration, same text) and reads it does not hand the
+// replacement the old run's failed parse: the recovered deserializer decides.
+func TestReplacementExperimentDoesNotInheritPanicFallback(t *testing.T) {
+	var exclude = `{"filter":[{"value":false}]}`
+	var original = audienceExperiment("exp_app", exclude, true)
+	var replacement = original
+	replacement.Id, replacement.Iteration = 2, 2
+	var ctx, _ = newSystemAttrContext("website", "production", original)
+	var d = &panicOnceDeserializer{}
+	ctx.AudienceMatcher_ = AudienceMatcher{d}
+	var inside = make(chan int, 1)
+	var logged int32
+	ctx.EventLogger_ = callbackEventLogger(func(c Context, event EventType, _ interface{}) {
+		if event != Error || atomic.AddInt32(&logged, 1) > 1 {
+			return
+		}
+		c.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{replacement}})
+		var v, _ = c.PeekTreatment("exp_app")
+		inside <- v
+	})
+	var done = make(chan int, 1)
+	go func() { v, _ := ctx.PeekTreatment("exp_app"); done <- v }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the read did not return")
+	}
+	select {
+	case v := <-inside:
+		assertAny(0, v, t)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the logger did not read the replacement")
+	}
+	assertAny(0, treatmentPeek(t, ctx, "exp_app"), t)
+	assertAny(int32(2), atomic.LoadInt32(&d.calls), t)
+}
+
 // A recovered parse from inside the logger must not replace the original
 // build's failed outcome, even when no nested read has cached that assignment.
 func TestAudiencePanicLoggerRecoveryKeepsOriginalFallback(t *testing.T) {
@@ -1175,6 +1244,42 @@ type controlledRefreshProvider struct {
 func (p *controlledRefreshProvider) GetContextData() *future.Future {
 	atomic.AddInt32(&p.calls, 1)
 	return p.result
+}
+
+// A completion logger that synchronously refreshes again leaves a joined
+// copy's reads consistent when the copy's refresh reports success.
+func TestJoinedCopyReadsAgreeAfterNestedRefresh(t *testing.T) {
+	var a, b, before = ruleExperiment("a", ""), ruleExperiment("b", ""), ruleExperiment("before", "")
+	var ctx, _ = newRuleContext(t, "production", withUnit(), before)
+	ctx.Clock_ = internal.FixedClock{Millis_: 1}
+	var copied = *ctx
+	var pendingA, settleA = future.New()
+	var provider = &controlledRefreshProvider{result: pendingA}
+	ctx.DataProvider_ = provider
+	var nested int32
+	ctx.EventLogger_ = callbackEventLogger(func(c Context, event EventType, _ interface{}) {
+		if event != Refresh || atomic.AddInt32(&nested, 1) > 1 {
+			return
+		}
+		var doneB, settleB = future.New()
+		settleB(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{b}}, nil)
+		provider.result = doneB
+		ctx.Refresh()
+	})
+	var started = ctx.RefreshAsync()
+	var joined = copied.RefreshAsync()
+	settleA(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{a}}, nil)
+	assertAny(nil, getWithTimeout(t, started), t)
+	assertAny(nil, getWithTimeout(t, joined), t)
+	var data, _ = copied.GetData()
+	assertAny(1, len(data.Experiments), t)
+	assertAny("b", data.Experiments[0].Name, t)
+	if _, found := copied.GetExperiment("b"); !found {
+		t.Error("the copy's GetExperiment misses the data GetData reports")
+	}
+	if _, found := copied.GetExperiment("a"); found {
+		t.Error("the copy's GetExperiment still finds replaced data")
+	}
 }
 
 // An earlier listener must be able to wait for a joining copy, independently

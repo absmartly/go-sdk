@@ -1321,6 +1321,9 @@ func (op *refreshOperation) join(receiver, root *Context) {
 	op.mu.Lock()
 	defer op.mu.Unlock()
 	if !op.completed {
+		if op.receivers == nil {
+			op.receivers = map[*Context]struct{}{}
+		}
 		op.receivers[receiver] = struct{}{}
 	} else if op.succeeded {
 		receiver.adoptLiveDataFrom(root)
@@ -1335,8 +1338,21 @@ func (op *refreshOperation) complete(root *Context, succeeded bool) {
 			receiver.adoptLiveDataFrom(root)
 		}
 	}
-	op.receivers = nil
 	op.completed, op.succeeded = true, succeeded
+}
+
+// settle re-adopts the live data into every joined copy just before the
+// operation's future settles: a completion logger may have refreshed again
+// meanwhile, and the copy's reads must agree when its caller sees success.
+func (op *refreshOperation) settle(root *Context) {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	if op.succeeded {
+		for receiver := range op.receivers {
+			receiver.adoptLiveDataFrom(root)
+		}
+	}
+	op.receivers = nil
 }
 
 func (c *Context) RefreshAsync() *future.Future {
@@ -1366,7 +1382,7 @@ func (c *Context) RefreshAsync() *future.Future {
 	}
 	c.Refreshing_.Store(true)
 	var tempfuture, donefun = future.New()
-	var op = &refreshOperation{receivers: map[*Context]struct{}{}}
+	var op = &refreshOperation{}
 	c.RefreshFuture_, st.refresh_ = tempfuture, op
 	st.stateLock_.Unlock()
 	op.join(receiver, c)
@@ -1407,6 +1423,7 @@ func (c *Context) RefreshAsync() *future.Future {
 		} else {
 			c.LogError(outcome)
 		}
+		op.settle(c)
 		donefun(nil, outcome)
 	}
 	loaded.Listen(complete)
@@ -1693,7 +1710,7 @@ func (c *Context) audienceMatches(st *contextState, data jsonmodels.Experiment, 
 	if entry.ruleOverride || len(data.Audience) == 0 {
 		return true
 	}
-	if entry.failed.matches(data.Audience, c.AudienceMatcher_.Deserializer_) {
+	if entry.failed.matches(data, c.AudienceMatcher_.Deserializer_) {
 		// Unparseable when built, so the audience was ignored. It stays
 		// ignored for this assignment, as v1.1.1's single assignment kept
 		// its fallback, while other experiments parse the text again.
@@ -1835,32 +1852,34 @@ func (c *Context) buildAssignment(st *contextState, experimentName string) *cach
 	var failed *failedParse
 	for attempt := 0; ; attempt++ {
 		var entry, unparsed = c.buildAssignmentLocked(st, experimentName, attempt >= maxAudienceAttempts, failed)
-		if unparsed == "" {
+		if unparsed == nil {
 			return entry
 		}
-		failed = nil
-		if parsed, deserializer := c.parseAudienceUnlocked(st, experimentName, unparsed); parsed.err != nil {
-			failed = &failedParse{text: unparsed, deserializer: deserializer}
-		}
+		failed = c.parseAudienceUnlocked(st, experimentName, *unparsed)
 	}
 }
 
 // failedParse is a parse that failed for the build that requested it. It is
 // not cached, so other experiments with the same text parse it themselves.
 type failedParse struct {
-	text         string
-	deserializer AudienceDeserializer
+	id, iteration int
+	text          string
+	deserializer  AudienceDeserializer
 }
 
-func (f *failedParse) matches(text string, deserializer AudienceDeserializer) bool {
-	return f != nil && f.text == text && text != "" && sameDeserializer(f.deserializer, deserializer)
+// matches reports whether f was made for this run of the experiment (its id
+// and iteration), with this text and deserializer: a replacement experiment
+// installed under the same name never inherits it.
+func (f *failedParse) matches(data jsonmodels.Experiment, deserializer AudienceDeserializer) bool {
+	return f != nil && f.id == data.Id && f.iteration == data.Iteration && f.text == data.Audience &&
+		data.Audience != "" && sameDeserializer(f.deserializer, deserializer)
 }
 
 // audiencePanic is called with ContextLock_ held. It prevents a logger's read
 // of the experiment reporting a panic from recursively invoking its parser.
-func (st *contextState) audiencePanic(name, text string, deserializer AudienceDeserializer) *failedParse {
+func (st *contextState) audiencePanic(name string, data jsonmodels.Experiment, deserializer AudienceDeserializer) *failedParse {
 	for _, failed := range st.audiencePanics[name] {
-		if failed.matches(text, deserializer) {
+		if failed.matches(data, deserializer) {
 			return failed
 		}
 	}
@@ -1873,7 +1892,7 @@ const maxAudienceAttempts = 4
 // to be parsed (with no lock held) before it can be built. failed is this
 // build's own failed parse; on the last attempt a text not parsed yet counts
 // as unparseable too.
-func (c *Context) buildAssignmentLocked(st *contextState, experimentName string, last bool, failed *failedParse) (*cachedAssignment, string) {
+func (c *Context) buildAssignmentLocked(st *contextState, experimentName string, last bool, failed *failedParse) (*cachedAssignment, *jsonmodels.Experiment) {
 
 	// Cache miss, out of date, or revalidated. Check again under the write
 	// lock: another goroutine may have rebuilt the assignment meanwhile, and
@@ -1882,7 +1901,7 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string,
 	var previous, validated, state = c.validCachedAssignment(st, experimentName)
 	if state == assignmentValid {
 		c.ContextLock_.Unlock()
-		return previous, ""
+		return previous, nil
 	}
 	if state == assignmentRevalidated {
 		// Still the same outcome: acknowledge the rules and attributes it was
@@ -1894,7 +1913,7 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string,
 		previous.rules = validated
 		previous.attrsSeq = atomic.LoadInt32(&st.attrsSeq_)
 		c.ContextLock_.Unlock()
-		return previous, ""
+		return previous, nil
 	}
 
 	var custom, cfound = c.Cassignments_[experimentName]
@@ -1933,21 +1952,23 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string,
 				var attrs = c.evaluationAttributesWithState(st)
 
 				var text = experiment.Data.Audience
-				if guarded := st.audiencePanic(experimentName, text, c.AudienceMatcher_.Deserializer_); guarded != nil {
+				if guarded := st.audiencePanic(experimentName, experiment.Data, c.AudienceMatcher_.Deserializer_); guarded != nil {
 					entry.failed = guarded
-				} else if failed.matches(text, c.AudienceMatcher_.Deserializer_) {
+				} else if failed.matches(experiment.Data, c.AudienceMatcher_.Deserializer_) {
 					entry.failed = failed
 				} else if parsed, ok := c.cachedAudience(st, text); ok {
 					if match, err := parsed.evaluate(attrs); err == nil {
 						assignment.AudienceMismatch = !match.Get()
 					} else {
-						entry.failed = &failedParse{text: text, deserializer: c.AudienceMatcher_.Deserializer_}
+						entry.failed = &failedParse{id: experiment.Data.Id, iteration: experiment.Data.Iteration,
+							text: text, deserializer: c.AudienceMatcher_.Deserializer_}
 					}
 				} else if !last {
 					// The data changed between the unlocked parse and this
 					// lock: parse the new audience unlocked and start over.
 					c.ContextLock_.Unlock()
-					return nil, text
+					var data = experiment.Data
+					return nil, &data
 				}
 				// Otherwise (the last attempt, with new data installed during
 				// every parse) the audience is ignored for this build only:
@@ -2009,7 +2030,7 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string,
 	st.assignmentCache_[experimentName] = entry
 	c.AssignmentCache[experimentName] = *assignment
 	c.ContextLock_.Unlock()
-	return entry, ""
+	return entry, nil
 }
 
 func (c *Context) ClearRefreshTimer() {
@@ -2079,33 +2100,43 @@ func sameDeserializer(a, b AudienceDeserializer) (same bool) {
 }
 
 // parseAudienceUnlocked runs customer code without context locks. Only usable
-// filters enter the shared cache; failures belong to the requesting assignment.
-func (c *Context) parseAudienceUnlocked(st *contextState, name, text string) (parsedAudience, AudienceDeserializer) {
+// filters enter the shared cache; a failure is returned for the requesting
+// assignment of this experiment run alone. A panic is detected by whether the
+// parse returned, not by recover's value, so panic(nil) on Go versions where
+// recover returns nil for it counts as a panic too.
+func (c *Context) parseAudienceUnlocked(st *contextState, name string, data jsonmodels.Experiment) *failedParse {
 	var deserializer = c.AudienceMatcher_.Deserializer_
-	if parsed, ok := c.cachedAudience(st, text); ok {
-		return parsed, deserializer
+	var text = data.Audience
+	if _, ok := c.cachedAudience(st, text); ok {
+		return nil
 	}
+	var failed = &failedParse{id: data.Id, iteration: data.Iteration, text: text, deserializer: deserializer}
+	var returned bool
 	var panicked interface{}
 	var parsed = func() (parsed parsedAudience) {
 		defer func() {
-			if panicked = recover(); panicked != nil {
+			if !returned {
+				panicked = recover()
 				parsed = parsedAudience{err: errors.New("can't evaluate data")}
 			}
 		}()
-		return AudienceMatcher{deserializer}.parseAudience(text)
+		parsed = AudienceMatcher{deserializer}.parseAudience(text)
+		returned = true
+		return parsed
 	}()
-	if panicked != nil {
-		c.logAudiencePanic(st, name, &failedParse{text: text, deserializer: deserializer}, panicked)
+	if !returned {
+		c.logAudiencePanic(st, name, failed, panicked)
+		return failed
 	}
 	if parsed.err != nil {
-		return parsed, deserializer
+		return failed
 	}
 	st.audiences.Store(text, &audienceEntry{deserializer: deserializer, parsed: parsed})
 	if !st.hasAudience(text) {
 		// Data installed during parsing may already have pruned this text.
 		st.audiences.Delete(text)
 	}
-	return parsed, deserializer
+	return nil
 }
 
 func (c *Context) logAudiencePanic(st *contextState, name string, failed *failedParse, panicked interface{}) {
