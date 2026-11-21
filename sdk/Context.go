@@ -230,6 +230,11 @@ type cachedAssignment struct {
 	resolvedId        int
 	resolvedIteration int
 	resolvedUnitType  string
+	// resolvedAudience and resolvedAudienceStrict are the audience definition
+	// the decision was evaluated against; ExperimentMatches does not compare
+	// them, so an audience edit is otherwise only seen once attributes change.
+	resolvedAudience       string
+	resolvedAudienceStrict bool
 }
 
 func (e *cachedAssignment) resolvedExperimentMatches(data jsonmodels.Experiment) bool {
@@ -976,9 +981,12 @@ func (c *Context) queueEligibleExposure(entry *cachedAssignment, eligible func(*
 		return c.queueExposure(entry.assignment, entry)
 	}
 	c = c.live()
-	c.ContextLock_.RLock()
-	var status = claimEligible(entry, eligible)
-	c.ContextLock_.RUnlock()
+	var status = func() exposureStatus {
+		c.ContextLock_.RLock()
+		// Released on unwind too: the audience evaluator can panic.
+		defer c.ContextLock_.RUnlock()
+		return claimEligible(entry, eligible)
+	}()
 	if status != exposureClaimed {
 		return status
 	}
@@ -1046,9 +1054,7 @@ func (c *Context) variableEligible(experimentName string, key string) func(*cach
 		if _, defined := indexed.variableKeys[key]; !defined {
 			return exposureIneligible
 		}
-		if current, _, state := c.validCachedAssignmentFor(experimentName, true); current != e || state == assignmentStale {
-			// Still a candidate, but this decision is no longer the current
-			// one: resolve again rather than claim it or skip the experiment.
+		if _, state := c.validEntry(experimentName, e, true); state == assignmentStale {
 			return exposureRetired
 		}
 		return exposureClaimed
@@ -1814,6 +1820,15 @@ func (c *Context) validCachedAssignmentFor(experimentName string, ignoreCustom b
 	if !found {
 		return nil, nil, assignmentStale
 	}
+	var rules, state = c.validEntry(experimentName, entry, ignoreCustom)
+	return entry, rules, state
+}
+
+// validEntry reports whether entry, cached or not, is still the decision the
+// installed data gives for experimentName. A variable read's claim checks its
+// own entry, so an equivalent rebuild by a concurrent read (an unapplied custom
+// assignment rebuilds on every lookup) does not make its decision stale.
+func (c *Context) validEntry(experimentName string, entry *cachedAssignment, ignoreCustom bool) (*experimentRules, assignmentState) {
 	var assignment = entry.assignment
 	var custom, cfound = c.Cassignments_[experimentName]
 	var override, ofound = c.Overrides_[experimentName]
@@ -1833,34 +1848,41 @@ func (c *Context) validCachedAssignmentFor(experimentName string, ignoreCustom b
 		// identity before a variable read can claim it in the new epoch.
 		if efound && !assignment.Exposed.Load().(bool) && c.index_.Load().keyed &&
 			!entry.resolvedExperimentMatches(experiment.Data) {
-			return entry, rules, assignmentStale
+			return rules, assignmentStale
 		}
 		if assignment.Overridden && assignment.Variant == override.(int) && (!efound ||
 			holdoutSetMatches(holdouts, entry.holdouts) && (entry.holdouts == nil || entry.resolvedUnitType == experiment.Data.UnitType)) {
-			return entry, rules, assignmentValid
+			return rules, assignmentValid
 		}
 	} else if !efound {
 		// A rule-won assignment is not assigned either, but its variant came
 		// from the experiment's rules, so it is rebuilt once the experiment
 		// is gone.
 		if !assignment.Assigned && !assignment.RuleOverride {
-			return entry, rules, assignmentValid
+			return rules, assignmentValid
 		}
 	} else if assignment.RuleOverride || entry.holdouts.isSuppressed() || !cfound || ignoreCustom || custom.(int) == assignment.Variant {
 		// A matching rule wins over a custom assignment, and a holdout
 		// suppression forces control, so a custom assignment that differs
 		// from either variant is not staleness.
 		if !c.ExperimentMatches(experiment.Data, *assignment) || !holdoutSetMatches(holdouts, entry.holdouts) {
-			return entry, rules, assignmentStale
+			return rules, assignmentStale
+		}
+		if ignoreCustom && (entry.resolvedAudience != experiment.Data.Audience ||
+			entry.resolvedAudienceStrict != experiment.Data.AudienceStrict) {
+			// The claim judges the decision against the audience it would be
+			// evaluated with now, so a definition that made it strict, or
+			// changed it, cannot authorize the earlier decision.
+			return rules, assignmentStale
 		}
 		if rules == entry.rules && atomic.LoadInt32(&c.AttrsSeq_) <= entry.attrsSeq {
-			return entry, rules, assignmentValid
+			return rules, assignmentValid
 		}
 		if c.ruleMatches(experiment.Data, rules, entry) && c.audienceMatches(experiment.Data, entry) {
-			return entry, rules, assignmentRevalidated
+			return rules, assignmentRevalidated
 		}
 	}
-	return entry, rules, assignmentStale
+	return rules, assignmentStale
 }
 
 // ruleMatches reports whether the experiment's assignment rules still give the
@@ -2046,6 +2068,8 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 		entry.resolvedId = experiment.Data.Id
 		entry.resolvedIteration = experiment.Data.Iteration
 		entry.resolvedUnitType = experiment.Data.UnitType
+		entry.resolvedAudience = experiment.Data.Audience
+		entry.resolvedAudienceStrict = experiment.Data.AudienceStrict
 	}
 
 	// Resolved for overrides and rule wins too: the holdouts' exposures fire
