@@ -3060,6 +3060,46 @@ func TestHoldout_WarmedReadDoesNoClaim(t *testing.T) {
 	if n := hoLeastAllocs(func() { _, _ = h.ctx.GetTreatment("exp") }); n > 2 {
 		t.Errorf("warmed GetTreatment: %.0f allocations", n)
 	}
+	if n := hoLeastAllocs(func() { _, _ = h.ctx.GetVariableValue("color", "d") }); n > 2 {
+		t.Errorf("warmed GetVariableValue: %.0f allocations", n)
+	}
+}
+
+func TestHoldout_WarmedReadsUseReadLock(t *testing.T) {
+	for _, covered := range []bool{false, true} {
+		t.Run(map[bool]string{false: "ordinary", true: "covered"}[covered], func(t *testing.T) {
+			var experiment = hoWithVariables(hoExperiment(1, "exp", hoUnitType, 0), "color")
+			var holdouts []jsonmodels.Holdout
+			if covered {
+				holdouts = []jsonmodels.Holdout{hoHoldoutA()}
+				experiment.HoldoutIds = []int{11}
+			}
+			var h = hoCreateFor(t, hoUID, hoData(holdouts, experiment))
+			var wantTreatment = h.treatment("exp")
+			var wantVariable = h.variable("color")
+			var done = make(chan struct{})
+			h.ctx.ContextLock_.RLock()
+			go func() {
+				defer close(done)
+				var treatment, err = h.ctx.GetTreatment("exp")
+				if err != nil || treatment != wantTreatment {
+					t.Errorf("warmed treatment = %v, %v; want %v", treatment, err, wantTreatment)
+				}
+				var variable, variableErr = h.ctx.GetVariableValue("color", "d")
+				if variableErr != nil || !reflect.DeepEqual(variable, wantVariable) {
+					t.Errorf("warmed variable = %v, %v; want %v", variable, variableErr, wantVariable)
+				}
+			}()
+			select {
+			case <-done:
+				h.ctx.ContextLock_.RUnlock()
+			case <-time.After(2 * time.Second):
+				h.ctx.ContextLock_.RUnlock()
+				<-done
+				t.Fatal("warmed exposing read waited for the exclusive context lock")
+			}
+		})
+	}
 }
 
 // Another read's exposure does not make this read retry.

@@ -1482,7 +1482,8 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 	c.DataLock.RUnlock()
 
 	var suppressedFallback map[string]interface{}
-	for _, experiment := range experiments {
+	for i := range experiments {
+		var experiment = &experiments[i]
 		var entry = c.getAssignment(experiment.Data.Name)
 		var assignment = entry.assignment
 		if assignment.Variables == nil {
@@ -1873,11 +1874,11 @@ func (c *Context) validEntry(experimentName string, entry *cachedAssignment, ign
 	var override, ofound = c.Overrides_[experimentName]
 	var indexed = c.indexedExperiment(experimentName)
 	var efound = indexed != nil
-	var experiment ExperimentVariables
+	var experiment *ExperimentVariables
 	var rules *experimentRules
 	var holdouts []*jsonmodels.Holdout
 	if efound {
-		experiment, rules, holdouts = indexed.experiment, indexed.rules, indexed.holdouts
+		experiment, rules, holdouts = &indexed.experiment, indexed.rules, indexed.holdouts
 	}
 
 	if ofound {
@@ -1904,7 +1905,7 @@ func (c *Context) validEntry(experimentName string, entry *cachedAssignment, ign
 		// A matching rule wins over a custom assignment, and a holdout
 		// suppression forces control, so a custom assignment that differs
 		// from either variant is not staleness.
-		if !c.ExperimentMatches(experiment.Data, *assignment) || !holdoutSetMatches(holdouts, entry.holdouts) {
+		if !experimentMatches(&experiment.Data, assignment) || !holdoutSetMatches(holdouts, entry.holdouts) {
 			return rules, assignmentStale
 		}
 		if (ignoreCustom || !assignment.Exposed.Load().(bool) && c.index_.Load().keyed) &&
@@ -2312,6 +2313,12 @@ func (c *Context) indexedExperiment(experimentName string) *indexedExperiment {
 }
 
 func (c *Context) ExperimentMatches(experiment jsonmodels.Experiment, assignment Assignment) bool {
+	return experimentMatches(&experiment, &assignment)
+}
+
+// experimentMatches reads the installed definition and cached assignment in
+// place; neither needs to be copied on every warmed cache hit.
+func experimentMatches(experiment *jsonmodels.Experiment, assignment *Assignment) bool {
 	return experiment.Id == assignment.Id &&
 		experiment.UnitType == assignment.UnitType &&
 		experiment.Iteration == assignment.Iteration &&
