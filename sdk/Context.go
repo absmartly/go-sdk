@@ -2719,7 +2719,7 @@ func (c *Context) experimentRulesFor(previous *experimentRules, text string) *ex
 	if previous != nil && previous.text == text {
 		return previous
 	}
-	var parsed, _ = c.AudienceMatcher_.parseRules(text)
+	var parsed, _ = parseRules(text)
 	return &experimentRules{text: text, parsed: parsed}
 }
 

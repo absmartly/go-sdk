@@ -3,7 +3,6 @@ package sdk
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"math"
 	"reflect"
 	"strconv"
@@ -89,22 +88,19 @@ type assignmentRules struct {
 	rules []interface{}
 }
 
-// parseRules parses an assignmentRules JSON string ({"rules": [...]}). It
-// returns nil without an error when there are no rules. A document whose
-// "rules" is not a list has no rules, like the JS SDK. A custom
-// AudienceDeserializer that panics is contained and reported as an error, so
-// only that experiment's rules are dropped.
-func (am AudienceMatcher) parseRules(text string) (parsed *assignmentRules, err error) {
+// parseRules parses an assignmentRules JSON string ({"rules": [...]}) with
+// encoding/json into fresh values. It never uses the configured
+// AudienceDeserializer: assignment rules are new in this release, so no
+// earlier contract routes them through it, and a decode kept in the index
+// must not share storage a custom deserializer may reuse. It returns nil
+// without an error when there are no rules. A document whose "rules" is not
+// a list has no rules, like the JS SDK.
+func parseRules(text string) (*assignmentRules, error) {
 	if len(text) == 0 {
 		return nil, nil
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			parsed, err = nil, fmt.Errorf("%v", r)
-		}
-	}()
-	document, err := am.deserializer().Deserialize([]byte(text), 0, len(text))
-	if err != nil {
+	var document map[string]interface{}
+	if err := json.Unmarshal([]byte(text), &document); err != nil {
 		return nil, err
 	}
 	if document == nil {
@@ -202,15 +198,6 @@ func parseRuleAction(rule map[string]interface{}) *ruleAction {
 // as 2147483648, is still a valid assign rule, as in JS: it is returned as -1,
 // so the caller finds it out of range, stops rule evaluation and falls back.
 func ruleVariant(value interface{}) (int, bool) {
-	// A custom AudienceDeserializer using json.Decoder.UseNumber gives
-	// json.Number, which is a string kind.
-	if number, ok := value.(json.Number); ok {
-		var f, err = number.Float64()
-		if err != nil {
-			return 0, false
-		}
-		value = f
-	}
 	var v = reflect.ValueOf(value)
 	var f float64
 	switch v.Kind() {
