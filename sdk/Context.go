@@ -1342,15 +1342,14 @@ func (op *refreshOperation) complete(root *Context, succeeded bool) {
 }
 
 // settle re-adopts the live data into every joined copy just before the
-// operation's future settles: a completion logger may have refreshed again
-// meanwhile, and the copy's reads must agree when its caller sees success.
+// operation's future settles: a completion logger may have refreshed (or set
+// data) again meanwhile, and the copy's reads must agree with the live data
+// when its caller sees the outcome, success or failure.
 func (op *refreshOperation) settle(root *Context) {
 	op.mu.Lock()
 	defer op.mu.Unlock()
-	if op.succeeded {
-		for receiver := range op.receivers {
-			receiver.adoptLiveDataFrom(root)
-		}
+	for receiver := range op.receivers {
+		receiver.adoptLiveDataFrom(root)
 	}
 	op.receivers = nil
 }

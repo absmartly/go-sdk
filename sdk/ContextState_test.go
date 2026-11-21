@@ -1139,10 +1139,23 @@ func TestNilPanicAudienceParseIsNotShared(t *testing.T) {
 // same name (new id and iteration, same text) and reads it does not hand the
 // replacement the old run's failed parse: the recovered deserializer decides.
 func TestReplacementExperimentDoesNotInheritPanicFallback(t *testing.T) {
+	for _, change := range []string{"id", "iteration", "both"} {
+		t.Run(change, func(t *testing.T) {
+			replacementDoesNotInheritPanicFallback(t, change)
+		})
+	}
+}
+
+func replacementDoesNotInheritPanicFallback(t *testing.T, change string) {
 	var exclude = `{"filter":[{"value":false}]}`
 	var original = audienceExperiment("exp_app", exclude, true)
 	var replacement = original
-	replacement.Id, replacement.Iteration = 2, 2
+	if change != "iteration" {
+		replacement.Id = 2
+	}
+	if change != "id" {
+		replacement.Iteration = 2
+	}
 	var ctx, _ = newSystemAttrContext("website", "production", original)
 	var d = &panicOnceDeserializer{}
 	ctx.AudienceMatcher_ = AudienceMatcher{d}
@@ -1246,6 +1259,37 @@ func (p *controlledRefreshProvider) GetContextData() *future.Future {
 	return p.result
 }
 
+// A joined refresh that fails, whose Error logger then refreshes successfully
+// through the original, leaves the copy's reads agreeing with the live data.
+func TestJoinedCopyReadsAgreeAfterFailedRefreshAndNestedSuccess(t *testing.T) {
+	var b, before = ruleExperiment("b", ""), ruleExperiment("before", "")
+	var ctx, _ = newRuleContext(t, "production", withUnit(), before)
+	ctx.Clock_ = internal.FixedClock{Millis_: 1}
+	var copied = *ctx
+	var pendingA, settleA = future.New()
+	var provider = &controlledRefreshProvider{result: pendingA}
+	ctx.DataProvider_ = provider
+	var nested int32
+	ctx.EventLogger_ = callbackEventLogger(func(c Context, event EventType, _ interface{}) {
+		if event != Error || atomic.AddInt32(&nested, 1) > 1 {
+			return
+		}
+		var doneB, settleB = future.New()
+		settleB(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{b}}, nil)
+		provider.result = doneB
+		ctx.Refresh()
+	})
+	var started = ctx.RefreshAsync()
+	var joined = copied.RefreshAsync()
+	var failure = errors.New("refresh failed")
+	settleA(nil, failure)
+	assertAny(failure, getWithTimeout(t, started), t)
+	assertAny(failure, getWithTimeout(t, joined), t)
+	if _, found := copied.GetExperiment("b"); !found {
+		t.Error("the copy's GetExperiment misses the data the nested refresh installed")
+	}
+}
+
 // A completion logger that synchronously refreshes again leaves a joined
 // copy's reads consistent when the copy's refresh reports success.
 func TestJoinedCopyReadsAgreeAfterNestedRefresh(t *testing.T) {
@@ -1268,9 +1312,20 @@ func TestJoinedCopyReadsAgreeAfterNestedRefresh(t *testing.T) {
 	})
 	var started = ctx.RefreshAsync()
 	var joined = copied.RefreshAsync()
+	var seenAtSettle = make(chan bool, 1)
+	joined.Listen(func(future.Value, error) {
+		var _, found = copied.GetExperiment("b")
+		seenAtSettle <- found
+	})
 	settleA(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{a}}, nil)
 	assertAny(nil, getWithTimeout(t, started), t)
 	assertAny(nil, getWithTimeout(t, joined), t)
+	select {
+	case seen := <-seenAtSettle:
+		assertAny(true, seen, t)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the joined refresh's listener did not run")
+	}
 	var data, _ = copied.GetData()
 	assertAny(1, len(data.Experiments), t)
 	assertAny("b", data.Experiments[0].Name, t)
