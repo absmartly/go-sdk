@@ -32,13 +32,13 @@ func (am AudienceMatcher) Evaluate(audience string, attributes map[string]interf
 	return am.parseAudience(audience).evaluate(attributes)
 }
 
-// parsedAudience is an audience run through the AudienceDeserializer, ready to
-// be evaluated against attributes. Parsing runs customer code, so the context
-// does it before taking its locks; evaluating runs only SDK code.
 // errAudienceUnparseable is the error for an audience that cannot be parsed
 // or evaluated, the same text v1.1.1's Evaluate returned.
 var errAudienceUnparseable = errors.New("can't evaluate data")
 
+// parsedAudience is an audience run through the AudienceDeserializer, ready to
+// be evaluated against attributes. Parsing runs customer code, so the context
+// does it before taking its locks; evaluating runs only SDK code.
 type parsedAudience struct {
 	filter interface{}
 	err    error
