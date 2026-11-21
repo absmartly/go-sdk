@@ -198,9 +198,13 @@ func (g *reentrantGate) init() {
 
 // admits reports whether goroutine id may take the gate now. g.mu is held.
 func (g *reentrantGate) admits(id uint64) bool {
-	if len(g.holders) == 0 || g.holders[id] > 0 {
-		return true
-	}
+	return len(g.holders) == 0 || g.holders[id] > 0 || g.executingLent(id)
+}
+
+// executingLent reports whether goroutine id executes an operation the gate
+// is lent to: it acts for a waiting holder, so it may lend in turn (a
+// Refresh called from a Refresh logger). g.mu is held.
+func (g *reentrantGate) executingLent(id uint64) bool {
 	for op := range g.lent {
 		if op.executor == id {
 			return true
@@ -246,7 +250,7 @@ func (g *reentrantGate) lend(op *gateOperation) (end func()) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.init()
-	if g.holders[id] == 0 {
+	if g.holders[id] == 0 && !g.executingLent(id) {
 		return func() {}
 	}
 	g.lent[op]++
@@ -1508,15 +1512,22 @@ func (c *Context) PublishAsync() (*future.Future, error) {
 		return nil, err
 	}
 
-	return c.Flush(), nil
+	var result, _ = c.flush()
+	return result, nil
 }
 
 func (c *Context) Publish() error {
-	var result, err = c.PublishAsync()
-	if err != nil {
+	c = c.live()
+	if err := c.CheckNotClosed(); err != nil {
 		return err
 	}
-	_, err = result.Get(context.Background())
+	var result, op = c.flush()
+	if op != nil && !result.Ready() {
+		// A deserializer calling Publish lends the gate to the publish's
+		// logger, as Refresh does to its own.
+		defer c.state().customAudiences.lend(op)()
+	}
+	var _, err = result.Get(context.Background())
 	return err
 }
 
@@ -2911,6 +2922,13 @@ func (c *Context) SetDataFailed(err error) {
 }
 
 func (c *Context) Flush() *future.Future {
+	var result, _ = c.flush()
+	return result
+}
+
+// flush is Flush, also returning the operation that runs the publish's event
+// logger, or nil when nothing was sent.
+func (c *Context) flush() (*future.Future, *gateOperation) {
 	c = c.live()
 	var st = c.state()
 	c.ClearTimeout()
@@ -2929,6 +2947,7 @@ func (c *Context) Flush() *future.Future {
 		// Publish callers wait on result, which includes logger delivery.
 		var settled, settledDone = future.New()
 		var result, done = future.New()
+		var op = &gateOperation{}
 
 		if eventCount > 0 {
 			if len(c.Exposures_) > 0 {
@@ -2990,16 +3009,16 @@ func (c *Context) Flush() *future.Future {
 						// Start the logger first: settledDone runs Close's listeners
 						// synchronously, and a panic there must not leave the
 						// caller's future unsettled.
-						runLogger(done, nil, func() { c.logEvent(Publish, event) })
+						runLogger(&st.customAudiences, op, done, nil, func() { c.logEvent(Publish, event) })
 					} else {
 						c.requeueEvents(exposures, achievements, eventCount)
-						runLogger(done, err, func() { c.logEvent(Error, err) })
+						runLogger(&st.customAudiences, op, done, err, func() { c.logEvent(Error, err) })
 					}
 					st.removeInflight(settled)
 					settledDone(nil, err)
 				})
 
-			return result
+			return result, op
 		}
 	} else {
 		c.EventLock_.Lock()
@@ -3011,7 +3030,7 @@ func (c *Context) Flush() *future.Future {
 
 	result, done := future.New()
 	done(nil, nil)
-	return result
+	return result, nil
 }
 
 func (st *contextState) addInflight(f *future.Future) {
@@ -3048,9 +3067,16 @@ func (st *contextState) inflightSnapshot() []*future.Future {
 
 // runLogger runs an observer on its own goroutine so lifecycle re-entry cannot
 // block the publisher callback. Logger panics never replace the publish outcome.
-func runLogger(done future.SetResultFunc, result error, log func()) {
+//
+// The logger goroutine is op's executor while it runs, so a Publish waiting
+// for it can lend the custom audience gate.
+func runLogger(gate *reentrantGate, op *gateOperation, done future.SetResultFunc, result error, log func()) {
 	go func() {
-		log()
+		var end = gate.execute(op)
+		func() {
+			defer end()
+			log()
+		}()
 		done(nil, result)
 	}()
 }

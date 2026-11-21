@@ -3,6 +3,7 @@ package sdk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -486,5 +487,64 @@ func TestReentrantGateLend(t *testing.T) {
 				t.Fatal("waiter not admitted after the holder released the gate")
 			}
 		}
+	}
+}
+
+// A's deserializer calls Refresh; that refresh's logger calls Refresh again,
+// and the nested refresh's logger reads cold custom B. The first refresh's
+// executor lends the gate on to the nested refresh, so every read finishes.
+func TestHandoffNestedRefreshLoggerReadsColdAudience(t *testing.T) {
+	var h = newHandoff(t, nil)
+	var refreshes, peekB = make(chan struct{}, 2), make(chan int, 1)
+	var depth int32
+	h.setLogger(func(c Context, event EventType) {
+		if event != Refresh {
+			return
+		}
+		refreshes <- struct{}{}
+		h.mu.Lock()
+		depth++
+		var d = depth
+		h.mu.Unlock()
+		if d == 1 {
+			h.ctx.Refresh()
+		} else if d == 2 {
+			var v, _ = c.PeekTreatment("B")
+			peekB <- v
+		}
+	})
+	var once sync.Once
+	h.d.setHook(true, func() { once.Do(func() { h.ctx.Refresh() }) })
+	var a int
+	handoffWithin(t, "Refresh nested in a Refresh logger reading B", func() { a, _ = h.ctx.GetTreatment("A") })
+	assertAny(1, a, t)
+	assertAny(2, len(refreshes), t)
+	assertHandoffB(t, h.ctx, <-peekB)
+}
+
+// A's deserializer calls Publish; the publish's event logger reads cold
+// custom B. Publish lends the gate to its logger, so both finish.
+func TestHandoffPublishLoggerReadsColdAudience(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		var h = newHandoff(t, nil)
+		var publisher = &CapturingPublishClient{}
+		if fail {
+			publisher.publishErr = errors.New("collector down")
+		}
+		h.ctx.EventHandler_ = DefaultContextEventHandler{client_: publisher}
+		assertAny(nil, h.ctx.Track("goal", nil), t)
+		var peekB = make(chan int, 1)
+		h.setLogger(func(c Context, event EventType) {
+			if event == Publish || event == Error {
+				var v, _ = c.PeekTreatment("B")
+				peekB <- v
+			}
+		})
+		var once sync.Once
+		h.d.setHook(true, func() { once.Do(func() { _ = h.ctx.Publish() }) })
+		var a int
+		handoffWithin(t, "deserializer Publish with a logger reading B", func() { a, _ = h.ctx.GetTreatment("A") })
+		assertAny(1, a, t)
+		assertHandoffB(t, h.ctx, <-peekB)
 	}
 }
