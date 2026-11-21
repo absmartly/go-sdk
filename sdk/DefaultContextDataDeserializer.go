@@ -84,21 +84,25 @@ func holdoutIds(raw json.RawMessage) []int {
 	return ids
 }
 
+// holdoutNumber rejects quoted numbers, which json.Number otherwise accepts.
+func holdoutNumber(raw json.RawMessage) (float64, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] == '"' {
+		return 0, strconv.ErrSyntax
+	}
+	var number json.Number
+	if err := json.Unmarshal(raw, &number); err != nil {
+		return 0, err
+	}
+	return number.Float64()
+}
+
 // holdoutId decodes an integral JSON number that fits an int. It goes
 // through float64, as JavaScript's JSON.parse does, so 10, 10.0 and 1e1 are
 // the same id, and any two spellings of one number decode alike (above 2^53
 // they round together, as in JavaScript).
 func holdoutId(raw json.RawMessage) (int, bool) {
-	raw = bytes.TrimSpace(raw)
-	if len(raw) == 0 || raw[0] == '"' {
-		// json.Number also accepts a quoted number; an id must be a number.
-		return 0, false
-	}
-	var number json.Number
-	if json.Unmarshal(raw, &number) != nil || len(number) == 0 {
-		return 0, false
-	}
-	var value, err = number.Float64()
+	var value, err = holdoutNumber(raw)
 	if err != nil || value != math.Trunc(value) || value < -math.Exp2(float64(strconv.IntSize-1)) || value >= math.Exp2(float64(strconv.IntSize-1)) {
 		return 0, false
 	}
@@ -109,16 +113,7 @@ func holdoutId(raw json.RawMessage) (int, bool) {
 // truncated and taken modulo 2^32. Non-numeric values default to 0 rather than
 // applying JavaScript's broader coercions; non-finite numbers also give 0.
 func holdoutSeed(raw json.RawMessage) int {
-	raw = bytes.TrimSpace(raw)
-	if len(raw) == 0 || raw[0] == '"' {
-		return 0
-	}
-	var number json.Number
-	if json.Unmarshal(raw, &number) != nil || len(number) == 0 {
-		return 0
-	}
-	// Through float64, as JavaScript parses every JSON number.
-	var value, err = number.Float64()
+	var value, err = holdoutNumber(raw)
 	if err != nil || math.IsInf(value, 0) || math.IsNaN(value) {
 		return 0
 	}
