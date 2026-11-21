@@ -1768,6 +1768,7 @@ func (c *Context) audienceMatches(st *contextState, data jsonmodels.Experiment, 
 	}
 	var parsed, ok = c.cachedAudience(st, data.Audience)
 	if !ok {
+		// Not parsed yet: force the rebuild, which parses with no lock held.
 		return false
 	}
 	var match, err = parsed.evaluate(c.evaluationAttributesWithState(st))
