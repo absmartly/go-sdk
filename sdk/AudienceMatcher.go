@@ -29,18 +29,39 @@ func CreateResult(result bool) Result {
 }
 
 func (am AudienceMatcher) Evaluate(audience string, attributes map[string]interface{}) (Result, error) {
+	return am.parseAudience(audience).evaluate(attributes)
+}
+
+var errAudienceUnparseable = errors.New("can't evaluate data")
+
+// parsedAudience is an audience run through the AudienceDeserializer, ready to
+// be evaluated against attributes. Parsing runs customer code, so the context
+// does it before taking its locks; evaluating runs only SDK code.
+type parsedAudience struct {
+	filter interface{}
+	err    error
+}
+
+func (am AudienceMatcher) parseAudience(audience string) parsedAudience {
 	result, err := am.deserializer().Deserialize([]byte(audience), 0, len(audience))
 	if err != nil {
-		return Result{}, errors.New("can't evaluate data")
+		return parsedAudience{err: errAudienceUnparseable}
 	}
-
 	var filter = result["filter"]
-	var kind = reflect.ValueOf(filter).Kind()
-	if kind == reflect.Map || kind == reflect.Slice || kind == reflect.Array {
-		return CreateResult(jsonexpr.EvaluateBooleanExpr(filter, attributes)), nil
+	switch reflect.ValueOf(filter).Kind() {
+	case reflect.Map, reflect.Slice, reflect.Array:
+		return parsedAudience{filter: filter}
+	default:
+		return parsedAudience{err: errAudienceUnparseable}
 	}
+}
 
-	return Result{}, errors.New("can't evaluate data")
+func (p parsedAudience) evaluate(attributes map[string]interface{}) (Result, error) {
+	if p.err != nil {
+		return Result{}, p.err
+	}
+	// parseAudience is the only source of a filter, and it validates its kind.
+	return CreateResult(jsonexpr.EvaluateBooleanExpr(p.filter, attributes)), nil
 }
 
 func (am AudienceMatcher) deserializer() AudienceDeserializer {

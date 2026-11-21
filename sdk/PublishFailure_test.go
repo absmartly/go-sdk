@@ -300,9 +300,9 @@ func TestFailedCloseDoesNotRestartRefreshTimer(t *testing.T) {
 
 	ctx.Refresh()
 	assertAny(before+1, atomic.LoadInt32(&provider.calls), t)
-	ctx.StateLock_.Lock()
+	ctx.state().stateLock_.Lock()
 	var timer = ctx.RefreshTimer_
-	ctx.StateLock_.Unlock()
+	ctx.state().stateLock_.Unlock()
 	if timer != nil {
 		t.Fatal("refresh timer re-armed after a failed close")
 	}
@@ -496,7 +496,7 @@ func TestEventLoggerCallingCloseFromPublishDoesNotDeadlock(t *testing.T) {
 
 type closingLogger struct {
 	ctx    *Context
-	closed atomic.Bool
+	closed atomicBool
 }
 
 func (l *closingLogger) HandleEvent(_ Context, event EventType, _ interface{}) {
@@ -512,8 +512,8 @@ func TestErrorEventsCarryErrorValues(t *testing.T) {
 	config.Units_ = map[string]string{"session_id": ""}
 	config.RefreshInterval_ = 0
 	config.EventLogger_ = logger
-	_ = createTrackedContext(clock, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
-	DefaultVariableParser{}.Parse(Context{EventLogger_: logger}, "exp", "variant", "{not json")
+	var ctx = createTrackedContext(clock, config, dataFutureReady, dataProvider, eventHandler, logger, variableParser, audienceMatcher)
+	ctx.LogError(errors.New("failure"))
 
 	var seen = 0
 	for _, e := range logger.GetEvents() {

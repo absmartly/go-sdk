@@ -876,7 +876,7 @@ func TestGetVariableKeysReturnsFirstExperimentPerKey(t *testing.T) {
 	var context = CreateTestContext(config, dataFutureRefresh)
 
 	context.DataLock.Lock()
-	context.indexVariables_["shared.key"] = []ExperimentVariables{
+	context.state().indexVariables_["shared.key"] = []ExperimentVariables{
 		{Data: jsonmodels.Experiment{Name: "first"}},
 		{Data: jsonmodels.Experiment{Name: "second"}},
 	}

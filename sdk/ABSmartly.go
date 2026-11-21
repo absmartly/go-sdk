@@ -6,10 +6,8 @@ import (
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
 
-type ABsmartly struct {
-	ContextDataProvider_ ContextDataProvider
-	ContextPublisher_    ContextEventHandler
-	// Deprecated: Use ContextPublisher_ instead.
+type ABSmartly struct {
+	ContextDataProvider_  ContextDataProvider
 	ContextEventHandler_  ContextEventHandler
 	ContextEventLogger_   ContextEventLogger
 	VariableParser_       VariableParser
@@ -17,7 +15,8 @@ type ABsmartly struct {
 	Client_               ClientI
 }
 
-type ABSmartly = ABsmartly
+// ABsmartly is an alias of ABSmartly, spelled as the product is.
+type ABsmartly = ABSmartly
 
 // clientSystemAttributes is the optional interface a client implements to
 // expose the application and environment names the context injects into the
@@ -29,11 +28,8 @@ type clientSystemAttributes interface {
 	GetEnvironment() string
 }
 
-func Create(config ABsmartlyConfig) ABsmartly {
-	var abs = ABsmartly(config)
-	if abs.ContextPublisher_ != nil {
-		abs.ContextEventHandler_ = abs.ContextPublisher_
-	}
+func Create(config ABSmartlyConfig) ABSmartly {
+	var abs = ABSmartly(config)
 	if abs.ContextDataProvider_ == nil {
 		abs.ContextDataProvider_ = DefaultContextDataProvider{client_: abs.Client_}
 	}
@@ -54,7 +50,7 @@ func Create(config ABsmartlyConfig) ABsmartly {
 }
 
 // CreateContext
-func (abs ABsmartly) CreateContext(config ContextConfig) *Context {
+func (abs ABSmartly) CreateContext(config ContextConfig) *Context {
 	var application, environment = abs.systemAttributes()
 	return createContext(internal.SystemClockUTC{}, config, abs.ContextDataProvider_.GetContextData(), abs.ContextDataProvider_,
 		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_},
@@ -62,7 +58,7 @@ func (abs ABsmartly) CreateContext(config ContextConfig) *Context {
 }
 
 // CreateContextWith
-func (abs ABsmartly) CreateContextWith(config ContextConfig, data jsonmodels.ContextData) *Context {
+func (abs ABSmartly) CreateContextWith(config ContextConfig, data jsonmodels.ContextData) *Context {
 	var application, environment = abs.systemAttributes()
 	var ft, done = future.New()
 	done(data, nil)
@@ -78,13 +74,13 @@ func (abs ABsmartly) CreateContextWith(config ContextConfig, data jsonmodels.Con
 // the callback fires during construction, and a Ready logger that evaluates an
 // audience must already see them. The collector adds the same values to every
 // exposure server-side, so they are never published as attributes here.
-func (abs ABsmartly) systemAttributes() (string, string) {
+func (abs ABSmartly) systemAttributes() (string, string) {
 	if client, ok := abs.Client_.(clientSystemAttributes); ok {
 		return client.GetApplication(), client.GetEnvironment()
 	}
 	return "", ""
 }
 
-func (abs ABsmartly) GetContextData() *future.Future {
+func (abs ABSmartly) GetContextData() *future.Future {
 	return abs.ContextDataProvider_.GetContextData()
 }

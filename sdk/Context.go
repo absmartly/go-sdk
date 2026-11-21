@@ -44,50 +44,52 @@ type Context struct {
 	Data_                jsonmodels.ContextData
 	Index_               map[string]ExperimentVariables
 	ContextCustomFields_ map[string]map[string]ContextCustomFieldValue
-	// Deprecated: IndexVariables_ keeps its v1.1.1 type; each key maps to the
-	// first ExperimentVariables that defines it. Use GetVariableKeysAll for
-	// every experiment per key.
-	IndexVariables_ map[interface{}]interface{}
-	ContextLock_    *sync.RWMutex
-	HashedUnits_    map[interface{}]interface{}
-	Assigners_      map[interface{}]interface{}
-	// Deprecated: AssignmentCache keeps its v1.1.1 type and is a read-only
-	// copy of the internal cache, written under ContextLock_.
-	AssignmentCache map[string]Assignment
-	EventLock_      *sync.Mutex
-	Exposures_      []jsonmodels.Exposure
-	Achievements_   []jsonmodels.GoalAchievement
-	Attributes_     []interface{}
-	Overrides_      map[interface{}]interface{}
-	Cassignments_   map[interface{}]interface{}
-	PendingCount_   *atomic.Value
-	Closing_        *atomic.Value
-	Closed_         *atomic.Value
-	Refreshing_     *atomic.Value
-	ReadyFuture_    *future.Future
-	ClosingFuture_  *future.Future
-	// FinalizedFuture_ includes logger delivery; ClosingFuture_ only includes
+	IndexVariables_      map[interface{}]interface{}
+	ContextLock_         *sync.RWMutex
+	HashedUnits_         map[interface{}]interface{}
+	Assigners_           map[interface{}]interface{}
+	AssignmentCache      map[string]Assignment
+	EventLock_           *sync.Mutex
+	Exposures_           []jsonmodels.Exposure
+	Achievements_        []jsonmodels.GoalAchievement
+	Attributes_          []interface{}
+	Overrides_           map[interface{}]interface{}
+	Cassignments_        map[interface{}]interface{}
+	PendingCount_        *atomic.Value
+	Closing_             *atomic.Value
+	Closed_              *atomic.Value
+	Refreshing_          *atomic.Value
+	ReadyFuture_         *future.Future
+	ClosingFuture_       *future.Future
+	RefreshFuture_       *future.Future
+	TimeoutLock_         *sync.Mutex
+	Timeout_             *time.Timer
+	RefreshTimer_        *time.Timer
+	Clock_               internal.Clock
+}
+
+// contextState is owned by a context, never by a process-wide registry.
+// Context keeps its v1.1.1 layout so external unkeyed literals remain valid.
+type contextState struct {
+	// manualRoot is the context createContext built. A copy of it whose
+	// Clock_ was replaced finds this state through Assigners_ and redirects to
+	// manualRoot, as a copy with the carrier does. It is nil for literals.
+	manualRoot *Context
+	// finalizedFuture_ includes logger delivery; ClosingFuture_ only includes
 	// transport/sealing, allowing loggers to re-enter Close safely.
-	FinalizedFuture_ *future.Future
+	finalizedFuture_ *future.Future
 	publishLogs_     []*future.Future
-	RefreshFuture_   *future.Future
-	TimeoutLock_     *sync.Mutex
-	// StateLock_ guards ReadyFuture_, RefreshFuture_, ClosingFuture_, RefreshTimer_ and closeStarted_.
-	StateLock_ *sync.Mutex
-	// inflight_ holds the publishes that have been sent and not yet settled. Guarded by StateLock_.
+	// indexLock_ makes a literal's Index_ write and index install in setData
+	// atomic for syncLiteralExperiment. It is taken last, with no other lock
+	// taken inside it.
+	indexLock_ sync.Mutex
+	// stateLock_ guards ReadyFuture_, RefreshFuture_, ClosingFuture_, RefreshTimer_, refresh_ and closeStarted_.
+	stateLock_ *sync.Mutex
+	refresh_   *refreshOperation
+	// inflight_ holds the publishes that have been sent and not yet settled. Guarded by stateLock_.
 	inflight_ []*future.Future
 
-	// root_ is set on the copies of the Context that callbacks receive. It
-	// points at the live context, which owns the lifecycle state (the
-	// closing/refresh futures, timers, in-flight publishes and event queue).
-	// The lifecycle methods run on the live context, so calling Close, Publish
-	// or Refresh on the copy a logger was given acts on the real context, not
-	// on stale copied fields.
-	root_         *Context
-	Timeout_      *time.Timer
-	RefreshTimer_ *time.Timer
-	Clock_        internal.Clock
-	AttrsSeq_     int32
+	attrsSeq_ int32
 
 	// application_ and environment_ are the application and environment names
 	// from the client config. They are injected into the attribute map that
@@ -98,11 +100,6 @@ type Context struct {
 	application_ string
 	environment_ string
 
-	// customFieldErrors_ holds, per experiment and field name, the error from
-	// parsing a "json" custom field. GetCustomFieldValue reports it through the
-	// event logger when the field is read. Guarded by DataLock.
-	customFieldErrors_ map[string]map[string]error
-
 	// unitValues_ keeps each unit as it was set (string or float64); Units_
 	// holds the string form that is hashed. Guarded by ContextLock_.
 	unitValues_ map[string]interface{}
@@ -110,7 +107,7 @@ type Context struct {
 	// readyDeliverer_ is the goroutine that is logging the initial ready or
 	// load-error event, or 0. A readiness wait from that goroutine is the
 	// logger waiting for itself, so it returns at once.
-	readyDeliverer_ *atomic.Uint64
+	readyDeliverer_ *uint64
 
 	// loggers_ records the goroutines that are inside an event logger call
 	// on this context, so a blocking Close from a logger does not wait for
@@ -119,7 +116,7 @@ type Context struct {
 
 	// closeStarted_ is set once Close has been called. The refresh timer
 	// that Close stops is never installed again, even if the close fails and
-	// leaves the context open for a retry. Guarded by StateLock_.
+	// leaves the context open for a retry. Guarded by stateLock_.
 	closeStarted_ bool
 
 	// indexVariables_ lists, per variable key, every experiment that defines
@@ -129,12 +126,225 @@ type Context struct {
 	// index_ is the installed experiment index and parsed assignment rules,
 	// replaced as a whole by setData under DataLock. The assignment read path
 	// loads it atomically instead of taking DataLock, so a cached read costs
-	// what it did before the index was guarded.
-	index_ *atomic.Pointer[contextIndex]
+	// what it did before the index was guarded. It always holds a
+	// *contextIndex (an atomic.Value rather than atomic.Pointer, which needs
+	// Go 1.19, so the module keeps v1.1.1's Go floor); read it with
+	// loadIndex.
+	index_ *atomic.Value
 
 	// assignmentCache_ holds the assignments by experiment name. Guarded by
 	// ContextLock_: entries are only written under the write lock.
 	assignmentCache_ map[string]*cachedAssignment
+	ruleIdentities   *ruleAssignmentIdentities
+
+	// audiences caches the usable parses of the built-in deserializer, whose
+	// output is fresh on every call. A custom deserializer's result is used
+	// by the build that requested it and never kept. Deserializers run
+	// without context locks. audiencePanics guards same-experiment logger
+	// reads while a panic is reported; it is protected by ContextLock_.
+	audiences      sync.Map
+	audiencePanics map[string][]*audienceParse
+
+	// customAudiences serialises, within this context, each custom
+	// deserializer call with the locked evaluation of its result, as v1.1.1
+	// did by holding ContextLock_ across both. It is taken with no context
+	// lock held and released after ContextLock_ is, and is reentrant for its
+	// owner, so a deserializer or a panic logger can read other experiments
+	// (a deserializer reusing storage across such nested calls on its own
+	// goroutine is not protected). See buildAssignment.
+	customAudiences reentrantGate
+}
+
+// reentrantGate is a mutex that the goroutine holding it may take again.
+type reentrantGate struct {
+	mu    sync.Mutex
+	free  sync.Cond
+	owner uint64
+	depth int
+}
+
+// lock takes the gate, waiting while another goroutine holds it unless wait
+// is false, in which case it reports false instead of waiting.
+func (g *reentrantGate) lock(wait bool) bool {
+	var id = goroutineID()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.free.L == nil {
+		g.free.L = &g.mu
+	}
+	for g.depth > 0 && g.owner != id {
+		if !wait {
+			return false
+		}
+		g.free.Wait()
+	}
+	g.owner = id
+	g.depth++
+	return true
+}
+
+func (g *reentrantGate) unlock() {
+	g.mu.Lock()
+	if g.depth--; g.depth == 0 {
+		g.owner = 0
+		g.free.Signal()
+	}
+	g.mu.Unlock()
+}
+
+// contextClock carries private state in an existing interface field without
+// changing Context's public layout. Millis still delegates to the supplied
+// clock. Ordinary value copies share state; callback snapshots additionally
+// point at the live context. All references are GC-owned, including cycles:
+// neither abandoned open contexts nor retained snapshots need a global map or
+// finalizer. The carrier is installed before a constructed context escapes.
+type contextClock struct {
+	internal.Clock
+	state    *contextState
+	root     *Context
+	snapshot bool
+}
+
+type contextStateKey struct{}
+
+func newContextState() *contextState {
+	var state = &contextState{
+		stateLock_:       &sync.Mutex{},
+		unitValues_:      map[string]interface{}{},
+		readyDeliverer_:  new(uint64),
+		loggers_:         &loggerGoroutines{ids: map[uint64]int{}},
+		index_:           &atomic.Value{},
+		assignmentCache_: map[string]*cachedAssignment{},
+		ruleIdentities:   &ruleAssignmentIdentities{ids: map[uintptr]struct{}{}},
+	}
+	state.index_.Store((*contextIndex)(nil))
+	return state
+}
+
+// state takes no lock on constructor-created contexts, including assignment
+// cache hits. A manually initialized v1.1.1 literal has no carrier; its existing
+// assigner map owns the state under a private, non-string key. That fallback is
+// protected by ContextLock_, and must be resolved before taking other locks.
+// It does not replace the caller's Clock_ or require process-lifetime storage.
+func (c *Context) state() *contextState {
+	if clock := c.ownClock(); clock != nil {
+		return clock.state
+	}
+	return c.literalState()
+}
+
+// ownClock returns the context's state carrier, or nil when Clock_ holds none
+// or holds another context's (a caller assigned b.Clock_ = a.Clock_, which in
+// v1.1.1 only shared the clock). Copies and snapshots of a context share its
+// ContextLock_, so the lock tells the two apart.
+func (c *Context) ownClock() *contextClock {
+	if clock, ok := c.Clock_.(*contextClock); ok && clock.root != nil && clock.root.ContextLock_ == c.ContextLock_ {
+		return clock
+	}
+	return nil
+}
+
+// literalState is the cold fallback for a context with no carrier of its own
+// (a literal, or one whose Clock_ was replaced), kept out of state so the
+// carrier lookup stays a short call.
+func (c *Context) literalState() *contextState {
+	if c.ContextLock_ == nil {
+		return newContextState()
+	}
+	c.ContextLock_.Lock()
+	defer c.ContextLock_.Unlock()
+	if state, ok := c.Assigners_[contextStateKey{}].(*contextState); ok {
+		return state
+	}
+	// A literal has no root: as in v1.1.1, each value copy acts on its own
+	// fields (sharing their maps and locks). Only a context the SDK created
+	// and whose Clock_ was replaced redirects to its root (createContext sets
+	// manualRoot for those).
+	var state = newContextState()
+	var indexed = make(map[string]*indexedExperiment, len(c.Index_))
+	for name, experiment := range c.Index_ {
+		// Manually supplied v1.1.1 indexes have no parsed-rule metadata.
+		// SetData installs it; don't call a user deserializer under this lock.
+		indexed[name] = &indexedExperiment{experiment: experiment}
+	}
+	state.index_.Store(&contextIndex{experiments: indexed})
+	state.indexVariables_ = map[string][]ExperimentVariables{}
+	for key, value := range c.IndexVariables_ {
+		if key, ok := key.(string); ok {
+			if experiment, ok := value.(ExperimentVariables); ok {
+				state.indexVariables_[key] = []ExperimentVariables{experiment}
+			}
+		}
+	}
+	for name, assignment := range c.AssignmentCache {
+		var assignment = assignment
+		state.assignmentCache_[name] = &cachedAssignment{assignment: &assignment}
+	}
+	if c.Assigners_ == nil {
+		c.Assigners_ = map[interface{}]interface{}{}
+	}
+	c.Assigners_[contextStateKey{}] = state
+	return state
+}
+
+// legacyVariableReader returns the context whose v1.1.1 IndexVariables_
+// answers variable-key reads, or nil when the private multi-experiment index
+// does: a Context{...} literal reads its own, and a snapshot of a literal (the
+// context its event logger receives) reads the literal it was taken from, so
+// edits to the mapping are seen in callbacks too. SDK-created contexts and
+// their copies use the private index.
+func (c *Context) legacyVariableReader() *Context {
+	if clock := c.ownClock(); clock != nil {
+		if clock.state.manualRoot == nil {
+			return clock.root
+		}
+		return nil
+	}
+	if c.ContextLock_ == nil || c.literalState().manualRoot == nil {
+		return c
+	}
+	return nil
+}
+
+func (c *Context) isSnapshot() bool {
+	var clock = c.ownClock()
+	return clock != nil && clock.snapshot
+}
+
+// ruleAssignmentIdentities remembers the rule flag of assignments handed to
+// callers even after their cache entries are replaced. Keys are numeric, not
+// pointers: the registry must not keep an abandoned assignment alive. Each
+// flag's finalizer removes its key and captures only this standalone registry,
+// never the context or its cache (which would create a retention cycle).
+// A retained Assignment copy keeps Exposed alive, so its rule flag remains
+// available for as long as QueueExposure can use it. No global table is used.
+type ruleAssignmentIdentities struct {
+	mu  sync.Mutex
+	ids map[uintptr]struct{}
+}
+
+func (r *ruleAssignmentIdentities) remember(flag *atomic.Value) {
+	var id = reflect.ValueOf(flag).Pointer()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, found := r.ids[id]; found {
+		return
+	}
+	r.ids[id] = struct{}{}
+	runtime.SetFinalizer(flag, func(*atomic.Value) {
+		r.mu.Lock()
+		delete(r.ids, id)
+		r.mu.Unlock()
+	})
+}
+
+func (r *ruleAssignmentIdentities) contains(flag *atomic.Value) bool {
+	var id = reflect.ValueOf(flag).Pointer()
+	r.mu.Lock()
+	_, found := r.ids[id]
+	r.mu.Unlock()
+	runtime.KeepAlive(flag)
+	return found
 }
 
 // contextIndex is an installed experiment index and, by experiment name, the
@@ -142,6 +352,28 @@ type Context struct {
 // modified once published in index_.
 type contextIndex struct {
 	experiments map[string]*indexedExperiment
+
+	// audiences is the set of audience texts in experiments, built once per
+	// snapshot on first use: a snapshot is never changed after it is stored.
+	audiencesOnce sync.Once
+	audiences     map[string]struct{}
+}
+
+// audienceSetBuilds counts audience-set builds, for tests.
+var audienceSetBuilds int64
+
+// audienceTexts returns the snapshot's set of audience texts.
+func (index *contextIndex) audienceTexts() map[string]struct{} {
+	index.audiencesOnce.Do(func() {
+		atomic.AddInt64(&audienceSetBuilds, 1)
+		index.audiences = map[string]struct{}{}
+		for _, entry := range index.experiments {
+			if text := entry.experiment.Data.Audience; text != "" {
+				index.audiences[text] = struct{}{}
+			}
+		}
+	})
+	return index.audiences
 }
 
 // indexedExperiment is an installed experiment with its parsed assignment
@@ -169,10 +401,18 @@ type cachedAssignment struct {
 	assignment *Assignment
 	rules      *experimentRules
 	attrsSeq   int32
+	// ruleOverride is set when a matching assignment rule chose the
+	// variant. The exposure carries it so the collector leaves the unit out
+	// of the analysis, as it does for overrides. It is kept here rather than
+	// on Assignment, so Assignment keeps its v1.1.1 fields.
+	ruleOverride bool
 	// ruleMissingUnit is set when a split rule matched while the
 	// experiment's unit was not set, so the variant is the experiment's
 	// no-unit result rather than a hash of the unit.
 	ruleMissingUnit bool
+	// failed is assignment-local: revalidation keeps the original fallback,
+	// but another experiment (or deserializer) gets its own parse.
+	failed *audienceParse
 }
 
 type loggerGoroutines struct {
@@ -228,13 +468,8 @@ type Assignment struct {
 	FullOn           bool
 	Custom           bool
 	AudienceMismatch bool
-	// RuleOverride is set when a matching assignment rule chose the variant.
-	// The exposure carries it so the collector leaves the unit out of the
-	// analysis, as it does for overrides.
-	RuleOverride bool
-	Variables    map[string]interface{}
-	Exposed      *atomic.Value
-	AttrsSeq     int32
+	Variables        map[string]interface{}
+	Exposed          *atomic.Value
 }
 
 func CreateContext(clock internal.Clock, config ContextConfig, dataFuture *future.Future, dataProvider ContextDataProvider,
@@ -253,8 +488,15 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	audienceMatcher AudienceMatcher, application string, environment string) *Context {
 	var cntx = Context{Clock_: clock, PublishDelay_: config.PublishDelay_, RefreshInterval_: config.RefreshInterval_,
 		EventHandler_: eventHandler, DataProvider_: dataProvider, VariableParser_: variableParser,
-		AudienceMatcher_: audienceMatcher, Units_: map[string]string{},
-		application_: application, environment_: environment}
+		AudienceMatcher_: audienceMatcher, Units_: map[string]string{}}
+	var state = newContextState()
+	state.application_, state.environment_ = application, environment
+	cntx.Clock_ = &contextClock{Clock: clock, state: state, root: &cntx}
+	// manualRoot marks the state as an SDK-created context's (literals have
+	// none) before anything can take a snapshot of it. A caller that later
+	// replaces the exported Clock_ (as v1.1.1 allowed) finds the state through
+	// Assigners_ and keeps the context's rules, caches and lifecycle.
+	state.manualRoot = &cntx
 
 	if config.EventLogger_ != nil {
 		cntx.EventLogger_ = config.EventLogger_
@@ -278,26 +520,18 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 	cntx.ContextLock_ = &sync.RWMutex{}
 	cntx.EventLock_ = &sync.Mutex{}
 	cntx.TimeoutLock_ = &sync.Mutex{}
-	cntx.StateLock_ = &sync.Mutex{}
-
 	cntx.AssignmentCache = map[string]Assignment{}
-	cntx.assignmentCache_ = map[string]*cachedAssignment{}
-	cntx.index_ = &atomic.Pointer[contextIndex]{}
-	cntx.unitValues_ = map[string]interface{}{}
-	cntx.readyDeliverer_ = &atomic.Uint64{}
-	cntx.loggers_ = &loggerGoroutines{ids: map[uint64]int{}}
 	cntx.Achievements_ = make([]jsonmodels.GoalAchievement, 0)
 	cntx.Exposures_ = make([]jsonmodels.Exposure, 0)
 	cntx.Attributes_ = make([]interface{}, 0)
 
 	var units = config.Units_
 	if units != nil {
-		if err := cntx.SetUnits(units); err != nil && cntx.EventLogger_ != nil {
-			notifyLogger(cntx.EventLogger_, cntx, Error, errors.New("CreateContext: Failed to set units: "+err.Error()))
-		}
+		_ = cntx.SetUnits(units)
 	}
 
 	cntx.Assigners_ = map[interface{}]interface{}{}
+	cntx.Assigners_[contextStateKey{}] = state
 	cntx.HashedUnits_ = map[interface{}]interface{}{}
 
 	var attributes = config.Attributes_
@@ -355,43 +589,45 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 		var tmp = &cntx
 		var tempFuture, readyFutureDone = future.New()
 		cntx.setReadyFuture(tempFuture)
+		// fail reports a failed initial load. It settles the failed future
+		// before clearing it, so a waiter that arrives in between joins it
+		// and sees the error. Nothing after it reads Clock_.
+		var fail = func(err error, diagnostics []bufferedEvent) {
+			tmp.SetDataFailed(err)
+			tmp.dispatchDiagnostics(diagnostics)
+			tmp.LogError(err)
+			readyFutureDone(nil, err)
+			cntx.setReadyFutureWith(state, nil)
+		}
 		dataFuture.Listen(func(val future.Value, err error) {
-			tmp.readyDeliverer_.Store(goroutineID())
-			defer tmp.readyDeliverer_.Store(0)
+			atomic.StoreUint64(state.readyDeliverer_, goroutineID())
+			defer atomic.StoreUint64(state.readyDeliverer_, 0)
 			if err == nil {
 				result, ok := val.(jsonmodels.ContextData)
 				if !ok {
-					err = &TypeError{Expected: "jsonmodels.ContextData", Actual: val}
-					tmp.SetDataFailed(err)
-					tmp.LogError(err)
-					readyFutureDone(nil, err)
-					cntx.setReadyFuture(nil)
+					fail(&TypeError{Expected: "jsonmodels.ContextData", Actual: val}, nil)
 					return
 				}
 				var diagnostics, panicErr = tmp.applyRefreshedData(result)
 				if panicErr != nil {
-					tmp.SetDataFailed(panicErr)
-					tmp.dispatchDiagnostics(diagnostics)
-					tmp.LogError(panicErr)
-					readyFutureDone(nil, panicErr)
-					cntx.setReadyFuture(nil)
+					fail(panicErr, diagnostics)
 					return
 				}
 				// Log before settling, so WaitUntilReady returns after the
 				// logger has seen the ready event.
 				tmp.dispatchDiagnostics(diagnostics)
 				tmp.LogEvent(Ready, result)
-				readyFutureDone(result, nil)
-				cntx.setReadyFuture(nil)
-
+				// Finish everything that reads the context before releasing
+				// waiters: once WaitUntilReady returns, the caller may replace
+				// Clock_. ReadyFuture_ stays installed until then, so a waiter
+				// that arrives meanwhile waits on it too.
 				if tmp.GetPendingCount() > 0 {
-					tmp.SetTimeout()
+					tmp.armTimeout()
 				}
+				cntx.setReadyFutureWith(state, nil)
+				readyFutureDone(result, nil)
 			} else {
-				tmp.SetDataFailed(err)
-				tmp.LogError(err)
-				readyFutureDone(nil, err)
-				cntx.setReadyFuture(nil)
+				fail(err, nil)
 			}
 
 		})
@@ -438,53 +674,80 @@ func (c *Context) WaitUntilReady() Context {
 }
 
 func (c *Context) pendingReadyFuture() *future.Future {
-	if c.Ready_.Load().(bool) && (c.root_ != nil || c.live().readyDeliverer_.Load() == goroutineID()) {
+	if c.Ready_.Load().(bool) && (c.isSnapshot() || atomic.LoadUint64(c.live().state().readyDeliverer_) == goroutineID()) {
 		return nil
 	}
 	return c.live().getReadyFuture()
 }
 
 func (c *Context) getReadyFuture() *future.Future {
-	c.StateLock_.Lock()
-	defer c.StateLock_.Unlock()
+	var st = c.state()
+	st.stateLock_.Lock()
+	defer st.stateLock_.Unlock()
 	return c.ReadyFuture_
 }
 
 func (c *Context) setReadyFuture(f *future.Future) {
-	c.StateLock_.Lock()
+	c.setReadyFutureWith(c.state(), f)
+}
+
+// setReadyFutureWith is setReadyFuture with the state already resolved, for
+// the ready callback: it runs after WaitUntilReady has returned, when the
+// caller may be replacing Clock_, so it must not read Clock_ again.
+func (c *Context) setReadyFutureWith(st *contextState, f *future.Future) {
+	st.stateLock_.Lock()
 	c.ReadyFuture_ = f
-	c.StateLock_.Unlock()
+	st.stateLock_.Unlock()
 }
 
 // snapshot returns a copy of the context taken while holding every lock that
 // guards a mutable field, so the copy handed to a callback does not race with
 // writers. Lock order is ContextLock_, DataLock, EventLock_, TimeoutLock_,
-// StateLock_. It must not be called while holding any of them.
+// stateLock_. It must not be called while holding any of them.
 func (c *Context) snapshot() Context {
 	c = c.live()
-	c.ContextLock_.RLock()
-	defer c.ContextLock_.RUnlock()
-	c.DataLock.RLock()
-	defer c.DataLock.RUnlock()
-	c.EventLock_.Lock()
-	defer c.EventLock_.Unlock()
-	c.TimeoutLock_.Lock()
-	defer c.TimeoutLock_.Unlock()
-	c.StateLock_.Lock()
-	defer c.StateLock_.Unlock()
+	var st = c.state()
+	if c.ContextLock_ != nil {
+		c.ContextLock_.RLock()
+		defer c.ContextLock_.RUnlock()
+	}
+	if c.DataLock != nil {
+		c.DataLock.RLock()
+		defer c.DataLock.RUnlock()
+	}
+	if c.EventLock_ != nil {
+		c.EventLock_.Lock()
+		defer c.EventLock_.Unlock()
+	}
+	if c.TimeoutLock_ != nil {
+		c.TimeoutLock_.Lock()
+		defer c.TimeoutLock_.Unlock()
+	}
+	st.stateLock_.Lock()
+	defer st.stateLock_.Unlock()
 	var cp = *c
-	cp.root_ = c
+	cp.Clock_ = &contextClock{Clock: c.Clock_, state: st, root: c, snapshot: true}
 	return cp
 }
 
+// live returns the context SetData installs data on: the root of a copy or
+// snapshot of an SDK-created context (also after its Clock_ was replaced),
+// or c itself for a literal. Data, attribute and experiment getters read it,
+// so reads through a copy agree with assignment evaluation.
 func (c *Context) live() *Context {
-	if c.root_ != nil {
-		return c.root_
+	if clock := c.ownClock(); clock != nil {
+		return clock.root
+	}
+	if c.ContextLock_ != nil {
+		if root := c.state().manualRoot; root != nil {
+			return root
+		}
 	}
 	return c
 }
 
 func (c *Context) GetExperiments() ([]string, error) {
+	c = c.live()
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
@@ -502,6 +765,7 @@ func (c *Context) GetExperiments() ([]string, error) {
 }
 
 func (c *Context) GetData() (jsonmodels.ContextData, error) {
+	c = c.live()
 	var err = c.CheckReady(true)
 	if err != nil {
 		return jsonmodels.ContextData{}, err
@@ -540,8 +804,12 @@ func (c *Context) SetOverrides(overrides map[string]int) error {
 	return nil
 }
 
-// SetCustomAssignment is allowed after the context is finalized, like SetOverride.
+// SetCustomAssignment returns the closed or closing error after Close, as in
+// v1.1.1 and the JS and Java SDKs. Unlike SetOverride, it is not allowed then.
 func (c *Context) SetCustomAssignment(experimentName string, variant int) error {
+	if err := c.CheckNotClosed(); err != nil {
+		return err
+	}
 	PutRW(c.ContextLock_, c.Cassignments_, experimentName, variant)
 	return nil
 }
@@ -589,6 +857,7 @@ func (c *Context) SetUnitValue(unitType string, uid interface{}) error {
 
 func (c *Context) setUnit(unitType string, uid interface{}) error {
 	c = c.live()
+	var st = c.state()
 	var err = c.CheckNotClosed()
 	if err != nil {
 		return err
@@ -607,7 +876,7 @@ func (c *Context) setUnit(unitType string, uid interface{}) error {
 
 	c.ContextLock_.Lock()
 	defer c.ContextLock_.Unlock()
-	var previous, exist = c.unitValues_[unitType]
+	var previous, exist = st.unitValues_[unitType]
 	if !exist {
 		if s, found := c.Units_[unitType]; found {
 			previous, exist = s, true
@@ -622,8 +891,8 @@ func (c *Context) setUnit(unitType string, uid interface{}) error {
 	}
 
 	c.Units_[unitType] = uidString
-	c.unitValues_[unitType] = value
-	c.evictRuleAssignmentsMissingUnit(unitType)
+	st.unitValues_[unitType] = value
+	c.evictRuleAssignmentsMissingUnit(st, unitType)
 	return nil
 }
 
@@ -634,12 +903,12 @@ func (c *Context) setUnit(unitType string, uid interface{}) error {
 // variant and queue a second, conflicting exposure. An evicted assignment is
 // marked exposed so a caller still holding it cannot queue it. The caller
 // holds ContextLock_ for writing.
-func (c *Context) evictRuleAssignmentsMissingUnit(unitType string) {
-	for name, entry := range c.assignmentCache_ {
+func (c *Context) evictRuleAssignmentsMissingUnit(st *contextState, unitType string) {
+	for name, entry := range st.assignmentCache_ {
 		var assignment = entry.assignment
-		if assignment.RuleOverride && entry.ruleMissingUnit && assignment.UnitType == unitType &&
+		if entry.ruleOverride && entry.ruleMissingUnit && assignment.UnitType == unitType &&
 			assignment.Exposed.CompareAndSwap(false, true) {
-			delete(c.assignmentCache_, name)
+			delete(st.assignmentCache_, name)
 			delete(c.AssignmentCache, name)
 		}
 	}
@@ -684,9 +953,10 @@ func toFloat64(v interface{}) float64 {
 // GetUnit returns the UID of a unit type, or nil when it is not set.
 func (c *Context) GetUnit(unitType string) interface{} {
 	c = c.live()
+	var st = c.state()
 	c.ContextLock_.RLock()
 	defer c.ContextLock_.RUnlock()
-	if v, ok := c.unitValues_[unitType]; ok {
+	if v, ok := st.unitValues_[unitType]; ok {
 		return v
 	}
 	if s, ok := c.Units_[unitType]; ok {
@@ -698,11 +968,12 @@ func (c *Context) GetUnit(unitType string) interface{} {
 // GetUnits returns a copy of all units, each as it was set.
 func (c *Context) GetUnits() map[string]interface{} {
 	c = c.live()
+	var st = c.state()
 	c.ContextLock_.RLock()
 	defer c.ContextLock_.RUnlock()
 	var result = make(map[string]interface{}, len(c.Units_))
 	for k, s := range c.Units_ {
-		if v, ok := c.unitValues_[k]; ok {
+		if v, ok := st.unitValues_[k]; ok {
 			result[k] = v
 		} else {
 			result[k] = s
@@ -722,6 +993,8 @@ func (c *Context) SetUnits(units map[string]string) error {
 }
 
 func (c *Context) SetAttribute(name string, value interface{}) error {
+	c = c.live()
+	var st = c.state()
 	var err = c.CheckNotClosed()
 	if err != nil {
 		return err
@@ -730,13 +1003,14 @@ func (c *Context) SetAttribute(name string, value interface{}) error {
 	var attribute = jsonmodels.Attribute{Name: name, Value: value, SetAt: c.Clock_.Millis()}
 	c.ContextLock_.Lock()
 	c.Attributes_ = append(c.Attributes_, attribute)
-	atomic.AddInt32(&c.AttrsSeq_, 1)
+	atomic.AddInt32(&st.attrsSeq_, 1)
 	c.ContextLock_.Unlock()
 	return nil
 }
 
 // GetAttribute returns the last value set for an attribute, or nil.
 func (c *Context) GetAttribute(name string) interface{} {
+	c = c.live()
 	c.ContextLock_.RLock()
 	defer c.ContextLock_.RUnlock()
 	for i := len(c.Attributes_) - 1; i >= 0; i-- {
@@ -749,6 +1023,7 @@ func (c *Context) GetAttribute(name string) interface{} {
 
 // GetAttributes returns the last value set for each attribute.
 func (c *Context) GetAttributes() map[string]interface{} {
+	c = c.live()
 	c.ContextLock_.RLock()
 	defer c.ContextLock_.RUnlock()
 	var result = map[string]interface{}{}
@@ -763,18 +1038,22 @@ func (c *Context) GetAttributes() map[string]interface{} {
 // evaluationAttributes builds the attribute map audiences are evaluated
 // against. The system attributes application and environment go in first, and
 // user-set attributes are overlaid on top, so a user-set value of the same
-// name always wins, even one set after an assignment was cached (the AttrsSeq_
+// name always wins, even one set after an assignment was cached (the attrsSeq_
 // bump invalidates it). Empty system values are left out rather than set to an
 // empty string, so a filter on a name that is not configured does not match.
 // These values are never published as attributes; the collector adds them to
 // exposures server-side. The caller must hold ContextLock_.
 func (c *Context) evaluationAttributes() map[string]interface{} {
+	return c.evaluationAttributesWithState(c.state())
+}
+
+func (c *Context) evaluationAttributesWithState(st *contextState) map[string]interface{} {
 	var attrs = map[string]interface{}{}
-	if len(c.application_) > 0 {
-		attrs["application"] = c.application_
+	if len(st.application_) > 0 {
+		attrs["application"] = st.application_
 	}
-	if len(c.environment_) > 0 {
-		attrs["environment"] = c.environment_
+	if len(st.environment_) > 0 {
+		attrs["environment"] = st.environment_
 	}
 	for _, v := range c.Attributes_ {
 		var attribute = v.(jsonmodels.Attribute)
@@ -798,21 +1077,34 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	var assignment = c.GetAssignment(experimentName)
-	if !assignment.Exposed.Load().(bool) {
-		c.QueueExposure(assignment)
+	var entry = c.assignmentEntry(experimentName)
+	if !entry.assignment.Exposed.Load().(bool) {
+		c.queueExposure(entry.assignment, entry.ruleOverride)
 	}
 
-	return assignment.Variant, nil
+	return entry.assignment.Variant, nil
 }
 
 func (c *Context) QueueExposure(assignment *Assignment) {
 	c = c.live()
+	var st = c.state()
+	// A copy returned by GetAssignment shares the cached assignment's exposed
+	// flag. Every rule-selected assignment's flag is recorded in
+	// ruleIdentities, which has its own lock, so this takes no ContextLock_
+	// and a caller holding it (an event logger, for one) cannot deadlock.
+	c.queueLiveExposure(assignment, st.ruleIdentities.contains(assignment.Exposed))
+}
+
+func (c *Context) queueExposure(assignment *Assignment, ruleOverride bool) {
+	c.live().queueLiveExposure(assignment, ruleOverride)
+}
+
+func (c *Context) queueLiveExposure(assignment *Assignment, ruleOverride bool) {
 	if assignment.Exposed.CompareAndSwap(false, true) {
 		var exposure = jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
 			Variant: assignment.Variant, ExposedAt: c.Clock_.Millis(), Assigned: assignment.Assigned,
 			Eligible: assignment.Eligible, Overridden: assignment.Overridden, FullOn: assignment.FullOn,
-			Custom: assignment.Custom, AudienceMismatch: assignment.AudienceMismatch, RuleOverride: assignment.RuleOverride}
+			Custom: assignment.Custom, AudienceMismatch: assignment.AudienceMismatch, RuleOverride: ruleOverride}
 
 		c.EventLock_.Lock()
 		// Close seals the context under EventLock_, so this check and the
@@ -842,7 +1134,7 @@ func (c *Context) PeekTreatment(experimentName string) (int, error) {
 		return -1, err
 	}
 
-	return c.GetAssignment(experimentName).Variant, nil
+	return c.assignmentEntry(experimentName).assignment.Variant, nil
 }
 
 // GetVariableKeys returns, for each variable key, the name of the first
@@ -854,9 +1146,22 @@ func (c *Context) GetVariableKeys() (map[string]string, error) {
 	}
 
 	var variableKeys = map[string]string{}
+	if literal := c.legacyVariableReader(); literal != nil {
+		literal.DataLock.RLock()
+		for key, value := range literal.IndexVariables_ {
+			if key, ok := key.(string); ok {
+				if experiment, ok := value.(ExperimentVariables); ok {
+					variableKeys[key] = experiment.Data.Name
+				}
+			}
+		}
+		literal.DataLock.RUnlock()
+		return variableKeys, nil
+	}
+	var st = c.state()
 
 	c.DataLock.RLock()
-	for key, experiments := range c.indexVariables_ {
+	for key, experiments := range st.indexVariables_ {
 		if len(experiments) > 0 {
 			variableKeys[key] = experiments[0].Data.Name
 		}
@@ -874,9 +1179,22 @@ func (c *Context) GetVariableKeysAll() (map[string][]string, error) {
 	}
 
 	var variableKeys = map[string][]string{}
+	if literal := c.legacyVariableReader(); literal != nil {
+		literal.DataLock.RLock()
+		for key, value := range literal.IndexVariables_ {
+			if key, ok := key.(string); ok {
+				if experiment, ok := value.(ExperimentVariables); ok {
+					variableKeys[key] = []string{experiment.Data.Name}
+				}
+			}
+		}
+		literal.DataLock.RUnlock()
+		return variableKeys, nil
+	}
+	var st = c.state()
 
 	c.DataLock.RLock()
-	for key, experiments := range c.indexVariables_ {
+	for key, experiments := range st.indexVariables_ {
 		var names = make([]string, 0, len(experiments))
 		for _, value := range experiments {
 			names = append(names, value.Data.Name)
@@ -901,6 +1219,7 @@ func removeDuplicateValues(intSlice []string) []string {
 }
 
 func (c *Context) GetCustomFieldValueKeys() ([]string, error) {
+	c = c.live()
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
@@ -934,6 +1253,7 @@ func (c *Context) GetCustomFieldValue(experimentName string, key string) interfa
 
 // GetCustomFieldValueE returns a custom field value or the context read error.
 func (c *Context) GetCustomFieldValueE(experimentName string, key string) (interface{}, error) {
+	c = c.live()
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
@@ -948,18 +1268,13 @@ func (c *Context) GetCustomFieldValueE(experimentName string, key string) (inter
 			value = field.Value
 		}
 	}
-	var parseErr = c.customFieldErrors_[experimentName][key]
 	c.DataLock.Unlock()
-
-	if parseErr != nil {
-		c.LogError(errors.New("Failed to parse JSON custom field value '" + key + "' for experiment '" +
-			experimentName + "': " + parseErr.Error()))
-	}
 
 	return value, nil
 }
 
 func (c *Context) GetCustomFieldValueType(experimentName string, key string) string {
+	c = c.live()
 	c.DataLock.Lock()
 	defer c.DataLock.Unlock()
 
@@ -991,29 +1306,56 @@ func (c *Context) PeekVariableValue(key string, defaultValue interface{}) (inter
 // set, so a fall-through still records that the unit saw the earlier
 // experiment. When no experiment along the way assigns the key, the caller's
 // default is returned. v1.1.1 read only the last experiment in the payload.
+//
+// A true Context{...} literal keeps v1.1.1's rule instead: it reads the one
+// experiment its current IndexVariables_ maps the key to, exposes it, and
+// returns the value whenever the assignment's variables have the key.
 func (c *Context) resolveVariableValue(key string, defaultValue interface{}, expose bool) (interface{}, error) {
 	var err = c.CheckReady(true)
 	if err != nil {
 		return nil, err
 	}
+	if literal := c.legacyVariableReader(); literal != nil {
+		return literal.resolveLiteralVariableValue(key, defaultValue, expose)
+	}
+	var st = c.state()
 
 	c.DataLock.RLock()
-	var experiments = c.indexVariables_[key]
+	var experiments = st.indexVariables_[key]
 	c.DataLock.RUnlock()
 
 	for _, experiment := range experiments {
-		var assignment = c.GetAssignment(experiment.Data.Name)
+		var entry = c.assignmentEntry(experiment.Data.Name)
+		var assignment = entry.assignment
 		if assignment.Variables == nil {
 			continue
 		}
 
 		if expose && !assignment.Exposed.Load().(bool) {
-			c.QueueExposure(assignment)
+			c.queueExposure(assignment, entry.ruleOverride)
 		}
 
-		if value, exist := assignment.Variables[key]; exist && (assignment.Assigned || assignment.Overridden || assignment.RuleOverride) {
+		if value, exist := assignment.Variables[key]; exist && (assignment.Assigned || assignment.Overridden || entry.ruleOverride) {
 			return value, nil
 		}
+	}
+	return defaultValue, nil
+}
+
+// resolveLiteralVariableValue is v1.1.1's GetVariableValue/PeekVariableValue
+// for a Context{...} literal.
+func (c *Context) resolveLiteralVariableValue(key string, defaultValue interface{}, expose bool) (interface{}, error) {
+	var experiment, err = c.GetVariableExperiment(key)
+	if err != nil {
+		return defaultValue, nil
+	}
+	var entry = c.assignmentEntry(experiment.Data.Name)
+	var assignment = entry.assignment
+	if expose && !assignment.Exposed.Load().(bool) {
+		c.queueExposure(assignment, entry.ruleOverride)
+	}
+	if value, exist := assignment.Variables[key]; exist {
+		return value, nil
 	}
 	return defaultValue, nil
 }
@@ -1076,8 +1418,63 @@ func (c *Context) GetPendingCount() int32 {
 	return c.PendingCount_.Load().(int32)
 }
 
+// refreshOperation owns copy adoption independently of Future's user listeners.
+// Its mutex is never held while invoking customer code or taking stateLock_.
+// A late join adopts synchronously, before RefreshAsync returns its future.
+// Every caller shares that future, so listeners can wait on other joiners.
+type refreshOperation struct {
+	mu        sync.Mutex
+	receivers map[*Context]struct{}
+	completed bool
+	settled   bool
+}
+
+func (op *refreshOperation) join(receiver, root *Context) {
+	if !receiver.needsLiveDataFrom(root) {
+		return
+	}
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	if !op.settled {
+		if op.receivers == nil {
+			op.receivers = map[*Context]struct{}{}
+		}
+		op.receivers[receiver] = struct{}{}
+	}
+	if op.completed {
+		receiver.adoptLiveDataFrom(root)
+	}
+}
+
+func (op *refreshOperation) complete(root *Context, succeeded bool) {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	if succeeded {
+		for receiver := range op.receivers {
+			receiver.adoptLiveDataFrom(root)
+		}
+	}
+	op.completed = true
+}
+
+// settle re-adopts the live data into every joined copy just before the
+// operation's future settles: a completion logger may have refreshed (or set
+// data) again meanwhile, and the copy's reads must agree with the live data
+// when its caller sees the outcome, success or failure.
+func (op *refreshOperation) settle(root *Context) {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	for receiver := range op.receivers {
+		receiver.adoptLiveDataFrom(root)
+	}
+	op.receivers = nil
+	op.settled = true
+}
+
 func (c *Context) RefreshAsync() *future.Future {
+	var receiver = c
 	c = c.live()
+	var st = c.state()
 	var err = c.CheckNotClosed()
 	if err != nil {
 		var tempfuture, donefun = future.New()
@@ -1085,19 +1482,14 @@ func (c *Context) RefreshAsync() *future.Future {
 		return tempfuture
 	}
 
-	if c.IsFailed() {
-		var resolved, done = future.New()
-		done(nil, nil)
-		return resolved
-	}
-
-	// Decide and publish under one lock so a concurrent caller that sees the
-	// refresh as running also sees its future.
-	c.StateLock_.Lock()
+	st.stateLock_.Lock()
 	if c.Refreshing_.Load().(bool) {
-		var active = c.RefreshFuture_
-		c.StateLock_.Unlock()
+		var active, op = c.RefreshFuture_, st.refresh_
+		st.stateLock_.Unlock()
 		if active != nil {
+			if op != nil {
+				op.join(receiver, c)
+			}
 			return active
 		}
 		var tempfuture, donefun = future.New()
@@ -1106,12 +1498,13 @@ func (c *Context) RefreshAsync() *future.Future {
 	}
 	c.Refreshing_.Store(true)
 	var tempfuture, donefun = future.New()
-	c.RefreshFuture_ = tempfuture
-	c.StateLock_.Unlock()
+	var op = &refreshOperation{}
+	c.RefreshFuture_, st.refresh_ = tempfuture, op
+	st.stateLock_.Unlock()
+	op.join(receiver, c)
 
-	c.callDataProvider().Listen(func(value future.Value, err error) {
-		// Whatever happens below, the refresh ends: Refreshing_ is cleared and
-		// the future settles, so later refreshes are not blocked for ever.
+	var loaded = c.callDataProvider()
+	var complete = func(value future.Value, err error) {
 		var outcome = err
 		var result jsonmodels.ContextData
 		var diagnostics []bufferedEvent
@@ -1128,19 +1521,28 @@ func (c *Context) RefreshAsync() *future.Future {
 				}
 			}
 		}
+		// Adopt every registered copy before loggers or future listeners can
+		// observe success. Registration racing completion adopts on its caller.
+		op.complete(c, outcome == nil)
+		st.stateLock_.Lock()
 		c.Refreshing_.Store(false)
+		if st.refresh_ == op {
+			st.refresh_ = nil
+		}
+		st.stateLock_.Unlock()
 
-		// The load is over, so a logger that calls Refresh starts a new one.
-		// Log before settling the future, so a caller that waits on Refresh
-		// returns after the logger has seen the refresh or error event.
+		// A logger may start another refresh. Keep this operation's future and
+		// settlement local, and preserve logger-before-return ordering.
 		c.dispatchDiagnostics(diagnostics)
 		if outcome == nil {
 			c.LogEvent(Refresh, result)
 		} else {
 			c.LogError(outcome)
 		}
+		op.settle(c)
 		donefun(nil, outcome)
-	})
+	}
+	loaded.Listen(complete)
 	return tempfuture
 }
 
@@ -1168,14 +1570,15 @@ func (c *Context) CloseAsync() (*future.Future, error) {
 // closeAttempt starts or joins a close and returns that attempt's close and
 // finalization futures together, so a later retry cannot replace them.
 func (c *Context) closeAttempt() (*future.Future, *future.Future) {
+	var st = c.state()
 	// Claim the close and publish its future in one critical section, so a
 	// concurrent caller that sees the context closing also gets the future of
 	// the close that is running.
-	c.StateLock_.Lock()
+	st.stateLock_.Lock()
 	if c.Closed_.Load().(bool) || c.Closing_.Load().(bool) {
 		var existing = c.ClosingFuture_
-		var existingFinalized = c.FinalizedFuture_
-		c.StateLock_.Unlock()
+		var existingFinalized = st.finalizedFuture_
+		st.stateLock_.Unlock()
 		if existingFinalized == nil {
 			var resolved, resolve = future.New()
 			resolve(nil, nil)
@@ -1184,7 +1587,7 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 		// A logger that re-enters a close that has already succeeded gets a
 		// settled future, as in v1.1.1: the close future may only settle once
 		// that logger returns.
-		if existing == nil || (c.Closed_.Load().(bool) && c.loggers_ != nil && c.loggers_.current()) {
+		if existing == nil || (c.Closed_.Load().(bool) && st.loggers_ != nil && st.loggers_.current()) {
 			var resolved, resolve = future.New()
 			resolve(nil, nil)
 			existing = resolved
@@ -1192,12 +1595,12 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 		return existing, existingFinalized
 	}
 	c.Closing_.Store(true)
-	c.closeStarted_ = true
+	st.closeStarted_ = true
 	var tempFuture, done = future.New()
 	c.ClosingFuture_ = tempFuture
 	var finalized, finalizeDone = future.New()
-	c.FinalizedFuture_ = finalized
-	c.StateLock_.Unlock()
+	st.finalizedFuture_ = finalized
+	st.stateLock_.Unlock()
 
 	c.ClearRefreshTimer()
 
@@ -1226,7 +1629,7 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 	var settle func(synchronous bool)
 	settle = func(synchronous bool) {
 		c.EventLock_.Lock()
-		var waitFor = c.inflightSnapshot()
+		var waitFor = st.inflightSnapshot()
 		if len(waitFor) > 0 {
 			c.EventLock_.Unlock()
 			var remaining = int32(len(waitFor))
@@ -1256,10 +1659,10 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 			// The failed batch is back in the queue. Leave the context open so
 			// Publish or Close can retry it. The refresh timer stays stopped:
 			// Close returns nothing, so the caller cannot know it must stop it.
-			c.StateLock_.Lock()
+			st.stateLock_.Lock()
 			c.ClosingFuture_ = nil
 			c.Closing_.Store(false)
-			c.StateLock_.Unlock()
+			st.stateLock_.Unlock()
 			// Start delivery before notifying Close listeners, which run
 			// synchronously and may wait for finalization.
 			go func() {
@@ -1277,7 +1680,7 @@ func (c *Context) closeAttempt() (*future.Future, *future.Future) {
 		// So is a close that would have to wait for an earlier publish logger.
 		// Each future's listeners run synchronously and may wait for the
 		// other future, so finalization settles on its own goroutine.
-		if synchronous && c.publishLogsDone() && (c.loggers_ == nil || !c.loggers_.current()) {
+		if synchronous && c.publishLogsDone() && (st.loggers_ == nil || !st.loggers_.current()) {
 			c.LogEvent(Finalize, nil)
 			go finalizeDone(nil, nil)
 			done(nil, nil)
@@ -1304,9 +1707,10 @@ func (c *Context) FinalizeAsync() (*future.Future, error) {
 }
 
 func (c *Context) publishLogsDone() bool {
-	c.StateLock_.Lock()
-	defer c.StateLock_.Unlock()
-	for _, f := range c.publishLogs_ {
+	var st = c.state()
+	st.stateLock_.Lock()
+	defer st.stateLock_.Unlock()
+	for _, f := range st.publishLogs_ {
 		if !f.Ready() {
 			return false
 		}
@@ -1315,9 +1719,10 @@ func (c *Context) publishLogsDone() bool {
 }
 
 func (c *Context) waitPublishLogs() {
-	c.StateLock_.Lock()
-	logs := append([]*future.Future(nil), c.publishLogs_...)
-	c.StateLock_.Unlock()
+	var st = c.state()
+	st.stateLock_.Lock()
+	logs := append([]*future.Future(nil), st.publishLogs_...)
+	st.stateLock_.Unlock()
 	for _, f := range logs {
 		f.Join(context.Background())
 	}
@@ -1329,8 +1734,9 @@ func (c *Context) waitPublishLogs() {
 // logger returns.
 func (c *Context) Close() {
 	c = c.live()
+	var st = c.state()
 	closing, finalized := c.closeAttempt()
-	if c.loggers_ != nil && c.loggers_.current() {
+	if st.loggers_ != nil && st.loggers_.current() {
 		closing.Join(context.Background())
 		return
 	}
@@ -1353,15 +1759,16 @@ const (
 // validCachedAssignment returns the cached assignment for experimentName and
 // whether it is still valid, with the rule set it was validated against. It
 // only reads, so it may run under ContextLock_ held for reading or writing.
-func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignment, *experimentRules, assignmentState) {
-	var entry, found = c.assignmentCache_[experimentName]
+// parse is the build's own fresh parse, or nil (see buildAssignmentLocked).
+func (c *Context) validCachedAssignment(st *contextState, experimentName string, parse *audienceParse) (*cachedAssignment, *experimentRules, assignmentState) {
+	var entry, found = st.assignmentCache_[experimentName]
 	if !found {
 		return nil, nil, assignmentStale
 	}
 	var assignment = entry.assignment
 	var custom, cfound = c.Cassignments_[experimentName]
 	var override, ofound = c.Overrides_[experimentName]
-	var experiment, rules, efound = c.experimentAndRules(experimentName)
+	var experiment, rules, efound = st.experimentAndRules(experimentName)
 
 	if ofound {
 		if assignment.Overridden && assignment.Variant == override.(int) {
@@ -1371,19 +1778,19 @@ func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignmen
 		// A rule-won assignment is not assigned either, but its variant came
 		// from the experiment's rules, so it is rebuilt once the experiment
 		// is gone.
-		if !assignment.Assigned && !assignment.RuleOverride {
+		if !assignment.Assigned && !entry.ruleOverride {
 			return entry, rules, assignmentValid
 		}
-	} else if assignment.RuleOverride || !cfound || custom.(int) == assignment.Variant {
+	} else if entry.ruleOverride || !cfound || custom.(int) == assignment.Variant {
 		// A matching rule wins over a custom assignment, so a custom
 		// assignment that differs from a rule-won variant is not staleness.
 		if !c.ExperimentMatches(experiment.Data, *assignment) {
 			return entry, rules, assignmentStale
 		}
-		if rules == entry.rules && atomic.LoadInt32(&c.AttrsSeq_) <= entry.attrsSeq {
+		if rules == entry.rules && atomic.LoadInt32(&st.attrsSeq_) <= entry.attrsSeq {
 			return entry, rules, assignmentValid
 		}
-		if c.ruleMatches(experiment.Data, rules, entry) && c.audienceMatches(experiment.Data, assignment) {
+		if c.ruleMatches(st, experiment.Data, rules, entry) && c.audienceMatches(st, experiment.Data, entry, parse) {
 			return entry, rules, assignmentRevalidated
 		}
 	}
@@ -1393,14 +1800,14 @@ func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignmen
 // ruleMatches reports whether the experiment's assignment rules still give the
 // cached assignment's outcome. It never updates the entry; a changed outcome
 // is reported as stale for GetAssignment to rebuild under the write lock.
-func (c *Context) ruleMatches(data jsonmodels.Experiment, rules *experimentRules, entry *cachedAssignment) bool {
+func (c *Context) ruleMatches(st *contextState, data jsonmodels.Experiment, rules *experimentRules, entry *cachedAssignment) bool {
 	var assignment = entry.assignment
 	// An exposed split resolved without its unit keeps resolving as if the
 	// unit were still missing, so a unit set afterwards cannot switch the
 	// variant the user already saw.
 	var pinnedMissing = entry.ruleMissingUnit && assignment.Exposed.Load().(bool)
-	var rule = c.resolveRule(data, rules, pinnedMissing, false)
-	if (rule != nil) != assignment.RuleOverride {
+	var rule = c.resolveRule(st, data, rules, pinnedMissing, false)
+	if (rule != nil) != entry.ruleOverride {
 		return false
 	}
 	if rule == nil {
@@ -1414,12 +1821,36 @@ func (c *Context) ruleMatches(data jsonmodels.Experiment, rules *experimentRules
 
 // audienceMatches reports whether the audience still gives the cached
 // assignment's audienceMismatch. A rule-won assignment skips the audience, as
-// in the JS SDK.
-func (c *Context) audienceMatches(data jsonmodels.Experiment, assignment *Assignment) bool {
-	if assignment.RuleOverride || len(data.Audience) == 0 {
+// in the JS SDK. parse is used when it was made for this experiment run;
+// otherwise only the built-in deserializer's cached parse is.
+func (c *Context) audienceMatches(st *contextState, data jsonmodels.Experiment, entry *cachedAssignment, parse *audienceParse) bool {
+	var assignment = entry.assignment
+	if entry.ruleOverride || len(data.Audience) == 0 {
 		return true
 	}
-	var match, err = c.AudienceMatcher_.Evaluate(data.Audience, c.evaluationAttributes())
+	if entry.failed.matches(data, c.AudienceMatcher_.Deserializer_) {
+		// Unparseable when built, so the audience was ignored. It stays
+		// ignored for this assignment, as v1.1.1's single assignment kept
+		// its fallback, while other experiments parse the text again.
+		return !assignment.AudienceMismatch
+	}
+	var parsed parsedAudience
+	if guarded := st.audiencePanic(data.Name, data, c.AudienceMatcher_.Deserializer_); guarded != nil {
+		// A logger is reporting this experiment's panic: revalidate with that
+		// failure, as the read that hit it does, rather than rebuilding.
+		parsed = guarded.parsed
+	} else if parse.matches(data, c.AudienceMatcher_.Deserializer_) {
+		// A fresh failure evaluates as an error, so the audience is ignored,
+		// as a rebuild would ignore it; an assignment that already ignored
+		// it is kept.
+		parsed = parse.parsed
+	} else if cached, ok := c.cachedAudience(st, data.Audience, c.AudienceMatcher_.Deserializer_); ok {
+		parsed = cached
+	} else {
+		// Not parsed yet: force the rebuild, which parses with no lock held.
+		return false
+	}
+	var match, err = parsed.evaluate(c.evaluationAttributesWithState(st))
 	var newAudienceMismatch = false
 	if err == nil {
 		newAudienceMismatch = !match.Get()
@@ -1444,12 +1875,12 @@ type ruleResolution struct {
 //
 // The caller holds ContextLock_. cache is false on the read path, where the
 // hashed-unit and assigner caches must not be written.
-func (c *Context) resolveRule(data jsonmodels.Experiment, rules *experimentRules, unitPinnedMissing bool, cache bool) *ruleResolution {
+func (c *Context) resolveRule(st *contextState, data jsonmodels.Experiment, rules *experimentRules, unitPinnedMissing bool, cache bool) *ruleResolution {
 	if rules == nil || rules.parsed == nil {
 		return nil
 	}
 
-	var action = c.AudienceMatcher_.evaluateRules(rules.parsed, c.environment_, c.evaluationAttributes())
+	var action = c.AudienceMatcher_.evaluateRules(rules.parsed, st.environment_, c.evaluationAttributesWithState(st))
 	if action == nil {
 		return nil
 	}
@@ -1492,36 +1923,140 @@ func (c *Context) resolveRule(data jsonmodels.Experiment, rules *experimentRules
 // the refreshed variables and rule bookkeeping, and the cached one is never
 // mutated while a reader may hold it. The caller holds ContextLock_ for
 // writing.
-func (c *Context) keepExposedRuleAssignment(data jsonmodels.Experiment, previous *cachedAssignment, fresh *Assignment) {
+func (c *Context) keepExposedRuleAssignment(data jsonmodels.Experiment, previous *cachedAssignment, entry *cachedAssignment) {
 	if previous == nil {
 		return
 	}
 	var old = previous.assignment
-	if !fresh.RuleOverride || !old.RuleOverride || old.Overridden || old.Variant != fresh.Variant ||
+	var fresh = entry.assignment
+	if !entry.ruleOverride || !previous.ruleOverride || old.Overridden || old.Variant != fresh.Variant ||
 		!old.Exposed.Load().(bool) || !c.ExperimentMatches(data, *old) {
 		return
 	}
 	fresh.Exposed = previous.assignment.Exposed
 }
 
+// GetAssignment returns a shallow copy of the experiment's assignment, as in
+// v1.1.1: changing its fields does not change the context's cached
+// assignment. The copy shares the cached Exposed flag (QueueExposure relies
+// on it), the Variables map and the TrafficSplit slice; treat those as
+// read-only.
 func (c *Context) GetAssignment(experimentName string) *Assignment {
+	var assignment = *c.assignmentEntry(experimentName).assignment
+	return &assignment
+}
+
+// assignmentEntry's assignment is shared with callers, so it is never mutated
+// once cached.
+func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
+	var st *contextState
+	if clock := c.ownClock(); clock != nil {
+		c, st = clock.root, clock.state
+	} else if st = c.literalState(); st.manualRoot != nil {
+		c = st.manualRoot
+	} else {
+		c.syncLiteralExperiment(st, experimentName)
+	}
 	// A valid cached assignment only needs the read lock, so concurrent reads
 	// of a shared context do not serialise.
 	c.ContextLock_.RLock()
-	if entry, _, state := c.validCachedAssignment(experimentName); state == assignmentValid {
+	if entry, _, state := c.validCachedAssignment(st, experimentName, nil); state == assignmentValid {
 		c.ContextLock_.RUnlock()
-		return entry.assignment
+		return entry
 	}
 	c.ContextLock_.RUnlock()
+
+	return c.buildAssignment(st, experimentName)
+}
+
+// buildAssignment validates or rebuilds experimentName's assignment under the
+// write lock. The audience is parsed only when the assignment needs it (an
+// override or a matching assignment rule skips it, as in v1.1.1): the locked
+// path then releases the lock, the text is parsed with no lock held, and it
+// tries again with that parse. Only new data installed during each parse
+// makes it parse again; after maxAudienceAttempts parses the audience counts
+// as unparseable for this evaluation.
+//
+// A custom deserializer's parse holds st.customAudiences from before the call
+// until the locked attempt that evaluates it returns, so on one context no
+// other custom parse runs while a result may still be in use, as in v1.1.1.
+// The built-in deserializer's parses, whose results are fresh, skip it. A
+// read from an event logger never waits for another goroutine's parse: that
+// deserializer may be waiting for the logger (a Refresh or WaitUntilReady
+// whose event it is delivering), so the read parses without the gate.
+func (c *Context) buildAssignment(st *contextState, experimentName string) *cachedAssignment {
+	var entry, unparsed = c.buildAssignmentLocked(st, experimentName, false, nil)
+	for attempt := 0; unparsed != nil; attempt++ {
+		entry, unparsed = c.buildAudienceAttempt(st, experimentName, attempt >= maxAudienceAttempts)
+	}
+	return entry
+}
+
+// buildAudienceAttempt owns the gate for one decode and its consuming locked
+// evaluation only. Waiting readers recheck the assignment before decoding:
+// another reader may have installed it while they waited.
+func (c *Context) buildAudienceAttempt(st *contextState, experimentName string, last bool) (*cachedAssignment, *jsonmodels.Experiment) {
+	if !builtinDeserializer(c.AudienceMatcher_.Deserializer_) &&
+		st.customAudiences.lock(st.loggers_ == nil || !st.loggers_.current()) {
+		defer st.customAudiences.unlock()
+	}
+	var entry, unparsed = c.buildAssignmentLocked(st, experimentName, last, nil)
+	if unparsed == nil {
+		return entry, nil
+	}
+	var parsed = c.parseAudienceUnlocked(st, experimentName, *unparsed)
+	return c.buildAssignmentLocked(st, experimentName, last, parsed)
+}
+
+// audienceParse is the parse one build made of an experiment run's audience,
+// successful or not (parsed.err set). It belongs to that build alone: a
+// custom deserializer's filter is evaluated by the next locked attempt and
+// then dropped, and a failure is kept only by the assignment it was made for
+// (cachedAssignment.failed), so other experiments with the same text parse
+// it themselves.
+type audienceParse struct {
+	id, iteration int
+	text          string
+	deserializer  AudienceDeserializer
+	parsed        parsedAudience
+}
+
+// matches reports whether f was made for this run of the experiment (its id
+// and iteration), with this text and deserializer: a replacement experiment
+// installed under the same name never inherits it.
+func (f *audienceParse) matches(data jsonmodels.Experiment, deserializer AudienceDeserializer) bool {
+	return f != nil && f.id == data.Id && f.iteration == data.Iteration && f.text == data.Audience &&
+		data.Audience != "" && sameDeserializer(f.deserializer, deserializer)
+}
+
+// audiencePanic is called with ContextLock_ held. It prevents a logger's read
+// of the experiment reporting a panic from recursively invoking its parser.
+func (st *contextState) audiencePanic(name string, data jsonmodels.Experiment, deserializer AudienceDeserializer) *audienceParse {
+	for _, failed := range st.audiencePanics[name] {
+		if failed.matches(data, deserializer) {
+			return failed
+		}
+	}
+	return nil
+}
+
+const maxAudienceAttempts = 4
+
+// buildAssignmentLocked returns the assignment, or the audience text that has
+// to be parsed (with no lock held) before it can be built. parse is this
+// build's own parse, from the previous attempt; it is used, for revalidating
+// or building, only when it was made for the experiment run found now. On the
+// last attempt a text not parsed yet counts as unparseable too.
+func (c *Context) buildAssignmentLocked(st *contextState, experimentName string, last bool, parse *audienceParse) (*cachedAssignment, *jsonmodels.Experiment) {
 
 	// Cache miss, out of date, or revalidated. Check again under the write
 	// lock: another goroutine may have rebuilt the assignment meanwhile, and
 	// replacing it would lose its exposed flag and queue a second exposure.
 	c.ContextLock_.Lock()
-	var previous, validated, state = c.validCachedAssignment(experimentName)
+	var previous, validated, state = c.validCachedAssignment(st, experimentName, parse)
 	if state == assignmentValid {
 		c.ContextLock_.Unlock()
-		return previous.assignment
+		return previous, nil
 	}
 	if state == assignmentRevalidated {
 		// Still the same outcome: acknowledge the rules and attributes it was
@@ -1531,21 +2066,21 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 		// validated; a refresh racing this records the old rule set, which
 		// only makes the next read revalidate.
 		previous.rules = validated
-		previous.attrsSeq = atomic.LoadInt32(&c.AttrsSeq_)
+		previous.attrsSeq = atomic.LoadInt32(&st.attrsSeq_)
 		c.ContextLock_.Unlock()
-		return previous.assignment
+		return previous, nil
 	}
 
 	var custom, cfound = c.Cassignments_[experimentName]
 	var override, ofound = c.Overrides_[experimentName]
-	var experiment, rules, efound = c.experimentAndRules(experimentName)
+	var experiment, rules, efound = st.experimentAndRules(experimentName)
 
 	var exposed = &atomic.Value{}
 	exposed.Store(false)
 	var assignment = &Assignment{Exposed: exposed}
 	assignment.Name = experimentName
 	assignment.Eligible = true
-	var entry = &cachedAssignment{assignment: assignment, rules: rules, attrsSeq: atomic.LoadInt32(&c.AttrsSeq_)}
+	var entry = &cachedAssignment{assignment: assignment, rules: rules, attrsSeq: atomic.LoadInt32(&st.attrsSeq_)}
 
 	if ofound {
 		if efound {
@@ -1562,22 +2097,45 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 			// A matching rule is an explicit assignment, like an override: it
 			// wins over the audience, audienceStrict, traffic eligibility,
 			// full-on and custom assignments.
-			if rule := c.resolveRule(experiment.Data, rules, false, true); rule != nil {
+			if rule := c.resolveRule(st, experiment.Data, rules, false, true); rule != nil {
 				assignment.Variant = rule.variant
-				assignment.RuleOverride = true
+				entry.ruleOverride = true
 				entry.ruleMissingUnit = rule.missingUnit
 			}
 
-			if !assignment.RuleOverride && len(experiment.Data.Audience) > 0 {
-				var attrs = c.evaluationAttributes()
+			if !entry.ruleOverride && len(experiment.Data.Audience) > 0 {
+				var attrs = c.evaluationAttributesWithState(st)
 
-				var match, err = c.AudienceMatcher_.Evaluate(experiment.Data.Audience, attrs)
-				if err == nil {
+				var text = experiment.Data.Audience
+				var deserializer = c.AudienceMatcher_.Deserializer_
+				if guarded := st.audiencePanic(experimentName, experiment.Data, deserializer); guarded != nil {
+					entry.failed = guarded
+				} else if parse.matches(experiment.Data, deserializer) {
+					// This build's own parse, evaluated as soon as the lock
+					// is taken: a custom deserializer's result is never kept.
+					if match, err := parse.parsed.evaluate(attrs); err == nil {
+						assignment.AudienceMismatch = !match.Get()
+					} else {
+						entry.failed = parse
+					}
+				} else if parsed, ok := c.cachedAudience(st, text, deserializer); ok {
+					// The built-in deserializer's cache holds only usable
+					// parses, so this evaluation cannot fail.
+					var match, _ = parsed.evaluate(attrs)
 					assignment.AudienceMismatch = !match.Get()
+				} else if !last {
+					// The data changed between the unlocked parse and this
+					// lock: parse the new audience unlocked and start over.
+					c.ContextLock_.Unlock()
+					var data = experiment.Data
+					return nil, &data
 				}
+				// Otherwise (the last attempt, with new data installed during
+				// every parse) the audience is ignored for this build only:
+				// the next revalidation parses it again.
 			}
 
-			if !assignment.RuleOverride {
+			if !entry.ruleOverride {
 				var assignBuf [12]int8
 				if experiment.Data.AudienceStrict && assignment.AudienceMismatch {
 					assignment.Variant = 0
@@ -1615,7 +2173,6 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 			assignment.Iteration = experiment.Data.Iteration
 			assignment.TrafficSplit = experiment.Data.TrafficSplit
 			assignment.FullOnVariant = experiment.Data.FullOnVariant
-			assignment.AttrsSeq = atomic.LoadInt32(&c.AttrsSeq_)
 		}
 	}
 
@@ -1624,19 +2181,23 @@ func (c *Context) GetAssignment(experimentName string) *Assignment {
 	}
 
 	if efound {
-		c.keepExposedRuleAssignment(experiment.Data, previous, assignment)
+		c.keepExposedRuleAssignment(experiment.Data, previous, entry)
 	}
 
-	c.assignmentCache_[experimentName] = entry
+	if entry.ruleOverride {
+		st.ruleIdentities.remember(assignment.Exposed)
+	}
+	st.assignmentCache_[experimentName] = entry
 	c.AssignmentCache[experimentName] = *assignment
 	c.ContextLock_.Unlock()
-	return assignment
+	return entry, nil
 }
 
 func (c *Context) ClearRefreshTimer() {
 	c = c.live()
-	c.StateLock_.Lock()
-	defer c.StateLock_.Unlock()
+	var st = c.state()
+	st.stateLock_.Lock()
+	defer st.stateLock_.Unlock()
 	if c.RefreshTimer_ != nil {
 		c.RefreshTimer_.Stop()
 		c.RefreshTimer_ = nil
@@ -1645,16 +2206,234 @@ func (c *Context) ClearRefreshTimer() {
 
 // GetExperiment returns the experiment from the installed context data. It
 // reads the index setData published atomically, so a refresh installing new
-// data cannot race it, and it takes no lock.
+// data cannot race it.
+//
+// A context with no state carrier (a literal, or a copy of a context whose
+// Clock_ was replaced) reads its own Index_ under DataLock, as v1.1.1 read
+// it, without ContextLock_. SetData and Refresh keep it current, including
+// through such a copy (see adoptLiveDataFrom).
 func (c *Context) GetExperiment(experimentName string) (ExperimentVariables, bool) {
-	var result, _, found = c.experimentAndRules(experimentName)
+	var clock = c.ownClock()
+	if clock == nil {
+		if c.DataLock != nil {
+			c.DataLock.RLock()
+			defer c.DataLock.RUnlock()
+		}
+		result, found := c.Index_[experimentName]
+		return result, found
+	}
+	var result, _, found = clock.state.experimentAndRules(experimentName)
 	return result, found
+}
+
+func (st *contextState) loadIndex() *contextIndex {
+	return st.index_.Load().(*contextIndex)
+}
+
+// audienceEntry is a cached parse and the deserializer that made it: the same
+// text through a replaced AudienceMatcher_ is parsed again.
+type audienceEntry struct {
+	deserializer AudienceDeserializer
+	parsed       parsedAudience
+}
+
+// sameDeserializer reports whether a cached parse was made by b. Values of a
+// type Go cannot compare (a func, a struct holding a map) or that compare
+// unequal to themselves (a struct holding a NaN, an interface field holding
+// a func) cannot be told apart, so for those any value of the same type
+// counts as the same deserializer. It never panics: it runs under
+// ContextLock_.
+func sameDeserializer(a, b AudienceDeserializer) (same bool) {
+	var ta, tb = reflect.TypeOf(a), reflect.TypeOf(b)
+	if ta != tb {
+		return false
+	}
+	if ta == nil || !ta.Comparable() {
+		return true
+	}
+	defer func() {
+		if recover() != nil {
+			same = true
+		}
+	}()
+	return a == b || b != b
+}
+
+// builtinDeserializer reports whether d is the SDK's own deserializer, whose
+// output is a fresh json.Unmarshal result on every call and so can be cached
+// as is.
+func builtinDeserializer(d AudienceDeserializer) bool {
+	switch d.(type) {
+	case nil, DefaultAudienceDeserializer, *DefaultAudienceDeserializer:
+		return true
+	}
+	return false
+}
+
+// parseAudienceUnlocked runs customer code without context locks and returns
+// the parse for the requesting build, successful or not. Only the built-in
+// deserializer's usable parses enter the shared cache: a custom deserializer
+// may reuse its result storage between calls, so its result is evaluated by
+// the next locked attempt and never kept. A panic is detected by whether the
+// parse returned, not by recover's value, so panic(nil) on Go versions where
+// recover returns nil for it counts as a panic too.
+func (c *Context) parseAudienceUnlocked(st *contextState, name string, data jsonmodels.Experiment) *audienceParse {
+	var deserializer = c.AudienceMatcher_.Deserializer_
+	var text = data.Audience
+	var parse = &audienceParse{id: data.Id, iteration: data.Iteration, text: text, deserializer: deserializer}
+	var builtin = builtinDeserializer(deserializer)
+	if builtin {
+		if parsed, ok := c.cachedAudience(st, text, deserializer); ok {
+			parse.parsed = parsed
+			return parse
+		}
+	}
+	var returned bool
+	var panicked interface{}
+	parse.parsed = func() (parsed parsedAudience) {
+		defer func() {
+			if !returned {
+				panicked = recover()
+				parsed = parsedAudience{err: errAudienceUnparseable}
+			}
+		}()
+		parsed = AudienceMatcher{deserializer}.parseAudience(text)
+		returned = true
+		return parsed
+	}()
+	if !returned {
+		c.logAudiencePanic(st, name, parse, panicked)
+		return parse
+	}
+	if builtin && parse.parsed.err == nil {
+		st.audiences.Store(text, &audienceEntry{deserializer: deserializer, parsed: parse.parsed})
+		if !st.hasAudience(text) {
+			// Data installed during parsing may already have pruned this text.
+			st.audiences.Delete(text)
+		}
+	}
+	return parse
+}
+
+func (c *Context) logAudiencePanic(st *contextState, name string, failed *audienceParse, panicked interface{}) {
+	c.ContextLock_.Lock()
+	if st.audiencePanics == nil {
+		st.audiencePanics = map[string][]*audienceParse{}
+	}
+	st.audiencePanics[name] = append(st.audiencePanics[name], failed)
+	c.ContextLock_.Unlock()
+	defer func() {
+		c.ContextLock_.Lock()
+		defer c.ContextLock_.Unlock()
+		var active = st.audiencePanics[name]
+		for i, entry := range active {
+			if entry == failed {
+				active = append(active[:i], active[i+1:]...)
+				break
+			}
+		}
+		if len(active) == 0 {
+			delete(st.audiencePanics, name)
+		} else {
+			st.audiencePanics[name] = active
+		}
+	}()
+	c.LogError(fmt.Errorf("AudienceDeserializer panicked: %v", panicked))
+}
+
+// cachedAudience returns a parse the built-in deserializer made earlier in
+// parseAudienceUnlocked, when deserializer is the one that made it. It may be
+// called with ContextLock_ held, so it never runs the deserializer; it reports
+// false when the audience was not parsed yet, and always for a custom
+// deserializer, whose parses are never cached.
+func (c *Context) cachedAudience(st *contextState, text string, deserializer AudienceDeserializer) (parsedAudience, bool) {
+	if entry, ok := st.audiences.Load(text); ok {
+		var entry = entry.(*audienceEntry)
+		if sameDeserializer(entry.deserializer, deserializer) {
+			return entry.parsed, true
+		}
+	}
+	// A miss carries the unparseable error, so evaluating it by mistake can
+	// never read a nil filter.
+	return parsedAudience{err: errAudienceUnparseable}, false
+}
+
+// pruneAudiences drops the parses of audience texts the installed data no
+// longer has, so the cache does not grow with every refresh.
+func (st *contextState) pruneAudiences() {
+	st.audiences.Range(func(text, _ interface{}) bool {
+		if !st.hasAudience(text.(string)) {
+			st.audiences.Delete(text)
+		}
+		return true
+	})
+}
+
+// hasAudience reports whether an installed experiment has audience text.
+func (st *contextState) hasAudience(text string) bool {
+	if index := st.loadIndex(); index != nil {
+		var _, found = index.audienceTexts()[text]
+		return found
+	}
+	return false
+}
+
+// syncLiteralExperiment makes the private index entry of a context built as
+// a literal follow its Index_ entry, which a caller may edit, so its
+// assignments read Index_ as v1.1.1 did. Like v1.1.1's GetExperiment it reads
+// Index_ without DataLock, so a caller holding DataLock can still read
+// treatments. No customer code runs here: an edited entry keeps the rules
+// SetData parsed for it only while its assignmentRules text is unchanged,
+// and otherwise has none, as an entry present at the first read has none
+// (v1.1.1 had no rules). Contexts the SDK created keep their own index.
+func (c *Context) syncLiteralExperiment(st *contextState, experimentName string) {
+	// indexLock_, not DataLock: setData holds it while it writes Index_ and
+	// installs the index, so the two are read consistently and race-free,
+	// and a caller holding DataLock can still read treatments.
+	st.indexLock_.Lock()
+	defer st.indexLock_.Unlock()
+	var experiment, found = c.Index_[experimentName]
+	var current, rules, installed = st.experimentAndRules(experimentName)
+	if found == installed && (!found || sameLiteralEntry(current, experiment)) {
+		return
+	}
+	var indexed = map[string]*indexedExperiment{}
+	if previous := st.loadIndex(); previous != nil {
+		for name, entry := range previous.experiments {
+			indexed[name] = entry
+		}
+	}
+	if !installed || current.Data.AssignmentRules != experiment.Data.AssignmentRules {
+		rules = nil
+	}
+	if found {
+		indexed[experimentName] = &indexedExperiment{experiment: experiment, rules: rules}
+	} else {
+		delete(indexed, experimentName)
+	}
+	st.index_.Store(&contextIndex{experiments: indexed})
+}
+
+// sameLiteralEntry reports whether an Index_ entry still matches the private
+// copy in the fields an assignment reads, without reflection on the cached
+// read path. Slices compare by identity: an entry copied from Index_ shares
+// them, and a replaced one has new ones.
+func sameLiteralEntry(a, b ExperimentVariables) bool {
+	var x, y = a.Data, b.Data
+	return x.Id == y.Id && x.Name == y.Name && x.UnitType == y.UnitType && x.Iteration == y.Iteration &&
+		x.SeedHi == y.SeedHi && x.SeedLo == y.SeedLo && x.TrafficSeedHi == y.TrafficSeedHi &&
+		x.TrafficSeedLo == y.TrafficSeedLo && x.FullOnVariant == y.FullOnVariant &&
+		x.Audience == y.Audience && x.AudienceStrict == y.AudienceStrict &&
+		sameSplit(x.Split, y.Split) && sameSplit(x.TrafficSplit, y.TrafficSplit) &&
+		x.AssignmentRules == y.AssignmentRules &&
+		len(x.Variants) == len(y.Variants) && (len(x.Variants) == 0 || &x.Variants[0] == &y.Variants[0]) &&
+		len(a.Variables) == len(b.Variables) && (len(a.Variables) == 0 || &a.Variables[0] == &b.Variables[0])
 }
 
 // experimentAndRules is GetExperiment plus the experiment's parsed assignment
 // rules, read from the same installed index.
-func (c *Context) experimentAndRules(experimentName string) (ExperimentVariables, *experimentRules, bool) {
-	var index = c.index_.Load()
+func (st *contextState) experimentAndRules(experimentName string) (ExperimentVariables, *experimentRules, bool) {
+	var index = st.loadIndex()
 	if index == nil {
 		return ExperimentVariables{}, nil, false
 	}
@@ -1669,23 +2448,23 @@ func (c *Context) ExperimentMatches(experiment jsonmodels.Experiment, assignment
 		experiment.UnitType == assignment.UnitType &&
 		experiment.Iteration == assignment.Iteration &&
 		experiment.FullOnVariant == assignment.FullOnVariant &&
-		reflect.DeepEqual(experiment.TrafficSplit, assignment.TrafficSplit)
+		sameSplit(experiment.TrafficSplit, assignment.TrafficSplit)
 }
 
-func (c *Context) AudienceMatches(experiment jsonmodels.Experiment, assignment *Assignment) bool {
-	if len(experiment.Audience) > 0 {
-		if atomic.LoadInt32(&c.AttrsSeq_) > assignment.AttrsSeq {
-			var attrs = c.evaluationAttributes()
-
-			var match, err = c.AudienceMatcher_.Evaluate(experiment.Audience, attrs)
-			var newAudienceMismatch = false
-			if err == nil {
-				newAudienceMismatch = !match.Get()
-			}
-
-			if newAudienceMismatch != assignment.AudienceMismatch {
-				return false
-			}
+// sameSplit is reflect.DeepEqual for two []float64, without its reflection
+// and allocation on the cached-read path. As DeepEqual: nil and empty differ,
+// the same backing array is equal, and other elements compare with == (so a
+// NaN in two different arrays differs).
+func sameSplit(a []float64, b []float64) bool {
+	if (a == nil) != (b == nil) || len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 || &a[0] == &b[0] {
+		return true
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
 		}
 	}
 	return true
@@ -1754,9 +2533,34 @@ func (c *Context) CheckReady(expectNotClosed bool) error {
 }
 
 func (c *Context) SetData(data jsonmodels.ContextData) {
+	var receiver, root = c, c.live()
 	var buffer = &diagnosticBuffer{}
-	c.setData(data, buffer)
-	c.dispatchDiagnostics(buffer.take())
+	root.setData(data, buffer)
+	receiver.adoptLiveDataFrom(root)
+	receiver.dispatchDiagnostics(buffer.take())
+	// A diagnostics logger may have installed newer data: adopt again, so the
+	// copy's reads agree with the live data when SetData returns.
+	receiver.adoptLiveDataFrom(root)
+}
+
+// adoptLiveDataFrom copies the data installed on root into c's own v1.1.1
+// data fields when c is a copy without a state carrier, so its direct index
+// lookups agree with reads through the live context. Resolve root before
+// taking DataLock: live may take ContextLock_ on a clock-replaced context.
+func (c *Context) adoptLiveDataFrom(root *Context) {
+	if !c.needsLiveDataFrom(root) {
+		return
+	}
+	c.DataLock.Lock()
+	c.Index_ = root.Index_
+	c.IndexVariables_ = root.IndexVariables_
+	c.Data_ = root.Data_
+	c.ContextCustomFields_ = root.ContextCustomFields_
+	c.DataLock.Unlock()
+}
+
+func (c *Context) needsLiveDataFrom(root *Context) bool {
+	return c != root && c.ownClock() == nil && c.ContextLock_ != nil
 }
 
 // diagnosticBuffer collects the events the parser and SetData emit while a
@@ -1794,14 +2598,15 @@ func (c *Context) dispatchDiagnostics(events []bufferedEvent) {
 }
 
 func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer) {
+	c = c.live()
+	var st = c.state()
 	var self = c.snapshot()
 	self.EventLogger_ = buffer
 	var index = map[string]ExperimentVariables{}
 	var indexVariables = map[string][]ExperimentVariables{}
 	var contextCustomFields = map[string]map[string]ContextCustomFieldValue{}
-	var customFieldErrors = map[string]map[string]error{}
 	var rules = map[string]*experimentRules{}
-	var previous = c.index_.Load()
+	var previous = st.loadIndex()
 	var previousRules = func(name string) *experimentRules {
 		if previous != nil {
 			if entry, found := previous.experiments[name]; found {
@@ -1846,34 +2651,15 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 			if len(customFieldValue.Value) > 0 {
 				var customValue = customFieldValue.Value
 				if strings.HasPrefix(customFieldValue.Type, "json") {
-					if parser, ok := c.VariableParser_.(CustomFieldValueParser); ok {
-						parsed, err := parser.ParseCustomFieldValue(self, experiment.Name, customFieldValue.Name, customValue)
-						value.Value = parsed
-						if err != nil {
-							if customFieldErrors[experiment.Name] == nil {
-								customFieldErrors[experiment.Name] = map[string]error{}
-							}
-							customFieldErrors[experiment.Name][customFieldValue.Name] = err
-						}
+					if parser, ok := customFieldValueParser(c.VariableParser_); ok {
+						value.Value, _ = parser.ParseCustomFieldValue(self, experiment.Name, customFieldValue.Name, customValue)
 					} else {
 						value.Value = c.VariableParser_.Parse(self, experiment.Name, customFieldValue.Name, customValue)
 					}
 				} else if strings.HasPrefix(customFieldValue.Type, "boolean") {
-					parsed, err := strconv.ParseBool(customValue)
-					if err != nil && c.EventLogger_ != nil {
-						buffer.HandleEvent(self, Error,
-							errors.New("SetData: Failed to parse boolean custom field '"+customFieldValue.Name+
-								"' in experiment '"+experiment.Name+"': "+err.Error()))
-					}
-					value.Value = parsed
+					value.Value, _ = strconv.ParseBool(customValue)
 				} else if strings.HasPrefix(customFieldValue.Type, "number") {
-					parsed, err := strconv.ParseInt(customValue, 10, 64)
-					if err != nil && c.EventLogger_ != nil {
-						buffer.HandleEvent(self, Error,
-							errors.New("SetData: Failed to parse number custom field '"+customFieldValue.Name+
-								"' in experiment '"+experiment.Name+"': "+err.Error()))
-					}
-					value.Value = parsed
+					value.Value, _ = strconv.ParseInt(customValue, 10, 64)
 				} else {
 					value.Value = customValue
 				}
@@ -1904,20 +2690,22 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 
 	c.DataLock.Lock()
 
-	c.Index_ = index
 	var indexed = make(map[string]*indexedExperiment, len(index))
 	for name, experiment := range index {
 		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name]}
 	}
-	c.index_.Store(&contextIndex{experiments: indexed})
+	st.indexLock_.Lock()
+	c.Index_ = index
+	st.index_.Store(&contextIndex{experiments: indexed})
+	st.indexLock_.Unlock()
+	st.pruneAudiences()
 	c.ContextCustomFields_ = contextCustomFields
-	c.customFieldErrors_ = customFieldErrors
-	c.indexVariables_ = indexVariables
+	st.indexVariables_ = indexVariables
 	c.IndexVariables_ = legacyIndexVariables(indexVariables)
 	c.Data_ = data
 	c.Ready_.Store(true)
 
-	c.SetRefreshTimer()
+	c.setRefreshTimer(st)
 	c.DataLock.Unlock()
 }
 
@@ -1949,7 +2737,7 @@ func (c *Context) LogError(err error) {
 func (c *Context) logEvent(event EventType, data interface{}) {
 	if c.EventLogger_ != nil {
 		var snapshot = c.snapshot()
-		if loggers := c.live().loggers_; loggers != nil {
+		if loggers := c.live().state().loggers_; loggers != nil {
 			var id = loggers.enter()
 			defer loggers.exit(id)
 		}
@@ -1977,20 +2765,26 @@ func panicToError(r interface{}) error {
 }
 
 func (c *Context) SetDataFailed(err error) {
+	var receiver = c
+	c = c.live()
+	var st = c.state()
 	c.DataLock.Lock()
+	st.indexLock_.Lock()
 	c.Index_ = map[string]ExperimentVariables{}
-	c.index_.Store(&contextIndex{})
-	c.indexVariables_ = map[string][]ExperimentVariables{}
+	st.index_.Store(&contextIndex{})
+	st.indexLock_.Unlock()
+	st.indexVariables_ = map[string][]ExperimentVariables{}
 	c.IndexVariables_ = map[interface{}]interface{}{}
-	c.customFieldErrors_ = nil
 	c.Data_ = jsonmodels.ContextData{}
 	c.Ready_.Store(true)
 	c.Failed_.Store(true)
 	c.DataLock.Unlock()
+	receiver.adoptLiveDataFrom(c)
 }
 
 func (c *Context) Flush() *future.Future {
 	c = c.live()
+	var st = c.state()
 	c.ClearTimeout()
 
 	if !c.Failed_.Load().(bool) {
@@ -2022,16 +2816,16 @@ func (c *Context) Flush() *future.Future {
 			c.PendingCount_.Store(int32(0))
 			// Register the publish in the same critical section that drains
 			// the queue, so CloseAsync cannot miss it.
-			c.addInflight(settled)
-			c.StateLock_.Lock()
+			st.addInflight(settled)
+			st.stateLock_.Lock()
 			var activeLogs []*future.Future
-			for _, f := range c.publishLogs_ {
+			for _, f := range st.publishLogs_ {
 				if !f.Ready() {
 					activeLogs = append(activeLogs, f)
 				}
 			}
-			c.publishLogs_ = append(activeLogs, result)
-			c.StateLock_.Unlock()
+			st.publishLogs_ = append(activeLogs, result)
+			st.stateLock_.Unlock()
 		}
 		c.EventLock_.Unlock()
 
@@ -2041,16 +2835,9 @@ func (c *Context) Flush() *future.Future {
 			event.PublishedAt = c.Clock_.Millis()
 
 			c.ContextLock_.Lock()
-			var entrySet []interface{}
+			event.Units = make([]jsonmodels.Unit, 0, len(c.Units_))
 			for key, value := range c.Units_ {
-				entrySet = append(entrySet, Pair{a: key, b: value})
-			}
-
-			var mapper = FlushMapper{ctx: c}
-			var temp = MapSetToArray(entrySet, make([]interface{}, 0), mapper)
-			event.Units = make([]jsonmodels.Unit, 0)
-			for _, value := range temp {
-				event.Units = append(event.Units, value.(jsonmodels.Unit))
+				event.Units = append(event.Units, flushUnit(c, key, value))
 			}
 			if len(c.Attributes_) == 0 {
 				event.Attributes = make([]jsonmodels.Attribute, 0)
@@ -2080,7 +2867,7 @@ func (c *Context) Flush() *future.Future {
 						c.requeueEvents(exposures, achievements, eventCount)
 						runLogger(done, err, func() { c.logEvent(Error, err) })
 					}
-					c.removeInflight(settled)
+					st.removeInflight(settled)
 					settledDone(nil, err)
 				})
 
@@ -2099,33 +2886,36 @@ func (c *Context) Flush() *future.Future {
 	return result
 }
 
-func (c *Context) addInflight(f *future.Future) {
-	c.StateLock_.Lock()
-	c.inflight_ = append(c.inflight_, f)
-	c.StateLock_.Unlock()
+func (st *contextState) addInflight(f *future.Future) {
+	st.stateLock_.Lock()
+	st.inflight_ = append(st.inflight_, f)
+	st.stateLock_.Unlock()
 }
 
-func (c *Context) removeInflight(f *future.Future) {
-	c.StateLock_.Lock()
-	for i, g := range c.inflight_ {
+// removeInflight drops a settled publish from the state that registered it
+// (Flush captured it), without reading Clock_ again.
+func (st *contextState) removeInflight(f *future.Future) {
+	st.stateLock_.Lock()
+	for i, g := range st.inflight_ {
 		if g == f {
-			c.inflight_ = append(c.inflight_[:i:i], c.inflight_[i+1:]...)
+			st.inflight_ = append(st.inflight_[:i:i], st.inflight_[i+1:]...)
 			break
 		}
 	}
-	c.StateLock_.Unlock()
+	st.stateLock_.Unlock()
 }
 
 func (c *Context) inflightCount() int {
-	c.StateLock_.Lock()
-	defer c.StateLock_.Unlock()
-	return len(c.inflight_)
+	var st = c.state()
+	st.stateLock_.Lock()
+	defer st.stateLock_.Unlock()
+	return len(st.inflight_)
 }
 
-func (c *Context) inflightSnapshot() []*future.Future {
-	c.StateLock_.Lock()
-	defer c.StateLock_.Unlock()
-	return append([]*future.Future(nil), c.inflight_...)
+func (st *contextState) inflightSnapshot() []*future.Future {
+	st.stateLock_.Lock()
+	defer st.stateLock_.Unlock()
+	return append([]*future.Future(nil), st.inflight_...)
 }
 
 // runLogger runs an observer on its own goroutine so lifecycle re-entry cannot
@@ -2200,24 +2990,21 @@ func (c *Context) requeueEvents(exposures []jsonmodels.Exposure, achievements []
 type FlushMapper struct {
 	MapperInt
 	Context Context
-	// ctx is the live context the SDK flushes; when nil, Context is used.
-	ctx *Context
 }
 
 func (f FlushMapper) Apply(value interface{}) interface{} {
-	var key = value.(Pair).a
-	var val = value.(Pair).b
-	var cntx = f.ctx
-	if cntx == nil {
-		cntx = &f.Context
-	}
-	var data [22]byte
-	var uid = cntx.GetUnitHash(key, val, data[:], false)
-	var res = f.forceASCII(string(uid))
-	return jsonmodels.Unit{Type: value.(Pair).a, Uid: res}
+	return flushUnit(&f.Context, value.(Pair).a, value.(Pair).b)
 }
 
-func (f FlushMapper) forceASCII(s string) string {
+// flushUnit is a published unit: its type and hashed UID. Flush calls it on
+// the live context directly, which must not be copied into a FlushMapper.
+func flushUnit(cntx *Context, unitType string, uid string) jsonmodels.Unit {
+	var data [22]byte
+	var hash = cntx.GetUnitHash(unitType, uid, data[:], false)
+	return jsonmodels.Unit{Type: unitType, Uid: asciiOnly(string(hash))}
+}
+
+func asciiOnly(s string) string {
 	rs := make([]rune, 0, len(s))
 	for _, r := range s {
 		if r <= 127 {
@@ -2238,7 +3025,13 @@ func (c *Context) ClearTimeout() {
 }
 
 func (c *Context) SetTimeout() {
-	c = c.live()
+	c.live().armTimeout()
+}
+
+// armTimeout arms the publish timeout on c, which must be the live context.
+// It does not read Clock_, so the ready callback can call it on the context it
+// created while a caller may be replacing Clock_.
+func (c *Context) armTimeout() {
 	if c.IsReady() {
 		c.TimeoutLock_.Lock()
 		if c.Timeout_ == nil && c.PublishDelay_ >= 0 {
@@ -2257,23 +3050,27 @@ func (c *Context) SetTimeout() {
 
 func (c *Context) SetRefreshTimer() {
 	c = c.live()
-	c.StateLock_.Lock()
-	defer c.StateLock_.Unlock()
+	c.setRefreshTimer(c.state())
+}
+
+func (c *Context) setRefreshTimer(st *contextState) {
+	st.stateLock_.Lock()
+	defer st.stateLock_.Unlock()
 	// A refresh that finishes after Close began calls SetData, which gets here.
 	// Installing the timer then would leave a timer on a closed context.
-	if c.Closed_.Load().(bool) || c.Closing_.Load().(bool) || c.closeStarted_ {
+	if c.Closed_.Load().(bool) || c.Closing_.Load().(bool) || st.closeStarted_ {
 		return
 	}
 	if c.RefreshInterval_ > 0 && c.RefreshTimer_ == nil {
 		var rate = time.Duration(uint64(c.RefreshInterval_ * int64(time.Millisecond)))
 
 		c.RefreshTimer_ = time.AfterFunc(rate, func() {
-			c.StateLock_.Lock()
+			st.stateLock_.Lock()
 			var timer = c.RefreshTimer_
 			if timer != nil {
 				timer.Reset(rate)
 			}
-			c.StateLock_.Unlock()
+			st.stateLock_.Unlock()
 			if timer != nil {
 				c.RefreshAsync()
 			}
@@ -2296,6 +3093,9 @@ func (c *Context) GetVariantAssigner(unitType string, hash []byte, needlock bool
 }
 
 func (c *Context) GetVariableAssignment(key string) (*Assignment, error) {
+	// Look the key up on the context whose index GetAssignment reads, so a
+	// stale copy cannot pair an old experiment with the live index.
+	c = c.live()
 	var experiment, err = c.GetVariableExperiment(key)
 
 	if err == nil {
@@ -2317,8 +3117,22 @@ func legacyIndexVariables(index map[string][]ExperimentVariables) map[interface{
 }
 
 func (c *Context) GetVariableExperiment(key string) (ExperimentVariables, error) {
+	var clock = c.ownClock()
+	if clock != nil && clock.state.manualRoot == nil {
+		c, clock = clock.root, nil
+	}
+	if clock == nil {
+		if c.DataLock != nil {
+			c.DataLock.RLock()
+			defer c.DataLock.RUnlock()
+		}
+		if experiment, ok := c.IndexVariables_[key].(ExperimentVariables); ok {
+			return experiment, nil
+		}
+		return ExperimentVariables{}, errors.New("result is nil")
+	}
 	c.DataLock.RLock()
-	var experiments = c.indexVariables_[key]
+	var experiments = clock.state.indexVariables_[key]
 	c.DataLock.RUnlock()
 	if len(experiments) == 0 {
 		return ExperimentVariables{}, errors.New("result is nil")
