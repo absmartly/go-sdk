@@ -2294,27 +2294,35 @@ func TestSwitchback_VariableReadIgnoresAUnitTypeOnlyRefresh(t *testing.T) {
 	h.expectPending(1)
 }
 
-// A switchback variable read whose experiment is refreshed to another
+// A switchback variable read whose experiment is refreshed to another id or
 // iteration between resolving its slot and claiming the exposure serves the
 // default and exposes nothing: the superseded slot's arm is never claimed.
-func TestSwitchback_VariableClaimDeclinesAnIterationRefreshedSlot(t *testing.T) {
-	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
-	h.at(sbAnchor + sbHour + 5)
-	h.peek("exp_sb")
-	var armed = true
-	afterReadResolve = func() {
-		if armed {
-			armed = false
-			var refreshed = sbDefault(2, sbHour)
-			refreshed.Iteration++
-			refreshed.SwitchbackStartAt = sbInt64(sbAnchor + sbHour)
-			h.refresh(refreshed)
+func TestSwitchback_VariableClaimDeclinesASlotRefreshedToAnotherIdentity(t *testing.T) {
+	for name, edit := range map[string]func(*jsonmodels.Experiment){
+		"iteration": func(e *jsonmodels.Experiment) { e.Iteration++ },
+		"id":        func(e *jsonmodels.Experiment) { e.Id = 77 },
+	} {
+		var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+		h.at(sbAnchor + sbHour + 5)
+		h.peek("exp_sb")
+		var armed = true
+		afterReadResolve = func() {
+			if armed {
+				armed = false
+				var refreshed = sbDefault(2, sbHour)
+				edit(&refreshed)
+				refreshed.SwitchbackStartAt = sbInt64(sbAnchor + sbHour)
+				h.refresh(refreshed)
+			}
 		}
+		var value = h.variable("sb.arm")
+		afterReadResolve = nil
+		if armed {
+			t.Fatalf("%s: the hook did not run", name)
+		}
+		if value != -1 {
+			t.Fatalf("%s: got %v, want -1", name, value)
+		}
+		h.expectPending(0)
 	}
-	defer func() { afterReadResolve = nil }()
-	expectValue(t, -1, h.variable("sb.arm"))
-	if armed {
-		t.Fatal("the hook did not run")
-	}
-	h.expectPending(0)
 }
