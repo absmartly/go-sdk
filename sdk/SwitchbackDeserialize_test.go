@@ -9,6 +9,7 @@ package sdk
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"reflect"
 	"testing"
@@ -237,5 +238,24 @@ func TestSwitchback_ExplicitUnitRandomizationPublishesTheSameBytes(t *testing.T)
 	var want, _ = os.ReadFile("testAssets/publish-no-holdouts.golden")
 	if got := hoPublishProbe(t, unit); got != string(want) {
 		t.Fatalf("publish changed:\n got %s\nwant %s", got, want)
+	}
+}
+
+// Cluster paths are parsed once, when the data is installed: resolving a new
+// period does not parse them again, however many sources the map has.
+func TestSwitchback_ClusterPathsAreParsedAtInstall(t *testing.T) {
+	var experiment = sbDefault(3, sbHour)
+	for i := 0; i < 20; i++ {
+		experiment.SwitchbackClusters = append(experiment.SwitchbackClusters, sbClusters(fmt.Sprintf("unit_%d", i), "store_key")...)
+	}
+	var h = sbCreate(t, sbData(experiment))
+	h.at(sbAnchor).peek("exp_sb")
+	var allocations = testing.AllocsPerRun(100, func() {
+		h.clock.set(h.clock.Millis() + sbHour)
+		h.ctx.GetAssignment("exp_sb")
+	})
+	// About 13 per resolution; reparsing 21 paths adds about 4 each.
+	if allocations > 40 {
+		t.Fatalf("a period resolution made %.0f allocations; cluster paths are parsed again", allocations)
 	}
 }

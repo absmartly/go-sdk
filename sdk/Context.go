@@ -2190,9 +2190,23 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cachedAssignment {
 	c = c.live()
 	// A valid cached assignment only needs the read lock, so concurrent reads
-	// of a shared context do not serialise.
-	if entry := c.cachedAssignmentAt(experimentName, at); entry != nil {
-		return entry
+	// of a shared context do not serialise. An ordinary experiment's lookup
+	// calls no injected code, so it stays inline with explicit unlocks; a
+	// switchback's reads the clock, so it goes through cachedAssignmentAt,
+	// which releases the lock on unwind.
+	c.ContextLock_.RLock()
+	var indexed = c.indexedExperiment(experimentName)
+	if indexed == nil || indexed.switchback == nil {
+		if entry, _, state := c.validCachedAssignment(experimentName, indexed, assignmentSlot{key: experimentName}); state == assignmentValid {
+			c.ContextLock_.RUnlock()
+			return entry
+		}
+		c.ContextLock_.RUnlock()
+	} else {
+		c.ContextLock_.RUnlock()
+		if entry := c.cachedAssignmentAt(experimentName, at); entry != nil {
+			return entry
+		}
 	}
 	return c.resolveAssignmentLocked(experimentName, at)
 }
