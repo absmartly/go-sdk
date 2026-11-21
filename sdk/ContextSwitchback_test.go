@@ -2279,3 +2279,17 @@ func TestSwitchback_UnitReadsDoNotReadTheClock(t *testing.T) {
 	}
 	expectInt(t, int(before), int(clock.reads.Load()))
 }
+
+// A switchback's unitType is not part of its identity, for variable reads
+// too: after a refresh that edits only the unitType, a variable read still
+// serves the slot's arm and exposes it once.
+func TestSwitchback_VariableReadIgnoresAUnitTypeOnlyRefresh(t *testing.T) {
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+	h.at(sbAnchor + 5)
+	expectInt(t, sbExpected2Arms[0], h.peek("exp_sb"))
+	var edited = sbDefault(2, sbHour)
+	edited.UnitType = "anything"
+	h.refresh(edited)
+	expectValue(t, sbExpected2Arms[0], h.variable("sb.arm"))
+	h.expectPending(1)
+}

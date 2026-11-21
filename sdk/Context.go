@@ -248,14 +248,17 @@ type cachedAssignment struct {
 	switchback *switchbackSlot
 	// resolvedId, resolvedIteration and resolvedUnitType identify the
 	// definition used to resolve this entry, including overrides whose public
-	// Iteration stays zero.
+	// Iteration stays zero. A switchback slot's unit identity is its
+	// generation instead (sameSwitchbackIdentity), so its unitType is not
+	// compared.
 	resolvedId        int
 	resolvedIteration int
 	resolvedUnitType  string
 }
 
 func (e *cachedAssignment) resolvedExperimentMatches(data jsonmodels.Experiment) bool {
-	return e.resolvedId == data.Id && e.resolvedIteration == data.Iteration && e.resolvedUnitType == data.UnitType
+	return e.resolvedId == data.Id && e.resolvedIteration == data.Iteration &&
+		(e.resolvedUnitType == data.UnitType || e.switchback != nil)
 }
 
 type loggerGoroutines struct {
@@ -1068,8 +1071,9 @@ func (e *cachedAssignment) needsSettling() bool {
 // seen holdouts, assignment rules or switchbacks (sources of retirement), a read
 // of key claims an exposure only for an experiment that, as installed now,
 // still exists, defines key in some variant and has the same resolved
-// experiment identity (id, iteration, unit type) and holdout epochs. Contexts
-// with none of them keep the released behaviour. The caller holds ContextLock_.
+// experiment identity (id, iteration, and unit type except for a switchback,
+// whose generation is its unit identity) and holdout epochs. Contexts with
+// none of them keep the released behaviour. The caller holds ContextLock_.
 func (c *Context) variableEligible(experimentName string, key string) func(*cachedAssignment) bool {
 	return func(e *cachedAssignment) bool {
 		if e.assignment.Variables == nil {
