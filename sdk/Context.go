@@ -225,14 +225,16 @@ type cachedAssignment struct {
 	holdouts *assignmentHoldouts
 	// retirement is shared by entries that carry the same Exposed identity.
 	retirement *atomic.Bool
-	// resolvedId and resolvedIteration identify the definition used to resolve
-	// this entry, including overrides whose public Iteration stays zero.
+	// resolvedId, resolvedIteration and resolvedUnitType identify the
+	// definition used to resolve this entry, including overrides whose public
+	// Iteration stays zero.
 	resolvedId        int
 	resolvedIteration int
+	resolvedUnitType  string
 }
 
 func (e *cachedAssignment) resolvedExperimentMatches(data jsonmodels.Experiment) bool {
-	return e.resolvedId == data.Id && e.resolvedIteration == data.Iteration
+	return e.resolvedId == data.Id && e.resolvedIteration == data.Iteration && e.resolvedUnitType == data.UnitType
 }
 
 type loggerGoroutines struct {
@@ -1022,7 +1024,7 @@ func (e *cachedAssignment) needsSettling() bool {
 // seen holdouts or assignment rules (the only sources of retirement), a read
 // of key claims an exposure only for an experiment that, as installed now,
 // still exists, defines key in some variant and has the same resolved experiment
-// and holdout epochs. Contexts with neither keep the released behaviour. The
+// identity (id, iteration, unit type) and holdout epochs. Contexts with neither keep the released behaviour. The
 // caller holds ContextLock_.
 func (c *Context) variableEligible(experimentName string, key string) func(*cachedAssignment) bool {
 	return func(e *cachedAssignment) bool {
@@ -2020,6 +2022,7 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 	if efound {
 		entry.resolvedId = experiment.Data.Id
 		entry.resolvedIteration = experiment.Data.Iteration
+		entry.resolvedUnitType = experiment.Data.UnitType
 	}
 
 	// Resolved for overrides and rule wins too: the holdouts' exposures fire
