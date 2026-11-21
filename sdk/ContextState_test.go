@@ -502,88 +502,6 @@ func TestReusedDeserializerOutputDoesNotOverwriteCachedAudience(t *testing.T) {
 	assertAny(true, ctx.Exposures_[0].AudienceMismatch, t)
 }
 
-// copyFilter keeps each container's type and value, and shares nothing
-// mutable with the original.
-func TestCopyFilterIsDeepAndTypePreserving(t *testing.T) {
-	var original = map[string]interface{}{
-		"and": []interface{}{
-			map[string]interface{}{"eq": []interface{}{map[string]interface{}{"var": "a"}, map[string]interface{}{"value": 1.5}}},
-			[]interface{}{"x", true, nil},
-		},
-		"typed": map[string]string{"k": "v"},
-		"array": [2]interface{}{map[string]interface{}{"m": 1}, "s"},
-	}
-	var value, ok = copyFilter(reflect.ValueOf(original), map[filterNode]bool{})
-	assertAny(true, ok, t)
-	var copied = value.Interface().(map[string]interface{})
-	assertAny(true, reflect.DeepEqual(original, copied), t)
-	original["and"].([]interface{})[0].(map[string]interface{})["eq"] = "changed"
-	original["typed"].(map[string]string)["k"] = "changed"
-	original["array"].([2]interface{})[0].(map[string]interface{})["m"] = 2
-	assertAny(false, reflect.DeepEqual(original, copied), t)
-	assertAny("v", copied["typed"].(map[string]string)["k"], t)
-	assertAny(1, copied["array"].([2]interface{})[0].(map[string]interface{})["m"], t)
-	var eq = copied["and"].([]interface{})[0].(map[string]interface{})["eq"]
-	assertAny(true, reflect.TypeOf(eq).Kind() == reflect.Slice, t)
-	// A container repeated without a cycle is copied; one that contains
-	// itself is reported instead of being copied without end.
-	var shared = map[string]interface{}{"value": true}
-	_, ok = copyFilter(reflect.ValueOf([]interface{}{shared, shared}), map[filterNode]bool{})
-	assertAny(true, ok, t)
-	var cyclic = map[string]interface{}{}
-	cyclic["self"] = cyclic
-	_, ok = copyFilter(reflect.ValueOf(cyclic), map[filterNode]bool{})
-	assertAny(false, ok, t)
-	var loop = []interface{}{nil}
-	loop[0] = loop
-	_, ok = copyFilter(reflect.ValueOf(loop), map[filterNode]bool{})
-	assertAny(false, ok, t)
-	// A shorter view of the same backing array is not a cycle.
-	var view = make([]interface{}, 2)
-	view[1] = view[:0]
-	_, ok = copyFilter(reflect.ValueOf(view), map[filterNode]bool{})
-	assertAny(true, ok, t)
-}
-
-// The public Evaluate parses without copying, as v1.1.1 did: only the
-// context's cache keeps an SDK-owned copy.
-func TestParseAudienceKeepsTheDeserializerResult(t *testing.T) {
-	var d = &scratchDeserializer{}
-	var parsed = AudienceMatcher{d}.parseAudience(`{"filter":[{"value":true}]}`)
-	assertAny(nil, parsed.err, t)
-	d.mu.Lock()
-	var same = reflect.ValueOf(parsed.filter).Pointer() == reflect.ValueOf(d.scratch["filter"]).Pointer()
-	d.mu.Unlock()
-	assertAny(true, same, t)
-	var owned = parsed.owned()
-	assertAny(false, reflect.ValueOf(owned.filter).Pointer() == reflect.ValueOf(parsed.filter).Pointer(), t)
-}
-
-// cyclicDeserializer returns a filter that contains itself.
-type cyclicDeserializer struct{}
-
-func (cyclicDeserializer) Deserialize([]byte, int, int) (map[string]interface{}, error) {
-	var filter = map[string]interface{}{}
-	filter["and"] = []interface{}{filter}
-	return map[string]interface{}{"filter": filter}, nil
-}
-
-// A self-referential filter from a broken deserializer is treated as an
-// unparseable audience, not copied without end: a strict audience is ignored,
-// as for any unparseable one.
-func TestCyclicAudienceFilterIsUnparseable(t *testing.T) {
-	var ctx, _ = newSystemAttrContext("website", "production", audienceExperiment("exp_app", appFilter, true))
-	ctx.AudienceMatcher_ = AudienceMatcher{cyclicDeserializer{}}
-	var done = make(chan int, 1)
-	go func() { done <- treatmentPeek(t, ctx, "exp_app") }()
-	select {
-	case variant := <-done:
-		assertAny(1, variant, t)
-	case <-time.After(5 * time.Second):
-		t.Fatal("a cyclic filter did not return")
-	}
-}
-
 // The first parse of each distinct audience checks membership against a set
 // built once per installed snapshot, not by walking the catalog each time.
 func TestColdAudienceReadsDoNotRescanTheCatalog(t *testing.T) {
@@ -1390,7 +1308,9 @@ func TestAudiencePanicLoggerReadsDifferentExperiment(t *testing.T) {
 	assertAny(nil, ctx.SetAttribute("x", 1), t)
 	assertAny(1, treatmentPeek(t, ctx, "first"), t)
 	assertAny(0, treatmentPeek(t, ctx, "second"), t)
-	assertAny(int32(2), atomic.LoadInt32(&d.calls), t)
+	// "first" keeps its failure without parsing; revalidating "second" asks
+	// the custom deserializer again, as its parse is never cached.
+	assertAny(int32(3), atomic.LoadInt32(&d.calls), t)
 }
 
 // nilPanicOnceDeserializer panics with nil on its first parse, then parses
@@ -1535,7 +1455,9 @@ func TestUnusableAudienceDocumentIsNotShared(t *testing.T) {
 			assertAny(nil, ctx.SetAttribute("x", 1), t)
 			assertAny(1, treatmentPeek(t, ctx, "first"), t)
 			assertAny(0, treatmentPeek(t, ctx, "second"), t)
-			assertAny(int32(2), atomic.LoadInt32(&calls), t)
+			// "first" keeps its local failure without parsing; "second" is
+			// revalidated with a fresh custom parse.
+			assertAny(int32(3), atomic.LoadInt32(&calls), t)
 		})
 	}
 }
@@ -2428,9 +2350,10 @@ func (d *lockProbeDeserializer) Deserialize(b []byte, offset, length int) (map[s
 // The AudienceDeserializer is customer code, so it runs on the reading
 // goroutine before any context lock is taken, never under ContextLock_. That
 // lets it call any context method, as in v1.1.1, without the SDK bypassing
-// its own locks. As in v1.1.1 it parses each audience once: at the first read
-// that evaluates it, not again for cached reads, attribute changes or a
-// refresh with unchanged audience text.
+// its own locks. As in v1.1.1 its result is never kept: it parses at the
+// first read that evaluates the audience and again when an attribute change
+// revalidates the cached assignment, but not for cached reads or a refresh
+// with unchanged data. Every call runs with no context lock held.
 func TestAudienceDeserializerRunsOutsideTheContextLock(t *testing.T) {
 	var d = &lockProbeDeserializer{}
 	var client = &systemAttrClient{application: "website", environment: "production"}
@@ -2453,13 +2376,20 @@ func TestAudienceDeserializerRunsOutsideTheContextLock(t *testing.T) {
 	d.mu.Unlock()
 
 	assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
+	d.mu.Lock()
+	assertAny(1, d.calls, t)
+	d.mu.Unlock()
+	var exposed = ctx.GetAssignment("exp_app").Exposed
 	assertAny(nil, ctx.SetAttribute("other", 1), t)
 	assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
 	ctx.Refresh()
 	assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
 	d.mu.Lock()
-	assertAny(1, d.calls, t)
+	assertAny(2, d.calls, t)
+	assertAny(2, d.free, t)
 	d.mu.Unlock()
+	// The same outcome keeps the cached assignment.
+	assertAny(true, ctx.GetAssignment("exp_app").Exposed == exposed, t)
 
 	// A new iteration with a new audience text is a new assignment, which
 	// parses the new text (a text change alone keeps the cached assignment,
@@ -2469,8 +2399,8 @@ func TestAudienceDeserializerRunsOutsideTheContextLock(t *testing.T) {
 	ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{changed}})
 	assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
 	d.mu.Lock()
-	assertAny(2, d.calls, t)
-	assertAny(2, d.free, t)
+	assertAny(3, d.calls, t)
+	assertAny(3, d.free, t)
 	d.mu.Unlock()
 }
 
@@ -2860,7 +2790,9 @@ func TestDeserializerComparisonNeverPanicsOrSpins(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatalf("%T: reads did not return", d)
 		}
-		assertAny(2, len(counter.texts()), t)
+		// One parse per build, and one for revalidating exp_app after the
+		// attribute change: a custom parse is never cached.
+		assertAny([]string{`{"filter":[{"value":false}]}`, `{"filter":[{"value":true}]}`, `{"filter":[{"value":false}]}`}, counter.texts(), t)
 		counter.mu.Lock()
 		counter.parsed = nil
 		counter.mu.Unlock()
@@ -3101,8 +3033,8 @@ func (d mapDeserializer) Deserialize(b []byte, offset, length int) (map[string]i
 	return DefaultAudienceDeserializer{}.Deserialize(b, offset, length)
 }
 
-// A deserializer of a non-comparable type works as in v1.1.1, and is still
-// called once per audience text.
+// A deserializer of a non-comparable type works as in v1.1.1: it is called
+// for the first evaluation and again when an attribute change revalidates.
 func TestUncomparableDeserializerDoesNotPanic(t *testing.T) {
 	var calls int32
 	var seen = map[string]int{}
@@ -3120,8 +3052,8 @@ func TestUncomparableDeserializerDoesNotPanic(t *testing.T) {
 		assertAny(nil, ctx.SetAttribute("x", 2), t)
 		assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
 	}
-	assertAny(int32(1), atomic.LoadInt32(&calls), t)
-	assertAny(map[string]int{appFilter: 1}, seen, t)
+	assertAny(int32(2), atomic.LoadInt32(&calls), t)
+	assertAny(map[string]int{appFilter: 2}, seen, t)
 }
 
 // SetData that changes only the audience text keeps the cached assignment, as
@@ -3287,16 +3219,32 @@ func (d *removingDeserializer) Deserialize(b []byte, offset, length int) (map[st
 
 // A parse that finishes after new data removed its audience is not kept.
 func TestParseOfRemovedAudienceIsNotCached(t *testing.T) {
+	var cachedTexts = func(ctx *Context) []string {
+		var texts []string
+		ctx.state().audiences.Range(func(text, _ interface{}) bool {
+			texts = append(texts, text.(string))
+			return true
+		})
+		return texts
+	}
+	// A custom deserializer that installs data while parsing: the read uses
+	// the new audience, and neither parse is stored.
 	var ctx, _ = newSystemAttrContext("website", "production",
 		audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true))
 	ctx.AudienceMatcher_ = AudienceMatcher{&removingDeserializer{ctx: ctx}}
 	assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
-	var texts []string
-	ctx.state().audiences.Range(func(text, _ interface{}) bool {
-		texts = append(texts, text.(string))
-		return true
-	})
-	assertAny([]string{`{"filter":[{"value":1}]}`}, texts, t)
+	assertAny([]string(nil), cachedTexts(ctx), t)
+
+	// The built-in deserializer's parse of a text no longer installed is
+	// dropped, while that of an installed text is kept.
+	ctx, _ = newSystemAttrContext("website", "production",
+		audienceExperiment("exp_app", `{"filter":[{"value":1}]}`, true))
+	var removed = audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true)
+	var parse = ctx.parseAudienceUnlocked(ctx.state(), "exp_app", removed)
+	assertAny(nil, parse.parsed.err, t)
+	assertAny([]string(nil), cachedTexts(ctx), t)
+	assertAny(1, treatmentPeek(t, ctx, "exp_app"), t)
+	assertAny([]string{`{"filter":[{"value":1}]}`}, cachedTexts(ctx), t)
 }
 
 func TestAudienceCacheIsPrunedOnInstall(t *testing.T) {
