@@ -237,6 +237,19 @@ type cachedAssignment struct {
 	resolvedAudienceStrict bool
 }
 
+// audienceChanged reports whether the audience definition a decision was
+// evaluated against has changed. A rule win or a holdout suppression never
+// evaluated the audience, so an edit leaves it the same decision. The cache
+// (for an unexposed decision in a keyed context) and the variable claim treat
+// a change as staleness; exposed decisions and other contexts keep the
+// released behaviour.
+func (e *cachedAssignment) audienceChanged(data jsonmodels.Experiment) bool {
+	if e.assignment.RuleOverride || e.holdouts.isSuppressed() {
+		return false
+	}
+	return e.resolvedAudience != data.Audience || e.resolvedAudienceStrict != data.AudienceStrict
+}
+
 func (e *cachedAssignment) resolvedExperimentMatches(data jsonmodels.Experiment) bool {
 	return e.resolvedId == data.Id && e.resolvedIteration == data.Iteration && e.resolvedUnitType == data.UnitType
 }
@@ -981,42 +994,76 @@ func (c *Context) queueEligibleExposure(entry *cachedAssignment, eligible func(*
 		return c.queueExposure(entry.assignment, entry)
 	}
 	c = c.live()
-	var status = func() exposureStatus {
-		c.ContextLock_.RLock()
-		// Released on unwind too: the audience evaluator can panic.
-		defer c.ContextLock_.RUnlock()
-		return claimEligible(entry, eligible)
-	}()
+	var status, claimed = c.claimEligible(entry, eligible)
 	if status != exposureClaimed {
 		return status
 	}
-	return c.admitExposure(entry.assignment, entry)
+	return c.admitExposure(claimed.assignment, claimed)
 }
 
-// claimEligible checks eligibility and claims the exposure in one step; the
-// caller holds ContextLock_ across the whole call, so no refresh can land
-// between the check and the claim. A claim already taken is honoured.
-func claimEligible(entry *cachedAssignment, eligible func(*cachedAssignment) exposureStatus) exposureStatus {
+// claimEligible checks eligibility and claims the exposure in one step under
+// ContextLock_, so no refresh can land between the check and the claim. The
+// lock is released on unwind too: the audience evaluator can panic. A claim
+// already taken is honoured.
+func (c *Context) claimEligible(entry *cachedAssignment, eligible func(*cachedAssignment) exposureStatus) (exposureStatus, *cachedAssignment) {
+	c.ContextLock_.RLock()
+	defer c.ContextLock_.RUnlock()
 	if beforeEligibleClaim != nil {
 		beforeEligibleClaim()
 	}
 	if entry.retirement.Load() {
-		return exposureRetired
+		return exposureRetired, nil
 	}
 	if entry.assignment.Exposed.Load().(bool) {
-		return exposureQueued
+		return exposureQueued, nil
 	}
 	if status := eligible(entry); status != exposureClaimed {
-		return status
+		return status, nil
 	}
-	var claimed = entry.assignment.Exposed.CompareAndSwap(false, true)
+	// A concurrent read may have rebuilt the same decision into a new cache
+	// entry; claim that one, so the decision has a single exposure flag and a
+	// later read of the cached entry does not expose it a second time.
+	var target = entry
+	if cached := c.assignmentCache_[entry.assignment.Name]; cached != nil && cached != entry && sameDecision(cached, entry) {
+		target = cached
+	}
+	var claimed = target.assignment.Exposed.CompareAndSwap(false, true)
 	if afterEligibleCAS != nil {
 		afterEligibleCAS()
 	}
 	if claimed {
-		return exposureClaimed
+		return exposureClaimed, target
 	}
-	return exposureQueued
+	return exposureQueued, nil
+}
+
+// sameDecision reports whether two entries publish the same exposures: the
+// same experiment record and the same holdout arms.
+func sameDecision(a *cachedAssignment, b *cachedAssignment) bool {
+	if a.retirement.Load() || decisionRecord(a) != decisionRecord(b) || (a.holdouts == nil) != (b.holdouts == nil) {
+		return false
+	}
+	if a.holdouts == nil {
+		return true
+	}
+	if a.holdouts.suppressed != b.holdouts.suppressed || len(a.holdouts.arms) != len(b.holdouts.arms) {
+		return false
+	}
+	for i, arm := range a.holdouts.arms {
+		if arm != b.holdouts.arms[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// decisionRecord is an entry's experiment exposure record without its
+// timestamp.
+func decisionRecord(e *cachedAssignment) jsonmodels.Exposure {
+	var a = e.assignment
+	return jsonmodels.Exposure{Id: a.Id, Name: a.Name, Unit: a.UnitType, Variant: a.Variant, Assigned: a.Assigned,
+		Eligible: a.Eligible, Overridden: a.Overridden, FullOn: a.FullOn, Custom: a.Custom,
+		AudienceMismatch: a.AudienceMismatch, RuleOverride: a.RuleOverride}
 }
 
 // needsSettling reports whether an exposing read must settle the entry's
@@ -1803,31 +1850,23 @@ const (
 // whether it is still valid, with the rule set it was validated against. It
 // only reads, so it may run under ContextLock_ held for reading or writing.
 func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignment, *experimentRules, assignmentState) {
-	return c.validCachedAssignmentFor(experimentName, false)
-}
-
-// validCachedAssignmentFor is validCachedAssignment; with ignoreCustom a
-// custom assignment that differs from the cached variant is not staleness,
-// and every other check still applies. The variable claim check uses it: a
-// custom assignment the build could not apply (full-on, traffic-ineligible,
-// strict audience mismatch) makes every rebuild stale, as in v1.1.1, but it
-// is no newer definition, so the read claims the decision it serves rather
-// than retrying it. A custom assignment set or changed during the read is
-// ignored by the claim the same way, as main and v1.1.1 expose what the read
-// resolved; the next read applies it.
-func (c *Context) validCachedAssignmentFor(experimentName string, ignoreCustom bool) (*cachedAssignment, *experimentRules, assignmentState) {
 	var entry, found = c.assignmentCache_[experimentName]
 	if !found {
 		return nil, nil, assignmentStale
 	}
-	var rules, state = c.validEntry(experimentName, entry, ignoreCustom)
+	var rules, state = c.validEntry(experimentName, entry, false)
 	return entry, rules, state
 }
 
 // validEntry reports whether entry, cached or not, is still the decision the
-// installed data gives for experimentName. A variable read's claim checks its
-// own entry, so an equivalent rebuild by a concurrent read (an unapplied custom
-// assignment rebuilds on every lookup) does not make its decision stale.
+// installed data gives for experimentName. The variable read's claim checks its
+// own entry with ignoreCustom: a custom assignment that differs from the
+// cached variant is then not staleness, and every other check still applies.
+// A custom assignment the build could not apply (full-on, traffic-ineligible,
+// strict audience mismatch) makes every rebuild stale, as in v1.1.1, but it is
+// no newer definition, so the read claims the decision it serves rather than
+// retrying it; one set or changed during the read is ignored the same way, as
+// main and v1.1.1 expose what the read resolved, and the next read applies it.
 func (c *Context) validEntry(experimentName string, entry *cachedAssignment, ignoreCustom bool) (*experimentRules, assignmentState) {
 	var assignment = entry.assignment
 	var custom, cfound = c.Cassignments_[experimentName]
@@ -1869,14 +1908,7 @@ func (c *Context) validEntry(experimentName string, entry *cachedAssignment, ign
 			return rules, assignmentStale
 		}
 		if (ignoreCustom || !assignment.Exposed.Load().(bool) && c.index_.Load().keyed) &&
-			(entry.resolvedAudience != experiment.Data.Audience ||
-				entry.resolvedAudienceStrict != experiment.Data.AudienceStrict) {
-			// An unexposed decision in a keyed context is judged against the
-			// audience it would be evaluated with now, by the cache and the
-			// claim alike, so a definition that made it strict, or changed it,
-			// rebuilds it rather than letting a variable read claim it. An
-			// exposed decision, and every decision in other contexts, keeps
-			// the released behaviour.
+			entry.audienceChanged(experiment.Data) {
 			return rules, assignmentStale
 		}
 		if rules == entry.rules && atomic.LoadInt32(&c.AttrsSeq_) <= entry.attrsSeq {
@@ -2033,10 +2065,11 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 	// Cache miss, out of date, or revalidated. Check again under the write
 	// lock: another goroutine may have rebuilt the assignment meanwhile, and
 	// replacing it would lose its exposed flag and queue a second exposure.
+	// The lock is released on unwind too: the audience evaluator can panic.
 	c.ContextLock_.Lock()
+	defer c.ContextLock_.Unlock()
 	var previous, validated, state = c.validCachedAssignment(experimentName)
 	if state == assignmentValid {
-		c.ContextLock_.Unlock()
 		return previous
 	}
 	if state == assignmentRevalidated {
@@ -2048,7 +2081,6 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 		// only makes the next read revalidate.
 		previous.rules = validated
 		previous.attrsSeq = atomic.LoadInt32(&c.AttrsSeq_)
-		c.ContextLock_.Unlock()
 		return previous
 	}
 
@@ -2166,7 +2198,11 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 	}
 	var rebuiltOverride = previous != nil && previous.assignment.Overridden && efound &&
 		c.index_.Load().keyed && !previous.resolvedExperimentMatches(experiment.Data)
-	if previous != nil && (previous.holdouts != nil || entry.holdouts != nil || rebuiltOverride) && previous.assignment.Exposed != assignment.Exposed {
+	// An unexposed keyed decision rebuilt because its audience was edited is
+	// superseded the same way: a caller still holding it must not publish it.
+	var rebuiltAudience = previous != nil && efound && c.index_.Load().keyed && previous.audienceChanged(experiment.Data)
+	if previous != nil && (previous.holdouts != nil || entry.holdouts != nil || rebuiltOverride || rebuiltAudience) &&
+		previous.assignment.Exposed != assignment.Exposed {
 		// Retire the replaced assignment, as eviction does: a caller still
 		// holding it must not claim a decision, or holdout arms, that the
 		// replacement has superseded. Retired before it is marked exposed,
@@ -2185,7 +2221,6 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 
 	c.assignmentCache_[experimentName] = entry
 	c.AssignmentCache[experimentName] = *assignment
-	c.ContextLock_.Unlock()
 	return entry
 }
 

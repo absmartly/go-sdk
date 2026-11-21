@@ -4373,12 +4373,12 @@ func TestHoldout_ReplacedUnretiredEntryIsResolvedAgain(t *testing.T) {
 
 // When every attempt of a variable read finds its decision stale, the read
 // stops after maxExposureAttempts and serves the last decision it tried,
-// without an exposure, as in the Java SDK; the next read exposes it. The first
-// decision serves treatment and every later one control, so serving the first
-// decision instead of the last fails.
+// without an exposure, as in the Java SDK; the next read exposes it.
 func TestHoldout_VariableReadServesTheLastDecisionWhenRetriesRunOut(t *testing.T) {
-	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
-	e.Split = []float64{0, 1}
+	var e = hoExperiment(1, "e", hoUnitType, 0)
+	e.Split = []float64{0, 1, 0, 0}
+	e.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"v":"a"}`}, {Name: "B", Config: `{"v":"b"}`},
+		{Name: "C", Config: `{"v":"c"}`}, {Name: "D", Config: `{"v":"d"}`}}
 	var r = hoExperiment(2, "r", hoUnitType, 0)
 	r.AssignmentRules = hoUSRule
 	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
@@ -4386,17 +4386,21 @@ func TestHoldout_VariableReadServesTheLastDecisionWhenRetriesRunOut(t *testing.T
 	var claims = 0
 	beforeSettleClaim = func() {
 		claims++
+		// Each attempt installs a split serving a different variant, so the
+		// value served names the attempt that produced it.
 		var next = e
-		next.Split = []float64{1, 0}
+		next.Split = []float64{0, 0, 0, 0}
+		next.Split[(claims%3)+1] = 1
 		next.TrafficSplit = []float64{0, 1, float64(claims)}
 		h.ctx.SetData(hoData(nil, next, r))
 	}
-	expectValue(t, "control", h.variable("v"))
+	// Attempt 1 serves the initial split (b), attempt 2 the one installed
+	// before claim 1 (c), attempt 3 the one installed before claim 2 (d);
+	// the install before claim 3 makes that last decision stale too.
+	expectValue(t, "d", h.variable("v"))
 	beforeSettleClaim = nil
 	expectInt(t, maxExposureAttempts, claims)
 	h.expectPending(0)
-	expectValue(t, "control", h.variable("v"))
-	h.expectPending(1)
 }
 
 // Changing the custom assignment after a decision was built from it is still
@@ -4633,9 +4637,7 @@ func TestHoldout_RestoredKeyDoesNotAuthorizeADecisionBeforeAnAudienceEdit(t *tes
 	}
 }
 
-// An exposed decision keeps the released behaviour across an audience edit
-// that leaves rules and attributes alone: it is not rebuilt, so it is not
-// exposed a second time.
+// An exposed decision keeps the released behaviour across an audience edit.
 func TestHoldout_AudienceEditKeepsAnExposedKeyedDecision(t *testing.T) {
 	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
 	e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
@@ -4674,6 +4676,102 @@ func TestHoldout_AudienceEditKeepsAPlainUnexposedDecision(t *testing.T) {
 	h.variable("v")
 	if h.ctx.getAssignment("e") != before {
 		t.Fatal("the plain unexposed decision was rebuilt")
+	}
+	h.expectPending(1)
+}
+
+// Two reads serving the same decision record it once, even when a concurrent
+// peek rebuilt an equivalent entry before the first read's claim and a custom
+// assignment made later reads reuse that rebuild.
+func TestHoldout_EquivalentRebuildsShareOneExposure(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 1), "v")
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	if err := h.ctx.SetCustomAssignment("e", 0); err != nil {
+		t.Fatal(err)
+	}
+	var armed = true
+	beforeSettleClaim = func() {
+		if armed {
+			armed = false
+			h.peek("e")
+			if err := h.ctx.SetCustomAssignment("e", 1); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	defer func() { beforeSettleClaim = nil }()
+	expectValue(t, "treatment", h.variable("v"))
+	expectValue(t, "treatment", h.variable("v"))
+	if exposures := queuedExposures(h.ctx); len(exposures) != 1 || !exposures[0].FullOn {
+		t.Fatalf("exposures %+v, want one full-on exposure", exposures)
+	}
+}
+
+// In a keyed context an unexposed assignment rebuilt because its audience was
+// edited is retired: queuing the old copy afterwards publishes nothing.
+func TestHoldout_AudienceRebuildRetiresTheSupersededAssignment(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 1), "v")
+	e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	var old = h.ctx.GetAssignment("e")
+	var strict = e
+	strict.AudienceStrict = true
+	h.ctx.SetData(hoData(nil, strict, r))
+	expectValue(t, "default", h.variable("v"))
+	h.ctx.QueueExposure(old)
+	var exposures = queuedExposures(h.ctx)
+	if len(exposures) != 1 || exposures[0].FullOn || exposures[0].Assigned {
+		t.Fatalf("exposures %+v, want only the strict decision", exposures)
+	}
+}
+
+// A panic while a rebuild evaluates an edited audience releases the context
+// write lock, so the context is not left stuck once the caller recovers.
+func TestHoldout_RebuildReleasesTheWriteLockOnPanic(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	h.setAttribute("nested", map[int]string{1: "GB"})
+	h.peek("e")
+	var edited = e
+	edited.Audience = `{"filter":[{"eq":[{"var":"nested/country"},{"value":"GB"}]}]}`
+	h.ctx.SetData(hoData(nil, edited, r))
+	func() {
+		defer func() { _ = recover() }()
+		h.ctx.GetVariableValue("v", "default")
+	}()
+	if !h.ctx.ContextLock_.TryLock() {
+		t.Fatal("the rebuild left the context write lock held after a panic")
+	}
+	h.ctx.ContextLock_.Unlock()
+}
+
+// A rule win never evaluated the audience, so an audience-only edit leaves it
+// the same decision: it is not rebuilt, and one variable read claims it on the
+// first attempt.
+func TestHoldout_AudienceEditKeepsARuleWin(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+	e.AssignmentRules = hoUSRule
+	e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e))
+	h.setAttribute("country", "US")
+	h.peek("e")
+	var before = h.ctx.getAssignment("e")
+	var edited = e
+	edited.AudienceStrict = true
+	h.ctx.SetData(hoData(nil, edited))
+	var claims = 0
+	beforeSettleClaim = func() { claims++ }
+	defer func() { beforeSettleClaim = nil }()
+	expectValue(t, "treatment", h.variable("v"))
+	expectInt(t, 1, claims)
+	if h.ctx.getAssignment("e") != before {
+		t.Fatal("the rule win was rebuilt")
 	}
 	h.expectPending(1)
 }
