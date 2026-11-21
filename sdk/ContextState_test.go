@@ -385,6 +385,25 @@ func TestLiteralLoggerVariableReadsFollowIndexVariables(t *testing.T) {
 	delete(manual.IndexVariables_, "key")
 	manual.LogEvent(Goal, nil)
 	assertAny(reads{"fallback", "fallback", "", map[string]string{}, map[string][]string{}}, <-seen, t)
+
+	// The logger context reads the literal itself, not its own copy of the
+	// fields: replacing the literal's IndexVariables_ map from inside the
+	// callback is seen by that callback's next read.
+	var inside = make(chan []interface{}, 1)
+	manual.EventLogger_ = callbackEventLogger(func(c Context, event EventType, _ interface{}) {
+		if event != Goal {
+			return
+		}
+		manual.DataLock.Lock()
+		manual.IndexVariables_ = map[interface{}]interface{}{"key": manual.Index_["b"]}
+		manual.DataLock.Unlock()
+		var value, _ = c.PeekVariableValue("key", "fallback")
+		var keys, _ = c.GetVariableKeys()
+		var all, _ = c.GetVariableKeysAll()
+		inside <- []interface{}{value, keys, all}
+	})
+	manual.LogEvent(Goal, nil)
+	assertAny([]interface{}{float64(2), map[string]string{"key": "b"}, map[string][]string{"key": {"b"}}}, <-inside, t)
 }
 
 // On a literal, as in v1.1.1, a variable value is returned whenever the
