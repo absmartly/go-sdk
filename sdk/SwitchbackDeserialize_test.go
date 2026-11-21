@@ -42,7 +42,6 @@ func TestSwitchbackDeserialize_AllFieldsInDeclaredOrder(t *testing.T) {
 	expectValue(t, jsonmodels.SwitchbackClusters(nil), data.Experiments[1].SwitchbackClusters)
 }
 
-// Without switchback fields every one is left unset.
 func TestSwitchbackDeserialize_WithoutSwitchbackFieldsLeavesThemUnset(t *testing.T) {
 	var raw, _ = os.ReadFile("testAssets/context.json")
 	var data, err = DefaultContextDataDeserializer{}.Deserialize(raw)

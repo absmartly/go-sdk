@@ -166,16 +166,19 @@ func switchbackStep(current interface{}, key string, index int, isIndex bool) in
 		if element.IsValid() && utf8.ValidString(key) && !strings.ContainsRune(key, utf8.RuneError) {
 			return element.Interface()
 		}
-		var matches []reflect.Value
+		// Ambiguous published names fail closed, independent of map order.
+		var match reflect.Value
 		var it = value.MapRange()
 		for it.Next() {
 			if publishedString(it.Key().String()) == key {
-				matches = append(matches, it.Value())
+				if match.IsValid() {
+					return nil
+				}
+				match = it.Value()
 			}
 		}
-		// Ambiguous published names fail closed, independent of map order.
-		if len(matches) == 1 {
-			return matches[0].Interface()
+		if match.IsValid() {
+			return match.Interface()
 		}
 	}
 	return nil
@@ -334,14 +337,8 @@ func switchbackEncodable(value reflect.Value, path map[switchbackContainer]bool,
 // only when written without a fraction or exponent. The key is passed to the
 // assigner unhashed.
 func switchbackClusterKey(value interface{}) string {
-	var v = reflect.ValueOf(value)
-	for hops := 0; v.IsValid() && (v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface) && !switchbackOpaque(v); hops++ {
-		if v.IsNil() || hops > switchbackMaxDepth {
-			return ""
-		}
-		v = v.Elem()
-	}
-	if !v.IsValid() || ((v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface) && v.IsNil()) {
+	var v = switchbackJSONView(reflect.ValueOf(value))
+	if !v.IsValid() {
 		return ""
 	}
 	if v.Type() == jsonNumberType {
@@ -349,13 +346,6 @@ func switchbackClusterKey(value interface{}) string {
 			return "0"
 		}
 		return integerNumberText(v.String())
-	}
-	if switchbackOpaque(v) {
-		var view = switchbackJSONView(v)
-		if !view.IsValid() || switchbackOpaque(view) {
-			return ""
-		}
-		return switchbackClusterKey(view.Interface())
 	}
 	switch v.Kind() {
 	case reflect.String:
@@ -421,32 +411,34 @@ type switchbackServing struct {
 // switchbackDefinition is what setData derives from a switchback experiment
 // once, so a resolution needs no parsing.
 type switchbackDefinition struct {
-	// sources are the switchbackClusters unit types in declared order and
-	// paths their parsed attribute paths. paths is nil when the map is
-	// missing, empty or holds an unsupported path: the legacy path.
-	sources []string
-	paths   []*switchbackPath
+	// sources are the switchbackClusters entries in declared order, each
+	// path parsed. sources is nil when the map is missing, empty or holds an
+	// unsupported path: the legacy path.
+	sources []switchbackSource
 	// generation is carried over by a refresh while the switchback identity
 	// is unchanged, and fresh otherwise; cached slots of another generation
 	// are stale.
 	generation uint64
 }
 
+type switchbackSource struct {
+	unitType string
+	path     *switchbackPath
+}
+
 func newSwitchbackDefinition(clusters jsonmodels.SwitchbackClusters) *switchbackDefinition {
 	var definition = &switchbackDefinition{}
-	if len(clusters) == 0 {
-		return definition
-	}
-	var sources = make([]string, len(clusters))
-	var paths = make([]*switchbackPath, len(clusters))
-	for i, cluster := range clusters {
+	var sources = make([]switchbackSource, 0, len(clusters))
+	for _, cluster := range clusters {
 		var path = parseSwitchbackPath(cluster.Path)
 		if path == nil {
 			return definition
 		}
-		sources[i], paths[i] = cluster.UnitType, path
+		sources = append(sources, switchbackSource{unitType: cluster.UnitType, path: path})
 	}
-	definition.sources, definition.paths = sources, paths
+	if len(sources) > 0 {
+		definition.sources = sources
+	}
 	return definition
 }
 
@@ -460,7 +452,8 @@ func resolveSwitchbackServing(definition *switchbackDefinition, allowed []string
 	read func(*switchbackPath) string) switchbackServing {
 	var first, serving switchbackServing
 	var found, disagreement = false, false
-	for s, unitType := range definition.sources {
+	for _, source := range definition.sources {
+		var unitType = source.unitType
 		var uid, set = units[unitType]
 		if !set {
 			continue
@@ -469,7 +462,7 @@ func resolveSwitchbackServing(definition *switchbackDefinition, allowed []string
 			found = true
 			first = switchbackServing{status: switchbackIneligible, unitType: unitType, uid: uid}
 		}
-		var value = read(definition.paths[s])
+		var value = read(source.path)
 		if len(value) == 0 {
 			continue
 		}

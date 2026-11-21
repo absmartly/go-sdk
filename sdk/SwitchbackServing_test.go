@@ -84,7 +84,6 @@ func TestSwitchbackPath_MatchesEveryPathCase(t *testing.T) {
 		if got := sbResolvePath(t, path, fixture.Attributes); !reflect.DeepEqual(c.Value, got) {
 			t.Errorf("%q: %v, want %v", c.Path, got, c.Value)
 		}
-		// The context reads the same cluster key from the attribute.
 		var key, _ = c.Value.(string)
 		if got := path.resolveAttribute(fixture.Attributes[path.rootKey()]); got != key {
 			t.Errorf("%q: key %q, want %q", c.Path, got, key)

@@ -994,20 +994,6 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 // in the Java SDK.
 const maxExposureAttempts = 3
 
-// settleExposure exposes entry on a read. If a replacement or an eviction
-// retired the assignment before the read claimed it, nothing of it was
-// published, so the current assignment is resolved again and exposed
-// instead, up to maxExposureAttempts times. It returns the entry the read
-// must serve: the replacement that was exposed, or on exhaustion the last
-// one tried. A non-nil eligible is checked with each new claim, atomically
-// with it; when it fails nothing is claimed and settleExposure reports false.
-// Loggers run after admit released its locks.
-func (c *Context) settleExposure(experimentName string, entry *cachedAssignment,
-	eligible func(*cachedAssignment) bool) (*cachedAssignment, bool) {
-	var at = clockReading{clock: c.Clock_}
-	return c.settleExposureAt(experimentName, entry, eligible, &at)
-}
-
 func (c *Context) settleExposureAt(experimentName string, entry *cachedAssignment,
 	eligible func(*cachedAssignment) bool, at *clockReading) (*cachedAssignment, bool) {
 	for attempt := 1; ; attempt++ {
@@ -1024,11 +1010,6 @@ func (c *Context) settleExposureAt(experimentName string, entry *cachedAssignmen
 		at = &clockReading{clock: c.Clock_}
 		entry = c.getAssignmentAt(experimentName, at)
 	}
-}
-
-func (c *Context) queueEligibleExposure(entry *cachedAssignment, eligible func(*cachedAssignment) bool) exposureStatus {
-	var at = clockReading{clock: c.Clock_}
-	return c.queueEligibleExposureAt(entry, eligible, &at)
 }
 
 // Eligibility and the claim share the read lock so a refresh cannot land
@@ -1358,10 +1339,7 @@ func (c *Context) exposedAt(slot *switchbackSlot, at *clockReading) int64 {
 // exposed. When the context is closed it reports false, and the caller
 // clears the mark so a later read can retry.
 func (c *Context) enqueueExposure(assignment *Assignment, exposedAt int64) bool {
-	var exposure = jsonmodels.Exposure{Id: assignment.Id, Name: assignment.Name, Unit: assignment.UnitType,
-		Variant: assignment.Variant, ExposedAt: exposedAt, Assigned: assignment.Assigned,
-		Eligible: assignment.Eligible, Overridden: assignment.Overridden, FullOn: assignment.FullOn,
-		Custom: assignment.Custom, AudienceMismatch: assignment.AudienceMismatch, RuleOverride: assignment.RuleOverride}
+	var exposure = c.exposureFor(assignment, exposedAt)
 
 	c.EventLock_.Lock()
 	// Close seals the context under EventLock_, so this check and the
@@ -1956,7 +1934,7 @@ func (c *Context) validCachedAssignment(experimentName string, indexed *indexedE
 			return entry, rules, assignmentStale
 		}
 		if assignment.Overridden && assignment.Variant == override.(int) && (!efound ||
-			holdoutSetMatches(holdouts, entry.holdouts) && (entry.holdouts == nil || entry.holdouts.unitType == unitTypeOf(experiment))) &&
+			holdoutSetMatches(holdouts, entry.holdouts) && (entry.holdouts == nil || entry.holdouts.unitType == experiment.Data.UnitType)) &&
 			switchbackSlotMatches(indexed, entry) {
 			return entry, rules, assignmentValid
 		}
@@ -1982,14 +1960,6 @@ func (c *Context) validCachedAssignment(experimentName string, indexed *indexedE
 		}
 	}
 	return entry, rules, assignmentStale
-}
-
-// unitTypeOf is an installed experiment's unit type, or "" without one.
-func unitTypeOf(experiment *ExperimentVariables) string {
-	if experiment == nil {
-		return ""
-	}
-	return experiment.Data.UnitType
 }
 
 // ruleMatches reports whether the experiment's assignment rules still give the
@@ -2153,12 +2123,19 @@ func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cach
 	}
 	c.ContextLock_.RUnlock()
 
-	// Mutable lazy state belongs to the live root, not a readiness snapshot.
-	c = c.live()
+	return c.resolveAssignmentLocked(experimentName, at)
+}
+
+// resolveAssignmentLocked rebuilds an assignment under the write lock. The
+// unlock is deferred: resolving a switchback cluster can call an attribute's
+// own JSON or text marshaler, and a panic there must not strand the lock.
+func (c *Context) resolveAssignmentLocked(experimentName string, at *clockReading) *cachedAssignment {
 	// Cache miss, out of date, or revalidated. Check again under the write
 	// lock: another goroutine may have rebuilt the assignment meanwhile, and
 	// replacing it would lose its exposed flag and queue a second exposure.
 	c.ContextLock_.Lock()
+	defer c.ContextLock_.Unlock()
+	var indexed *indexedExperiment
 	// The index may have been replaced between the locks; setData publishes
 	// it under this lock, so it is stable from here on.
 	indexed = c.indexedExperiment(experimentName)
@@ -2168,7 +2145,6 @@ func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cach
 	}
 	var previous, validated, state = c.validCachedAssignment(experimentName, indexed, slot)
 	if state == assignmentValid {
-		c.ContextLock_.Unlock()
 		return previous
 	}
 	if state == assignmentRevalidated {
@@ -2180,7 +2156,6 @@ func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cach
 		// only makes the next read revalidate.
 		previous.rules = validated
 		previous.attrsSeq = atomic.LoadInt32(&c.AttrsSeq_)
-		c.ContextLock_.Unlock()
 		return previous
 	}
 
@@ -2336,7 +2311,6 @@ func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cach
 		c.retainSwitchbackSlot(experimentName, indexed, slot)
 	}
 	c.AssignmentCache[experimentName] = *assignment
-	c.ContextLock_.Unlock()
 	return entry
 }
 
@@ -2691,7 +2665,6 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 			}
 			switchbacks[experiment.Name] = newSwitchbackDefinition(experiment.SwitchbackClusters)
 		} else if len(experiment.HoldoutIds) > 0 && len(holdoutsById) > 0 {
-			// Holdouts never apply to a switchback.
 			if covering := coveringHoldouts(experiment.HoldoutIds, holdoutsById); len(covering) > 0 {
 				if coverage == nil {
 					coverage = map[string][]*jsonmodels.Holdout{}

@@ -779,10 +779,11 @@ func TestSwitchbackCluster_AddressableFieldsAndSharedSubslice(t *testing.T) {
 }
 
 // A cluster value is the attribute as published: a json.Number that
-// encoding/json cannot encode gives no key, and an invalid UTF-8 string is
-// keyed by its published text, each bad byte replaced by U+FFFD, so it
-// matches an allow-list holding that text and agrees with another spelling
-// that publishes the same.
+// encoding/json cannot encode gives no key, and a string with a single
+// invalid byte is keyed by its published text, so it matches an allow-list
+// holding that text and agrees with another spelling that publishes the
+// same. Adjacent invalid bytes are pinned by
+// TestSwitchbackCluster_AdjacentInvalidBytesAndPublishedMemberNames.
 func TestSwitchbackCluster_ValuesAreReadAsPublished(t *testing.T) {
 	var invalid = map[string]interface{}{"city": "Lisboa", "n": json.Number("not-a-number")}
 	if _, err := json.Marshal(invalid); err == nil {
@@ -841,4 +842,31 @@ func TestSwitchbackCluster_RootAttributeNamesMatchAsPublished(t *testing.T) {
 			h.expectPending(0)
 		}
 	}
+}
+
+type sbPanickingCity struct{}
+
+func (sbPanickingCity) MarshalJSON() ([]byte, error) {
+	panic("marshal")
+}
+
+// A cluster attribute whose marshaler panics leaves the context usable: the
+// panic reaches the caller, and the context lock is released.
+func TestSwitchbackCluster_MarshalerPanicReleasesTheContext(t *testing.T) {
+	var h = sbCreateBare(t, map[string]string{sbUnitType: sbUID}, sbData(sbAttributeSwitchback("city")))
+	h.setAttribute("city", sbPanickingCity{})
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("the marshaler's panic did not reach the caller")
+			}
+		}()
+		_, _ = h.ctx.GetTreatment("exp_sb")
+	}()
+	if !h.ctx.ContextLock_.TryLock() {
+		t.Fatal("the context lock was left held")
+	}
+	h.ctx.ContextLock_.Unlock()
+	h.setAttribute("city", "Lisboa")
+	expectInt(t, sbDraw("Lisboa", 0, sbClusterArms), h.at(sbAnchor+5).treatment("exp_sb"))
 }

@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/absmartly/go-sdk/sdk/internal"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
@@ -92,7 +93,7 @@ func switchbackScheduleServable(data jsonmodels.Experiment) bool {
 // legacy path.
 func currentSwitchbackPeriod(indexed *indexedExperiment, now int64) (int64, bool) {
 	var data = indexed.experiment.Data
-	if indexed.switchback.paths == nil || !switchbackScheduleServable(data) {
+	if indexed.switchback.sources == nil || !switchbackScheduleServable(data) {
 		return 0, false
 	}
 	var startAt = *data.SwitchbackStartAt
@@ -116,9 +117,7 @@ type switchbackSlot struct {
 	resolvedAt int64
 	// silent is set for a resolution the Collector records nothing for: no
 	// linked unit, an ineligible cluster, or no period to draw in.
-	silent bool
-	// customSet and custom are the custom assignment the slot was resolved
-	// with.
+	silent    bool
 	customSet bool
 	custom    int
 }
@@ -156,8 +155,8 @@ func (s *switchbackSlot) unitType(indexed *indexedExperiment) string {
 	if len(s.serving.unitType) > 0 {
 		return s.serving.unitType
 	}
-	if indexed.switchback.paths != nil {
-		return indexed.switchback.sources[0]
+	if indexed.switchback.sources != nil {
+		return indexed.switchback.sources[0].unitType
 	}
 	return indexed.experiment.Data.UnitType
 }
@@ -373,7 +372,7 @@ func (c *Context) newSwitchbackSlot(indexed *indexedExperiment, previous *cached
 // unit. The caller holds ContextLock_.
 func (c *Context) resolveSwitchbackServing(indexed *indexedExperiment, now int64) switchbackServing {
 	var data = indexed.experiment.Data
-	if indexed.switchback.paths == nil {
+	if indexed.switchback.sources == nil {
 		return legacySwitchbackServing(data.UnitType, c.Units_)
 	}
 	return resolveSwitchbackServing(indexed.switchback, data.SwitchbackClusterValues, c.Units_,
@@ -388,14 +387,7 @@ func (c *Context) resolveSwitchbackServing(indexed *indexedExperiment, now int64
 // javaTrim is Java's String.trim: leading and trailing characters at or
 // below U+0020 are removed, and nothing else (a non-breaking space stays).
 func javaTrim(s string) string {
-	var start, end = 0, len(s)
-	for start < end && s[start] <= ' ' {
-		start++
-	}
-	for end > start && s[end-1] <= ' ' {
-		end--
-	}
-	return s[start:end]
+	return strings.TrimFunc(s, func(r rune) bool { return r <= ' ' })
 }
 
 // latestAttribute is the attribute the Collector records with an exposure at
@@ -537,7 +529,7 @@ func sameSwitchbackIdentity(previous *indexedExperiment, installed *indexedExper
 		equalInt64Pointers(a.SwitchbackStartAt, b.SwitchbackStartAt) &&
 		equalInt64Pointers(a.SwitchbackPeriodMs, b.SwitchbackPeriodMs) &&
 		a.SwitchbackDesignType == b.SwitchbackDesignType &&
-		((previous.switchback.paths != nil && installed.switchback.paths != nil) || a.UnitType == b.UnitType)
+		((previous.switchback.sources != nil && installed.switchback.sources != nil) || a.UnitType == b.UnitType)
 }
 
 func equalInt64Pointers(a *int64, b *int64) bool {

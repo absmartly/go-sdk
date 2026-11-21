@@ -616,8 +616,10 @@ for the full rules):
   aligned or outside `[0, 10000-01-01)`, a period of 0 or less, fewer than
   two arms), the draw gives variant `0` with no exposure. Holdouts never
   apply to a switchback experiment.
-- The exposure is published under the serving unit, once per period, and is
-  stamped with the time that chose its period. Its fields are the same as a
+- The exposure is published under the serving unit, once per period while
+  that period is retained (the last two periods per experiment; re-entering
+  an older period, after a clock rewind for example, exposes it again), and
+  is stamped with the time that chose its period. Its fields are the same as a
   unit experiment's; the cluster attributes are published with their
   timestamps as before.
 

@@ -1334,7 +1334,6 @@ func TestSwitchback_TransitionsWithoutAnInterveningLookupStillReresolve(t *testi
 	expectInt(t, sbExpected2Arms[0], h.treatment("exp_sb"))
 	h.expectPending(4)
 
-	// An unchanged identity keeps the epoch.
 	h.refresh(sbDefault(2, sbHour))
 	h.treatment("exp_sb")
 	h.expectPending(4)
