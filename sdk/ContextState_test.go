@@ -373,6 +373,35 @@ func TestLiteralVariableValueWhenUnassigned(t *testing.T) {
 	}
 }
 
+// On a literal whose IndexVariables_ maps a key to an experiment that is not
+// in Index_, GetVariableValue still exposes that (unknown) assignment and
+// returns the default, as in v1.1.1.
+func TestLiteralVariableValueExposesAnAssignmentWithoutVariables(t *testing.T) {
+	var experiment = audienceExperiment("exp", "", false)
+	var manual = audienceLiteral(experiment)
+	manual.IndexVariables_ = map[interface{}]interface{}{"key": ExperimentVariables{Data: audienceExperiment("missing", "", false)}}
+	var value, err = manual.GetVariableValue("key", "fallback")
+	assertAny(nil, err, t)
+	assertAny("fallback", value, t)
+	assertAny(int32(1), manual.GetPendingCount(), t)
+}
+
+// A literal's variable read exposes a rule-chosen assignment with its rule
+// flag, as the treatment path does.
+func TestLiteralVariableValueExposureKeepsRuleFlag(t *testing.T) {
+	var ruled = ruleExperiment("ruled", rulesJSON(`{"type":"assign","variant":1}`))
+	ruled.Variants[1].Config = `{"key":1}`
+	var manual = audienceLiteral(ruled)
+	manual.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{ruled}})
+	var value, err = manual.GetVariableValue("key", "fallback")
+	assertAny(nil, err, t)
+	assertAny(float64(1), value, t)
+	manual.EventLock_.Lock()
+	defer manual.EventLock_.Unlock()
+	assertAny(1, len(manual.Exposures_), t)
+	assertAny(true, manual.Exposures_[0].RuleOverride, t)
+}
+
 // The first parse of each distinct audience checks membership against a set
 // built once per installed snapshot, not by walking the catalog each time.
 func TestColdAudienceReadsDoNotRescanTheCatalog(t *testing.T) {
