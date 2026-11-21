@@ -253,6 +253,11 @@ type cachedAssignment struct {
 	resolvedId        int
 	resolvedIteration int
 	resolvedUnitType  string
+	// resolvedAudience and resolvedAudienceStrict are the audience definition
+	// the decision was evaluated against; ExperimentMatches does not compare
+	// them, so an audience edit is otherwise only seen once attributes change.
+	resolvedAudience       string
+	resolvedAudienceStrict bool
 }
 
 func (e *cachedAssignment) resolvedExperimentMatches(data jsonmodels.Experiment) bool {
@@ -1033,9 +1038,12 @@ func (c *Context) queueEligibleExposureAt(entry *cachedAssignment, eligible func
 		return c.queueExposureAt(entry.assignment, entry, at)
 	}
 	c = c.live()
-	c.ContextLock_.RLock()
-	var status = claimEligible(entry, eligible)
-	c.ContextLock_.RUnlock()
+	var status = func() exposureStatus {
+		c.ContextLock_.RLock()
+		// Released on unwind too: the audience evaluator can panic.
+		defer c.ContextLock_.RUnlock()
+		return claimEligible(entry, eligible)
+	}()
 	if status != exposureClaimed {
 		return status
 	}
@@ -1103,13 +1111,7 @@ func (c *Context) variableEligible(experimentName string, key string) func(*cach
 		if _, defined := indexed.variableKeys[key]; !defined {
 			return exposureIneligible
 		}
-		// The entry's own slot: a read resolved in a period claims that
-		// period's decision, even if the clock has since moved on.
-		var slot = assignmentSlot{key: experimentName}
-		if e.switchback != nil && e.switchback.hasPeriod {
-			slot = assignmentSlot{key: switchbackSlotKey(experimentName, e.switchback.period), period: e.switchback.period, hasPeriod: true}
-		}
-		if current, _, state := c.validCachedAssignmentFor(experimentName, indexed, slot, true); current != e || state == assignmentStale {
+		if _, state := c.validEntry(experimentName, indexed, e, true); state == assignmentStale {
 			// Still a candidate, but this decision is no longer the current
 			// one: resolve again rather than claim it or skip the experiment.
 			return exposureRetired
@@ -1948,11 +1950,22 @@ func (c *Context) validCachedAssignmentFor(experimentName string, indexed *index
 	if !found {
 		return nil, nil, assignmentStale
 	}
+	var rules, state = c.validEntry(experimentName, indexed, entry, ignoreCustom)
+	return entry, rules, state
+}
+
+// validEntry reports whether entry, cached or not, is still the decision the
+// installed data gives for experimentName. indexed is the installed
+// experiment, nil when there is none. A variable read's claim checks its own
+// entry, so an equivalent rebuild by a concurrent read (an unapplied custom
+// assignment rebuilds on every lookup) does not make its decision stale.
+func (c *Context) validEntry(experimentName string, indexed *indexedExperiment, entry *cachedAssignment,
+	ignoreCustom bool) (*experimentRules, assignmentState) {
 	if c.switchbackEpochStale(experimentName, indexed) {
-		return entry, nil, assignmentStale
+		return nil, assignmentStale
 	}
 	if entry.retirement.Load() {
-		return entry, nil, assignmentStale
+		return nil, assignmentStale
 	}
 	var assignment = entry.assignment
 	var custom, cfound = c.Cassignments_[experimentName]
@@ -1975,35 +1988,46 @@ func (c *Context) validCachedAssignmentFor(experimentName string, indexed *index
 		// identity before a variable read can claim it in the new epoch.
 		if efound && !assignment.Exposed.Load().(bool) && c.index_.Load().keyed &&
 			!entry.resolvedExperimentMatches(experiment.Data) {
-			return entry, rules, assignmentStale
+			return rules, assignmentStale
 		}
 		if assignment.Overridden && assignment.Variant == override.(int) && (!efound ||
 			holdoutSetMatches(holdouts, entry.holdouts) && (entry.holdouts == nil || entry.resolvedUnitType == experiment.Data.UnitType)) &&
 			switchbackSlotMatches(indexed, entry) {
-			return entry, rules, assignmentValid
+			return rules, assignmentValid
 		}
 	} else if !efound {
 		// A rule-won assignment is not assigned either, but its variant came
 		// from the experiment's rules, so it is rebuilt once the experiment
 		// is gone.
 		if !assignment.Assigned && !assignment.RuleOverride {
-			return entry, rules, assignmentValid
+			return rules, assignmentValid
 		}
 	} else if assignment.RuleOverride || entry.holdouts.isSuppressed() || ignoreCustom || entry.switchback.customMatches(custom, cfound, assignment) {
 		// A matching rule wins over a custom assignment, and a holdout
 		// suppression forces control, so a custom assignment that differs
 		// from either variant is not staleness.
 		if !c.entryMatches(indexed, entry) || !holdoutSetMatches(holdouts, entry.holdouts) {
-			return entry, rules, assignmentStale
+			return rules, assignmentStale
+		}
+		if (ignoreCustom || !assignment.Exposed.Load().(bool) && c.index_.Load().keyed) &&
+			(entry.resolvedAudience != experiment.Data.Audience ||
+				entry.resolvedAudienceStrict != experiment.Data.AudienceStrict) {
+			// An unexposed decision in a keyed context is judged against the
+			// audience it would be evaluated with now, by the cache and the
+			// claim alike, so a definition that made it strict, or changed it,
+			// rebuilds it rather than letting a variable read claim it. An
+			// exposed decision, and every decision in other contexts, keeps
+			// the released behaviour.
+			return rules, assignmentStale
 		}
 		if rules == entry.rules && atomic.LoadInt32(&c.AttrsSeq_) <= entry.attrsSeq {
-			return entry, rules, assignmentValid
+			return rules, assignmentValid
 		}
 		if c.ruleMatches(experiment.Data, rules, entry) && c.audienceMatches(experiment.Data, entry) {
-			return entry, rules, assignmentRevalidated
+			return rules, assignmentRevalidated
 		}
 	}
-	return entry, rules, assignmentStale
+	return rules, assignmentStale
 }
 
 // ruleMatches reports whether the experiment's assignment rules still give the
@@ -2222,6 +2246,8 @@ func (c *Context) resolveAssignmentLocked(experimentName string, at *clockReadin
 		entry.resolvedId = experiment.Data.Id
 		entry.resolvedIteration = experiment.Data.Iteration
 		entry.resolvedUnitType = experiment.Data.UnitType
+		entry.resolvedAudience = experiment.Data.Audience
+		entry.resolvedAudienceStrict = experiment.Data.AudienceStrict
 	}
 
 	// Resolved for overrides and rule wins too: the holdouts' exposures fire
