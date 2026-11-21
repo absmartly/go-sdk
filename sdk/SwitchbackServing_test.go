@@ -134,8 +134,6 @@ func TestSwitchbackPath_IndexSegmentsReadOnlyListsAndKeySegmentsReadOnlyMaps(t *
 	expectValue(t, nil, sbResolvePath(t, parseSwitchbackPath("name/x"), attributes))
 	expectValue(t, nil, sbResolvePath(t, parseSwitchbackPath("missing/x"), attributes))
 	expectValue(t, "Lisbon", sbResolvePath(t, parseSwitchbackPath("items/-0/city"), attributes))
-	// A list segment never reads a map key that looks like an index, nor a
-	// key segment a list.
 	expectValue(t, "", parseSwitchbackPath("geo/0/city").resolveAttribute(attributes["geo"]))
 	expectValue(t, "", parseSwitchbackPath("items/city").resolveAttribute(attributes["items"]))
 	expectValue(t, "", parseSwitchbackPath("name/x").resolveAttribute("scalar"))

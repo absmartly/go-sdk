@@ -787,8 +787,6 @@ func TestSwitchback_OverrideIsReresolvedWhenTheGridChanges(t *testing.T) {
 	expectValue(t, 2, h.variable("sb.arm"))
 	h.expectPending(1)
 
-	// Same index 0 under the new period length; variant 2 carries another
-	// value now.
 	var regridded = sbDefault(3, 2*sbHour)
 	regridded.HoldoutIds = []int{11}
 	regridded.Variants[2] = jsonmodels.ExperimentVariant{Name: "C", Config: `{"sb.arm":22}`}
@@ -2304,24 +2302,21 @@ func TestSwitchback_VariableReadIgnoresAUnitTypeOnlyRefresh(t *testing.T) {
 }
 
 // A switchback variable read whose experiment is refreshed to another id or
-// iteration between resolving its slot and claiming the exposure never
-// claims the superseded slot: it resolves again, then serves and exposes the
-// replacement once, under the new identity.
+// iteration alone (same grid) between resolving its slot and claiming the
+// exposure never claims the superseded slot: it resolves again, then serves
+// and exposes the replacement once, under the new identity.
 func TestSwitchback_VariableClaimServesTheReplacementOfARefreshedSlot(t *testing.T) {
-	if sbExpected2Arms[0] == sbExpected2Arms[1] {
-		t.Fatal("fixture: periods 0 and 1 draw the same arm")
-	}
 	for name, edit := range map[string]func(*jsonmodels.Experiment){
 		"iteration": func(e *jsonmodels.Experiment) { e.Iteration++ },
 		"id":        func(e *jsonmodels.Experiment) { e.Id = 77 },
 	} {
 		var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
-		h.at(sbAnchor + sbHour + 5)
-		expectInt(t, sbExpected2Arms[1], h.peek("exp_sb"))
+		h.at(sbAnchor + 5)
+		var arm = h.peek("exp_sb")
 		var refreshed = sbDefault(2, sbHour)
 		edit(&refreshed)
-		// Period 0 of the moved start, so the replacement draws another arm.
-		refreshed.SwitchbackStartAt = sbInt64(sbAnchor + sbHour)
+		refreshed.Variants = append([]jsonmodels.ExperimentVariant(nil), refreshed.Variants...)
+		refreshed.Variants[arm].Config = `{"sb.arm":123}`
 		var armed = true
 		afterReadResolve = func() {
 			if armed {
@@ -2334,11 +2329,11 @@ func TestSwitchback_VariableClaimServesTheReplacementOfARefreshedSlot(t *testing
 		if armed {
 			t.Fatalf("%s: the hook did not run", name)
 		}
-		if value != sbExpected2Arms[0] {
-			t.Fatalf("%s: got %v, want the replacement's arm %d", name, value, sbExpected2Arms[0])
+		if value != 123 {
+			t.Fatalf("%s: got %v, want the replacement's value 123", name, value)
 		}
 		var exposures = queuedExposures(h.ctx)
-		if len(exposures) != 1 || exposures[0].Id != refreshed.Id || exposures[0].Variant != sbExpected2Arms[0] {
+		if len(exposures) != 1 || exposures[0].Id != refreshed.Id || exposures[0].Variant != arm {
 			t.Fatalf("%s: exposures %+v", name, exposures)
 		}
 	}
@@ -2422,4 +2417,112 @@ func TestSwitchback_RejectedLegacyOverrideStaysRetryable(t *testing.T) {
 	h.expectPending(0)
 	h.ctx.QueueExposure(held)
 	h.expectPending(1)
+}
+
+// A held switchback override resolved without a serving unit stays
+// queueable when a unit no serving source reads is set, for a readable
+// cluster map and on the legacy path alike.
+func TestSwitchback_UnrelatedUnitKeepsAHeldOverrideQueueable(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		var experiment = sbDefault(2, sbHour)
+		if legacy {
+			experiment.SwitchbackClusters = sbClusters("device_id", "'unterminated")
+		}
+		var h = sbCreateAt(t, sbAnchor+5, map[string]string{}, sbData(experiment), sbOverride("exp_sb", 1))
+		var held = h.ctx.GetAssignment("exp_sb")
+		_ = h.ctx.SetUnit("unrelated", "some")
+		h.ctx.QueueExposure(held)
+		if pending := len(queuedExposures(h.ctx)); pending != 1 {
+			t.Fatalf("legacy=%v: %d exposures queued, want 1", legacy, pending)
+		}
+	}
+}
+
+// A shared variable key's later candidate resolves and stamps at the
+// reading a retry of an earlier candidate took, never at the one it
+// discarded.
+func TestSwitchback_SharedKeyCandidateUsesTheRetryReading(t *testing.T) {
+	var first = sbExperiment(1, "exp_a", 2, sbHour)
+	var second = sbExperiment(2, "exp_b", 2, sbHour)
+	second.SeedHi, second.SeedLo = 77, 88
+	var h = sbCreateAt(t, sbAnchor+sbHour-1, map[string]string{sbUnitType: sbUID}, sbData(first, second))
+	var retryAt = sbAnchor + sbHour
+	if sbDrawSeeded(77, 88, 0) == sbDrawSeeded(77, 88, 1) {
+		t.Fatal("fixture: exp_b draws the same arm in periods 0 and 1")
+	}
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			// exp_a falls through after its retry: a strict mismatch.
+			var refreshed = first
+			refreshed.Iteration++
+			refreshed.AudienceStrict = true
+			refreshed.Audience = sbStrictGoldAudience
+			h.at(retryAt)
+			h.refresh(refreshed, second)
+		}
+	}
+	var value = h.variable("sb.arm")
+	afterReadResolve = nil
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	expectValue(t, sbDrawSeeded(77, 88, 1), value)
+	for _, exposure := range queuedExposures(h.ctx) {
+		if exposure.ExposedAt != retryAt {
+			t.Fatalf("%s stamped %d, want the retry reading %d", exposure.Name, exposure.ExposedAt, retryAt)
+		}
+	}
+}
+
+type sbPanickingClock struct {
+	panics bool
+	now    int64
+}
+
+func (c *sbPanickingClock) Millis() int64 {
+	if c.panics {
+		panic("clock")
+	}
+	return c.now
+}
+
+// A context whose injected clock panics during a read stays usable once the
+// caller recovers: the read lock is released.
+func TestSwitchback_ClockPanicReleasesTheReadLock(t *testing.T) {
+	var config = CreateDefaultContextConfig()
+	config.PublishDelay_, config.RefreshInterval_ = -1, -1
+	config.Units_[sbUnitType] = sbUID
+	config.Attributes_ = map[string]interface{}{sbClusterPath: sbClusterKey}
+	var clock = &sbPanickingClock{now: sbAnchor + 5}
+	var ft, done = future.New()
+	done(sbData(sbDefault(2, sbHour)), nil)
+	var ctx = CreateContext(clock, config, ft, &hoProvider{}, &hoPublisher{}, nil, DefaultVariableParser{},
+		AudienceMatcher{DefaultAudienceDeserializer{}})
+	ctx.WaitUntilReady()
+	t.Cleanup(func() { ctx.ClearTimeout(); ctx.ClearRefreshTimer() })
+	clock.panics = true
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("the clock's panic did not reach the caller")
+			}
+		}()
+		_, _ = ctx.GetTreatment("exp_sb")
+	}()
+	clock.panics = false
+	if !ctx.ContextLock_.TryLock() {
+		t.Fatal("the context lock was left held")
+	}
+	ctx.ContextLock_.Unlock()
+	if err := ctx.SetUnit("other", "x"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// sbDrawSeeded is the draw for the default cluster key under other seeds.
+func sbDrawSeeded(seedHi int, seedLo int, period int64) int {
+	var variant, _ = SwitchbackAssign(sbClusterKey, period, int64(switchbackSeed(seedHi, seedLo)), 2)
+	return variant
 }

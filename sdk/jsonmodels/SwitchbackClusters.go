@@ -35,9 +35,7 @@ func decodeSwitchbackClusters(data []byte) SwitchbackClusters {
 		return nil
 	}
 	var clusters = SwitchbackClusters{}
-	// A repeated key's earlier, overwritten value does not make the map
-	// unreadable; only a final value does.
-	var unreadable = map[string]bool{}
+	var values = map[string]json.RawMessage{}
 	for decoder.More() {
 		var key, err = decoder.Token()
 		if err != nil {
@@ -48,32 +46,21 @@ func decodeSwitchbackClusters(data []byte) SwitchbackClusters {
 			return nil
 		}
 		var unitType = key.(string)
-		var path string
-		var readable = true
-		switch {
-		case len(raw) == 0 || raw[0] == '{' || raw[0] == '[' || bytes.Equal(raw, []byte("null")):
-			readable = false
-		case raw[0] == '"':
-			readable = json.Unmarshal(raw, &path) == nil
-		default:
-			path = string(raw)
+		if _, seen := values[unitType]; !seen {
+			clusters = append(clusters, SwitchbackCluster{UnitType: unitType})
 		}
-		unreadable[unitType] = !readable
-		var found = false
-		for i := range clusters {
-			if clusters[i].UnitType == unitType {
-				clusters[i].Path = path
-				found = true
-				break
-			}
-		}
-		if !found {
-			clusters = append(clusters, SwitchbackCluster{UnitType: unitType, Path: path})
-		}
+		values[unitType] = raw
 	}
-	for _, bad := range unreadable {
-		if bad {
+	for i := range clusters {
+		var cluster = &clusters[i]
+		var raw = values[cluster.UnitType]
+		switch raw[0] {
+		case '{', '[', 'n':
 			return nil
+		case '"':
+			_ = json.Unmarshal(raw, &cluster.Path)
+		default:
+			cluster.Path = string(raw)
 		}
 	}
 	return clusters

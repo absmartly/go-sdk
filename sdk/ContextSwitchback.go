@@ -393,9 +393,7 @@ func javaTrim(s string) string {
 // legacy path the declared unitType. The caller holds ContextLock_.
 func (c *Context) switchbackServingUnitSet(indexed *indexedExperiment) bool {
 	if indexed.switchback.sources == nil {
-		var unitType = indexed.experiment.Data.UnitType
-		var _, set = c.Units_[unitType]
-		return set && len(unitType) > 0
+		return legacySwitchbackServing(indexed.experiment.Data.UnitType, c.Units_).status != switchbackAbsent
 	}
 	for _, source := range indexed.switchback.sources {
 		if _, set := c.Units_[source.unitType]; set {

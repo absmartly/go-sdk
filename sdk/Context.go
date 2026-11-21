@@ -772,6 +772,11 @@ func (c *Context) evictAssignmentsMissingUnit(unitType string) {
 	for name, entry := range c.assignmentCache_ {
 		var assignment = entry.assignment
 		if entry.switchback != nil && entry.switchback.serving.status == switchbackAbsent {
+			// A unit no serving source reads leaves the slot as it is.
+			if indexed := c.indexedExperiment(assignment.Name); indexed == nil || indexed.switchback == nil ||
+				!c.switchbackServingUnitSet(indexed) {
+				continue
+			}
 			// A switchback resolved before any linked unit was set is
 			// resolved again now that one may be. One that is not overridden
 			// never published anything, so it is dropped even if exposed. An
@@ -1025,7 +1030,10 @@ func (c *Context) settleExposureAt(experimentName string, entry *cachedAssignmen
 		if status != exposureRetired || attempt >= maxExposureAttempts {
 			return entry, true
 		}
-		at = &clockReading{clock: c.Clock_}
+		// Reset in place: the caller's later candidates (a shared variable
+		// key's fall-through) resolve and stamp at the retry's reading, never
+		// at the one the retry discarded.
+		*at = clockReading{clock: c.Clock_}
 		entry = c.getAssignmentAt(experimentName, at)
 	}
 }
@@ -2183,15 +2191,23 @@ func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cach
 	c = c.live()
 	// A valid cached assignment only needs the read lock, so concurrent reads
 	// of a shared context do not serialise.
-	c.ContextLock_.RLock()
-	var indexed = c.indexedExperiment(experimentName)
-	if entry, _, state := c.validCachedAssignment(experimentName, indexed, assignmentSlotFor(experimentName, indexed, at)); state == assignmentValid {
-		c.ContextLock_.RUnlock()
+	if entry := c.cachedAssignmentAt(experimentName, at); entry != nil {
 		return entry
 	}
-	c.ContextLock_.RUnlock()
-
 	return c.resolveAssignmentLocked(experimentName, at)
+}
+
+// cachedAssignmentAt is the valid cached assignment, or nil. The read lock
+// is released on unwind too: the slot lookup reads an injected clock, which
+// may panic.
+func (c *Context) cachedAssignmentAt(experimentName string, at *clockReading) *cachedAssignment {
+	c.ContextLock_.RLock()
+	defer c.ContextLock_.RUnlock()
+	var indexed = c.indexedExperiment(experimentName)
+	if entry, _, state := c.validCachedAssignment(experimentName, indexed, assignmentSlotFor(experimentName, indexed, at)); state == assignmentValid {
+		return entry
+	}
+	return nil
 }
 
 // resolveAssignmentLocked rebuilds an assignment under the write lock. The

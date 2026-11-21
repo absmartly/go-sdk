@@ -22,9 +22,7 @@ import (
 // unterminated or any segment key, quoted or not, contains a '.' (dotted
 // paths are not a nesting syntax; nesting is written with '/').
 type switchbackPath struct {
-	keys []string
-	// indices is parallel to keys; isIndex marks the segments that index a
-	// list.
+	keys    []string
 	indices []int
 	isIndex []bool
 }
@@ -434,15 +432,14 @@ func newSwitchbackDefinition(clusters jsonmodels.SwitchbackClusters) *switchback
 func resolveSwitchbackServing(definition *switchbackDefinition, allowed []string, units map[string]string,
 	read func(*switchbackPath) string) switchbackServing {
 	var first, serving switchbackServing
-	var found, disagreement = false, false
+	var disagreement = false
 	for _, source := range definition.sources {
 		var unitType = source.unitType
 		var uid, set = units[unitType]
 		if !set {
 			continue
 		}
-		if !found {
-			found = true
+		if first.status == switchbackAbsent {
 			first = switchbackServing{status: switchbackIneligible, unitType: unitType, uid: uid}
 		}
 		var value = read(source.path)
@@ -455,8 +452,8 @@ func resolveSwitchbackServing(definition *switchbackDefinition, allowed []string
 			disagreement = true
 		}
 	}
-	if !found {
-		return switchbackServing{status: switchbackAbsent}
+	if first.status == switchbackAbsent {
+		return first
 	}
 	if len(serving.clusterKey) == 0 || disagreement || !switchbackValueAllowed(allowed, serving.clusterKey) {
 		return first
