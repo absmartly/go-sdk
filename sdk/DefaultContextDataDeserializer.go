@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"math"
+	"math/big"
 	"strconv"
 
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
@@ -258,11 +259,13 @@ func jsonInt64(raw json.RawMessage) *int64 {
 	if value, err := number.Int64(); err == nil {
 		return &value
 	}
-	var value, err = number.Float64()
-	if err != nil || value != math.Trunc(value) || math.Abs(value) > 1<<53 {
+	// A decimal or exponent spelling counts only when it is exactly integral:
+	// rounding through float64 would turn 3600000.0000000001 into 3600000.
+	var exact, ok = new(big.Rat).SetString(number.String())
+	if !ok || !exact.IsInt() || !exact.Num().IsInt64() {
 		return nil
 	}
-	var integer = int64(value)
+	var integer = exact.Num().Int64()
 	return &integer
 }
 

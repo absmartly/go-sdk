@@ -851,3 +851,17 @@ func TestJSONNumberBeyondFloat64IsInfinity(t *testing.T) {
 		t.Errorf("1e400: %v, %v", number, err)
 	}
 }
+
+// A json.Number haystack is a number, as a float64 is: `in` does not search
+// its digits, while a string haystack still matches a substring.
+func TestJSONNumberHaystackIsNotText(t *testing.T) {
+	var expr = map[string]interface{}{"in": []interface{}{map[string]interface{}{"var": "n"}, map[string]interface{}{"value": "2"}}}
+	for _, haystack := range []interface{}{json.Number("123"), float64(123)} {
+		if jsonexpr.EvaluateBooleanExpr(expr, map[string]interface{}{"n": haystack}) {
+			t.Errorf("%#v contains \"2\"", haystack)
+		}
+	}
+	if !jsonexpr.EvaluateBooleanExpr(expr, map[string]interface{}{"n": "123"}) {
+		t.Error("\"123\" does not contain \"2\"")
+	}
+}

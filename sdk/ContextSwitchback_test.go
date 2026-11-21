@@ -468,7 +468,6 @@ func TestSwitchback_UnservableScheduleIsIneligibleAndNeverFallsBackToUnitAssignm
 		for i := int64(0); i < 4; i++ {
 			h.at(sbAnchor + i*sbHour)
 			expectInt(t, 0, h.treatment("exp_sb"))
-			// Variant 0's own config, like any ineligible assignment.
 			expectValue(t, 0, h.variable("sb.arm"))
 		}
 		h.expectPending(0)
@@ -539,7 +538,6 @@ func TestSwitchback_MissingClusterUnitIsUnassignedWithoutFallback(t *testing.T) 
 // its exposure is not repeated.
 func TestSwitchback_OverrideWithoutALinkedUnitIsKeptOnceExposed(t *testing.T) {
 	var experiment = sbDefault(2, sbHour)
-	// Recorded under the first linked type, never the declared unitType.
 	experiment.UnitType = "user_id"
 	var h = sbCreateAt(t, sbAnchor+5, nil, sbData(experiment), sbOverride("exp_sb", 1))
 	expectInt(t, 1, h.treatment("exp_sb"))
@@ -1222,7 +1220,6 @@ func TestSwitchback_GridRefreshToALowerIndexExposesOnce(t *testing.T) {
 		expectInt(t, sbExpected2Arms[0], h.treatment("exp_sb"))
 	}
 	h.expectPending(3)
-	// The new epoch dropped the old one's slots together.
 	h.ctx.ContextLock_.RLock()
 	defer h.ctx.ContextLock_.RUnlock()
 	expectInt(t, 1, len(h.ctx.assignmentCache_))
@@ -2352,4 +2349,65 @@ func TestSwitchback_OverrideIgnoresAUnitTypeOnlyRefresh(t *testing.T) {
 	}
 	h.expectPublished(jsonmodels.Exposure{Id: 1, Name: "exp_sb", Unit: sbUnitType, Variant: 1, ExposedAt: sbAnchor + 5,
 		Eligible: true, Overridden: true})
+}
+
+// A switchback variable read whose experiment is refreshed to another
+// generation (an allow-list excluding its cluster) or to unit randomization
+// between resolving its slot and claiming the exposure never claims the
+// superseded slot: it resolves again under the installed definition.
+func TestSwitchback_VariableClaimDeclinesASupersededGeneration(t *testing.T) {
+	var excluded = sbDefault(2, sbHour)
+	excluded.SwitchbackClusterValues = []string{"other"}
+	var unit = sbUnit(sbDefault(2, sbHour))
+	unit.UnitType = "user_id"
+	unit.Split = []float64{0, 1}
+	for name, c := range map[string]struct {
+		refreshed jsonmodels.Experiment
+		value     interface{}
+		unit      string
+	}{
+		"allow-list": {excluded, 0, ""},
+		"to unit":    {unit, 1, "user_id"},
+	} {
+		var h = sbCreateAt(t, sbAnchor+5, map[string]string{sbUnitType: sbUID, "user_id": "u1"}, sbData(sbDefault(2, sbHour)))
+		var armed = true
+		afterReadResolve = func() {
+			if armed {
+				armed = false
+				h.refresh(c.refreshed)
+			}
+		}
+		var value = h.variable("sb.arm")
+		afterReadResolve = nil
+		if armed {
+			t.Fatalf("%s: the hook did not run", name)
+		}
+		if value != c.value {
+			t.Fatalf("%s: got %v, want %v", name, value, c.value)
+		}
+		var exposures = queuedExposures(h.ctx)
+		if c.unit == "" {
+			if len(exposures) != 0 {
+				t.Fatalf("%s: exposures %+v", name, exposures)
+			}
+		} else if len(exposures) != 1 || exposures[0].Unit != c.unit {
+			t.Fatalf("%s: exposures %+v", name, exposures)
+		}
+	}
+}
+
+// A held legacy-path override whose exposure a close rejected is queued
+// again by the next QueueExposure when no serving unit arrived: a set unit
+// of a type the unreadable cluster map lists is not a serving unit.
+func TestSwitchback_RejectedLegacyOverrideStaysRetryable(t *testing.T) {
+	var experiment = sbDefault(2, sbHour)
+	experiment.SwitchbackClusters = sbClusters("device_id", "'unterminated")
+	var h = sbCreateAt(t, sbAnchor+5, map[string]string{"device_id": "d1"}, sbData(experiment), sbOverride("exp_sb", 1))
+	var held = h.ctx.GetAssignment("exp_sb")
+	h.ctx.Closing_.Store(true)
+	h.ctx.QueueExposure(held)
+	h.ctx.Closing_.Store(false)
+	h.expectPending(0)
+	h.ctx.QueueExposure(held)
+	h.expectPending(1)
 }

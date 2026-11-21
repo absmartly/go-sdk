@@ -1304,14 +1304,13 @@ func (c *Context) reopenExposure(assignment *Assignment, claimed *cachedAssignme
 		return
 	}
 	if claimed != nil && claimed.switchback != nil && claimed.switchback.serving.status == switchbackAbsent {
+		// Resolved before any serving unit was set: if one has arrived, the
+		// next read resolves again under it. The serving sources are the
+		// readable cluster map's, or the declared unitType on the legacy path.
 		var indexed = c.indexedExperiment(assignment.Name)
-		if indexed != nil && indexed.switchback != nil {
-			for _, source := range indexed.experiment.Data.SwitchbackClusters {
-				if _, set := c.Units_[source.UnitType]; set {
-					claimed.retirement.Store(true)
-					return
-				}
-			}
+		if indexed != nil && indexed.switchback != nil && c.switchbackServingUnitSet(indexed) {
+			claimed.retirement.Store(true)
+			return
 		}
 	}
 	var entry = c.assignmentCache_[assignment.Name]

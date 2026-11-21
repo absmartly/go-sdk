@@ -35,6 +35,9 @@ func decodeSwitchbackClusters(data []byte) SwitchbackClusters {
 		return nil
 	}
 	var clusters = SwitchbackClusters{}
+	// A repeated key's earlier, overwritten value does not make the map
+	// unreadable; only a final value does.
+	var unreadable = map[string]bool{}
 	for decoder.More() {
 		var key, err = decoder.Token()
 		if err != nil {
@@ -44,18 +47,18 @@ func decodeSwitchbackClusters(data []byte) SwitchbackClusters {
 		if decoder.Decode(&raw) != nil {
 			return nil
 		}
+		var unitType = key.(string)
 		var path string
+		var readable = true
 		switch {
 		case len(raw) == 0 || raw[0] == '{' || raw[0] == '[' || bytes.Equal(raw, []byte("null")):
-			return nil
+			readable = false
 		case raw[0] == '"':
-			if json.Unmarshal(raw, &path) != nil {
-				return nil
-			}
+			readable = json.Unmarshal(raw, &path) == nil
 		default:
 			path = string(raw)
 		}
-		var unitType = key.(string)
+		unreadable[unitType] = !readable
 		var found = false
 		for i := range clusters {
 			if clusters[i].UnitType == unitType {
@@ -66,6 +69,11 @@ func decodeSwitchbackClusters(data []byte) SwitchbackClusters {
 		}
 		if !found {
 			clusters = append(clusters, SwitchbackCluster{UnitType: unitType, Path: path})
+		}
+	}
+	for _, bad := range unreadable {
+		if bad {
+			return nil
 		}
 	}
 	return clusters

@@ -106,9 +106,7 @@ func currentSwitchbackPeriod(indexed *indexedExperiment, now int64) (int64, bool
 // switchbackSlot is a switchback assignment's serving resolution and the
 // period it was resolved for.
 type switchbackSlot struct {
-	serving switchbackServing
-	// generation is the switchback definition's generation the slot was
-	// resolved under.
+	serving    switchbackServing
 	generation uint64
 	period     int64
 	hasPeriod  bool
@@ -388,6 +386,23 @@ func (c *Context) resolveSwitchbackServing(indexed *indexedExperiment, now int64
 // below U+0020 are removed, and nothing else (a non-breaking space stays).
 func javaTrim(s string) string {
 	return strings.TrimFunc(s, func(r rune) bool { return r <= ' ' })
+}
+
+// switchbackServingUnitSet reports whether a unit that switchback serving
+// reads is set: one of the readable cluster map's linked types, or on the
+// legacy path the declared unitType. The caller holds ContextLock_.
+func (c *Context) switchbackServingUnitSet(indexed *indexedExperiment) bool {
+	if indexed.switchback.sources == nil {
+		var unitType = indexed.experiment.Data.UnitType
+		var _, set = c.Units_[unitType]
+		return set && len(unitType) > 0
+	}
+	for _, source := range indexed.switchback.sources {
+		if _, set := c.Units_[source.unitType]; set {
+			return true
+		}
+	}
+	return false
 }
 
 // latestAttribute is the attribute the Collector records with an exposure at

@@ -94,32 +94,15 @@ func (p *switchbackPath) rootKey() string {
 // more ASCII digits, within int32 range. "+1" and non-ASCII digits are not
 // numbers; "-0" is 0.
 func tryParseInt32(s string) (int, bool) {
-	var negative = len(s) > 0 && s[0] == '-'
-	var i = 0
-	if negative {
-		i = 1
-	}
-	if i == len(s) {
+	var digits = strings.TrimPrefix(s, "-")
+	if len(digits) == 0 || digits[0] < '0' || digits[0] > '9' {
 		return 0, false
 	}
-	var magnitude int64
-	for ; i < len(s); i++ {
-		var c = s[i]
-		if c < '0' || c > '9' {
-			return 0, false
-		}
-		magnitude = magnitude*10 + int64(c-'0')
-		if magnitude > 1<<31 {
-			return 0, false
-		}
-	}
-	if negative {
-		magnitude = -magnitude
-	}
-	if magnitude > 1<<31-1 {
+	var value, err = strconv.ParseInt(s, 10, 32)
+	if err != nil {
 		return 0, false
 	}
-	return int(magnitude), true
+	return int(value), true
 }
 
 // resolveAttribute reads the path below rootKey in an attribute value, as the

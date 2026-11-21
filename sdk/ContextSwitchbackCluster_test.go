@@ -198,7 +198,6 @@ func TestSwitchbackCluster_ValuesWithoutAClusterKeyAreIneligible(t *testing.T) {
 		if got := h.treatment("exp_sb"); got != 0 {
 			t.Errorf("%#v: variant %d", value, got)
 		}
-		// Variant 0's own config, like any ineligible assignment.
 		expectValue(t, 0, h.variable("sb.arm"))
 		if h.pending() != 0 {
 			t.Errorf("%#v: %d pending", value, h.pending())
@@ -671,7 +670,6 @@ func TestSwitchbackCluster_StructFieldsAreReadFromTheirEncoding(t *testing.T) {
 	expectValue(t, "", parseSwitchbackPath("geo/City").resolveAttribute(geo{City: 3.5}))
 	expectValue(t, "", parseSwitchbackPath("geo/City").resolveAttribute(map[string]interface{}{"City": 3.0}))
 	expectValue(t, "", parseSwitchbackPath("geo").resolveAttribute(3.0))
-	// A map with non-string keys is encoded with string keys.
 	expectValue(t, "Porto", parseSwitchbackPath("geo/'1'").resolveAttribute(map[int]string{1: "Porto"}))
 }
 
@@ -684,7 +682,6 @@ func TestSwitchbackCluster_FirstReadFixesThePeriodsArmBeforeAnyExposure(t *testi
 	if lisboa == faro {
 		t.Fatal("fixture: Lisboa and Faro agree in period 0")
 	}
-	// A peek fixes the arm before the exposure.
 	var h = sbCreateBare(t, map[string]string{sbUnitType: sbUID}, sbData(sbAttributeSwitchback("city")))
 	h.at(sbAnchor+10).setAttribute("city", "Lisboa")
 	expectInt(t, lisboa, h.peek("exp_sb"))
@@ -693,8 +690,6 @@ func TestSwitchbackCluster_FirstReadFixesThePeriodsArmBeforeAnyExposure(t *testi
 	h.expectPublished(sbClusterExposure(lisboa, sbAnchor+20, true, false))
 	expectInt(t, sbDraw("Faro", 1, sbClusterArms), h.at(sbAnchor+sbHour).peek("exp_sb"))
 
-	// An exposure rejected by a close, queued again after the change, keeps
-	// the arm.
 	h = sbCreateBare(t, map[string]string{sbUnitType: sbUID}, sbData(sbAttributeSwitchback("city")))
 	h.at(sbAnchor+10).setAttribute("city", "Lisboa")
 	h.ctx.Closing_.Store(true)

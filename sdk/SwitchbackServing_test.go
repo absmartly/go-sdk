@@ -138,7 +138,6 @@ func TestSwitchbackPath_IndexSegmentsReadOnlyListsAndKeySegmentsReadOnlyMaps(t *
 	// key segment a list.
 	expectValue(t, "", parseSwitchbackPath("geo/0/city").resolveAttribute(attributes["geo"]))
 	expectValue(t, "", parseSwitchbackPath("items/city").resolveAttribute(attributes["items"]))
-	// A root that is a scalar has nothing below it.
 	expectValue(t, "", parseSwitchbackPath("name/x").resolveAttribute("scalar"))
 	expectValue(t, "scalar", parseSwitchbackPath("name").resolveAttribute("scalar"))
 }
