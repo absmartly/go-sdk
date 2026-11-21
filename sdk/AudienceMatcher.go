@@ -56,6 +56,13 @@ func (am AudienceMatcher) parseAudience(audience string) parsedAudience {
 	}
 }
 
+// filterNode identifies a map or slice on copyFilter's current path.
+type filterNode struct {
+	ptr    uintptr
+	kind   reflect.Kind
+	length int
+}
+
 // owned returns p with an SDK-owned copy of its filter, for caching: a
 // custom deserializer may reuse its result maps for the next audience. A
 // filter that contains itself (only a broken deserializer can produce one)
@@ -64,7 +71,7 @@ func (p parsedAudience) owned() parsedAudience {
 	if p.err != nil {
 		return p
 	}
-	var copied, ok = copyFilter(reflect.ValueOf(p.filter), map[uintptr]bool{})
+	var copied, ok = copyFilter(reflect.ValueOf(p.filter), map[filterNode]bool{})
 	if !ok {
 		return parsedAudience{err: errAudienceUnparseable}
 	}
@@ -75,18 +82,22 @@ func (p parsedAudience) owned() parsedAudience {
 // keeping each container's own type, so the evaluator sees the same values.
 // Scalars and other values are shared: the evaluator never mutates them. It
 // reports false when a map or slice contains itself; visiting holds the
-// containers on the current path.
-func copyFilter(value reflect.Value, visiting map[uintptr]bool) (reflect.Value, bool) {
+// containers on the current path. A slice is identified by its data pointer
+// and length, so a shorter view of the same array is not taken for a cycle.
+func copyFilter(value reflect.Value, visiting map[filterNode]bool) (reflect.Value, bool) {
 	var enter = func() (func(), bool) {
-		var ptr = value.Pointer()
-		if ptr == 0 {
+		var node = filterNode{ptr: value.Pointer(), kind: value.Kind()}
+		if value.Kind() == reflect.Slice {
+			node.length = value.Len()
+		}
+		if node.ptr == 0 {
 			return func() {}, true
 		}
-		if visiting[ptr] {
+		if visiting[node] {
 			return nil, false
 		}
-		visiting[ptr] = true
-		return func() { delete(visiting, ptr) }, true
+		visiting[node] = true
+		return func() { delete(visiting, node) }, true
 	}
 	switch value.Kind() {
 	case reflect.Interface:

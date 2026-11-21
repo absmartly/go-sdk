@@ -513,7 +513,7 @@ func TestCopyFilterIsDeepAndTypePreserving(t *testing.T) {
 		"typed": map[string]string{"k": "v"},
 		"array": [2]interface{}{map[string]interface{}{"m": 1}, "s"},
 	}
-	var value, ok = copyFilter(reflect.ValueOf(original), map[uintptr]bool{})
+	var value, ok = copyFilter(reflect.ValueOf(original), map[filterNode]bool{})
 	assertAny(true, ok, t)
 	var copied = value.Interface().(map[string]interface{})
 	assertAny(true, reflect.DeepEqual(original, copied), t)
@@ -528,16 +528,35 @@ func TestCopyFilterIsDeepAndTypePreserving(t *testing.T) {
 	// A container repeated without a cycle is copied; one that contains
 	// itself is reported instead of being copied without end.
 	var shared = map[string]interface{}{"value": true}
-	_, ok = copyFilter(reflect.ValueOf([]interface{}{shared, shared}), map[uintptr]bool{})
+	_, ok = copyFilter(reflect.ValueOf([]interface{}{shared, shared}), map[filterNode]bool{})
 	assertAny(true, ok, t)
 	var cyclic = map[string]interface{}{}
 	cyclic["self"] = cyclic
-	_, ok = copyFilter(reflect.ValueOf(cyclic), map[uintptr]bool{})
+	_, ok = copyFilter(reflect.ValueOf(cyclic), map[filterNode]bool{})
 	assertAny(false, ok, t)
 	var loop = []interface{}{nil}
 	loop[0] = loop
-	_, ok = copyFilter(reflect.ValueOf(loop), map[uintptr]bool{})
+	_, ok = copyFilter(reflect.ValueOf(loop), map[filterNode]bool{})
 	assertAny(false, ok, t)
+	// A shorter view of the same backing array is not a cycle.
+	var view = make([]interface{}, 2)
+	view[1] = view[:0]
+	_, ok = copyFilter(reflect.ValueOf(view), map[filterNode]bool{})
+	assertAny(true, ok, t)
+}
+
+// The public Evaluate parses without copying, as v1.1.1 did: only the
+// context's cache keeps an SDK-owned copy.
+func TestParseAudienceKeepsTheDeserializerResult(t *testing.T) {
+	var d = &scratchDeserializer{}
+	var parsed = AudienceMatcher{d}.parseAudience(`{"filter":[{"value":true}]}`)
+	assertAny(nil, parsed.err, t)
+	d.mu.Lock()
+	var same = reflect.ValueOf(parsed.filter).Pointer() == reflect.ValueOf(d.scratch["filter"]).Pointer()
+	d.mu.Unlock()
+	assertAny(true, same, t)
+	var owned = parsed.owned()
+	assertAny(false, reflect.ValueOf(owned.filter).Pointer() == reflect.ValueOf(parsed.filter).Pointer(), t)
 }
 
 // cyclicDeserializer returns a filter that contains itself.
