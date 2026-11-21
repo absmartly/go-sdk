@@ -1985,27 +1985,27 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 // deserializer may be waiting for the logger (a Refresh or WaitUntilReady
 // whose event it is delivering), so the read parses without the gate.
 func (c *Context) buildAssignment(st *contextState, experimentName string) *cachedAssignment {
-	var parse *audienceParse
-	var gated bool
-	defer func() {
-		if gated {
-			st.customAudiences.unlock()
-		}
-	}()
-	for attempt := 0; ; attempt++ {
-		var entry, unparsed = c.buildAssignmentLocked(st, experimentName, attempt >= maxAudienceAttempts, parse)
-		if gated {
-			gated = false
-			st.customAudiences.unlock()
-		}
-		if unparsed == nil {
-			return entry
-		}
-		if !builtinDeserializer(c.AudienceMatcher_.Deserializer_) {
-			gated = st.customAudiences.lock(st.loggers_ == nil || !st.loggers_.current())
-		}
-		parse = c.parseAudienceUnlocked(st, experimentName, *unparsed)
+	var entry, unparsed = c.buildAssignmentLocked(st, experimentName, false, nil)
+	for attempt := 0; unparsed != nil; attempt++ {
+		entry, unparsed = c.buildAudienceAttempt(st, experimentName, attempt >= maxAudienceAttempts)
 	}
+	return entry
+}
+
+// buildAudienceAttempt owns the gate for one decode and its consuming locked
+// evaluation only. Waiting readers recheck the assignment before decoding:
+// another reader may have installed it while they waited.
+func (c *Context) buildAudienceAttempt(st *contextState, experimentName string, last bool) (*cachedAssignment, *jsonmodels.Experiment) {
+	if !builtinDeserializer(c.AudienceMatcher_.Deserializer_) &&
+		st.customAudiences.lock(st.loggers_ == nil || !st.loggers_.current()) {
+		defer st.customAudiences.unlock()
+	}
+	var entry, unparsed = c.buildAssignmentLocked(st, experimentName, last, nil)
+	if unparsed == nil {
+		return entry, nil
+	}
+	var parsed = c.parseAudienceUnlocked(st, experimentName, *unparsed)
+	return c.buildAssignmentLocked(st, experimentName, last, parsed)
 }
 
 // audienceParse is the parse one build made of an experiment run's audience,

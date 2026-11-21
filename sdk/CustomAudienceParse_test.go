@@ -440,3 +440,39 @@ func TestRefreshLoggerReadingCustomAudienceDuringDeserializerRefresh(t *testing.
 	}
 	assertAny(1, <-peeked, t)
 }
+
+// Readers that selected the same cold audience before waiting at the gate
+// reuse the assignment installed by the first reader, without decoding again.
+func TestQueuedAudienceAttemptsRecheckBeforeDecode(t *testing.T) {
+	var ctx, _ = newSystemAttrContext("website", "production",
+		audienceExperiment("exp_app", `{"filter":[{"value":true}]}`, true))
+	var counter = &countingDeserializer{}
+	ctx.AudienceMatcher_ = AudienceMatcher{counter}
+	var st = ctx.state()
+	var first, requested = ctx.buildAssignmentLocked(st, "exp_app", false, nil)
+	if first != nil || requested == nil {
+		t.Fatal("expected a cold assignment requesting a parse")
+	}
+	const readers = 32
+	var done = make(chan int, readers)
+	for i := 0; i < readers; i++ {
+		go func() {
+			var entry, pending = ctx.buildAudienceAttempt(st, "exp_app", false)
+			if pending != nil || entry == nil {
+				done <- -1
+				return
+			}
+			done <- entry.assignment.Variant
+		}()
+	}
+	var deadline = time.After(5 * time.Second)
+	for i := 0; i < readers; i++ {
+		select {
+		case variant := <-done:
+			assertAny(1, variant, t)
+		case <-deadline:
+			t.Fatal("queued readers did not finish")
+		}
+	}
+	assertAny(1, len(counter.texts()), t)
+}
