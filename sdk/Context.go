@@ -1311,6 +1311,7 @@ type refreshOperation struct {
 	mu        sync.Mutex
 	receivers map[*Context]struct{}
 	completed bool
+	settled   bool
 }
 
 func (op *refreshOperation) join(receiver, root *Context) {
@@ -1319,13 +1320,19 @@ func (op *refreshOperation) join(receiver, root *Context) {
 	}
 	op.mu.Lock()
 	defer op.mu.Unlock()
-	if !op.completed {
+	if !op.settled {
+		// Until the future settles, register: settle adopts after the
+		// completion logger, which may install newer data. complete has
+		// already adopted the earlier joiners, so adopt this one now too.
 		if op.receivers == nil {
 			op.receivers = map[*Context]struct{}{}
 		}
 		op.receivers[receiver] = struct{}{}
+		if op.completed {
+			receiver.adoptLiveDataFrom(root)
+		}
 	} else {
-		// A copy joining after completion adopts the live data itself,
+		// A copy joining after settlement adopts the live data itself,
 		// whatever the outcome, as settle does for earlier joiners.
 		receiver.adoptLiveDataFrom(root)
 	}
@@ -1353,6 +1360,7 @@ func (op *refreshOperation) settle(root *Context) {
 		receiver.adoptLiveDataFrom(root)
 	}
 	op.receivers = nil
+	op.settled = true
 }
 
 func (c *Context) RefreshAsync() *future.Future {
@@ -2369,6 +2377,9 @@ func (c *Context) SetData(data jsonmodels.ContextData) {
 	root.setData(data, buffer)
 	receiver.adoptLiveDataFrom(root)
 	receiver.dispatchDiagnostics(buffer.take())
+	// A diagnostics logger may have installed newer data: adopt again, so the
+	// copy's reads agree with the live data when SetData returns.
+	receiver.adoptLiveDataFrom(root)
 }
 
 // adoptLiveDataFrom copies the data installed on root into c's own v1.1.1

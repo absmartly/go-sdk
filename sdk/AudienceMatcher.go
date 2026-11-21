@@ -58,12 +58,8 @@ func (p parsedAudience) evaluate(attributes map[string]interface{}) (Result, err
 	if p.err != nil {
 		return Result{}, p.err
 	}
-	var kind = reflect.ValueOf(p.filter).Kind()
-	if kind == reflect.Map || kind == reflect.Slice || kind == reflect.Array {
-		return CreateResult(jsonexpr.EvaluateBooleanExpr(p.filter, attributes)), nil
-	}
-
-	return Result{}, errors.New("can't evaluate data")
+	// parseAudience is the only source of a filter, and it validates its kind.
+	return CreateResult(jsonexpr.EvaluateBooleanExpr(p.filter, attributes)), nil
 }
 
 func (am AudienceMatcher) deserializer() AudienceDeserializer {

@@ -1290,6 +1290,79 @@ func TestJoinedCopyReadsAgreeAfterFailedRefreshAndNestedSuccess(t *testing.T) {
 	}
 }
 
+// diagnosticParser logs one diagnostic through the context it is given.
+type diagnosticParser struct{ DefaultVariableParser }
+
+func (p diagnosticParser) Parse(ctx Context, experimentName string, variantName string, value string) map[string]interface{} {
+	ctx.LogEvent(Exposure, "diagnostic from "+experimentName)
+	return p.DefaultVariableParser.Parse(ctx, experimentName, variantName, value)
+}
+
+// SetData through a copy whose diagnostics logger synchronously installs
+// newer data returns with the copy's reads agreeing with the live data.
+func TestCopySetDataReadsAgreeAfterDiagnosticsLoggerRefresh(t *testing.T) {
+	var a, b, before = ruleExperiment("a", ""), ruleExperiment("b", ""), ruleExperiment("before", "")
+	var ctx, _ = newRuleContext(t, "production", withUnit(), before)
+	ctx.Clock_ = internal.FixedClock{Millis_: 1}
+	var doneB, settleB = future.New()
+	settleB(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{b}}, nil)
+	ctx.DataProvider_ = &controlledRefreshProvider{result: doneB}
+	ctx.VariableParser_ = diagnosticParser{}
+	var nested int32
+	ctx.EventLogger_ = callbackEventLogger(func(c Context, event EventType, _ interface{}) {
+		if event != Exposure || atomic.AddInt32(&nested, 1) > 1 {
+			return
+		}
+		ctx.Refresh()
+	})
+	var copied = *ctx
+	copied.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{a}})
+	if atomic.LoadInt32(&nested) == 0 {
+		t.Fatal("the diagnostics logger did not run")
+	}
+	var data, _ = copied.GetData()
+	assertAny(1, len(data.Experiments), t)
+	assertAny("b", data.Experiments[0].Name, t)
+	if _, found := copied.GetExperiment("b"); !found {
+		t.Error("the copy's GetExperiment misses the data GetData reports")
+	}
+	if _, found := copied.GetExperiment("a"); found {
+		t.Error("the copy's GetExperiment still finds replaced data")
+	}
+}
+
+// A copy that captured an active refresh but registers after completion has
+// started (completed, not yet settled) is re-adopted at settlement, so it
+// sees data a completion logger installed.
+func TestLateRegistrantBeforeSettleIsReadoptedAtSettle(t *testing.T) {
+	for _, success := range []bool{false, true} {
+		var before, a, b = ruleExperiment("before", ""), ruleExperiment("a", ""), ruleExperiment("b", "")
+		var ctx, _ = newRuleContext(t, "production", withUnit(), before)
+		ctx.Clock_ = internal.FixedClock{Millis_: 1}
+		var copied = *ctx
+		var op = &refreshOperation{}
+		ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{a}})
+		op.complete(ctx, success)
+		op.join(&copied, ctx)
+		if _, found := copied.GetExperiment("a"); !found {
+			t.Errorf("success=%v: a copy joining after completion did not adopt", success)
+		}
+		// The completion logger installs newer data before settlement.
+		ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{b}})
+		op.settle(ctx)
+		if _, found := copied.GetExperiment("b"); !found {
+			t.Errorf("success=%v: the late registrant was not re-adopted at settlement", success)
+		}
+		if _, found := copied.GetExperiment("a"); found {
+			t.Errorf("success=%v: the late registrant still finds replaced data", success)
+		}
+		// After settlement a copy adopts directly and is not retained.
+		var later = *ctx
+		op.join(&later, ctx)
+		assertAny(0, len(op.receivers), t)
+	}
+}
+
 // A completion logger that synchronously refreshes again leaves a joined
 // copy's reads consistent when the copy's refresh reports success.
 func TestJoinedCopyReadsAgreeAfterNestedRefresh(t *testing.T) {
@@ -1475,8 +1548,10 @@ func TestRefreshOperationLateCopyRegistration(t *testing.T) {
 		var op = &refreshOperation{receivers: map[*Context]struct{}{}}
 		ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{after}})
 		op.complete(ctx, success)
+		op.settle(ctx)
 		op.join(&copied, ctx)
-		// The copy agrees with the live data whatever the outcome.
+		// The copy agrees with the live data whatever the outcome, and a
+		// join after settlement is not retained.
 		var _, found = copied.GetExperiment("after")
 		assertAny(true, found, t)
 		assertAny(0, len(op.receivers), t)
