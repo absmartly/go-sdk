@@ -2295,23 +2295,28 @@ func TestSwitchback_VariableReadIgnoresAUnitTypeOnlyRefresh(t *testing.T) {
 }
 
 // A switchback variable read whose experiment is refreshed to another id or
-// iteration between resolving its slot and claiming the exposure serves the
-// default and exposes nothing: the superseded slot's arm is never claimed.
-func TestSwitchback_VariableClaimDeclinesASlotRefreshedToAnotherIdentity(t *testing.T) {
+// iteration between resolving its slot and claiming the exposure never
+// claims the superseded slot: it resolves again, then serves and exposes the
+// replacement once, under the new identity.
+func TestSwitchback_VariableClaimServesTheReplacementOfARefreshedSlot(t *testing.T) {
+	if sbExpected2Arms[0] == sbExpected2Arms[1] {
+		t.Fatal("fixture: periods 0 and 1 draw the same arm")
+	}
 	for name, edit := range map[string]func(*jsonmodels.Experiment){
 		"iteration": func(e *jsonmodels.Experiment) { e.Iteration++ },
 		"id":        func(e *jsonmodels.Experiment) { e.Id = 77 },
 	} {
 		var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
 		h.at(sbAnchor + sbHour + 5)
-		h.peek("exp_sb")
+		expectInt(t, sbExpected2Arms[1], h.peek("exp_sb"))
+		var refreshed = sbDefault(2, sbHour)
+		edit(&refreshed)
+		// Period 0 of the moved start, so the replacement draws another arm.
+		refreshed.SwitchbackStartAt = sbInt64(sbAnchor + sbHour)
 		var armed = true
 		afterReadResolve = func() {
 			if armed {
 				armed = false
-				var refreshed = sbDefault(2, sbHour)
-				edit(&refreshed)
-				refreshed.SwitchbackStartAt = sbInt64(sbAnchor + sbHour)
 				h.refresh(refreshed)
 			}
 		}
@@ -2320,9 +2325,31 @@ func TestSwitchback_VariableClaimDeclinesASlotRefreshedToAnotherIdentity(t *test
 		if armed {
 			t.Fatalf("%s: the hook did not run", name)
 		}
-		if value != -1 {
-			t.Fatalf("%s: got %v, want -1", name, value)
+		if value != sbExpected2Arms[0] {
+			t.Fatalf("%s: got %v, want the replacement's arm %d", name, value, sbExpected2Arms[0])
 		}
-		h.expectPending(0)
+		var exposures = queuedExposures(h.ctx)
+		if len(exposures) != 1 || exposures[0].Id != refreshed.Id || exposures[0].Variant != sbExpected2Arms[0] {
+			t.Fatalf("%s: exposures %+v", name, exposures)
+		}
 	}
+}
+
+// An unexposed switchback override is not rebuilt by a refresh that edits
+// only its unitType: the slot keeps its identity, and the first read exposes
+// it once under the serving unit.
+func TestSwitchback_OverrideIgnoresAUnitTypeOnlyRefresh(t *testing.T) {
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour)), sbOverride("exp_sb", 1))
+	h.at(sbAnchor + 5)
+	expectInt(t, 1, h.peek("exp_sb"))
+	var held = h.ctx.GetAssignment("exp_sb")
+	var edited = sbDefault(2, sbHour)
+	edited.UnitType = "anything"
+	h.refresh(edited)
+	expectValue(t, 1, h.variable("sb.arm"))
+	if h.ctx.GetAssignment("exp_sb") != held {
+		t.Fatal("the override slot was rebuilt")
+	}
+	h.expectPublished(jsonmodels.Exposure{Id: 1, Name: "exp_sb", Unit: sbUnitType, Variant: 1, ExposedAt: sbAnchor + 5,
+		Eligible: true, Overridden: true})
 }

@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -175,10 +176,26 @@ func TestHermeticWireContract(t *testing.T) {
 }
 
 func TestHermeticWireContractSuppressedHoldoutExposure(t *testing.T) {
-	const payload = `{"experiments":[{"id":1,"name":"covered_experiment","unitType":"session_id","iteration":1,
+	for _, arm := range []int{0, 1} {
+		t.Run(fmt.Sprintf("arm%d", arm), func(t *testing.T) {
+			hermeticSuppressedHoldoutExposure(t, arm)
+		})
+	}
+}
+
+// hermeticSuppressedHoldoutExposure publishes a suppressed read over HTTP with
+// the unit in the given arm of a three-arm holdout (arm 1 holds out only
+// non-full-on experiments, which the covered one is), so the holdout record's
+// variant is the arm, not the experiment's control variant.
+func hermeticSuppressedHoldoutExposure(t *testing.T, arm int) {
+	var split = "[1,0,0]"
+	if arm == 1 {
+		split = "[0,1,0]"
+	}
+	var payload = `{"experiments":[{"id":1,"name":"covered_experiment","unitType":"session_id","iteration":1,
 		"seedHi":100,"seedLo":200,"split":[0,1],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],
 		"variants":[{"name":"A","config":"{\"v\":\"control\"}"},{"name":"B","config":"{\"v\":\"treatment\"}"}],"holdoutIds":[11]}],
-		"holdouts":[{"id":11,"name":"wire_holdout","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":[1,0]}]}`
+		"holdouts":[{"id":11,"name":"wire_holdout","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":` + split + `}]}`
 	var mu sync.Mutex
 	var published []map[string]interface{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -244,7 +261,7 @@ func TestHermeticWireContractSuppressedHoldoutExposure(t *testing.T) {
 		t.Fatalf("wire exposure is not an object: %+v", exposures[0])
 	}
 	for field, want := range map[string]interface{}{
-		"id": float64(11), "name": "wire_holdout", "unit": "session_id", "variant": float64(0),
+		"id": float64(11), "name": "wire_holdout", "unit": "session_id", "variant": float64(arm),
 		"assigned": true, "eligible": true, "overridden": false, "ruleOverride": false,
 	} {
 		if got := exposure[field]; got != want {

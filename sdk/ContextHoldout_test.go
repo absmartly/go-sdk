@@ -3350,16 +3350,21 @@ func hoKeyed(ctx *Context) bool {
 }
 
 func hoInstalledDefines(ctx *Context, name string, key string) bool {
-	ctx.ContextLock_.RLock()
-	defer ctx.ContextLock_.RUnlock()
-	var entry = &cachedAssignment{assignment: &Assignment{Variables: map[string]interface{}{}}}
-	if indexed := ctx.indexedExperiment(name); indexed != nil {
-		entry.resolvedId = indexed.experiment.Data.Id
-		entry.resolvedIteration = indexed.experiment.Data.Iteration
-		entry.resolvedUnitType = indexed.experiment.Data.UnitType
-		entry.holdouts = &assignmentHoldouts{holdouts: indexed.holdouts}
+	var entry = ctx.getAssignment(name)
+	ctx.ContextLock_.Lock()
+	defer ctx.ContextLock_.Unlock()
+	if entry.assignment.Variables == nil {
+		// The eligibility check rejects an entry without variables before
+		// looking at the key; give it an empty map to probe the key alone.
+		var probe = *entry
+		var assignment = *entry.assignment
+		assignment.Variables = map[string]interface{}{}
+		probe.assignment = &assignment
+		ctx.assignmentCache_[name] = &probe
+		defer func() { ctx.assignmentCache_[name] = entry }()
+		return ctx.variableEligible(name, key)(&probe) == exposureClaimed
 	}
-	return ctx.variableEligible(name, key)(entry)
+	return ctx.variableEligible(name, key)(entry) == exposureClaimed
 }
 
 // A variable read whose assignment is replaced, before its claim, by a
@@ -4057,13 +4062,17 @@ func TestHoldout_RestoredKeyDoesNotAuthorizeAnIntermediateIteration(t *testing.T
 						h.ctx.SetData(hoData([]jsonmodels.Holdout{restored}, last))
 					}
 				}
-				expectValue(t, "default", h.variable("v"))
+				// The read resolves again onto the final definition and serves
+				// and exposes that decision, never the intermediate one.
+				expectValue(t, "control", h.variable("v"))
 				afterReadResolve, beforeSettleClaim = nil, nil
-				if armed || claims < 2 {
+				if armed || claims < 3 {
 					t.Fatal("the intermediate decision was not retried")
 				}
-				if exposures := queuedExposures(h.ctx); len(exposures) != 0 {
-					t.Fatalf("override=%v: wrong decision exposed: %+v", override, exposures)
+				var exposures = queuedExposures(h.ctx)
+				if len(exposures) != 2 || exposures[0].Id != 2 || exposures[0].Unit != hoUnitType ||
+					exposures[0].Overridden != override || exposures[1].Id != 11 || exposures[1].Name == "intermediate_holdout" {
+					t.Fatalf("override=%v: exposures %+v, want only the final decision", override, exposures)
 				}
 			}
 		})
@@ -4109,12 +4118,13 @@ func TestHoldout_IdentityChangeAtVariableClaimIsRejected(t *testing.T) {
 		}
 	}
 	defer func() { beforeSettleClaim = nil }()
-	expectValue(t, "default", h.variable("v"))
+	expectValue(t, "control", h.variable("v"))
 	if armed {
 		t.Fatal("the claim hook did not run")
 	}
-	if exposures := queuedExposures(h.ctx); len(exposures) != 0 {
-		t.Fatalf("old identity exposed: %+v", exposures)
+	var exposures = queuedExposures(h.ctx)
+	if len(exposures) != 2 || exposures[0].Id != e.Id || exposures[1].Id != 11 {
+		t.Fatalf("exposures %+v, want only the new identity's decision", exposures)
 	}
 }
 
@@ -4218,6 +4228,257 @@ func TestHoldout_RulesOnlyUnclaimedOverrideResolvesCurrentIdentity(t *testing.T)
 			var want = hoOwn(fresh.UnitType, fresh.Id, "e", 0)
 			want.Assigned, want.Overridden = false, true
 			h.expectPublished(want)
+		})
+	}
+}
+
+// A restored key cannot authorize a claim on a different full-on decision.
+// With the unit in arm 1 of a three-arm holdout, the key goes v -> w -> v
+// while FullOnVariant goes 0 -> 1 -> 0, and nothing else in the experiment's
+// or holdout's identity changes: the read retries onto the middle (full-on,
+// not suppressed) decision, and the last refresh lands before it claims.
+func TestHoldout_RestoredKeyDoesNotAuthorizeADifferentFullOnDecision(t *testing.T) {
+	var three = hoThreeArm(11, "three_arm", hoThreeArm1Lo)
+	var first = hoWithVariables(hoExperiment(2, "b", hoUnitType, 0, 11), "v")
+	var middle = hoWithVariables(hoExperiment(2, "b", hoUnitType, 1, 11), "w")
+	var last = hoWithVariables(hoExperiment(2, "b", hoUnitType, 0, 11), "v")
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{three}, first))
+	t.Cleanup(func() { afterReadResolve, beforeSettleClaim = nil, nil })
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{three}, middle))
+			h.ctx.GetAssignment("b")
+		}
+	}
+	var claims = 0
+	beforeSettleClaim = func() {
+		claims++
+		if claims == 2 {
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{three}, last))
+		}
+	}
+	// The read resolves again onto the final (suppressed) decision: it serves
+	// the control value and publishes only the holdout's arm, never the
+	// middle full-on decision.
+	expectValue(t, "control", h.variable("v"))
+	afterReadResolve, beforeSettleClaim = nil, nil
+	if armed || claims < 3 {
+		t.Fatal("the middle decision was not retried")
+	}
+	h.expectPublished(hoExposure(hoUnitType, 11, "three_arm", 1))
+}
+
+// A refresh that only changes the traffic split, landing between a variable
+// read's resolve and its claim, makes the cached decision stale but leaves the
+// experiment a candidate: the read resolves again and serves and exposes the
+// current decision once, instead of skipping it (no lost exposure), and a
+// later GetTreatment adds nothing.
+func TestHoldout_StaleUnreplacedCandidateIsResolvedAgain(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+	e.Split = []float64{0, 1}
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	h.peek("e")
+	var armed = true
+	beforeSettleClaim = func() {
+		if armed {
+			armed = false
+			var traffic = e
+			traffic.TrafficSplit = []float64{0, 1, 0}
+			h.ctx.SetData(hoData(nil, traffic, r))
+		}
+	}
+	defer func() { beforeSettleClaim = nil }()
+	expectValue(t, "treatment", h.variable("v"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	expectInt(t, 1, h.treatment("e"))
+	if exposures := queuedExposures(h.ctx); len(exposures) != 1 || exposures[0].Id != 1 || exposures[0].Variant != 1 {
+		t.Fatalf("exposures %+v, want exactly one for the current decision", exposures)
+	}
+}
+
+// An entry that revalidates to the same outcome (attributes changed but the
+// rule still gives the same variant) stays the current decision, so the
+// variable read claims it.
+func TestHoldout_RevalidatedEntryStaysEligible(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+	e.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e))
+	h.setAttribute("country", "US")
+	h.peek("e")
+	var claims = 0
+	beforeSettleClaim = func() {
+		claims++
+		if claims == 1 {
+			h.setAttribute("unrelated", 1)
+		}
+	}
+	defer func() { beforeSettleClaim = nil }()
+	expectValue(t, "treatment", h.variable("v"))
+	// Claimed on the first attempt: a revalidated entry is not resolved again.
+	expectInt(t, 1, claims)
+	if exposures := queuedExposures(h.ctx); len(exposures) != 1 || exposures[0].Id != 1 || !exposures[0].RuleOverride {
+		t.Fatalf("exposures %+v, want exactly the rule-won decision", exposures)
+	}
+}
+
+// In a keyed context an experiment whose custom assignment the build cannot
+// apply (full-on here) is exposed by every variable read, once per read, as in
+// v1.1.1: the claim check does not treat the unapplied custom assignment as a
+// newer decision, so the read neither retries nor skips it.
+func TestHoldout_UnappliedCustomAssignmentIsStillExposed(t *testing.T) {
+	for _, keyed := range []bool{false, true} {
+		var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 1), "v")
+		var r = hoExperiment(2, "r", hoUnitType, 0)
+		if keyed {
+			r.AssignmentRules = hoUSRule
+		}
+		var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+		if hoKeyed(h.ctx) != keyed {
+			t.Fatalf("keyed = %v, want %v", hoKeyed(h.ctx), keyed)
+		}
+		if err := h.ctx.SetCustomAssignment("e", 0); err != nil {
+			t.Fatal(err)
+		}
+		var claims = 0
+		beforeSettleClaim = func() { claims++ }
+		expectValue(t, "treatment", h.variable("v"))
+		expectValue(t, "treatment", h.variable("v"))
+		beforeSettleClaim = nil
+		expectInt(t, 2, claims)
+		var exposures = queuedExposures(h.ctx)
+		if len(exposures) != 2 || !exposures[0].FullOn || !exposures[1].FullOn {
+			t.Fatalf("keyed=%v: exposures %+v, want one full-on exposure per read", keyed, exposures)
+		}
+	}
+}
+
+// A refresh that replaces the cached entry (a rebuild after a traffic change)
+// between a variable read's resolve and its claim, without retiring it, makes
+// the read resolve again onto the replacement: exactly one exposure in total,
+// even with a following GetTreatment.
+func TestHoldout_ReplacedUnretiredEntryIsResolvedAgain(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+	e.Split = []float64{0, 1}
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	h.peek("e")
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			var traffic = e
+			traffic.TrafficSplit = []float64{0, 1, 0}
+			h.ctx.SetData(hoData(nil, traffic, r))
+			h.ctx.GetAssignment("e")
+		}
+	}
+	defer func() { afterReadResolve = nil }()
+	expectValue(t, "treatment", h.variable("v"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	expectInt(t, 1, h.treatment("e"))
+	if exposures := queuedExposures(h.ctx); len(exposures) != 1 {
+		t.Fatalf("exposures %+v, want exactly one", exposures)
+	}
+}
+
+// When every attempt of a variable read finds its decision stale, the read
+// stops after maxExposureAttempts and serves the last decision it tried,
+// without an exposure, as in the Java SDK; the next read exposes it.
+func TestHoldout_VariableReadServesTheLastDecisionWhenRetriesRunOut(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+	e.Split = []float64{0, 1}
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	h.peek("e")
+	var claims = 0
+	beforeSettleClaim = func() {
+		claims++
+		var traffic = e
+		traffic.TrafficSplit = []float64{0, 1, float64(claims)}
+		h.ctx.SetData(hoData(nil, traffic, r))
+	}
+	expectValue(t, "treatment", h.variable("v"))
+	beforeSettleClaim = nil
+	expectInt(t, maxExposureAttempts, claims)
+	h.expectPending(0)
+	expectValue(t, "treatment", h.variable("v"))
+	h.expectPending(1)
+}
+
+// Changing the custom assignment after a decision was built from it is still
+// a new decision: an applicable new custom variant rebuilds the entry.
+func TestHoldout_ChangedCustomAssignmentStillRebuilds(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	if err := h.ctx.SetCustomAssignment("e", 0); err != nil {
+		t.Fatal(err)
+	}
+	expectInt(t, 0, h.peek("e"))
+	if err := h.ctx.SetCustomAssignment("e", 1); err != nil {
+		t.Fatal(err)
+	}
+	expectInt(t, 1, h.peek("e"))
+	expectValue(t, "treatment", h.variable("v"))
+}
+
+// In a keyed context a custom assignment that becomes applicable between a
+// variable read's resolve and its claim (here a refresh makes the unit
+// traffic-eligible, or an attribute makes a strict audience match) leaves the
+// read's decision stale, so the read resolves again: it serves the custom
+// variant and exposes it once, with the custom flag.
+func TestHoldout_CustomBecomingApplicableDuringAReadIsResolvedAgain(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		setup  func(*jsonmodels.Experiment)
+		mutate func(*hoContext, jsonmodels.Experiment, jsonmodels.Experiment)
+	}{
+		{"traffic refresh", func(e *jsonmodels.Experiment) { e.TrafficSplit = []float64{1, 0} },
+			func(h *hoContext, e jsonmodels.Experiment, r jsonmodels.Experiment) {
+				e.TrafficSplit = []float64{0, 1}
+				h.ctx.SetData(hoData(nil, e, r))
+			}},
+		{"strict audience attribute", func(e *jsonmodels.Experiment) {
+			e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+			e.AudienceStrict = true
+		}, func(h *hoContext, _ jsonmodels.Experiment, _ jsonmodels.Experiment) { h.setAttribute("country", "GB") }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+			c.setup(&e)
+			var r = hoExperiment(2, "r", hoUnitType, 0)
+			r.AssignmentRules = hoUSRule
+			var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+			if err := h.ctx.SetCustomAssignment("e", 1); err != nil {
+				t.Fatal(err)
+			}
+			var armed = true
+			afterReadResolve = func() {
+				if armed {
+					armed = false
+					c.mutate(h, e, r)
+				}
+			}
+			defer func() { afterReadResolve = nil }()
+			expectValue(t, "treatment", h.variable("v"))
+			if armed {
+				t.Fatal("the hook did not run")
+			}
+			var exposures = queuedExposures(h.ctx)
+			if len(exposures) != 1 || exposures[0].Variant != 1 || !exposures[0].Custom {
+				t.Fatalf("exposures %+v, want one custom variant 1", exposures)
+			}
 		})
 	}
 }

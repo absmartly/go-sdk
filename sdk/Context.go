@@ -212,7 +212,6 @@ type holdoutArm struct {
 type assignmentHoldouts struct {
 	holdouts   []*jsonmodels.Holdout
 	arms       []*holdoutArm
-	unitType   string
 	suppressed bool
 }
 
@@ -999,8 +998,17 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 // in the Java SDK.
 const maxExposureAttempts = 3
 
+// settleExposureAt exposes entry on a read. If a replacement or an eviction
+// retired the assignment before the read claimed it, nothing of it was
+// published, so the current assignment is resolved again and exposed
+// instead, up to maxExposureAttempts times. It returns the entry the read
+// must serve: the replacement that was exposed, or on exhaustion the last
+// one tried. A non-nil eligible is checked with each new claim, atomically
+// with it; when it fails nothing is claimed and settleExposureAt reports false.
+// Each retry resolves at a fresh clock reading, which stamps a switchback
+// exposure, as in the Java SDK. Loggers run after admit released its locks.
 func (c *Context) settleExposureAt(experimentName string, entry *cachedAssignment,
-	eligible func(*cachedAssignment) bool, at *clockReading) (*cachedAssignment, bool) {
+	eligible func(*cachedAssignment) exposureStatus, at *clockReading) (*cachedAssignment, bool) {
 	for attempt := 1; ; attempt++ {
 		if beforeSettleClaim != nil {
 			beforeSettleClaim()
@@ -1017,9 +1025,10 @@ func (c *Context) settleExposureAt(experimentName string, entry *cachedAssignmen
 	}
 }
 
-// Eligibility and the claim share the read lock so a refresh cannot land
-// between them. Admission runs after releasing it, including logger callbacks.
-func (c *Context) queueEligibleExposureAt(entry *cachedAssignment, eligible func(*cachedAssignment) bool, at *clockReading) exposureStatus {
+// queueEligibleExposureAt is queueExposureAt for a read: a non-nil eligible is
+// checked under ContextLock_ together with the claim, so a refresh can never
+// land between the check and the claim. A claim already taken is honoured.
+func (c *Context) queueEligibleExposureAt(entry *cachedAssignment, eligible func(*cachedAssignment) exposureStatus, at *clockReading) exposureStatus {
 	if eligible == nil {
 		return c.queueExposureAt(entry.assignment, entry, at)
 	}
@@ -1036,7 +1045,7 @@ func (c *Context) queueEligibleExposureAt(entry *cachedAssignment, eligible func
 // claimEligible checks eligibility and claims the exposure in one step; the
 // caller holds ContextLock_ across the whole call, so no refresh can land
 // between the check and the claim. A claim already taken is honoured.
-func claimEligible(entry *cachedAssignment, eligible func(*cachedAssignment) bool) exposureStatus {
+func claimEligible(entry *cachedAssignment, eligible func(*cachedAssignment) exposureStatus) exposureStatus {
 	if beforeEligibleClaim != nil {
 		beforeEligibleClaim()
 	}
@@ -1046,8 +1055,8 @@ func claimEligible(entry *cachedAssignment, eligible func(*cachedAssignment) boo
 	if entry.assignment.Exposed.Load().(bool) {
 		return exposureQueued
 	}
-	if !eligible(entry) {
-		return exposureIneligible
+	if status := eligible(entry); status != exposureClaimed {
+		return status
 	}
 	var claimed = entry.assignment.Exposed.CompareAndSwap(false, true)
 	if afterEligibleCAS != nil {
@@ -1070,26 +1079,42 @@ func (e *cachedAssignment) needsSettling() bool {
 // variableEligible is the variable read's claim check: once the context has
 // seen holdouts, assignment rules or switchbacks (sources of retirement), a read
 // of key claims an exposure only for an experiment that, as installed now,
-// still exists, defines key in some variant and has the same resolved
-// experiment identity (id, iteration, and unit type except for a switchback,
-// whose generation is its unit identity) and holdout epochs. Contexts with
-// none of them keep the released behaviour. The caller holds ContextLock_.
-func (c *Context) variableEligible(experimentName string, key string) func(*cachedAssignment) bool {
-	return func(e *cachedAssignment) bool {
+// still exists and defines key in some variant, and only while the entry is
+// still the current decision for that definition by the cache's own rules
+// (identity, full-on variant, traffic, holdout epochs, overrides, assignment
+// rules and audience). It reports exposureClaimed when the claim may be taken,
+// exposureIneligible when the experiment is no longer a candidate for key, and
+// exposureRetired when it still is but this decision is no longer current, so
+// the read resolves again. Contexts with none of them keep the released behaviour.
+// The caller holds ContextLock_.
+func (c *Context) variableEligible(experimentName string, key string) func(*cachedAssignment) exposureStatus {
+	return func(e *cachedAssignment) exposureStatus {
 		if e.assignment.Variables == nil {
-			return false
+			return exposureIneligible
 		}
 		var index = c.index_.Load()
 		if index == nil || !index.keyed {
-			return true
+			return exposureClaimed
 		}
 		var indexed = index.experiments[experimentName]
-		if indexed == nil || !e.resolvedExperimentMatches(indexed.experiment.Data) ||
-			!holdoutSetMatches(indexed.holdouts, e.holdouts) {
-			return false
+		if indexed == nil {
+			return exposureIneligible
 		}
-		_, defined := indexed.variableKeys[key]
-		return defined
+		if _, defined := indexed.variableKeys[key]; !defined {
+			return exposureIneligible
+		}
+		// The entry's own slot: a read resolved in a period claims that
+		// period's decision, even if the clock has since moved on.
+		var slot = assignmentSlot{key: experimentName}
+		if e.switchback != nil && e.switchback.hasPeriod {
+			slot = assignmentSlot{key: switchbackSlotKey(experimentName, e.switchback.period), period: e.switchback.period, hasPeriod: true}
+		}
+		if current, _, state := c.validCachedAssignmentFor(experimentName, indexed, slot, true); current != e || state == assignmentStale {
+			// Still a candidate, but this decision is no longer the current
+			// one: resolve again rather than claim it or skip the experiment.
+			return exposureRetired
+		}
+		return exposureClaimed
 	}
 }
 
@@ -1906,6 +1931,20 @@ const (
 // from, nil when there is none. It only reads, so it may run under
 // ContextLock_ held for reading or writing.
 func (c *Context) validCachedAssignment(experimentName string, indexed *indexedExperiment, slot assignmentSlot) (*cachedAssignment, *experimentRules, assignmentState) {
+	return c.validCachedAssignmentFor(experimentName, indexed, slot, false)
+}
+
+// validCachedAssignmentFor is validCachedAssignment; with ignoreCustom a
+// custom assignment that differs from the cached one is not staleness, and
+// every other check still applies. The variable claim check uses it: a
+// custom assignment the build could not apply (full-on, traffic-ineligible,
+// strict audience mismatch, an ineligible switchback cluster) makes every
+// rebuild stale, as in v1.1.1, but it is no newer definition, so the read
+// claims the decision it serves rather than retrying it. A custom assignment
+// set or changed during the read is ignored by the claim the same way, as
+// main and v1.1.1 expose what the read resolved; the next read applies it.
+func (c *Context) validCachedAssignmentFor(experimentName string, indexed *indexedExperiment, slot assignmentSlot,
+	ignoreCustom bool) (*cachedAssignment, *experimentRules, assignmentState) {
 	var entry, found = c.assignmentCache_[slot.key]
 	if !found {
 		return nil, nil, assignmentStale
@@ -1940,7 +1979,7 @@ func (c *Context) validCachedAssignment(experimentName string, indexed *indexedE
 			return entry, rules, assignmentStale
 		}
 		if assignment.Overridden && assignment.Variant == override.(int) && (!efound ||
-			holdoutSetMatches(holdouts, entry.holdouts) && (entry.holdouts == nil || entry.holdouts.unitType == experiment.Data.UnitType)) &&
+			holdoutSetMatches(holdouts, entry.holdouts) && (entry.holdouts == nil || entry.resolvedUnitType == experiment.Data.UnitType)) &&
 			switchbackSlotMatches(indexed, entry) {
 			return entry, rules, assignmentValid
 		}
@@ -1951,7 +1990,7 @@ func (c *Context) validCachedAssignment(experimentName string, indexed *indexedE
 		if !assignment.Assigned && !assignment.RuleOverride {
 			return entry, rules, assignmentValid
 		}
-	} else if assignment.RuleOverride || entry.holdouts.isSuppressed() || entry.switchback.customMatches(custom, cfound, assignment) {
+	} else if assignment.RuleOverride || entry.holdouts.isSuppressed() || ignoreCustom || entry.switchback.customMatches(custom, cfound, assignment) {
 		// A matching rule wins over a custom assignment, and a holdout
 		// suppression forces control, so a custom assignment that differs
 		// from either variant is not staleness.
@@ -2327,7 +2366,7 @@ func (c *Context) resolveAssignmentLocked(experimentName string, at *clockReadin
 // when the experiment's unit is not set. The caller holds ContextLock_ for
 // writing.
 func (c *Context) resolveHoldouts(holdouts []*jsonmodels.Holdout, data jsonmodels.Experiment) (*assignmentHoldouts, bool) {
-	var resolved = &assignmentHoldouts{holdouts: holdouts, arms: make([]*holdoutArm, len(holdouts)), unitType: data.UnitType}
+	var resolved = &assignmentHoldouts{holdouts: holdouts, arms: make([]*holdoutArm, len(holdouts))}
 	var held = false
 	for i, holdout := range holdouts {
 		var arm = c.holdoutArm(holdout, data.UnitType)
