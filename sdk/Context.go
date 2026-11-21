@@ -1801,11 +1801,14 @@ func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignmen
 }
 
 // validCachedAssignmentFor is validCachedAssignment; with ignoreCustom a
-// custom assignment that differs from the cached variant is not staleness.
-// The variable claim check uses it: a custom assignment the build could not
-// apply (full-on, traffic-ineligible, strict audience mismatch) makes every
-// rebuild stale, as in v1.1.1, but it is no newer definition, so the read
-// claims the decision it serves rather than retrying it.
+// custom assignment that differs from the cached variant is not staleness,
+// and every other check still applies. The variable claim check uses it: a
+// custom assignment the build could not apply (full-on, traffic-ineligible,
+// strict audience mismatch) makes every rebuild stale, as in v1.1.1, but it
+// is no newer definition, so the read claims the decision it serves rather
+// than retrying it. A custom assignment set or changed during the read is
+// ignored by the claim the same way, as main and v1.1.1 expose what the read
+// resolved; the next read applies it.
 func (c *Context) validCachedAssignmentFor(experimentName string, ignoreCustom bool) (*cachedAssignment, *experimentRules, assignmentState) {
 	var entry, found = c.assignmentCache_[experimentName]
 	if !found {

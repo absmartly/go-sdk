@@ -4417,3 +4417,53 @@ func TestHoldout_ChangedCustomAssignmentStillRebuilds(t *testing.T) {
 	expectInt(t, 1, h.peek("e"))
 	expectValue(t, "treatment", h.variable("v"))
 }
+
+// In a keyed context a custom assignment that becomes applicable between a
+// variable read's resolve and its claim (here a refresh makes the unit
+// traffic-eligible, or an attribute makes a strict audience match) leaves the
+// read's decision stale, so the read resolves again: it serves the custom
+// variant and exposes it once, with the custom flag.
+func TestHoldout_CustomBecomingApplicableDuringAReadIsResolvedAgain(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		setup  func(*jsonmodels.Experiment)
+		mutate func(*hoContext, jsonmodels.Experiment, jsonmodels.Experiment)
+	}{
+		{"traffic refresh", func(e *jsonmodels.Experiment) { e.TrafficSplit = []float64{1, 0} },
+			func(h *hoContext, e jsonmodels.Experiment, r jsonmodels.Experiment) {
+				e.TrafficSplit = []float64{0, 1}
+				h.ctx.SetData(hoData(nil, e, r))
+			}},
+		{"strict audience attribute", func(e *jsonmodels.Experiment) {
+			e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+			e.AudienceStrict = true
+		}, func(h *hoContext, _ jsonmodels.Experiment, _ jsonmodels.Experiment) { h.setAttribute("country", "GB") }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+			c.setup(&e)
+			var r = hoExperiment(2, "r", hoUnitType, 0)
+			r.AssignmentRules = hoUSRule
+			var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+			if err := h.ctx.SetCustomAssignment("e", 1); err != nil {
+				t.Fatal(err)
+			}
+			var armed = true
+			afterReadResolve = func() {
+				if armed {
+					armed = false
+					c.mutate(h, e, r)
+				}
+			}
+			defer func() { afterReadResolve = nil }()
+			expectValue(t, "treatment", h.variable("v"))
+			if armed {
+				t.Fatal("the hook did not run")
+			}
+			var exposures = queuedExposures(h.ctx)
+			if len(exposures) != 1 || exposures[0].Variant != 1 || !exposures[0].Custom {
+				t.Fatalf("exposures %+v, want one custom variant 1", exposures)
+			}
+		})
+	}
+}
