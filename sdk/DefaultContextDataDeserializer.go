@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/big"
 	"strconv"
+	"strings"
 
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
@@ -261,6 +262,14 @@ func jsonInt64(raw json.RawMessage) *int64 {
 	}
 	// A decimal or exponent spelling counts only when it is exactly integral:
 	// rounding through float64 would turn 3600000.0000000001 into 3600000.
+	// Spellings too long to hold an int64 are rejected before the exact
+	// decode, which grows with the literal and its exponent.
+	if len(number) > 48 {
+		return nil
+	}
+	if e := strings.IndexAny(string(number), "eE"); e >= 0 && len(strings.TrimLeft(string(number[e+1:]), "+-")) > 3 {
+		return nil
+	}
 	var exact, ok = new(big.Rat).SetString(number.String())
 	if !ok || !exact.IsInt() || !exact.Num().IsInt64() {
 		return nil

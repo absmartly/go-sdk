@@ -2140,22 +2140,34 @@ func TestSwitchback_ReadyCopyUsesLiveEpochs(t *testing.T) {
 }
 
 func TestSwitchback_RejectedNoUnitOverrideResolvesWithArrivingUnit(t *testing.T) {
-	var experiment = sbDefault(2, sbHour)
-	experiment.SwitchbackClusters = sbClusters("device_id", "city", sbUnitType, "city")
-	var h = sbCreateAt(t, sbAnchor+5, map[string]string{}, sbData(experiment), sbOverride("exp_sb", 1))
-	var entry = h.ctx.getAssignment("exp_sb")
-	if !entry.assignment.Exposed.CompareAndSwap(false, true) {
-		t.Fatal("claim failed")
-	}
-	_ = h.ctx.SetUnit(sbUnitType, sbUID)
-	h.ctx.Closing_.Store(true)
-	expectInt(t, int(exposureRejected), int(h.ctx.admitExposure(entry.assignment, entry)))
-	h.ctx.Closing_.Store(false)
-	_ = h.ctx.SetUnit(sbUnitType, sbUID)
-	expectInt(t, 1, h.treatment("exp_sb"))
-	var exposures = queuedExposures(h.ctx)
-	if len(exposures) != 1 || exposures[0].Unit != sbUnitType {
-		t.Fatalf("exposures %+v", exposures)
+	for _, legacy := range []bool{false, true} {
+		for _, repeatSetUnit := range []bool{false, true} {
+			var experiment = sbDefault(2, sbHour)
+			experiment.SwitchbackClusters = sbClusters("device_id", "city", sbUnitType, "city")
+			if legacy {
+				// An unreadable map: the declared unitType serves.
+				experiment.SwitchbackClusters = sbClusters("device_id", "'unterminated")
+			}
+			var h = sbCreateAt(t, sbAnchor+5, map[string]string{}, sbData(experiment), sbOverride("exp_sb", 1))
+			var entry = h.ctx.getAssignment("exp_sb")
+			if !entry.assignment.Exposed.CompareAndSwap(false, true) {
+				t.Fatal("claim failed")
+			}
+			_ = h.ctx.SetUnit(sbUnitType, sbUID)
+			h.ctx.Closing_.Store(true)
+			expectInt(t, int(exposureRejected), int(h.ctx.admitExposure(entry.assignment, entry)))
+			h.ctx.Closing_.Store(false)
+			if repeatSetUnit {
+				// The repeated SetUnit must not make the rejected claim look
+				// admitted.
+				_ = h.ctx.SetUnit(sbUnitType, sbUID)
+			}
+			expectInt(t, 1, h.treatment("exp_sb"))
+			var exposures = queuedExposures(h.ctx)
+			if len(exposures) != 1 || exposures[0].Unit != sbUnitType {
+				t.Fatalf("legacy=%v repeat=%v: exposures %+v", legacy, repeatSetUnit, exposures)
+			}
+		}
 	}
 }
 

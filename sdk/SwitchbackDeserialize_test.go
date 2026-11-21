@@ -67,18 +67,21 @@ func TestSwitchbackDeserialize_WronglyTypedFieldsDropOnlyThatField(t *testing.T)
 		"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}]`
 	for fields, check := range map[string]func(jsonmodels.Experiment) bool{
 		`"randomizationType":1`: func(e jsonmodels.Experiment) bool { return e.RandomizationType == "" },
-		`"randomizationType":"switchback","switchbackStartAt":"1767225600000"`: func(e jsonmodels.Experiment) bool { return e.SwitchbackStartAt == nil },
-		`"switchbackStartAt":1767225600000.5`:                                  func(e jsonmodels.Experiment) bool { return e.SwitchbackStartAt == nil },
-		`"switchbackStartAt":1.7672256e12`:                                     func(e jsonmodels.Experiment) bool { return *e.SwitchbackStartAt == 1767225600000 },
-		`"switchbackStartAt":null`:                                             func(e jsonmodels.Experiment) bool { return e.SwitchbackStartAt == nil },
-		`"switchbackStartAt":3600000.0000000001`:                               func(e jsonmodels.Experiment) bool { return e.SwitchbackStartAt == nil },
-		`"switchbackStartAt":3600000.000`:                                      func(e jsonmodels.Experiment) bool { return *e.SwitchbackStartAt == 3600000 },
-		`"switchbackPeriodMs":1.00000000000000001`:                             func(e jsonmodels.Experiment) bool { return e.SwitchbackPeriodMs == nil },
-		`"switchbackPeriodMs":36e5`:                                            func(e jsonmodels.Experiment) bool { return *e.SwitchbackPeriodMs == 3600000 },
-		`"switchbackPeriodMs":{"a":1}`:                                         func(e jsonmodels.Experiment) bool { return e.SwitchbackPeriodMs == nil },
-		`"switchbackPeriodMs":99999999999999999999`:                            func(e jsonmodels.Experiment) bool { return e.SwitchbackPeriodMs == nil },
-		`"switchbackClusters":["store_id"]`:                                    func(e jsonmodels.Experiment) bool { return e.SwitchbackClusters == nil },
-		`"switchbackClusters":{"store_id":{"a":1}}`:                            func(e jsonmodels.Experiment) bool { return e.SwitchbackClusters == nil },
+		`"randomizationType":"switchback","switchbackStartAt":"1767225600000"`:      func(e jsonmodels.Experiment) bool { return e.SwitchbackStartAt == nil },
+		`"switchbackStartAt":1767225600000.5`:                                       func(e jsonmodels.Experiment) bool { return e.SwitchbackStartAt == nil },
+		`"switchbackStartAt":1.7672256e12`:                                          func(e jsonmodels.Experiment) bool { return *e.SwitchbackStartAt == 1767225600000 },
+		`"switchbackStartAt":null`:                                                  func(e jsonmodels.Experiment) bool { return e.SwitchbackStartAt == nil },
+		`"switchbackStartAt":3600000.0000000001`:                                    func(e jsonmodels.Experiment) bool { return e.SwitchbackStartAt == nil },
+		`"switchbackStartAt":3600000.000`:                                           func(e jsonmodels.Experiment) bool { return *e.SwitchbackStartAt == 3600000 },
+		`"switchbackPeriodMs":1.00000000000000001`:                                  func(e jsonmodels.Experiment) bool { return e.SwitchbackPeriodMs == nil },
+		`"switchbackPeriodMs":36e5`:                                                 func(e jsonmodels.Experiment) bool { return *e.SwitchbackPeriodMs == 3600000 },
+		`"switchbackPeriodMs":36e0005`:                                              func(e jsonmodels.Experiment) bool { return e.SwitchbackPeriodMs == nil },
+		`"switchbackStartAt":1e999999`:                                              func(e jsonmodels.Experiment) bool { return e.SwitchbackStartAt == nil },
+		`"switchbackStartAt":3600000.000000000000000000000000000000000000000000000`: func(e jsonmodels.Experiment) bool { return e.SwitchbackStartAt == nil },
+		`"switchbackPeriodMs":{"a":1}`:                                              func(e jsonmodels.Experiment) bool { return e.SwitchbackPeriodMs == nil },
+		`"switchbackPeriodMs":99999999999999999999`:                                 func(e jsonmodels.Experiment) bool { return e.SwitchbackPeriodMs == nil },
+		`"switchbackClusters":["store_id"]`:                                         func(e jsonmodels.Experiment) bool { return e.SwitchbackClusters == nil },
+		`"switchbackClusters":{"store_id":{"a":1}}`:                                 func(e jsonmodels.Experiment) bool { return e.SwitchbackClusters == nil },
 		// A repeated key keeps its first position and its last value, so an
 		// overwritten malformed value leaves the map readable.
 		`"switchbackClusters":{"store_id":null,"device_id":"store_key","store_id":"store_key"}`: func(e jsonmodels.Experiment) bool {
