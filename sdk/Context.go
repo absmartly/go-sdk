@@ -285,6 +285,22 @@ func (r *ruleAssignmentIdentities) contains(flag *atomic.Value) bool {
 // modified once published in index_.
 type contextIndex struct {
 	experiments map[string]*indexedExperiment
+
+	// audiences is the set of audience texts in experiments, built once per
+	// snapshot on first use: a snapshot is never changed after it is stored.
+	audiencesOnce sync.Once
+	audiences     map[string]struct{}
+}
+
+// audienceTexts returns the snapshot's set of audience texts.
+func (index *contextIndex) audienceTexts() map[string]struct{} {
+	index.audiencesOnce.Do(func() {
+		index.audiences = make(map[string]struct{}, len(index.experiments))
+		for _, entry := range index.experiments {
+			index.audiences[entry.experiment.Data.Audience] = struct{}{}
+		}
+	})
+	return index.audiences
 }
 
 // indexedExperiment is an installed experiment with its parsed assignment
@@ -1223,9 +1239,20 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 		return nil, err
 	}
 
-	c.DataLock.RLock()
-	var experiments = st.indexVariables_[key]
-	c.DataLock.RUnlock()
+	var experiments []ExperimentVariables
+	if c.ownClock() == nil && (c.ContextLock_ == nil || c.literalState().manualRoot == nil) {
+		// A true literal resolves through its current IndexVariables_, as
+		// v1.1.1 did, so a replaced or deleted mapping takes effect.
+		c.DataLock.RLock()
+		if experiment, ok := c.IndexVariables_[key].(ExperimentVariables); ok {
+			experiments = []ExperimentVariables{experiment}
+		}
+		c.DataLock.RUnlock()
+	} else {
+		c.DataLock.RLock()
+		experiments = st.indexVariables_[key]
+		c.DataLock.RUnlock()
+	}
 
 	for _, experiment := range experiments {
 		var entry = c.assignmentEntry(experiment.Data.Name)
@@ -2192,15 +2219,8 @@ func (c *Context) cachedAudience(st *contextState, text string) (parsedAudience,
 // pruneAudiences drops the parses of audience texts the installed data no
 // longer has, so the cache does not grow with every refresh.
 func (st *contextState) pruneAudiences() {
-	var index = st.loadIndex()
-	var live = map[string]bool{}
-	if index != nil {
-		for _, entry := range index.experiments {
-			live[entry.experiment.Data.Audience] = true
-		}
-	}
 	st.audiences.Range(func(text, _ interface{}) bool {
-		if !live[text.(string)] {
+		if !st.hasAudience(text.(string)) {
 			st.audiences.Delete(text)
 		}
 		return true
@@ -2210,11 +2230,8 @@ func (st *contextState) pruneAudiences() {
 // hasAudience reports whether an installed experiment has audience text.
 func (st *contextState) hasAudience(text string) bool {
 	if index := st.loadIndex(); index != nil {
-		for _, entry := range index.experiments {
-			if entry.experiment.Data.Audience == text {
-				return true
-			}
-		}
+		var _, found = index.audienceTexts()[text]
+		return found
 	}
 	return false
 }

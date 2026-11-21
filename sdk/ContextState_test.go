@@ -316,6 +316,59 @@ func TestReentrantDeserializerAfterClockReplacementDoesNotDeadlock(t *testing.T)
 	}
 }
 
+// On a literal, PeekVariableValue and GetVariableValue resolve through the
+// current IndexVariables_, as v1.1.1 did: replacing a key's experiment reads
+// the new one, and deleting the key returns the default.
+func TestLiteralVariableValueFollowsIndexVariables(t *testing.T) {
+	var a, b = audienceExperiment("a", "", false), audienceExperiment("b", "", false)
+	a.Variants[1].Config = `{"key":1}`
+	b.Id = 9
+	b.Variants[1].Config = `{"key":2}`
+	for _, expose := range []bool{false, true} {
+		var manual = audienceLiteral(a)
+		manual.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{a, b}})
+		var read = func() interface{} {
+			var value interface{}
+			var err error
+			if expose {
+				value, err = manual.GetVariableValue("key", "fallback")
+			} else {
+				value, err = manual.PeekVariableValue("key", "fallback")
+			}
+			assertAny(nil, err, t)
+			return value
+		}
+		manual.IndexVariables_["key"] = manual.Index_["a"]
+		assertAny(float64(1), read(), t)
+		manual.IndexVariables_["key"] = manual.Index_["b"]
+		assertAny(float64(2), read(), t)
+		delete(manual.IndexVariables_, "key")
+		assertAny("fallback", read(), t)
+	}
+}
+
+// The first parse of each distinct audience checks membership against a set
+// built once per installed snapshot, not by walking the catalog each time.
+func TestColdAudienceReadsDoNotRescanTheCatalog(t *testing.T) {
+	var experiments []jsonmodels.Experiment
+	for i := 0; i < 200; i++ {
+		var e = audienceExperiment(fmt.Sprintf("exp_%d", i), fmt.Sprintf(`{"filter":[{"value":%d}]}`, i+1), true)
+		e.Id = i + 1
+		experiments = append(experiments, e)
+	}
+	var ctx, _ = newSystemAttrContext("website", "production", experiments...)
+	var index = ctx.state().loadIndex()
+	for _, e := range experiments {
+		var _ = treatmentPeek(t, ctx, e.Name)
+	}
+	// The snapshot built its audience set once, and every parse is cached.
+	assertAny(true, index == ctx.state().loadIndex(), t)
+	assertAny(200, len(index.audienceTexts()), t)
+	var cached = 0
+	ctx.state().audiences.Range(func(_, _ interface{}) bool { cached++; return true })
+	assertAny(200, cached, t)
+}
+
 // A literal context reads Index_ and IndexVariables_ as v1.1.1 did, including
 // entries replaced after the first read, with or without ContextLock_.
 func TestContextLiteralReadsCurrentLegacyIndexes(t *testing.T) {
