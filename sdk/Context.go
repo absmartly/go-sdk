@@ -231,6 +231,10 @@ type cachedAssignment struct {
 	resolvedIteration int
 }
 
+func (e *cachedAssignment) resolvedExperimentMatches(data jsonmodels.Experiment) bool {
+	return e.resolvedId == data.Id && e.resolvedIteration == data.Iteration
+}
+
 type loggerGoroutines struct {
 	mu  sync.Mutex
 	ids map[uint64]int
@@ -987,11 +991,11 @@ func claimEligible(entry *cachedAssignment, eligible func(*cachedAssignment) boo
 	if beforeEligibleClaim != nil {
 		beforeEligibleClaim()
 	}
-	if entry.assignment.Exposed.Load().(bool) && !entry.retirement.Load() {
-		return exposureQueued
-	}
 	if entry.retirement.Load() {
 		return exposureRetired
+	}
+	if entry.assignment.Exposed.Load().(bool) {
+		return exposureQueued
 	}
 	if !eligible(entry) {
 		return exposureIneligible
@@ -1002,9 +1006,6 @@ func claimEligible(entry *cachedAssignment, eligible func(*cachedAssignment) boo
 	}
 	if claimed {
 		return exposureClaimed
-	}
-	if entry.retirement.Load() {
-		return exposureRetired
 	}
 	return exposureQueued
 }
@@ -1020,8 +1021,9 @@ func (e *cachedAssignment) needsSettling() bool {
 // variableEligible is the variable read's claim check: once the context has
 // seen holdouts or assignment rules (the only sources of retirement), a read
 // of key claims an exposure only for an experiment that, as installed now,
-// still exists and defines key in some variant. Contexts with neither keep
-// the released behaviour. The caller holds ContextLock_.
+// still exists, defines key in some variant and has the same resolved experiment
+// and holdout epochs. Contexts with neither keep the released behaviour. The
+// caller holds ContextLock_.
 func (c *Context) variableEligible(experimentName string, key string) func(*cachedAssignment) bool {
 	return func(e *cachedAssignment) bool {
 		if e.assignment.Variables == nil {
@@ -1032,8 +1034,8 @@ func (c *Context) variableEligible(experimentName string, key string) func(*cach
 			return true
 		}
 		var indexed = index.experiments[experimentName]
-		if indexed == nil || indexed.experiment.Data.Id != e.resolvedId ||
-			indexed.experiment.Data.Iteration != e.resolvedIteration {
+		if indexed == nil || !e.resolvedExperimentMatches(indexed.experiment.Data) ||
+			!holdoutSetMatches(indexed.holdouts, e.holdouts) {
 			return false
 		}
 		_, defined := indexed.variableKeys[key]
@@ -1091,12 +1093,10 @@ type exposureStatus int
 const (
 	// exposureQueued: the decision was queued, or there was nothing to queue.
 	exposureQueued exposureStatus = iota
-	// exposureRejected: a close rejected it.
 	exposureRejected
 	// exposureIneligible: the read's eligibility check failed, so nothing was
 	// claimed.
 	exposureIneligible
-	// exposureClaimed: claimEligible took the claim; the caller admits it.
 	exposureClaimed
 	// exposureRetired: the claim failed because a replacement or an eviction
 	// retired the assignment and marked it exposed; nothing of it was
@@ -1807,7 +1807,7 @@ func (c *Context) validCachedAssignment(experimentName string) (*cachedAssignmen
 		// A still-unclaimed override needs current variables and resolved
 		// identity before a variable read can claim it in the new epoch.
 		if efound && !assignment.Exposed.Load().(bool) && c.index_.Load().keyed &&
-			(entry.resolvedId != experiment.Data.Id || entry.resolvedIteration != experiment.Data.Iteration) {
+			!entry.resolvedExperimentMatches(experiment.Data) {
 			return entry, rules, assignmentStale
 		}
 		if assignment.Overridden && assignment.Variant == override.(int) && (!efound ||
@@ -2110,7 +2110,9 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 	if efound {
 		c.keepExposedRuleAssignment(experiment.Data, previous, entry)
 	}
-	if previous != nil && (previous.holdouts != nil || entry.holdouts != nil) && previous.assignment.Exposed != assignment.Exposed {
+	var rebuiltOverride = previous != nil && previous.assignment.Overridden && efound &&
+		c.index_.Load().keyed && !previous.resolvedExperimentMatches(experiment.Data)
+	if previous != nil && (previous.holdouts != nil || entry.holdouts != nil || rebuiltOverride) && previous.assignment.Exposed != assignment.Exposed {
 		// Retire the replaced assignment, as eviction does: a caller still
 		// holding it must not claim a decision, or holdout arms, that the
 		// replacement has superseded. Retired before it is marked exposed,
