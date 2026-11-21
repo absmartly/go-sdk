@@ -2125,7 +2125,7 @@ func (c *Context) parseAudienceUnlocked(st *contextState, name string, data json
 		defer func() {
 			if !returned {
 				panicked = recover()
-				parsed = parsedAudience{err: errors.New("can't evaluate data")}
+				parsed = parsedAudience{err: errAudienceUnparseable}
 			}
 		}()
 		parsed = AudienceMatcher{deserializer}.parseAudience(text)
@@ -2186,7 +2186,7 @@ func (c *Context) cachedAudience(st *contextState, text string) (parsedAudience,
 	}
 	// A miss carries the unparseable error, so evaluating it by mistake can
 	// never read a nil filter.
-	return parsedAudience{err: errors.New("can't evaluate data")}, false
+	return parsedAudience{err: errAudienceUnparseable}, false
 }
 
 // pruneAudiences drops the parses of audience texts the installed data no

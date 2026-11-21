@@ -1290,6 +1290,31 @@ func TestJoinedCopyReadsAgreeAfterFailedRefreshAndNestedSuccess(t *testing.T) {
 	}
 }
 
+// keyedExperiment is ruleExperiment with one variable key on its variant 1.
+func keyedExperiment(name, key string) jsonmodels.Experiment {
+	var experiment = ruleExperiment(name, "")
+	experiment.Variants[1].Config = fmt.Sprintf(`{%q:1}`, key)
+	return experiment
+}
+
+// assertCopyReadsOnly checks that c's experiment and variable-key lookups find
+// want and want_key, and no longer find gone and gone_key.
+func assertCopyReadsOnly(t *testing.T, c *Context, want, gone string) {
+	t.Helper()
+	if _, found := c.GetExperiment(want); !found {
+		t.Errorf("GetExperiment(%q) misses the installed data", want)
+	}
+	if _, found := c.GetExperiment(gone); found {
+		t.Errorf("GetExperiment(%q) still finds replaced data", gone)
+	}
+	if experiment, err := c.GetVariableExperiment(want + "_key"); err != nil || experiment.Data.Name != want {
+		t.Errorf("GetVariableExperiment(%q) = %q, %v", want+"_key", experiment.Data.Name, err)
+	}
+	if _, err := c.GetVariableExperiment(gone + "_key"); err == nil {
+		t.Errorf("GetVariableExperiment(%q) still resolves a replaced key", gone+"_key")
+	}
+}
+
 // diagnosticParser logs one diagnostic through the context it is given.
 type diagnosticParser struct{ DefaultVariableParser }
 
@@ -1301,7 +1326,7 @@ func (p diagnosticParser) Parse(ctx Context, experimentName string, variantName 
 // SetData through a copy whose diagnostics logger synchronously installs
 // newer data returns with the copy's reads agreeing with the live data.
 func TestCopySetDataReadsAgreeAfterDiagnosticsLoggerRefresh(t *testing.T) {
-	var a, b, before = ruleExperiment("a", ""), ruleExperiment("b", ""), ruleExperiment("before", "")
+	var a, b, before = keyedExperiment("a", "a_key"), keyedExperiment("b", "b_key"), ruleExperiment("before", "")
 	var ctx, _ = newRuleContext(t, "production", withUnit(), before)
 	ctx.Clock_ = internal.FixedClock{Millis_: 1}
 	var doneB, settleB = future.New()
@@ -1323,12 +1348,7 @@ func TestCopySetDataReadsAgreeAfterDiagnosticsLoggerRefresh(t *testing.T) {
 	var data, _ = copied.GetData()
 	assertAny(1, len(data.Experiments), t)
 	assertAny("b", data.Experiments[0].Name, t)
-	if _, found := copied.GetExperiment("b"); !found {
-		t.Error("the copy's GetExperiment misses the data GetData reports")
-	}
-	if _, found := copied.GetExperiment("a"); found {
-		t.Error("the copy's GetExperiment still finds replaced data")
-	}
+	assertCopyReadsOnly(t, &copied, "b", "a")
 }
 
 // A copy that captured an active refresh but registers after completion has
@@ -1336,7 +1356,7 @@ func TestCopySetDataReadsAgreeAfterDiagnosticsLoggerRefresh(t *testing.T) {
 // sees data a completion logger installed.
 func TestLateRegistrantBeforeSettleIsReadoptedAtSettle(t *testing.T) {
 	for _, success := range []bool{false, true} {
-		var before, a, b = ruleExperiment("before", ""), ruleExperiment("a", ""), ruleExperiment("b", "")
+		var before, a, b = ruleExperiment("before", ""), keyedExperiment("a", "a_key"), keyedExperiment("b", "b_key")
 		var ctx, _ = newRuleContext(t, "production", withUnit(), before)
 		ctx.Clock_ = internal.FixedClock{Millis_: 1}
 		var copied = *ctx
@@ -1350,12 +1370,7 @@ func TestLateRegistrantBeforeSettleIsReadoptedAtSettle(t *testing.T) {
 		// The completion logger installs newer data before settlement.
 		ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{b}})
 		op.settle(ctx)
-		if _, found := copied.GetExperiment("b"); !found {
-			t.Errorf("success=%v: the late registrant was not re-adopted at settlement", success)
-		}
-		if _, found := copied.GetExperiment("a"); found {
-			t.Errorf("success=%v: the late registrant still finds replaced data", success)
-		}
+		assertCopyReadsOnly(t, &copied, "b", "a")
 		// After settlement a copy adopts directly and is not retained.
 		var later = *ctx
 		op.join(&later, ctx)
@@ -1366,7 +1381,7 @@ func TestLateRegistrantBeforeSettleIsReadoptedAtSettle(t *testing.T) {
 // A completion logger that synchronously refreshes again leaves a joined
 // copy's reads consistent when the copy's refresh reports success.
 func TestJoinedCopyReadsAgreeAfterNestedRefresh(t *testing.T) {
-	var a, b, before = ruleExperiment("a", ""), ruleExperiment("b", ""), ruleExperiment("before", "")
+	var a, b, before = keyedExperiment("a", "a_key"), keyedExperiment("b", "b_key"), ruleExperiment("before", "")
 	var ctx, _ = newRuleContext(t, "production", withUnit(), before)
 	ctx.Clock_ = internal.FixedClock{Millis_: 1}
 	var copied = *ctx
@@ -1402,12 +1417,7 @@ func TestJoinedCopyReadsAgreeAfterNestedRefresh(t *testing.T) {
 	var data, _ = copied.GetData()
 	assertAny(1, len(data.Experiments), t)
 	assertAny("b", data.Experiments[0].Name, t)
-	if _, found := copied.GetExperiment("b"); !found {
-		t.Error("the copy's GetExperiment misses the data GetData reports")
-	}
-	if _, found := copied.GetExperiment("a"); found {
-		t.Error("the copy's GetExperiment still finds replaced data")
-	}
+	assertCopyReadsOnly(t, &copied, "b", "a")
 }
 
 // An earlier listener must be able to wait for a joining copy, independently
@@ -1550,8 +1560,6 @@ func TestRefreshOperationLateCopyRegistration(t *testing.T) {
 		op.complete(ctx, success)
 		op.settle(ctx)
 		op.join(&copied, ctx)
-		// The copy agrees with the live data whatever the outcome, and a
-		// join after settlement is not retained.
 		var _, found = copied.GetExperiment("after")
 		assertAny(true, found, t)
 		assertAny(0, len(op.receivers), t)
@@ -2489,7 +2497,6 @@ func TestEditedLiteralIndexDoesNotRecurse(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("PeekTreatment after an Index_ edit did not return")
 	}
-	// Only the audiences the reads evaluated are parsed, each once.
 	assertAny([]string{`{"filter":[{"value":true}]}`, `{"filter":[{"value":false}]}`}, counter.texts(), t)
 
 	// Editing an entry already assigned is picked up as in v1.1.1: a changed
@@ -2564,7 +2571,6 @@ func TestDeserializerComparisonNeverPanicsOrSpins(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatalf("%T: reads did not return", d)
 		}
-		// Each audience is parsed once; the reads after SetAttribute reuse it.
 		assertAny(2, len(counter.texts()), t)
 		counter.mu.Lock()
 		counter.parsed = nil
@@ -2875,7 +2881,6 @@ func TestDataInstalledDuringParseIsParsedBeforeEvaluation(t *testing.T) {
 	go func() { done <- treatmentPeek(t, ctx, "exp_app") }()
 	select {
 	case variant := <-done:
-		// The last installed audience ({"value":1}) matches.
 		assertAny(1, variant, t)
 	case <-time.After(5 * time.Second):
 		t.Fatal("evaluation did not finish")
@@ -3010,7 +3015,7 @@ func TestAudienceCacheIsPrunedOnInstall(t *testing.T) {
 	var ctx, _ = newSystemAttrContext("website", "production", audienceExperiment("exp_app", appFilter, true))
 	for i := 0; i < 5; i++ {
 		var _, _ = reparseAudience(ctx)
-		assertAny(nil, ctx.SetAttribute("round", i), t) // revalidates, so the new text is parsed
+		assertAny(nil, ctx.SetAttribute("round", i), t)
 		var _ = treatmentPeek(t, ctx, "exp_app")
 	}
 	var n = 0
