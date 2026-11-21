@@ -548,3 +548,28 @@ func TestHandoffPublishLoggerReadsColdAudience(t *testing.T) {
 		assertHandoffB(t, h.ctx, <-peekB)
 	}
 }
+
+// A's deserializer calls Close while the final publish fails and its Error
+// logger reads cold custom B: Close lends the gate to that publish, so the
+// failed close returns, the context stays open, and the reads finish.
+func TestHandoffCloseWithFailedPublishLoggerReadsColdAudience(t *testing.T) {
+	var h = newHandoff(t, nil)
+	h.ctx.EventHandler_ = DefaultContextEventHandler{client_: &CapturingPublishClient{publishErr: errors.New("collector down")}}
+	assertAny(nil, h.ctx.Track("goal", nil), t)
+	var peekB = make(chan int, 1)
+	h.setLogger(func(c Context, event EventType) {
+		if event == Error {
+			select {
+			case peekB <- func() int { v, _ := c.PeekTreatment("B"); return v }():
+			default:
+			}
+		}
+	})
+	var once sync.Once
+	h.d.setHook(true, func() { once.Do(func() { h.ctx.Close() }) })
+	var a int
+	handoffWithin(t, "deserializer Close with a failing publish whose logger reads B", func() { a, _ = h.ctx.GetTreatment("A") })
+	assertAny(1, a, t)
+	assertAny(false, h.ctx.IsClosed(), t)
+	assertHandoffB(t, h.ctx, <-peekB)
+}

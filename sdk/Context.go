@@ -79,6 +79,10 @@ type contextState struct {
 	// transport/sealing, allowing loggers to re-enter Close safely.
 	finalizedFuture_ *future.Future
 	publishLogs_     []*future.Future
+	// publishOps_ are the gate operations of the publishes whose loggers have
+	// not returned, so a blocking Close or Finalize can lend them the custom
+	// audience gate. Guarded by stateLock_.
+	publishOps_ map[*gateOperation]struct{}
 	// indexLock_ makes a literal's Index_ write and index install in setData
 	// atomic for syncLiteralExperiment. It is taken last, with no other lock
 	// taken inside it.
@@ -150,7 +154,7 @@ type contextState struct {
 	// did by holding ContextLock_ across both. It is taken with no context
 	// lock held and released after ContextLock_ is. It is reentrant for its
 	// holder, so a deserializer or a panic logger can read other experiments,
-	// and it is lent to a Refresh or initial load the holder waits for, so
+	// and it is lent to a Refresh, initial load or publish the holder waits for, so
 	// that operation's variable parser and loggers can read too. Such nested
 	// reads decode before the outer deserializer returns: a deserializer
 	// reusing storage across its own nested calls is responsible for it.
@@ -180,7 +184,8 @@ type reentrantGate struct {
 	lent map[*gateOperation]int
 }
 
-// gateOperation is an SDK operation (a refresh, or the initial load) that a
+// gateOperation is an SDK operation (a refresh, the initial load, or a
+// publish's logger) that a
 // gate holder can wait for. executor is the goroutine running the
 // operation's completion (installing its data, calling the variable parser
 // and event loggers for it), or 0. It is guarded by the gate's mu.
@@ -1873,6 +1878,9 @@ func (c *Context) Close() {
 	c = c.live()
 	var st = c.state()
 	closing, finalized := c.closeAttempt()
+	// A deserializer calling Close lends the gate to the publishes it waits
+	// for, as Publish does to its own.
+	defer st.lendPublishes()()
 	if st.loggers_ != nil && st.loggers_.current() {
 		closing.Join(context.Background())
 		return
@@ -2119,10 +2127,10 @@ func (c *Context) assignmentEntry(experimentName string) *cachedAssignment {
 // other custom parse runs while a result may still be in use, as in v1.1.1.
 // The built-in deserializer's parses, whose results are fresh, skip it. Any
 // read from another goroutine, an event logger's included, waits for the
-// gate, except the executor of a Refresh or initial load that the holder is
-// waiting for in Refresh or WaitUntilReady: the holder lent it the gate, so
-// that operation's parser and loggers run nested, as v1.1.1 ran refresh
-// callbacks on the joining goroutine.
+// gate, except the executor of a refresh, initial load or publish that the
+// holder waits for in Refresh, WaitUntilReady, Publish or Close: the holder
+// lent it the gate, so that operation's parser and loggers run nested, as
+// v1.1.1 ran refresh callbacks on the joining goroutine.
 func (c *Context) buildAssignment(st *contextState, experimentName string) *cachedAssignment {
 	var entry, unparsed = c.buildAssignmentLocked(st, experimentName, false, nil)
 	for attempt := 0; unparsed != nil; attempt++ {
@@ -2972,6 +2980,10 @@ func (c *Context) flush() (*future.Future, *gateOperation) {
 				}
 			}
 			st.publishLogs_ = append(activeLogs, result)
+			if st.publishOps_ == nil {
+				st.publishOps_ = map[*gateOperation]struct{}{}
+			}
+			st.publishOps_[op] = struct{}{}
 			st.stateLock_.Unlock()
 		}
 		c.EventLock_.Unlock()
@@ -3009,10 +3021,10 @@ func (c *Context) flush() (*future.Future, *gateOperation) {
 						// Start the logger first: settledDone runs Close's listeners
 						// synchronously, and a panic there must not leave the
 						// caller's future unsettled.
-						runLogger(&st.customAudiences, op, done, nil, func() { c.logEvent(Publish, event) })
+						runLogger(st, op, done, nil, func() { c.logEvent(Publish, event) })
 					} else {
 						c.requeueEvents(exposures, achievements, eventCount)
-						runLogger(&st.customAudiences, op, done, err, func() { c.logEvent(Error, err) })
+						runLogger(st, op, done, err, func() { c.logEvent(Error, err) })
 					}
 					st.removeInflight(settled)
 					settledDone(nil, err)
@@ -3070,15 +3082,39 @@ func (st *contextState) inflightSnapshot() []*future.Future {
 //
 // The logger goroutine is op's executor while it runs, so a Publish waiting
 // for it can lend the custom audience gate.
-func runLogger(gate *reentrantGate, op *gateOperation, done future.SetResultFunc, result error, log func()) {
+func runLogger(st *contextState, op *gateOperation, done future.SetResultFunc, result error, log func()) {
 	go func() {
-		var end = gate.execute(op)
+		var end = st.customAudiences.execute(op)
 		func() {
 			defer end()
 			log()
 		}()
+		st.stateLock_.Lock()
+		delete(st.publishOps_, op)
+		st.stateLock_.Unlock()
 		done(nil, result)
 	}()
+}
+
+// lendPublishes lends the custom audience gate, if the caller holds it, to
+// every publish whose logger is still running, for a wait (Close, Finalize)
+// that cannot end before those loggers return.
+func (st *contextState) lendPublishes() (end func()) {
+	st.stateLock_.Lock()
+	var ops = make([]*gateOperation, 0, len(st.publishOps_))
+	for op := range st.publishOps_ {
+		ops = append(ops, op)
+	}
+	st.stateLock_.Unlock()
+	var ends = make([]func(), 0, len(ops))
+	for _, op := range ops {
+		ends = append(ends, st.customAudiences.lend(op))
+	}
+	return func() {
+		for _, e := range ends {
+			e()
+		}
+	}
 }
 
 // callPublisher calls the event handler and always returns a future. A
