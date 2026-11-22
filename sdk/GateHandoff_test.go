@@ -13,7 +13,7 @@ import (
 )
 
 // The tests in this file cover lending the custom audience gate to a
-// Refresh or initial load its holder waits for. A and B are strict custom
+// refresh, initial load or publish its holder waits for. A and B are strict custom
 // audiences: A's filter is true (variant 1), B's false (variant 0, mismatch).
 
 const handoffTrue = `{"filter":[{"value":true}]}`
@@ -572,4 +572,51 @@ func TestHandoffCloseWithFailedPublishLoggerReadsColdAudience(t *testing.T) {
 	assertAny(1, a, t)
 	assertAny(false, h.ctx.IsClosed(), t)
 	assertHandoffB(t, h.ctx, <-peekB)
+}
+
+// A publish that starts while a deserializer's Close is under way (here from
+// a listener of the failed close future) is lent the gate too, so its Error
+// logger's read of cold custom B finishes and Close returns.
+func TestHandoffCloseLendsToPublishStartedDuringClose(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		var h = newHandoff(t, nil)
+		h.ctx.EventHandler_ = DefaultContextEventHandler{client_: &CapturingPublishClient{publishErr: errors.New("collector down")}}
+		assertAny(nil, h.ctx.Track("goal", nil), t)
+		h.setLogger(func(c Context, event EventType) {
+			if event == Error {
+				var _, _ = c.PeekTreatment("B")
+			}
+		})
+		var once sync.Once
+		h.d.setHook(true, func() {
+			once.Do(func() {
+				var ctx = h.ctx
+				var listener = func(future.Value, error) {
+					_ = ctx.Track("late", nil)
+					_, _ = ctx.PublishAsync()
+				}
+				var st = ctx.state()
+				var stop = make(chan struct{})
+				go func() {
+					for {
+						st.stateLock_.Lock()
+						var closing = ctx.ClosingFuture_
+						st.stateLock_.Unlock()
+						if closing != nil {
+							closing.Listen(listener)
+							return
+						}
+						select {
+						case <-stop:
+							return
+						default:
+						}
+					}
+				}()
+				ctx.Close()
+				close(stop)
+			})
+		})
+		handoffWithin(t, "deserializer Close while a later publish's logger reads B", func() { _, _ = h.ctx.GetTreatment("A") })
+	}
 }

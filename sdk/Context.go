@@ -83,6 +83,10 @@ type contextState struct {
 	// not returned, so a blocking Close or Finalize can lend them the custom
 	// audience gate. Guarded by stateLock_.
 	publishOps_ map[*gateOperation]struct{}
+	// closeLenders_ are the lends of holders waiting in Close: each lends the
+	// gate to every publish in publishOps_, including those registered while
+	// it waits. Guarded by stateLock_.
+	closeLenders_ map[*publishLender]struct{}
 	// indexLock_ makes a literal's Index_ write and index install in setData
 	// atomic for syncLiteralExperiment. It is taken last, with no other lock
 	// taken inside it.
@@ -182,6 +186,9 @@ type reentrantGate struct {
 	holders map[uint64]int
 	// lent counts, per operation, the holders currently waiting for it.
 	lent map[*gateOperation]int
+	// lenders counts, per holder, the lends it has in force (it is blocked
+	// waiting for those operations).
+	lenders map[uint64]int
 }
 
 // gateOperation is an SDK operation (a refresh, the initial load, or a
@@ -198,12 +205,34 @@ func (g *reentrantGate) init() {
 		g.free.L = &g.mu
 		g.holders = map[uint64]int{}
 		g.lent = map[*gateOperation]int{}
+		g.lenders = map[uint64]int{}
 	}
 }
 
 // admits reports whether goroutine id may take the gate now. g.mu is held.
 func (g *reentrantGate) admits(id uint64) bool {
-	return len(g.holders) == 0 || g.holders[id] > 0 || g.executingLent(id)
+	if len(g.holders) == 0 || g.holders[id] > 0 {
+		return true
+	}
+	if !g.executingLent(id) {
+		return false
+	}
+	// A lent executor stands in for the holder that waits for it, but two
+	// executors (two publishes a Close waits for, say) must not decode at
+	// the same time: admit it only while every other holder is blocked
+	// waiting for an operation the gate is lent to.
+	for holder := range g.holders {
+		if !g.waitingOnLend(holder) {
+			return false
+		}
+	}
+	return true
+}
+
+// waitingOnLend reports whether holder is blocked waiting for an operation
+// the gate is lent to on its behalf. g.mu is held.
+func (g *reentrantGate) waitingOnLend(holder uint64) bool {
+	return g.lenders[holder] > 0
 }
 
 // executingLent reports whether goroutine id executes an operation the gate
@@ -236,9 +265,9 @@ func (g *reentrantGate) unlock() {
 	g.mu.Lock()
 	if g.holders[id]--; g.holders[id] <= 0 {
 		delete(g.holders, id)
-		if len(g.holders) == 0 {
-			g.free.Broadcast()
-		}
+		// Wake waiters whenever a holder leaves: a lent executor waits for
+		// the other admitted executors, not only for the gate to be free.
+		g.free.Broadcast()
 	}
 	g.mu.Unlock()
 }
@@ -251,7 +280,11 @@ func (g *reentrantGate) unlock() {
 // Whether the executor registers before or after the lend, or is already
 // waiting in lock, it is admitted: both sides broadcast under g.mu.
 func (g *reentrantGate) lend(op *gateOperation) (end func()) {
-	var id = goroutineID()
+	return g.lendAs(goroutineID(), op)
+}
+
+// lendAs is lend on behalf of goroutine id, which is blocked waiting for op.
+func (g *reentrantGate) lendAs(id uint64, op *gateOperation) (end func()) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.init()
@@ -259,11 +292,15 @@ func (g *reentrantGate) lend(op *gateOperation) (end func()) {
 		return func() {}
 	}
 	g.lent[op]++
+	g.lenders[id]++
 	g.free.Broadcast()
 	return func() {
 		g.mu.Lock()
 		if g.lent[op]--; g.lent[op] <= 0 {
 			delete(g.lent, op)
+		}
+		if g.lenders[id]--; g.lenders[id] <= 0 {
+			delete(g.lenders, id)
 		}
 		g.mu.Unlock()
 	}
@@ -1877,14 +1914,17 @@ func (c *Context) waitPublishLogs() {
 func (c *Context) Close() {
 	c = c.live()
 	var st = c.state()
-	closing, finalized := c.closeAttempt()
-	// A deserializer calling Close lends the gate to the publishes it waits
-	// for, as Publish does to its own.
-	defer st.lendPublishes()()
 	if st.loggers_ != nil && st.loggers_.current() {
+		closing, _ := c.closeAttempt()
 		closing.Join(context.Background())
 		return
 	}
+	// A deserializer calling Close lends the gate to the publishes it waits
+	// for, as Publish does to its own, from before the close starts its
+	// final publish until finalization (which waits for their loggers) ends.
+	var end = st.lendPublishes()
+	defer end()
+	_, finalized := c.closeAttempt()
 	finalized.Join(context.Background())
 }
 
@@ -2984,6 +3024,9 @@ func (c *Context) flush() (*future.Future, *gateOperation) {
 				st.publishOps_ = map[*gateOperation]struct{}{}
 			}
 			st.publishOps_[op] = struct{}{}
+			for lender := range st.closeLenders_ {
+				lender.add(op)
+			}
 			st.stateLock_.Unlock()
 		}
 		c.EventLock_.Unlock()
@@ -3096,21 +3139,41 @@ func runLogger(st *contextState, op *gateOperation, done future.SetResultFunc, r
 	}()
 }
 
+// publishLender is a holder's lend of the custom audience gate to the
+// publishes a Close it is waiting in depends on.
+type publishLender struct {
+	gate *reentrantGate
+	id   uint64
+	ends []func()
+}
+
+// add lends the gate to op on behalf of the waiting holder. stateLock_ is
+// held; lend only takes the gate's own mutex.
+func (l *publishLender) add(op *gateOperation) {
+	l.ends = append(l.ends, l.gate.lendAs(l.id, op))
+}
+
 // lendPublishes lends the custom audience gate, if the caller holds it, to
-// every publish whose logger is still running, for a wait (Close, Finalize)
-// that cannot end before those loggers return.
+// every publish whose logger is running now or starts before the returned
+// function is called: a Close cannot end before those loggers return, and on
+// a failed close its finalization waits for publishes started meanwhile.
 func (st *contextState) lendPublishes() (end func()) {
+	var lender = &publishLender{gate: &st.customAudiences, id: goroutineID()}
 	st.stateLock_.Lock()
-	var ops = make([]*gateOperation, 0, len(st.publishOps_))
+	if st.closeLenders_ == nil {
+		st.closeLenders_ = map[*publishLender]struct{}{}
+	}
+	st.closeLenders_[lender] = struct{}{}
 	for op := range st.publishOps_ {
-		ops = append(ops, op)
+		lender.add(op)
 	}
 	st.stateLock_.Unlock()
-	var ends = make([]func(), 0, len(ops))
-	for _, op := range ops {
-		ends = append(ends, st.customAudiences.lend(op))
-	}
 	return func() {
+		st.stateLock_.Lock()
+		delete(st.closeLenders_, lender)
+		var ends = lender.ends
+		lender.ends = nil
+		st.stateLock_.Unlock()
 		for _, e := range ends {
 			e()
 		}
