@@ -854,3 +854,94 @@ func gateHasWaiter(g *reentrantGate) bool {
 	defer g.mu.Unlock()
 	return g.waiting > 0
 }
+
+// A holder lent to two operations admits only one of their executors at a
+// time: the second waits until the first leaves, so two lent loggers never
+// decode at once.
+func TestReentrantGateLentExecutorsAreExclusive(t *testing.T) {
+	var g reentrantGate
+	var first, second = &gateOperation{}, &gateOperation{}
+	g.lock()
+	var endFirst, endSecond = g.lend(first), g.lend(second)
+	var firstIn, firstLeave, secondIn = make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		var end = g.execute(first)
+		g.lock()
+		close(firstIn)
+		<-firstLeave
+		g.unlock()
+		end()
+	}()
+	<-firstIn
+	go func() {
+		var end = g.execute(second)
+		g.lock()
+		close(secondIn)
+		g.unlock()
+		end()
+	}()
+	var deadline = time.Now().Add(handoffTimeout)
+	for !gateHasWaiter(&g) {
+		if time.Now().After(deadline) {
+			t.Fatal("the second executor did not reach the gate")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-secondIn:
+		t.Fatal("two lent executors held the gate at once")
+	default:
+	}
+	close(firstLeave)
+	select {
+	case <-secondIn:
+	case <-time.After(handoffTimeout):
+		t.Fatal("the second executor was not admitted after the first left")
+	}
+	endFirst()
+	endSecond()
+	g.unlock()
+}
+
+// The last holder's unlock wakes every waiter, not just one: several plain
+// waiters blocked behind a holder all get through once it leaves, with no
+// other gate event to wake them.
+func TestReentrantGateUnlockWakesEveryWaiter(t *testing.T) {
+	var g reentrantGate
+	g.lock()
+	const waiters = 4
+	var in = make(chan struct{}, waiters)
+	var release = make(chan struct{})
+	for i := 0; i < waiters; i++ {
+		go func() {
+			g.lock()
+			in <- struct{}{}
+			<-release
+			g.unlock()
+		}()
+	}
+	var deadline = time.Now().Add(handoffTimeout)
+	for {
+		g.mu.Lock()
+		var n = g.waiting
+		g.mu.Unlock()
+		if n == waiters {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("waiters did not block")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	g.unlock()
+	// The gate is free, so the first waiter in holds it; the rest wait for
+	// it. Each releases in turn; every one must be admitted.
+	for i := 0; i < waiters; i++ {
+		select {
+		case <-in:
+			release <- struct{}{}
+		case <-time.After(handoffTimeout):
+			t.Fatalf("waiter %d was never woken", i)
+		}
+	}
+}
