@@ -882,15 +882,15 @@ func TestReentrantGateLentExecutorsAreExclusive(t *testing.T) {
 	}()
 	var deadline = time.Now().Add(handoffTimeout)
 	for !gateHasWaiter(&g) {
+		select {
+		case <-secondIn:
+			t.Fatal("two lent executors held the gate at once")
+		default:
+		}
 		if time.Now().After(deadline) {
 			t.Fatal("the second executor did not reach the gate")
 		}
 		time.Sleep(time.Millisecond)
-	}
-	select {
-	case <-secondIn:
-		t.Fatal("two lent executors held the gate at once")
-	default:
 	}
 	close(firstLeave)
 	select {
@@ -903,9 +903,8 @@ func TestReentrantGateLentExecutorsAreExclusive(t *testing.T) {
 	g.unlock()
 }
 
-// The last holder's unlock wakes every waiter, not just one: several plain
-// waiters blocked behind a holder all get through once it leaves, with no
-// other gate event to wake them.
+// Several plain waiters blocked behind a holder are all admitted once it
+// leaves, each after the one before it releases.
 func TestReentrantGateUnlockWakesEveryWaiter(t *testing.T) {
 	var g reentrantGate
 	g.lock()
