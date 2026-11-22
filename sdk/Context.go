@@ -302,6 +302,12 @@ func (g *reentrantGate) lendAs(id uint64, op *gateOperation) (end func()) {
 		if g.lenders[id]--; g.lenders[id] <= 0 {
 			delete(g.lenders, id)
 		}
+		// The holder resumes only once op's executor is out of the gate:
+		// a lend that ends early (an operation registered after the wait
+		// snapshot) must not leave the two decoding at the same time.
+		for op.executor != 0 && g.holders[op.executor] > 0 && op.executor != id {
+			g.free.Wait()
+		}
 		g.mu.Unlock()
 	}
 }
@@ -1922,10 +1928,10 @@ func (c *Context) Close() {
 	// A deserializer calling Close lends the gate to the publishes it waits
 	// for, as Publish does to its own, from before the close starts its
 	// final publish until finalization (which waits for their loggers) ends.
-	var end = st.lendPublishes()
+	var wait, end = st.lendPublishes()
 	defer end()
 	_, finalized := c.closeAttempt()
-	finalized.Join(context.Background())
+	wait(func() { finalized.Join(context.Background()) })
 }
 
 // assignmentState is what validCachedAssignment found for a cached assignment.
@@ -3142,22 +3148,30 @@ func runLogger(st *contextState, op *gateOperation, done future.SetResultFunc, r
 // publishLender is a holder's lend of the custom audience gate to the
 // publishes a Close it is waiting in depends on.
 type publishLender struct {
-	gate *reentrantGate
-	id   uint64
-	ends []func()
+	gate   *reentrantGate
+	id     uint64
+	active bool
+	ops    []*gateOperation
+	ends   []func()
 }
 
-// add lends the gate to op on behalf of the waiting holder. stateLock_ is
-// held; lend only takes the gate's own mutex.
+// add records op, and lends the gate to it at once if the holder is already
+// blocked waiting. stateLock_ is held; lendAs only takes the gate's mutex.
 func (l *publishLender) add(op *gateOperation) {
-	l.ends = append(l.ends, l.gate.lendAs(l.id, op))
+	l.ops = append(l.ops, op)
+	if l.active {
+		l.ends = append(l.ends, l.gate.lendAs(l.id, op))
+	}
 }
 
-// lendPublishes lends the custom audience gate, if the caller holds it, to
-// every publish whose logger is running now or starts before the returned
-// function is called: a Close cannot end before those loggers return, and on
-// a failed close its finalization waits for publishes started meanwhile.
-func (st *contextState) lendPublishes() (end func()) {
+// lendPublishes registers the caller, if it holds the custom audience gate,
+// for every publish whose logger is running now or starts before the
+// returned end is called: a Close cannot end before those loggers return,
+// and on a failed close its finalization waits for publishes started
+// meanwhile. The returned wait must wrap the blocking wait itself: the gate
+// is lent only while the holder is blocked there, so it never decodes at the
+// same time as an admitted logger.
+func (st *contextState) lendPublishes() (wait func(func()), end func()) {
 	var lender = &publishLender{gate: &st.customAudiences, id: goroutineID()}
 	st.stateLock_.Lock()
 	if st.closeLenders_ == nil {
@@ -3168,16 +3182,31 @@ func (st *contextState) lendPublishes() (end func()) {
 		lender.add(op)
 	}
 	st.stateLock_.Unlock()
-	return func() {
+	wait = func(block func()) {
+		st.stateLock_.Lock()
+		lender.active = true
+		for _, op := range lender.ops {
+			lender.ends = append(lender.ends, lender.gate.lendAs(lender.id, op))
+		}
+		st.stateLock_.Unlock()
+		defer func() {
+			st.stateLock_.Lock()
+			lender.active = false
+			var ends = lender.ends
+			lender.ends = nil
+			st.stateLock_.Unlock()
+			for _, e := range ends {
+				e()
+			}
+		}()
+		block()
+	}
+	end = func() {
 		st.stateLock_.Lock()
 		delete(st.closeLenders_, lender)
-		var ends = lender.ends
-		lender.ends = nil
 		st.stateLock_.Unlock()
-		for _, e := range ends {
-			e()
-		}
 	}
+	return wait, end
 }
 
 // callPublisher calls the event handler and always returns a future. A

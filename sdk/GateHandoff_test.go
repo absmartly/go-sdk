@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -574,49 +575,205 @@ func TestHandoffCloseWithFailedPublishLoggerReadsColdAudience(t *testing.T) {
 	assertHandoffB(t, h.ctx, <-peekB)
 }
 
-// A publish that starts while a deserializer's Close is under way (here from
-// a listener of the failed close future) is lent the gate too, so its Error
+// lateHandler fails every publish. Its first publish (the close's final
+// one) attaches onFirst to the close future before failing, so a listener
+// runs deterministically on that close.
+type lateHandler struct {
+	mu       sync.Mutex
+	ctx      *Context
+	calls    int
+	onFirst  func(*future.Future)
+	syncFail bool
+}
+
+func (h *lateHandler) Publish(Context, jsonmodels.PublishEvent) *future.Future {
+	h.mu.Lock()
+	h.calls++
+	var first = h.calls == 1
+	var ctx = h.ctx
+	h.mu.Unlock()
+	if first && h.onFirst != nil {
+		var st = ctx.state()
+		st.stateLock_.Lock()
+		var closing = ctx.ClosingFuture_
+		st.stateLock_.Unlock()
+		if closing != nil {
+			h.onFirst(closing)
+		}
+	}
+	var f, done = future.New()
+	if first && h.syncFail {
+		done(nil, errors.New("collector down"))
+		return f
+	}
+	go done(nil, errors.New("collector down"))
+	return f
+}
+
+// A publish that starts while a deserializer's Close is under way (from a
+// listener of the failed close future) is lent the gate too, so its Error
 // logger's read of cold custom B finishes and Close returns.
 func TestHandoffCloseLendsToPublishStartedDuringClose(t *testing.T) {
-	for i := 0; i < 20; i++ {
-		var h = newHandoff(t, nil)
-		h.ctx.EventHandler_ = DefaultContextEventHandler{client_: &CapturingPublishClient{publishErr: errors.New("collector down")}}
-		assertAny(nil, h.ctx.Track("goal", nil), t)
-		h.setLogger(func(c Context, event EventType) {
+	var h = newHandoff(t, nil)
+	var handler = &lateHandler{ctx: h.ctx}
+	h.ctx.EventHandler_ = handler
+	assertAny(nil, h.ctx.Track("goal", nil), t)
+	var lateRead = make(chan int, 4)
+	var errors_ int32
+	h.setLogger(func(c Context, event EventType) {
+		if event == Error && atomic.AddInt32(&errors_, 1) >= 2 {
+			var v, _ = c.PeekTreatment("B")
+			lateRead <- v
+		}
+	})
+	handler.onFirst = func(closing *future.Future) {
+		closing.Listen(func(future.Value, error) {
+			_ = h.ctx.Track("late", nil)
+			_, _ = h.ctx.PublishAsync()
+		})
+	}
+	var once sync.Once
+	h.d.setHook(true, func() { once.Do(func() { h.ctx.Close() }) })
+	handoffWithin(t, "deserializer Close while a later publish's logger reads B", func() { _, _ = h.ctx.GetTreatment("A") })
+	select {
+	case v := <-lateRead:
+		assertHandoffB(t, h.ctx, v)
+	case <-time.After(handoffTimeout):
+		t.Fatal("the late publish's Error logger did not read B")
+	}
+}
+
+// overlapDeserializer records whether the gate holder's goroutine decodes
+// while another goroutine is inside the deserializer.
+type overlapDeserializer struct {
+	mu       sync.Mutex
+	holder   uint64
+	inside   map[uint64]int
+	overlaps int
+	hook     func()
+	slow     map[string]time.Duration
+}
+
+func (d *overlapDeserializer) Deserialize(b []byte, _ int, _ int) (map[string]interface{}, error) {
+	var id = goroutineID()
+	d.mu.Lock()
+	if d.inside == nil {
+		d.inside = map[uint64]int{}
+	}
+	var hook = d.hook
+	if string(b) == handoffTrue {
+		d.hook = nil
+		d.holder = id
+	}
+	d.inside[id]++
+	d.check()
+	var pause = d.slow[string(b)]
+	d.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	time.Sleep(pause)
+	d.mu.Lock()
+	d.check()
+	d.inside[id]--
+	if d.inside[id] == 0 {
+		delete(d.inside, id)
+	}
+	d.mu.Unlock()
+	var m map[string]interface{}
+	var err = json.Unmarshal(b, &m)
+	return m, err
+}
+
+// check counts an overlap when the holder decodes a nested audience (it is
+// inside more than once) while another goroutine is inside. d.mu is held.
+func (d *overlapDeserializer) check() {
+	if d.inside[d.holder] > 1 && len(d.inside) > 1 {
+		d.overlaps++
+	}
+}
+
+// A's deserializer starts a publish whose Error logger reads cold custom B
+// (a slow decode), then calls Close with a failing collector; the failed
+// close future's listener reads cold custom C on the holder's own goroutine.
+// The holder never decodes C while the lent logger decodes B: the gate is
+// lent only while the holder is blocked in Close.
+func TestHandoffCloseListenerDoesNotOverlapLentLogger(t *testing.T) {
+	setUp()
+	var d = &overlapDeserializer{slow: map[string]time.Duration{
+		handoffFalse: 100 * time.Millisecond, `{"filter":[{"value":1}]}`: 100 * time.Millisecond}}
+	var data = jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+		handoffExperiment("A", 1, handoffTrue), handoffExperiment("B", 2, handoffFalse),
+		handoffExperiment("C", 3, `{"filter":[{"value":1}]}`)}}
+	var ready, done = future.New()
+	done(data, nil)
+	var ctx *Context
+	var handler = &lateHandler{}
+	ctx = CreateContext(clock, ContextConfig{Units_: map[string]string{"session_id": "u1"}, PublishDelay_: -1}, ready,
+		handoffProvider{data, nil}, handler,
+		callbackEventLogger(func(c Context, event EventType, _ interface{}) {
 			if event == Error {
 				var _, _ = c.PeekTreatment("B")
 			}
-		})
-		var once sync.Once
-		h.d.setHook(true, func() {
-			once.Do(func() {
-				var ctx = h.ctx
-				var listener = func(future.Value, error) {
-					_ = ctx.Track("late", nil)
-					_, _ = ctx.PublishAsync()
-				}
-				var st = ctx.state()
-				var stop = make(chan struct{})
-				go func() {
-					for {
-						st.stateLock_.Lock()
-						var closing = ctx.ClosingFuture_
-						st.stateLock_.Unlock()
-						if closing != nil {
-							closing.Listen(listener)
-							return
-						}
-						select {
-						case <-stop:
-							return
-						default:
-						}
-					}
-				}()
-				ctx.Close()
-				close(stop)
-			})
-		})
-		handoffWithin(t, "deserializer Close while a later publish's logger reads B", func() { _, _ = h.ctx.GetTreatment("A") })
+		}), DefaultVariableParser{}, AudienceMatcher{d})
+	handler.ctx = ctx
+	ctx.WaitUntilReady()
+	d.hook = func() {
+		_ = ctx.Track("first", nil)
+		_, _ = ctx.PublishAsync()
+		time.Sleep(50 * time.Millisecond)
+		handler.mu.Lock()
+		handler.calls = 0
+		handler.syncFail = true
+		handler.onFirst = func(closing *future.Future) {
+			closing.Listen(func(future.Value, error) { var _, _ = ctx.PeekTreatment("C") })
+		}
+		handler.mu.Unlock()
+		_ = ctx.Track("goal", nil)
+		ctx.Close()
 	}
+	handoffWithin(t, "deserializer Close with a listener reading C", func() { _, _ = ctx.GetTreatment("A") })
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	assertAny(0, d.overlaps, t)
+}
+
+// Ending a lend waits until the operation's admitted executor has left the
+// gate, so the holder never resumes decoding while that executor still holds
+// it (an operation the holder lent to but did not wait for).
+func TestReentrantGateLendEndWaitsForExecutor(t *testing.T) {
+	var g reentrantGate
+	var op = &gateOperation{}
+	g.lock()
+	var admitted, leave, left = make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		var end = g.execute(op)
+		g.lock()
+		close(admitted)
+		<-leave
+		g.unlock()
+		close(left)
+		end()
+	}()
+	var endLend = g.lend(op)
+	select {
+	case <-admitted:
+	case <-time.After(handoffTimeout):
+		t.Fatal("executor not admitted after the lend")
+	}
+	var ended = make(chan struct{})
+	go func() { endLend(); close(ended) }()
+	select {
+	case <-ended:
+		t.Fatal("the lend ended while its executor still held the gate")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(leave)
+	select {
+	case <-ended:
+	case <-time.After(handoffTimeout):
+		t.Fatal("the lend did not end after its executor left")
+	}
+	<-left
+	g.unlock()
 }
