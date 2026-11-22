@@ -189,6 +189,9 @@ type reentrantGate struct {
 	// lenders counts, per holder, the lends it has in force (it is blocked
 	// waiting for those operations).
 	lenders map[uint64]int
+	// waiting counts goroutines blocked in lock, and ending lend ends
+	// waiting for their executor, for tests.
+	waiting, ending int
 }
 
 // gateOperation is an SDK operation (a refresh, the initial load, or a
@@ -255,7 +258,9 @@ func (g *reentrantGate) lock() {
 	defer g.mu.Unlock()
 	g.init()
 	for !g.admits(id) {
+		g.waiting++
 		g.free.Wait()
+		g.waiting--
 	}
 	g.holders[id]++
 }
@@ -296,17 +301,21 @@ func (g *reentrantGate) lendAs(id uint64, op *gateOperation) (end func()) {
 	g.free.Broadcast()
 	return func() {
 		g.mu.Lock()
+		// The holder resumes only once op's executor is out of the gate: a
+		// lend that ends early (an operation registered after the wait
+		// snapshot) must not leave the two decoding at the same time. The
+		// lend stays in force while it waits, so the holder still counts
+		// as blocked and operations that executor waits for are admitted.
+		for op.executor != 0 && g.holders[op.executor] > 0 && op.executor != id {
+			g.ending++
+			g.free.Wait()
+			g.ending--
+		}
 		if g.lent[op]--; g.lent[op] <= 0 {
 			delete(g.lent, op)
 		}
 		if g.lenders[id]--; g.lenders[id] <= 0 {
 			delete(g.lenders, id)
-		}
-		// The holder resumes only once op's executor is out of the gate:
-		// a lend that ends early (an operation registered after the wait
-		// snapshot) must not leave the two decoding at the same time.
-		for op.executor != 0 && g.holders[op.executor] > 0 && op.executor != id {
-			g.free.Wait()
 		}
 		g.mu.Unlock()
 	}
@@ -330,6 +339,7 @@ func (g *reentrantGate) execute(op *gateOperation) (end func()) {
 		once.Do(func() {
 			g.mu.Lock()
 			op.executor = 0
+			g.free.Broadcast()
 			g.mu.Unlock()
 		})
 	}

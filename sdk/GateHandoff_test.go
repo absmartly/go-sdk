@@ -721,7 +721,16 @@ func TestHandoffCloseListenerDoesNotOverlapLentLogger(t *testing.T) {
 	d.hook = func() {
 		_ = ctx.Track("first", nil)
 		_, _ = ctx.PublishAsync()
-		time.Sleep(50 * time.Millisecond)
+		// Wait until the first publish's logger is blocked at the gate,
+		// so Close lends to it and it decodes B while the holder waits.
+		var deadline = time.Now().Add(handoffTimeout)
+		for !gateHasWaiter(&ctx.state().customAudiences) {
+			if time.Now().After(deadline) {
+				t.Error("the first publish's logger did not reach the gate")
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
 		handler.mu.Lock()
 		handler.calls = 0
 		handler.syncFail = true
@@ -776,4 +785,72 @@ func TestReentrantGateLendEndWaitsForExecutor(t *testing.T) {
 	}
 	<-left
 	g.unlock()
+}
+
+// While a holder ends its lend and waits for op's executor E to leave the
+// gate, E lends to a second operation and blocks on it; that operation's
+// executor arrives only after the holder started ending its lend, and must
+// still be admitted, so nothing hangs.
+func TestReentrantGateLendEndAdmitsExecutorsNestedLend(t *testing.T) {
+	var g reentrantGate
+	var op, nested = &gateOperation{}, &gateOperation{}
+	g.lock()
+	var endLend = g.lend(op)
+	var outerLending, startNested, innerDone, outerDone = make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		var end = g.execute(op)
+		g.lock()
+		var endNested = g.lend(nested)
+		close(outerLending)
+		<-innerDone
+		endNested()
+		g.unlock()
+		end()
+		close(outerDone)
+	}()
+	<-outerLending
+	var ended = make(chan struct{})
+	go func() { endLend(); close(ended) }()
+	// The holder is now waiting in its lend end for E to leave.
+	var deadline = time.Now().Add(handoffTimeout)
+	for !gateHolderEnding(&g) {
+		if time.Now().After(deadline) {
+			t.Fatal("the holder did not start ending its lend")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(startNested)
+	go func() {
+		<-startNested
+		var end = g.execute(nested)
+		g.lock()
+		g.unlock()
+		end()
+		close(innerDone)
+	}()
+	for _, step := range []struct {
+		ch   chan struct{}
+		what string
+	}{{innerDone, "nested executor admitted"}, {outerDone, "outer executor finished"}, {ended, "holder's lend ended"}} {
+		select {
+		case <-step.ch:
+		case <-time.After(handoffTimeout):
+			t.Fatalf("%s: deadlock", step.what)
+		}
+	}
+	g.unlock()
+}
+
+// gateHolderEnding reports whether a lend end is waiting for its executor.
+func gateHolderEnding(g *reentrantGate) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.ending > 0
+}
+
+// gateHasWaiter reports whether a goroutine is blocked in g.lock.
+func gateHasWaiter(g *reentrantGate) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.waiting > 0
 }
