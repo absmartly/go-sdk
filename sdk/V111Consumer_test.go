@@ -10,8 +10,8 @@ package sdk_test
 // The publish-failure steps check v1.2.0's fixed behaviour (v1.1.1 returned
 // nil and dropped the batch), so they are not a v1.1.1 compatibility check.
 //
-// The unkeyed literals are the point of the file, so `go vet ./...` reports
-// them by design; run vet with -composites=false.
+// The unkeyed literals of jsonmodels and eval types are in those packages'
+// V111Layout_test.go, where `go vet ./...` accepts them.
 
 import (
 	"errors"
@@ -23,7 +23,6 @@ import (
 
 	"github.com/absmartly/go-sdk/sdk"
 	"github.com/absmartly/go-sdk/sdk/future"
-	"github.com/absmartly/go-sdk/sdk/jsonexpr/eval"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
 
@@ -117,15 +116,6 @@ func TestV111ConsumerCompiles(t *testing.T) {
 	var _ = sdk.ContextCustomFieldValue{"name", "string", "value"}
 	var _ = sdk.FlushMapper{nil, sdk.Context{}}
 	var _ = sdk.AudienceMatcher{sdk.DefaultAudienceDeserializer{}}
-	var _ = eval.Evaluator{nil, nil}
-	var _ = jsonmodels.PublishEvent{true, nil, 0, nil, nil, nil}
-	var _ = jsonmodels.Unit{"session_id", "uid"}
-	var _ = jsonmodels.GoalAchievement{"goal", 0, nil}
-	var _ = jsonmodels.Attribute{"name", "value", 0}
-	var _ = jsonmodels.CustomFieldValue{"name", "string", "value"}
-	var _ = jsonmodels.ExperimentVariant{"A", "{}"}
-	var _ = jsonmodels.ExperimentApplication{"website"}
-	var _ = jsonmodels.ContextData{nil}
 
 	var ctx sdk.Context
 	var _ map[string]sdk.ExperimentVariables = ctx.Index_

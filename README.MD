@@ -880,10 +880,7 @@ func createContextWithDeadline(absmartly sdk.ABsmartly, wait time.Duration) (*sd
 
 ## Releasing
 
-Run `./test.sh` and `go vet -composites=false ./...` before releasing. Plain
-`go vet ./...` reports the unkeyed struct literals in
-`sdk/V111Consumer_test.go`, which are there on purpose to check that v1.1.1
-callers still compile.
+Run `./test.sh` and `go vet ./...` before releasing.
 
 Go modules are published by git tags. To release:
 
