@@ -1466,14 +1466,17 @@ func (c *Context) PeekVariableValue(key string, defaultValue interface{}) (inter
 	return c.resolveVariableValue(key, defaultValue, false)
 }
 
-// resolveVariableValue implements the JS SDK's _resolveVariableValue rule so
-// shared variable keys behave the same across SDKs. It walks the experiments
-// that define key in experiment-id order (see indexVariables_), and returns
-// the value from the first experiment the unit is actually assigned to or
-// overridden in. Each experiment visited on the way is exposed when expose is
-// set, so a fall-through still records that the unit saw the earlier
-// experiment. When no experiment along the way assigns the key, the caller's
-// default is returned. v1.1.1 read only the last experiment in the payload.
+// resolveVariableValue resolves a shared variable key as the Java SDK's
+// Context.getVariableAssignment does. The candidates are the experiments any
+// of whose variants define key, in experiment-id order (see indexVariables_).
+// The winner is the first candidate the unit is assigned to, overridden in or
+// rule-assigned to; its selected variant supplies the value, or the caller's
+// default when that variant lacks key. Later candidates are never consulted,
+// so which variant the unit got cannot move it to another experiment. Only
+// the winner is exposed, and only when expose is set: the candidates checked
+// before it were never shown to the unit. With no winner the caller's default
+// is returned and nothing is exposed. v1.1.1 read only the last experiment in
+// the payload.
 //
 // A true Context{...} literal keeps v1.1.1's rule instead: it reads the one
 // experiment its current IndexVariables_ maps the key to, exposes it, and
@@ -1495,17 +1498,16 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 	for _, experiment := range experiments {
 		var entry = c.assignmentEntry(experiment.Data.Name)
 		var assignment = entry.assignment
-		if assignment.Variables == nil {
+		if !assignment.Assigned && !assignment.Overridden && !entry.ruleOverride {
 			continue
 		}
-
 		if expose && !assignment.Exposed.Load().(bool) {
 			c.queueExposure(assignment, entry.ruleOverride)
 		}
-
-		if value, exist := assignment.Variables[key]; exist && (assignment.Assigned || assignment.Overridden || entry.ruleOverride) {
+		if value, exist := assignment.Variables[key]; exist {
 			return value, nil
 		}
+		return defaultValue, nil
 	}
 	return defaultValue, nil
 }
@@ -2878,11 +2880,10 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		index[experiment.Name] = experiemntVariables
 	}
 
-	// Keep each key's experiments sorted and unique by experiment id, matching
-	// the JS SDK's insertUniqueSorted. GetVariableValue/PeekVariableValue walk
-	// this list in id order, so a shared key resolves to the lowest-id
-	// experiment the unit is assigned to or overridden in, regardless of the
-	// experiment order in the payload. GetVariableKeys, GetVariableKeysAll and
+	// Keep each key's experiments sorted and unique by experiment id, as the
+	// Java and JS SDKs do. GetVariableValue/PeekVariableValue walk this list in
+	// id order (see resolveVariableValue), regardless of the experiment order
+	// in the payload. GetVariableKeys, GetVariableKeysAll and
 	// IndexVariables_ follow the same id order.
 	for key := range indexVariables {
 		var experiments = indexVariables[key]

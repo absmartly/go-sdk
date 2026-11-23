@@ -7,7 +7,7 @@ Go SDK for [ABsmartly](https://www.absmartly.com/) A/B testing platform.
 The A/B Smartly Go SDK is compatible with Go versions 1.17 and later. (v1.1.1's go.mod said 1.15, but it used `atomic.Value.CompareAndSwap` and so needed Go 1.17 to build.) CI builds and tests on Go 1.17, 1.20, 1.23 and the latest stable Go. The module requires `resty` v2.16.5; it builds with Go 1.17, which CI checks. Upgrading `resty` to v2.17+ in your own module raises your Go floor to 1.23.
 It provides both a blocking and an asynchronous interfaces.
 
-`Context.GetVariableKeys()` keeps its v1.1 signature (`map[string]string`), returning, for each key, the first experiment that defines it by experiment id. Use the new `Context.GetVariableKeysAll()` to get every experiment per key (`map[string][]string`, in experiment-id order), as the other ABsmartly SDKs return. When several experiments share a variable key, `GetVariableValue`/`PeekVariableValue` read from the first experiment, by id, that the unit is assigned to or overridden in; `GetVariableValue` exposes each experiment visited along the way and `PeekVariableValue` exposes none (v1.1.1 used the last experiment in the payload); this matches the JS SDK.
+`Context.GetVariableKeys()` keeps its v1.1 signature (`map[string]string`), returning, for each key, the first experiment that defines it by experiment id. Use the new `Context.GetVariableKeysAll()` to get every experiment per key (`map[string][]string`, in experiment-id order), as the other ABsmartly SDKs return. When several experiments share a variable key, see [Shared variable keys](#shared-variable-keys).
 
 **Behavior changes:** Read methods (`GetTreatment`, `PeekTreatment`, `GetVariableValue`, `PeekVariableValue`, `GetVariableKeys`, `GetExperiments`, `GetCustomFieldValueKeys`, `GetData`) return `sdk.ErrContextNotReady` (`ABSmartly Context is not yet ready`) before the context is ready; callers must not treat the zero value as a result. After close they return `sdk.ErrContextClosing`/`sdk.ErrContextClosed`; the texts are unchanged from v1.1 (`ABSmartly Context is closing`/`ABSmartly Context is closed`), and the errors can also be matched with `errors.Is`. `GetCustomFieldValue` keeps its signature and returns nil on any error; use the new `GetCustomFieldValueE` to receive the error. Refreshing a context whose initial load failed fetches and installs the data, as in v1.1.1. Panics in event loggers are contained and do not change the publisher's success or failure result.
 
@@ -425,6 +425,17 @@ if err != nil {
     buttonColor = defaultButtonColor
 }
 ```
+
+### Shared variable keys
+
+When several experiments define the same variable key, `GetVariableValue` and `PeekVariableValue` pick one winner:
+
+- The candidates are the experiments any of whose variants define the key, in experiment-id order.
+- The winner is the first candidate the unit is assigned to, overridden in or rule-assigned to. A unit outside a strict audience, or without a unit of the experiment's type, is not assigned.
+- The value comes from the winner's selected variant. If that variant does not define the key, you get your default; later experiments are not consulted. A key defined as `null`, `false`, `0` or `""` returns that value.
+- Only the winner is exposed. With no winner you get your default and nothing is exposed. `PeekVariableValue` never exposes.
+
+This matches the Java SDK. (v1.1.1 used the last experiment in the payload.)
 
 ### Peek at Treatment Variants
 

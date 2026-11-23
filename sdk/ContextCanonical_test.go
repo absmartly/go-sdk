@@ -1553,23 +1553,19 @@ func TestVariableValueExposureIncludesAudienceMatchTrue(t *testing.T) {
 	context.EventLock_.Unlock()
 }
 
+// A unit outside a strict audience is not assigned, so, as in the Java SDK
+// (getVariableValueDoesNotQueuesExposure...InStrictMode), reading the
+// variable returns the default and queues no exposure.
 func TestVariableValueExposureAudienceMismatchStrict(t *testing.T) {
 	setUp()
 	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureSrict)
 
-	context.GetVariableValue("banner.border", 0)
-
-	context.EventLock_.Lock()
-	if len(context.Exposures_) > 0 {
-		exp := context.Exposures_[0]
-		assertAny(true, exp.AudienceMismatch, t)
-		assertAny(0, exp.Variant, t)
-	} else {
-		t.Error("Expected at least one exposure")
-	}
-	context.EventLock_.Unlock()
+	var res, err = context.GetVariableValue("banner.size", "small")
+	assertAny(nil, err, t)
+	assertAny("small", res, t)
+	assertAny(int32(0), context.GetPendingCount(), t)
 }
 
 func TestVariableValueReturnsDefaultOnUnknownVariable(t *testing.T) {
