@@ -903,6 +903,90 @@ func TestReentrantGateLentExecutorsAreExclusive(t *testing.T) {
 	g.unlock()
 }
 
+// A lent executor leaving the gate wakes every waiter, not just the longest
+// waiting: a plain waiter queued first cannot get in (the holder still holds
+// the gate), but the lent executor queued behind it can, before the first
+// executor ends its registration.
+func TestReentrantGateExecutorLeavingWakesLaterLentExecutor(t *testing.T) {
+	var g reentrantGate
+	var first, second = &gateOperation{}, &gateOperation{}
+	g.lock()
+	var endFirst, endSecond = g.lend(first), g.lend(second)
+	var firstIn, firstUnlock, firstEnd = make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var firstOut = make(chan struct{})
+	go func() {
+		var end = g.execute(first)
+		g.lock()
+		close(firstIn)
+		<-firstUnlock
+		g.unlock()
+		close(firstOut)
+		<-firstEnd
+		end()
+	}()
+	<-firstIn
+	// The second executor registers before the plain waiter queues, since
+	// registering wakes every waiter and would requeue it behind the second.
+	var secondRegistered, secondLock, secondIn = make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		var end = g.execute(second)
+		close(secondRegistered)
+		<-secondLock
+		g.lock()
+		close(secondIn)
+		g.unlock()
+		end()
+	}()
+	<-secondRegistered
+	var plainIn = make(chan struct{})
+	go func() {
+		g.lock()
+		close(plainIn)
+		g.unlock()
+	}()
+	waitForGateWaiters(t, &g, 1)
+	close(secondLock)
+	waitForGateWaiters(t, &g, 2)
+	close(firstUnlock)
+	<-firstOut
+	select {
+	case <-secondIn:
+	case <-time.After(handoffTimeout):
+		t.Fatal("the second lent executor was not woken when the first left the gate")
+	}
+	close(firstEnd)
+	endFirst()
+	endSecond()
+	select {
+	case <-plainIn:
+		t.Fatal("a plain waiter got in while the holder held the gate")
+	default:
+	}
+	g.unlock()
+	select {
+	case <-plainIn:
+	case <-time.After(handoffTimeout):
+		t.Fatal("the plain waiter was not admitted after the holder left")
+	}
+}
+
+func waitForGateWaiters(t *testing.T, g *reentrantGate, n int) {
+	t.Helper()
+	var deadline = time.Now().Add(handoffTimeout)
+	for {
+		g.mu.Lock()
+		var waiting = g.waiting
+		g.mu.Unlock()
+		if waiting == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d goroutines waiting for the gate, want %d", waiting, n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // Several plain waiters blocked behind a holder are all admitted once it
 // leaves, each after the one before it releases.
 func TestReentrantGateUnlockWakesEveryWaiter(t *testing.T) {
