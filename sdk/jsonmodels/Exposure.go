@@ -17,6 +17,11 @@ type Exposure struct {
 	RuleOverride     bool   `json:"ruleOverride"`
 }
 
+// MarshalJSON writes an empty Unit (an unknown experiment's exposure) as
+// null, as the JS SDK publishes it and as the Exposure event's data is
+// compared across SDKs. Because it is a method of Exposure, a struct that
+// embeds Exposure is encoded by it too, so its own fields are not encoded;
+// see CHANGELOG v1.2.0.
 func (e Exposure) MarshalJSON() ([]byte, error) {
 	var unit *string
 	if e.Unit != "" {
