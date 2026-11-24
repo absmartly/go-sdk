@@ -3,7 +3,12 @@ set -e
 
 
 echo "run golang fmt"
-test -z "$(gofmt -l .)" || { gofmt -l .; echo "files above are not gofmt-formatted"; exit 1; }
+unformatted=$(gofmt -l .)
+if [ -n "$unformatted" ]; then
+  echo "$unformatted"
+  echo "files above are not gofmt-formatted"
+  exit 1
+fi
 
 echo "run golang vet"
 go vet ./...

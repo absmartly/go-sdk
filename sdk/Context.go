@@ -421,14 +421,6 @@ func (c *Context) literalState() *contextState {
 		indexed[name] = &indexedExperiment{experiment: experiment}
 	}
 	state.index_.Store(&contextIndex{experiments: indexed})
-	state.indexVariables_ = map[string][]ExperimentVariables{}
-	for key, value := range c.IndexVariables_ {
-		if key, ok := key.(string); ok {
-			if experiment, ok := value.(ExperimentVariables); ok {
-				state.indexVariables_[key] = []ExperimentVariables{experiment}
-			}
-		}
-	}
 	for name, assignment := range c.AssignmentCache {
 		var assignment = assignment
 		state.assignmentCache_[name] = &cachedAssignment{assignment: &assignment}
@@ -743,36 +735,33 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 		var tempFuture, readyFutureDone = future.New()
 		var loadOp = &gateOperation{}
 		state.loadOp_ = loadOp
-		// endLoad ends the load's executor registration before its future
-		// settles; set by the completion below before it can be called.
-		var endLoad = func() {}
 		cntx.setReadyFuture(tempFuture)
-		// fail reports a failed initial load. It settles the failed future
-		// before clearing it, so a waiter that arrives in between joins it
-		// and sees the error. Nothing after it reads Clock_.
-		var fail = func(err error, diagnostics []bufferedEvent) {
+		// fail reports a failed initial load. It ends the load's executor
+		// registration (executed) and settles the failed future before
+		// clearing it, so a waiter that arrives in between joins it and sees
+		// the error. Nothing after it reads Clock_.
+		var fail = func(err error, diagnostics []bufferedEvent, executed func()) {
 			tmp.SetDataFailed(err)
 			tmp.dispatchDiagnostics(diagnostics)
 			tmp.LogError(err)
-			endLoad()
+			executed()
 			readyFutureDone(nil, err)
 			cntx.setReadyFutureWith(state, nil)
 		}
 		dataFuture.Listen(func(val future.Value, err error) {
 			var executed = state.customAudiences.execute(loadOp)
 			defer executed()
-			endLoad = executed
 			atomic.StoreUint64(state.readyDeliverer_, goroutineID())
 			defer atomic.StoreUint64(state.readyDeliverer_, 0)
 			if err == nil {
 				result, ok := val.(jsonmodels.ContextData)
 				if !ok {
-					fail(&TypeError{Expected: "jsonmodels.ContextData", Actual: val}, nil)
+					fail(&TypeError{Expected: "jsonmodels.ContextData", Actual: val}, nil, executed)
 					return
 				}
 				var diagnostics, panicErr = tmp.applyRefreshedData(result)
 				if panicErr != nil {
-					fail(panicErr, diagnostics)
+					fail(panicErr, diagnostics, executed)
 					return
 				}
 				// Log before settling, so WaitUntilReady returns after the
@@ -790,7 +779,7 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 				executed()
 				readyFutureDone(result, nil)
 			} else {
-				fail(err, nil)
+				fail(err, nil, executed)
 			}
 
 		})
@@ -1475,8 +1464,7 @@ func (c *Context) PeekVariableValue(key string, defaultValue interface{}) (inter
 // so which variant the unit got cannot move it to another experiment. Only
 // the winner is exposed, and only when expose is set: the candidates checked
 // before it were never shown to the unit. With no winner the caller's default
-// is returned and nothing is exposed. v1.1.1 read only the last experiment in
-// the payload.
+// is returned and nothing is exposed.
 //
 // A true Context{...} literal keeps v1.1.1's rule instead: it reads the one
 // experiment its current IndexVariables_ maps the key to, exposes it, and
@@ -1497,19 +1485,24 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 
 	for _, experiment := range experiments {
 		var entry = c.assignmentEntry(experiment.Data.Name)
-		var assignment = entry.assignment
-		if !assignment.Assigned && !assignment.Overridden && !entry.ruleOverride {
-			continue
+		if entry.assignment.Assigned || entry.assignment.Overridden || entry.ruleOverride {
+			return c.variableFrom(entry, key, defaultValue, expose), nil
 		}
-		if expose && !assignment.Exposed.Load().(bool) {
-			c.queueExposure(assignment, entry.ruleOverride)
-		}
-		if value, exist := assignment.Variables[key]; exist {
-			return value, nil
-		}
-		return defaultValue, nil
 	}
 	return defaultValue, nil
+}
+
+// variableFrom exposes the selected assignment when expose is set and returns
+// its value for key, or defaultValue when its variables lack key.
+func (c *Context) variableFrom(entry *cachedAssignment, key string, defaultValue interface{}, expose bool) interface{} {
+	var assignment = entry.assignment
+	if expose && !assignment.Exposed.Load().(bool) {
+		c.queueExposure(assignment, entry.ruleOverride)
+	}
+	if value, exist := assignment.Variables[key]; exist {
+		return value
+	}
+	return defaultValue
 }
 
 // resolveLiteralVariableValue is v1.1.1's GetVariableValue/PeekVariableValue
@@ -1519,15 +1512,7 @@ func (c *Context) resolveLiteralVariableValue(key string, defaultValue interface
 	if err != nil {
 		return defaultValue, nil
 	}
-	var entry = c.assignmentEntry(experiment.Data.Name)
-	var assignment = entry.assignment
-	if expose && !assignment.Exposed.Load().(bool) {
-		c.queueExposure(assignment, entry.ruleOverride)
-	}
-	if value, exist := assignment.Variables[key]; exist {
-		return value, nil
-	}
-	return defaultValue, nil
+	return c.variableFrom(c.assignmentEntry(experiment.Data.Name), key, defaultValue, expose), nil
 }
 
 func (c *Context) Track(goalName string, properties map[string]interface{}) error {

@@ -811,7 +811,6 @@ func TestReentrantGateLendEndAdmitsExecutorsNestedLend(t *testing.T) {
 	<-outerLending
 	var ended = make(chan struct{})
 	go func() { endLend(); close(ended) }()
-	// The holder is now waiting in its lend end for E to leave.
 	var deadline = time.Now().Add(handoffTimeout)
 	for !gateHolderEnding(&g) {
 		if time.Now().After(deadline) {
