@@ -38,25 +38,17 @@ func otherUnitType(experiment jsonmodels.Experiment) jsonmodels.Experiment {
 	return experiment
 }
 
-func exposedNames(ctx *Context) []string {
-	var names []string
-	for _, exposure := range queuedExposures(ctx) {
-		names = append(names, exposure.Name)
-	}
-	return names
-}
-
-func expectExposed(t *testing.T, ctx *Context, names ...string) {
+// expectExposed checks that exactly the named experiments were exposed, in
+// order, and returns their exposures.
+func expectExposed(t *testing.T, ctx *Context, names ...string) []jsonmodels.Exposure {
 	t.Helper()
-	var got = exposedNames(ctx)
-	if len(got) != len(names) {
-		t.Fatalf("exposed %v, want %v", got, names)
-	}
-	for i := range names {
-		if got[i] != names[i] {
-			t.Fatalf("exposed %v, want %v", got, names)
+	var exposures = expectExposures(t, ctx, len(names))
+	for i, exposure := range exposures {
+		if exposure.Name != names[i] {
+			t.Fatalf("exposed %+v, want %v", exposures, names)
 		}
 	}
+	return exposures
 }
 
 func variableValue(t *testing.T, ctx *Context, key string, defaultValue interface{}) interface{} {
@@ -88,8 +80,7 @@ func TestSharedKeyUnassignedLowerCandidateIsNotExposed(t *testing.T) {
 			var ctx, _ = newRuleContext(t, "production", withUnit(), low,
 				keyExperiment(2, "high", `{"k":"high0"}`, `{"k":"high1"}`))
 			assertAny("high1", variableValue(t, ctx, "k", "def"), t)
-			expectExposed(t, ctx, "high")
-			assertAny(true, queuedExposures(ctx)[0].Assigned, t)
+			assertAny(true, expectExposed(t, ctx, "high")[0].Assigned, t)
 		})
 	}
 }
@@ -141,8 +132,7 @@ func TestSharedKeyOverrideWinsAndIsTheOnlyExposure(t *testing.T) {
 			keyExperiment(2, "high", `{"k":"high0"}`, `{"k":"high1"}`))
 		assertAny(nil, ctx.SetOverride("low", tc.variant), t)
 		assertAny(tc.want, variableValue(t, ctx, "k", "def"), t)
-		expectExposed(t, ctx, "low")
-		assertAny(true, queuedExposures(ctx)[0].Overridden, t)
+		assertAny(true, expectExposed(t, ctx, "low")[0].Overridden, t)
 	}
 }
 
@@ -156,8 +146,7 @@ func TestSharedKeyRuleAssignedCandidateWins(t *testing.T) {
 		strictMismatch(keyExperiment(1, "low", `{"k":"low0"}`, `{"k":"low1"}`)), ruled,
 		keyExperiment(3, "high", `{"k":"high0"}`, `{"k":"high1"}`))
 	assertAny("ruled2", variableValue(t, ctx, "k", "def"), t)
-	expectExposed(t, ctx, "ruled")
-	assertAny(true, queuedExposures(ctx)[0].RuleOverride, t)
+	assertAny(true, expectExposed(t, ctx, "ruled")[0].RuleOverride, t)
 }
 
 // A key the winner's variant defines with null, false, 0 or "" returns that
@@ -178,8 +167,6 @@ func TestSharedKeyZeroValuesAreValues(t *testing.T) {
 	}
 }
 
-// An already exposed winner is not exposed again, and a later read that
-// resolves to the same winner queues nothing.
 func TestSharedKeyWinnerExposedOnce(t *testing.T) {
 	var ctx, _ = newRuleContext(t, "production", withUnit(),
 		strictMismatch(keyExperiment(1, "low", `{"k":"low0"}`, `{"k":"low1"}`)),
@@ -211,11 +198,28 @@ func TestSharedKeyExcludedOrNonStrictMismatchStillWins(t *testing.T) {
 			var ctx, _ = newRuleContext(t, "production", withUnit(), tc.low,
 				keyExperiment(2, "high", `{"k":"high0"}`, `{"k":"high1"}`))
 			assertAny(tc.want, variableValue(t, ctx, "k", "def"), t)
-			expectExposed(t, ctx, "low")
-			var exposure = queuedExposures(ctx)[0]
+			var exposure = expectExposed(t, ctx, "low")[0]
 			assertAny(true, exposure.Assigned, t)
 			assertAny(tc.eligible, exposure.Eligible, t)
 			assertAny(tc.mismatched, exposure.AudienceMismatch, t)
 		})
+	}
+}
+
+// A winner whose selected variant has no variables at all (a `null` config
+// parses to a nil map; an empty config to an empty one) still wins: the
+// caller's default, only the winner exposed, no fall-through to the later
+// candidate that has the key.
+func TestSharedKeyWinnerWithoutVariablesGivesDefault(t *testing.T) {
+	for _, config := range []string{"null", ""} {
+		var ctx, _ = newRuleContext(t, "production", withUnit(),
+			keyExperiment(1, "first", `{"k":"first0"}`, config),
+			keyExperiment(2, "second", `{"k":"second0"}`, `{"k":"second1"}`))
+		if config == "null" && ctx.GetAssignment("first").Variables != nil {
+			t.Fatalf("a null config gave variables %v, want a nil map", ctx.GetAssignment("first").Variables)
+		}
+		assertAny("def", peekVariableValue(t, ctx, "k", "def"), t)
+		assertAny("def", variableValue(t, ctx, "k", "def"), t)
+		expectExposed(t, ctx, "first")
 	}
 }

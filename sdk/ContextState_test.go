@@ -87,6 +87,11 @@ func TestContextManualLiteralState(t *testing.T) {
 	manual.ClearTimeout()
 }
 
+// countingClock returns 1, 2, 3, ... from successive reads.
+type countingClock struct{ n int64 }
+
+func (c *countingClock) Millis() int64 { return atomic.AddInt64(&c.n, 1) }
+
 func TestContextValueCopiesAndSnapshotsShareLifecycle(t *testing.T) {
 	var ctx, _ = newRuleContext(t, "production", withUnit(), ruleExperiment("exp", ""))
 	var copied = *ctx
@@ -97,7 +102,18 @@ func TestContextValueCopiesAndSnapshotsShareLifecycle(t *testing.T) {
 	assertAny(ctx, snapshot.live(), t)
 	assertAny(false, copied.isSnapshot(), t)
 	assertAny(true, snapshot.isSnapshot(), t)
-	assertAny(ctx.Clock_.Millis(), snapshot.Clock_.Millis(), t)
+	// The snapshot reads time through the live context's clock, not a copy
+	// of a reading: each of its reads reaches the clock the context was
+	// created with.
+	var snapshotClock, ok = snapshot.Clock_.(*contextClock)
+	if !ok || snapshotClock.Clock != ctx.Clock_ {
+		t.Fatalf("the snapshot's clock %#v does not wrap the context's clock", snapshot.Clock_)
+	}
+	var counting = &countingClock{}
+	ctx.Clock_.(*contextClock).Clock = counting
+	assertAny(int64(1), snapshot.Clock_.Millis(), t)
+	assertAny(int64(2), snapshot.Clock_.Millis(), t)
+	assertAny(int64(3), ctx.Clock_.Millis(), t)
 	assertAny(nil, copied.Track("goal", nil), t)
 	assertAny(int32(1), ctx.GetPendingCount(), t)
 	copied.Close()
