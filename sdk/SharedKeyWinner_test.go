@@ -188,3 +188,34 @@ func TestSharedKeyWinnerExposedOnce(t *testing.T) {
 	variableValue(t, ctx, "k", "def")
 	expectExposed(t, ctx, "high")
 }
+
+// A unit assigned but excluded by traffic, or outside a non-strict audience,
+// is still assigned: the lower-id candidate wins with the value of the
+// variant it got, and is the only exposure.
+func TestSharedKeyExcludedOrNonStrictMismatchStillWins(t *testing.T) {
+	var excluded = keyExperiment(1, "low", `{"k":"low0"}`, `{"k":"low1"}`)
+	excluded.FullOnVariant, excluded.TrafficSplit = 0, []float64{1, 0}
+	var nonStrict = keyExperiment(1, "low", `{"k":"low0"}`, `{"k":"low1"}`)
+	nonStrict.Audience = strictUSAudience
+	for _, tc := range []struct {
+		name       string
+		low        jsonmodels.Experiment
+		want       interface{}
+		eligible   bool
+		mismatched bool
+	}{
+		{"excluded by traffic", excluded, "low0", false, false},
+		{"non-strict audience mismatch", nonStrict, "low1", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var ctx, _ = newRuleContext(t, "production", withUnit(), tc.low,
+				keyExperiment(2, "high", `{"k":"high0"}`, `{"k":"high1"}`))
+			assertAny(tc.want, variableValue(t, ctx, "k", "def"), t)
+			expectExposed(t, ctx, "low")
+			var exposure = queuedExposures(ctx)[0]
+			assertAny(true, exposure.Assigned, t)
+			assertAny(tc.eligible, exposure.Eligible, t)
+			assertAny(tc.mismatched, exposure.AudienceMismatch, t)
+		})
+	}
+}

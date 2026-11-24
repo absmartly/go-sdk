@@ -2,6 +2,7 @@ package sdk_test
 
 import (
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/absmartly/go-sdk/sdk"
@@ -267,6 +268,41 @@ func TestV111MethodSetKept(t *testing.T) {
 			t.Errorf("%s was removed; v1.1.1 callers of it no longer compile", name)
 		} else if got != signature {
 			t.Errorf("%s is %s, v1.1.1 had %s", name, got, signature)
+		}
+	}
+}
+
+// v111Interfaces is the exact method set of each exported v1.1.1 interface.
+// A customer type implementing one must keep satisfying it, so the set must
+// not gain a method; a caller using one must keep compiling, so it must not
+// lose one or change a signature.
+var v111Interfaces = map[reflect.Type][]string{
+	reflect.TypeOf((*eval.Operator)(nil)).Elem():                        []string{"Evaluate func(eval.Evaluator, interface {}) interface {}"},
+	reflect.TypeOf((*operators.BinaryOperatorInterface)(nil)).Elem():    []string{"Binary func(eval.Evaluator, interface {}, interface {}) interface {}"},
+	reflect.TypeOf((*operators.BooleanCombinatorInterface)(nil)).Elem(): []string{"Combine func(eval.Evaluator, reflect.Value) bool"},
+	reflect.TypeOf((*operators.UnaryOperatorInterface)(nil)).Elem():     []string{"Unary func(eval.Evaluator, interface {}) interface {}"},
+	reflect.TypeOf((*sdk.AudienceDeserializer)(nil)).Elem():             []string{"Deserialize func([]uint8, int, int) (map[string]interface {}, error)"},
+	reflect.TypeOf((*sdk.ClientI)(nil)).Elem():                          []string{"GetContextData func() *future.Future", "Publish func(jsonmodels.PublishEvent) *future.Future"},
+	reflect.TypeOf((*sdk.ContextDataDeserializer)(nil)).Elem():          []string{"Deserialize func([]uint8) (jsonmodels.ContextData, error)"},
+	reflect.TypeOf((*sdk.ContextDataProvider)(nil)).Elem():              []string{"GetContextData func() *future.Future"},
+	reflect.TypeOf((*sdk.ContextEventHandler)(nil)).Elem():              []string{"Publish func(sdk.Context, jsonmodels.PublishEvent) *future.Future"},
+	reflect.TypeOf((*sdk.ContextEventLogger)(nil)).Elem():               []string{"HandleEvent func(sdk.Context, sdk.EventType, interface {})"},
+	reflect.TypeOf((*sdk.ContextEventSerializer)(nil)).Elem():           []string{"Serialize func(jsonmodels.PublishEvent) ([]uint8, error)"},
+	reflect.TypeOf((*sdk.HTTPClient)(nil)).Elem():                       []string{"Get func(string, map[string]string, map[string]string) *future.Future", "Post func(string, map[string]string, map[string]string, []uint8) *future.Future", "Put func(string, map[string]string, map[string]string, []uint8) *future.Future"},
+	reflect.TypeOf((*sdk.MapperInt)(nil)).Elem():                        []string{"Apply func(interface {}) interface {}"},
+	reflect.TypeOf((*sdk.VariableParser)(nil)).Elem():                   []string{"Parse func(sdk.Context, string, string, string) map[string]interface {}"},
+}
+
+func TestV111InterfacesUnchanged(t *testing.T) {
+	for it, want := range v111Interfaces {
+		var got []string
+		for i := 0; i < it.NumMethod(); i++ {
+			var m = it.Method(i)
+			got = append(got, m.Name+" "+m.Type.String())
+		}
+		sort.Strings(got)
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%s has methods %v, v1.1.1 had %v", it, got, want)
 		}
 	}
 }
