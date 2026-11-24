@@ -1027,3 +1027,158 @@ func TestReentrantGateUnlockWakesEveryWaiter(t *testing.T) {
 		}
 	}
 }
+
+// operationOrder records, in order, the holder finishing ("holder") and a
+// listener on the operation's future finishing its cold custom read, and
+// whether the listener ran while still registered as the operation's
+// executor.
+type operationOrder struct {
+	mu         sync.Mutex
+	order      []string
+	registered bool
+	read       chan struct{}
+}
+
+func newOperationOrder() *operationOrder {
+	return &operationOrder{read: make(chan struct{})}
+}
+
+func (o *operationOrder) record(what string) {
+	o.mu.Lock()
+	o.order = append(o.order, what)
+	o.mu.Unlock()
+}
+
+// listen attaches to f, before it settles, a listener that reads cold custom
+// experiment name. It runs on the goroutine settling f, which must already
+// have ended its registration as op's executor: otherwise, while the holder
+// still lends the gate to op, the listener could decode alongside it.
+func (o *operationOrder) listen(f *future.Future, ctx *Context, op *gateOperation, name string) {
+	var g = &ctx.state().customAudiences
+	f.Listen(func(future.Value, error) {
+		g.mu.Lock()
+		var registered = op.executor == goroutineID()
+		g.mu.Unlock()
+		var _, _ = ctx.PeekTreatment(name)
+		o.mu.Lock()
+		o.registered = registered
+		o.mu.Unlock()
+		o.record("listener")
+		close(o.read)
+	})
+}
+
+// holderDone records the holder finishing after a pause long enough for a
+// listener admitted too early to finish first.
+func (o *operationOrder) holderDone() {
+	time.Sleep(50 * time.Millisecond)
+	o.record("holder")
+}
+
+func (o *operationOrder) check(t *testing.T) {
+	t.Helper()
+	select {
+	case <-o.read:
+	case <-time.After(handoffTimeout):
+		t.Fatal("the future's listener did not finish its read")
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.registered {
+		t.Error("the listener ran while its goroutine was still the operation's executor")
+	}
+	assertAny([]string{"holder", "listener"}, o.order, t)
+}
+
+// A listener on an operation's future is not part of the operation: the
+// operation ends its executor registration before settling the future, so a
+// listener that runs on the settling goroutine and reads a cold custom
+// audience waits for the deserializer holding the gate to return. Initial
+// load (WaitUntilReady), refresh and publish.
+func TestHandoffInitialLoadListenerWaitsForHolder(t *testing.T) {
+	setUp()
+	var d = &handoffDeserializer{}
+	var data = jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
+		handoffExperiment("A", 1, handoffTrue), handoffExperiment("B", 2, handoffFalse)}}
+	var ready, settle = future.New()
+	var cfg = ContextConfig{Units_: map[string]string{"session_id": "u1"}, PublishDelay_: -1}
+	var ctx = CreateContext(clock, cfg, ready, handoffProvider{data, nil}, eventHandler,
+		nil, DefaultVariableParser{}, AudienceMatcher{d})
+	ctx.SetData(data)
+	var o = newOperationOrder()
+	o.listen(ctx.WaitUntilReadyAsync(), ctx, ctx.state().loadOp_, "B")
+	var once sync.Once
+	d.setHook(true, func() {
+		once.Do(func() {
+			go settle(data, nil)
+			ctx.WaitUntilReady()
+			o.holderDone()
+		})
+	})
+	handoffWithin(t, "deserializer WaitUntilReady with a ready listener reading B", func() { _, _ = ctx.PeekTreatment("A") })
+	o.check(t)
+}
+
+func TestHandoffRefreshListenerWaitsForHolder(t *testing.T) {
+	var release = make(chan struct{})
+	var h = newHandoff(t, release)
+	var o = newOperationOrder()
+	var once sync.Once
+	h.d.setHook(true, func() {
+		once.Do(func() {
+			var refreshing = h.ctx.RefreshAsync()
+			var st = h.ctx.state()
+			st.stateLock_.Lock()
+			var op = &st.refresh_.gate
+			st.stateLock_.Unlock()
+			o.listen(refreshing, h.ctx, op, "B")
+			close(release)
+			h.ctx.Refresh()
+			o.holderDone()
+		})
+	})
+	handoffWithin(t, "deserializer Refresh with a refresh listener reading B", func() { _, _ = h.ctx.GetTreatment("A") })
+	o.check(t)
+}
+
+func TestHandoffPublishListenerWaitsForHolder(t *testing.T) {
+	var h = newHandoff(t, nil)
+	var o = newOperationOrder()
+	// The Publish logger runs as its publish's executor; it attaches the
+	// listener to that publish's future, the one the holder's Publish waits
+	// on and lends the gate to.
+	h.setLogger(func(c Context, event EventType) {
+		if event != Publish {
+			return
+		}
+		var st = h.ctx.state()
+		var g = &st.customAudiences
+		var id = goroutineID()
+		st.stateLock_.Lock()
+		var published = st.publishLogs_[len(st.publishLogs_)-1]
+		var ops []*gateOperation
+		for op := range st.publishOps_ {
+			ops = append(ops, op)
+		}
+		st.stateLock_.Unlock()
+		var mine *gateOperation
+		g.mu.Lock()
+		for _, op := range ops {
+			if op.executor == id {
+				mine = op
+			}
+		}
+		g.mu.Unlock()
+		o.listen(published, h.ctx, mine, "B")
+	})
+	var once sync.Once
+	h.d.setHook(true, func() {
+		once.Do(func() {
+			_ = h.ctx.Track("goal", nil)
+			assertAny(nil, h.ctx.Publish(), t)
+			o.holderDone()
+		})
+	})
+	handoffWithin(t, "deserializer Publish with a publish listener reading B", func() { _, _ = h.ctx.GetTreatment("A") })
+	o.check(t)
+}

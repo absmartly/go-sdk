@@ -439,10 +439,29 @@ func TestLiteralVariableValueWhenUnassigned(t *testing.T) {
 		manual.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{experiment}})
 		var peeked, _ = manual.PeekVariableValue("key", "fallback")
 		assertAny(float64(0), peeked, t)
+		assertAny(int32(0), manual.GetPendingCount(), t)
 		var got, _ = manual.GetVariableValue("key", "fallback")
 		assertAny(float64(0), got, t)
 		assertAny(int32(1), manual.GetPendingCount(), t)
 	}
+}
+
+// On a literal, as in v1.1.1, a key defined as null returns nil, not the
+// default, and only GetVariableValue exposes.
+func TestLiteralVariableValueNullIsAValue(t *testing.T) {
+	var experiment = audienceExperiment("exp", "", false)
+	experiment.Variants[0].Config = `{"key":null}`
+	experiment.Variants[1].Config = `{"key":null}`
+	var manual = audienceLiteral(experiment)
+	manual.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{experiment}})
+	var peeked, err = manual.PeekVariableValue("key", "fallback")
+	assertAny(nil, err, t)
+	assertAny(nil, peeked, t)
+	assertAny(int32(0), manual.GetPendingCount(), t)
+	got, err := manual.GetVariableValue("key", "fallback")
+	assertAny(nil, err, t)
+	assertAny(nil, got, t)
+	assertAny(int32(1), manual.GetPendingCount(), t)
 }
 
 // On a literal whose IndexVariables_ maps a key to an experiment that is not
