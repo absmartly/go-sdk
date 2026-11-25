@@ -5280,7 +5280,7 @@ func TestHoldout_RulesOnlyContextKeepsCachedDecisionsAsInV120(t *testing.T) {
 // coverage: the edited experiment is still held out and publishes only its
 // holdout's exposure.
 func TestHoldout_LiteralIndexEditKeepsHoldoutCoverage(t *testing.T) {
-	var e = hoExperiment(1, "exp", hoUnitType, 0, 11)
+	var e = hoWithVariables(hoExperiment(1, "exp", hoUnitType, 0, 11), "v")
 	var literal = audienceLiteral(e)
 	literal.Units_ = map[string]string{hoUnitType: hoUID}
 	literal.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
@@ -5296,4 +5296,57 @@ func TestHoldout_LiteralIndexEditKeepsHoldoutCoverage(t *testing.T) {
 	if exposures := literal.Exposures_; len(exposures) != 1 || exposures[0].Id != 11 || exposures[0].Variant != 0 {
 		t.Fatalf("exposures %+v, want only holdout 11's", exposures)
 	}
+	// The gates and the edited entry's variable keys are kept too.
+	var index = literal.state().loadIndex()
+	if !index.keyed || !index.heldOut {
+		t.Fatalf("an Index_ edit dropped the gates: keyed %v, heldOut %v", index.keyed, index.heldOut)
+	}
+	if _, defined := index.experiments["exp"].variableKeys["v"]; !defined {
+		t.Fatal("the edited entry has no variable key set")
+	}
+}
+
+// "Once a context has seen holdouts" is sticky: a later install without
+// holdouts, or a failed load in between, still rebuilds an unexposed decision
+// whose audience was made strict.
+func TestHoldout_SeenHoldoutsStaysOnAcrossInstalls(t *testing.T) {
+	var gb = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+	for _, failed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("SetDataFailed=%v", failed), func(t *testing.T) {
+			var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 1), "v")
+			e.Audience = gb
+			var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
+			if failed {
+				h.ctx.SetDataFailed(errors.New("load failed"))
+			}
+			h.ctx.SetData(hoData(nil, e))
+			expectInt(t, 1, h.peek("e"))
+			var strict = e
+			strict.AudienceStrict = true
+			h.ctx.SetData(hoData(nil, strict))
+			expectInt(t, 0, h.peek("e"))
+		})
+	}
+}
+
+// In a context with assignment rules but no holdouts, an audience rebuild does
+// not retire the old decision: a caller's earlier GetAssignment copy is still
+// queued beside the new decision, as in v1.2.0.
+func TestHoldout_RulesOnlyAudienceRebuildKeepsTheOldCopyQueueable(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 1), "v")
+	e.Audience = `{"filter":[{"eq":[{"var":"tier"},{"value":"gold"}]}]}`
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	h.setAttribute("tier", "gold")
+	var old = h.ctx.GetAssignment("e")
+	expectInt(t, 1, old.Variant)
+	var strict = e
+	strict.Audience = `{"filter":[{"eq":[{"var":"tier"},{"value":"silver"}]}]}`
+	strict.AudienceStrict = true
+	h.ctx.SetData(hoData(nil, strict, r))
+	h.setAttribute("tier", "bronze")
+	expectInt(t, 0, h.treatment("e"))
+	h.ctx.QueueExposure(old)
+	h.expectPending(2)
 }
