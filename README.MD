@@ -583,7 +583,11 @@ and warmed cached reads and exposures allocate nothing more. Creating a
 context and rebuilding an assignment each allocate one small extra object.
 Once a context has seen holdouts, a `GetVariableValue` that passes an
 experiment the unit is not in briefly takes the context's read lock for it,
-to fire that experiment's holdouts and check that the decision is current.
+to fire that experiment's holdouts and check that the decision is current. This also applies when the context has assignment rules but no
+holdout covers that particular experiment: keyed validation is retained so a
+refresh cannot authorize an obsolete decision. The measured cost is about
+7% in a serial synthetic read and 27% in parallel; warmed reads still make
+0 allocations.
 
 `ContextData` gained a `Holdouts` field and `Experiment` a `HoldoutIds` field,
 so unkeyed (positional) literals of `jsonmodels.ContextData` must become keyed
