@@ -510,6 +510,11 @@ type contextIndex struct {
 	// then on every install builds its variable key set, since an entry
 	// resolved under them may be retired by any later replacement.
 	keyed bool
+	// heldOut is set once any install had holdouts. Only then is an unexposed
+	// decision resolved again when its audience definition or, for an
+	// override, its experiment's identity changes, so a context without
+	// holdouts keeps v1.2.0's cached decisions, as the JS and Java SDKs do.
+	heldOut bool
 
 	// audiences is the set of audience texts in experiments, built once per
 	// snapshot on first use: a snapshot is never changed after it is stored.
@@ -2613,7 +2618,7 @@ func (c *Context) validEntry(st *contextState, experimentName string, entry *cac
 		// (experiment == null || holdoutSetMatches).
 		// A still-unclaimed override needs current variables and resolved
 		// identity before a variable read can claim it in the new epoch.
-		if efound && !assignment.Exposed.Load().(bool) && st.loadIndex().keyed &&
+		if efound && !assignment.Exposed.Load().(bool) && st.loadIndex().heldOut &&
 			!entry.resolvedExperimentMatches(experiment.Data) {
 			return rules, assignmentStale
 		}
@@ -2635,7 +2640,7 @@ func (c *Context) validEntry(st *contextState, experimentName string, entry *cac
 		if !experimentMatches(&experiment.Data, assignment) || !holdoutSetMatches(holdouts, entry.holdouts) {
 			return rules, assignmentStale
 		}
-		if (ignoreCustom || !assignment.Exposed.Load().(bool) && st.loadIndex().keyed) &&
+		if (ignoreCustom || !assignment.Exposed.Load().(bool)) && st.loadIndex().heldOut &&
 			entry.audienceChanged(experiment.Data) {
 			return rules, assignmentStale
 		}
@@ -3085,11 +3090,11 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string,
 		entry.retirement = previous.retirement
 	}
 	var rebuiltOverride = previous != nil && previous.assignment.Overridden && efound &&
-		st.loadIndex().keyed && !previous.resolvedExperimentMatches(experiment.Data)
+		st.loadIndex().heldOut && !previous.resolvedExperimentMatches(experiment.Data)
 	// An unexposed keyed decision rebuilt because its audience was edited is
 	// superseded the same way: a caller still holding it must not publish it.
 	var rebuiltAudience = previous != nil && !previous.assignment.Exposed.Load().(bool) && efound &&
-		st.loadIndex().keyed && previous.audienceChanged(experiment.Data)
+		st.loadIndex().heldOut && previous.audienceChanged(experiment.Data)
 	if previous != nil && (previous.holdouts != nil || entry.holdouts != nil || rebuiltOverride || rebuiltAudience) &&
 		previous.assignment.Exposed != assignment.Exposed {
 		// Retire the replaced assignment, as eviction does: a caller still
@@ -3377,20 +3382,31 @@ func (c *Context) syncLiteralExperiment(st *contextState, experimentName string)
 		return
 	}
 	var indexed = map[string]*indexedExperiment{}
+	// The edited entry keeps the installed holdouts and the gates, so an
+	// Index_ edit never drops holdout coverage.
+	var next = &contextIndex{experiments: indexed}
 	if previous := st.loadIndex(); previous != nil {
 		for name, entry := range previous.experiments {
 			indexed[name] = entry
 		}
+		next.holdouts, next.keyed, next.heldOut = previous.holdouts, previous.keyed, previous.heldOut
 	}
 	if !installed || current.Data.AssignmentRules != experiment.Data.AssignmentRules {
 		rules = nil
 	}
 	if found {
-		indexed[experimentName] = &indexedExperiment{experiment: experiment, rules: rules}
+		var entry = &indexedExperiment{experiment: experiment, rules: rules}
+		if len(next.holdouts) > 0 {
+			entry.holdouts = coveringHoldouts(experiment.Data.HoldoutIds, next.holdouts)
+		}
+		if next.keyed {
+			entry.variableKeys = variableKeysOf(experiment)
+		}
+		indexed[experimentName] = entry
 	} else {
 		delete(indexed, experimentName)
 	}
-	st.index_.Store(&contextIndex{experiments: indexed})
+	st.index_.Store(next)
 }
 
 // sameLiteralEntry reports whether an Index_ entry still matches the private
@@ -3737,23 +3753,17 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	// finished while this one was parsing does not lose the gate.
 	var current = st.loadIndex()
 	var keyed = len(holdoutsById) > 0 || len(rules) > 0 || (current != nil && current.keyed)
+	var heldOut = len(holdoutsById) > 0 || (current != nil && current.heldOut)
 	for name, experiment := range index {
 		var keys variableKeySet
 		if keyed {
-			keys = variableKeySet{}
-			for _, variables := range experiment.Variables {
-				for key := range variables {
-					if _, found := keys[key]; !found {
-						keys[string(append([]byte(nil), key...))] = struct{}{}
-					}
-				}
-			}
+			keys = variableKeysOf(experiment)
 		}
 		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name], holdouts: coverage[name], variableKeys: keys}
 	}
 	st.indexLock_.Lock()
 	c.Index_ = index
-	st.index_.Store(&contextIndex{experiments: indexed, holdouts: holdoutsById, keyed: keyed})
+	st.index_.Store(&contextIndex{experiments: indexed, holdouts: holdoutsById, keyed: keyed, heldOut: heldOut})
 	st.indexLock_.Unlock()
 	st.pruneAudiences()
 	c.ContextCustomFields_ = contextCustomFields
@@ -3765,6 +3775,21 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	c.setRefreshTimer(st)
 	c.DataLock.Unlock()
 	c.ContextLock_.Unlock()
+}
+
+// variableKeysOf returns the variable keys an experiment defines in any
+// variant. The keys are copied, so the set never retains the parsed variant
+// maps.
+func variableKeysOf(experiment ExperimentVariables) variableKeySet {
+	var keys = variableKeySet{}
+	for _, variables := range experiment.Variables {
+		for key := range variables {
+			if _, found := keys[key]; !found {
+				keys[string(append([]byte(nil), key...))] = struct{}{}
+			}
+		}
+	}
+	return keys
 }
 
 // sameHoldoutDraw reports whether two definitions of one holdout id draw the
@@ -3862,11 +3887,11 @@ func (c *Context) SetDataFailed(err error) {
 	c.DataLock.Lock()
 	st.indexLock_.Lock()
 	c.Index_ = map[string]ExperimentVariables{}
-	var keyed = false
+	var keyed, heldOut = false, false
 	if previous := st.loadIndex(); previous != nil {
-		keyed = previous.keyed
+		keyed, heldOut = previous.keyed, previous.heldOut
 	}
-	st.index_.Store(&contextIndex{keyed: keyed})
+	st.index_.Store(&contextIndex{keyed: keyed, heldOut: heldOut})
 	st.indexLock_.Unlock()
 	st.indexVariables_ = map[string][]ExperimentVariables{}
 	c.IndexVariables_ = map[interface{}]interface{}{}

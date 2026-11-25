@@ -4230,18 +4230,18 @@ func TestHoldout_ExposedOverrideIsKeptAcrossAnIdentityRefresh(t *testing.T) {
 	}
 }
 
-// A context with assignment rules but no holdouts also rebuilds an unclaimed
-// override after its experiment's id, iteration or unit type changes, so it
-// serves and exposes the current definition.
-func TestHoldout_RulesOnlyUnclaimedOverrideResolvesCurrentIdentity(t *testing.T) {
+// A context that has seen holdouts rebuilds an unclaimed override after its
+// experiment's id, iteration or unit type changes, so it serves and exposes the
+// current definition. The holdout covers nothing here.
+func TestHoldout_HeldOutContextUnclaimedOverrideResolvesCurrentIdentity(t *testing.T) {
 	for _, identity := range []string{"iteration", "id", "unitType"} {
 		t.Run(identity, func(t *testing.T) {
 			var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
 			var r = hoExperiment(2, "r", hoUnitType, 0)
 			r.AssignmentRules = hoUSRule
-			var h = hoCreate(t, map[string]string{hoUnitType: hoUIDNotHeldOut, "user_id": hoUID}, hoData(nil, e, r))
+			var h = hoCreate(t, map[string]string{hoUnitType: hoUIDNotHeldOut, "user_id": hoUID}, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e, r))
 			if !hoKeyed(h.ctx) {
-				t.Fatal("a context with rules is not keyed")
+				t.Fatal("a context with holdouts is not keyed")
 			}
 			if err := h.ctx.SetOverride("e", 0); err != nil {
 				t.Fatal(err)
@@ -4261,7 +4261,7 @@ func TestHoldout_RulesOnlyUnclaimedOverrideResolvesCurrentIdentity(t *testing.T)
 				fresh.UnitType = "user_id"
 			}
 			fresh.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"v":"new"}`}, {Name: "B", Config: `{"v":"other"}`}}
-			h.ctx.SetData(hoData(nil, fresh, r))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, fresh, r))
 			expectValue(t, "new", h.variable("v"))
 			h.ctx.QueueExposure(old)
 			h.ctx.QueueExposure(&retainedCopy)
@@ -4766,11 +4766,11 @@ func TestHoldout_AudienceRebuildRetiresTheSupersededAssignment(t *testing.T) {
 	e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
 	var r = hoExperiment(2, "r", hoUnitType, 0)
 	r.AssignmentRules = hoUSRule
-	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e, r))
 	var old = h.ctx.GetAssignment("e")
 	var strict = e
 	strict.AudienceStrict = true
-	h.ctx.SetData(hoData(nil, strict, r))
+	h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, strict, r))
 	expectValue(t, "default", h.variable("v"))
 	h.expectPending(0)
 	expectInt(t, 0, h.treatment("e"))
@@ -4954,7 +4954,7 @@ func TestHoldout_AudienceRebuildRetiresOlderEquivalentCopies(t *testing.T) {
 	e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
 	var r = hoExperiment(2, "r", hoUnitType, 0)
 	r.AssignmentRules = hoUSRule
-	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r), hoCustom("e", 0))
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e, r), hoCustom("e", 0))
 	var retained []*cachedAssignment
 	var copies []Assignment
 	for i := 0; i < 3; i++ {
@@ -4970,7 +4970,7 @@ func TestHoldout_AudienceRebuildRetiresOlderEquivalentCopies(t *testing.T) {
 	}
 	var strict = e
 	strict.AudienceStrict = true
-	h.ctx.SetData(hoData(nil, strict, r))
+	h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, strict, r))
 	expectValue(t, "default", h.variable("v"))
 	h.expectPending(0)
 	expectInt(t, 0, h.treatment("e"))
@@ -5055,11 +5055,11 @@ func TestHoldout_RebuildSharingIsScopedToTheExperimentRun(t *testing.T) {
 			if overridden {
 				options = append(options, hoOverride("e", 1))
 			}
-			var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r), options...)
+			var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e, r), options...)
 			var first = h.ctx.assignmentEntry("e")
 			var next = e
 			next.Iteration++
-			h.ctx.SetData(hoData(nil, next, r))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, next, r))
 			var second = h.ctx.assignmentEntry("e")
 			if second.assignment.Exposed == first.assignment.Exposed || second.retirement == first.retirement {
 				t.Fatal("distinct iterations shared exposure identity")
@@ -5229,5 +5229,71 @@ func TestHoldout_InformationalFieldOfTheWrongTypeKeepsTheHoldout(t *testing.T) {
 		expectInt(t, 0, h.treatment("exp"))
 		var exposure = hoExposure(hoUnitType, 11, data.Holdouts[0].Name, 0)
 		h.expectPublished(exposure)
+	}
+}
+
+// A context with assignment rules but no holdouts keeps v1.2.0's cached
+// decisions, as the JS and Java SDKs do: an audience edit, or an override's
+// iteration bump, does not rebuild an unexposed decision. Only the variable-key
+// set and the SetUnit eviction that rules need are on.
+func TestHoldout_RulesOnlyContextKeepsCachedDecisionsAsInV120(t *testing.T) {
+	var gb = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+	t.Run("audience edit", func(t *testing.T) {
+		var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 1), "v")
+		e.Audience = gb
+		var r = hoExperiment(2, "r", hoUnitType, 0)
+		r.AssignmentRules = hoUSRule
+		var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+		if !hoKeyed(h.ctx) {
+			t.Fatal("a context with rules is not keyed")
+		}
+		expectInt(t, 1, h.peek("e"))
+		var strict = e
+		strict.AudienceStrict = true
+		h.ctx.SetData(hoData(nil, strict, r))
+		expectInt(t, 1, h.peek("e"))
+		expectInt(t, 1, h.treatment("e"))
+		var own = hoOwn(hoUnitType, 1, "e", 1)
+		own.FullOn = true
+		own.AudienceMismatch = true
+		h.expectPublished(own)
+	})
+	t.Run("override iteration", func(t *testing.T) {
+		var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+		var r = hoExperiment(2, "r", hoUnitType, 0)
+		r.AssignmentRules = hoUSRule
+		var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r), hoOverride("e", 0))
+		expectValue(t, "control", h.peekVariable("v"))
+		var next = e
+		next.Iteration++
+		next.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"v":"new"}`}, {Name: "B", Config: `{"v":"other"}`}}
+		h.ctx.SetData(hoData(nil, next, r))
+		expectValue(t, "control", h.peekVariable("v"))
+		expectValue(t, "control", h.variable("v"))
+		var own = hoOwn(hoUnitType, 1, "e", 0)
+		own.Assigned, own.Overridden = false, true
+		h.expectPublished(own)
+	})
+}
+
+// Editing a literal context's Index_ entry keeps the installed holdout
+// coverage: the edited experiment is still held out and publishes only its
+// holdout's exposure.
+func TestHoldout_LiteralIndexEditKeepsHoldoutCoverage(t *testing.T) {
+	var e = hoExperiment(1, "exp", hoUnitType, 0, 11)
+	var literal = audienceLiteral(e)
+	literal.Units_ = map[string]string{hoUnitType: hoUID}
+	literal.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
+	expectInt(t, 0, treatmentPeek(t, literal, "exp"))
+	var next = e
+	next.Iteration = 2
+	literal.Index_["exp"] = ExperimentVariables{Data: next, Variables: literal.Index_["exp"].Variables}
+	var variant, err = literal.GetTreatment("exp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectInt(t, 0, variant)
+	if exposures := literal.Exposures_; len(exposures) != 1 || exposures[0].Id != 11 || exposures[0].Variant != 0 {
+		t.Fatalf("exposures %+v, want only holdout 11's", exposures)
 	}
 }
