@@ -138,10 +138,10 @@ func holdoutSplit(raw json.RawMessage) ([]float64, bool) {
 
 // wireHoldout decodes a holdout with its integer fields written as any
 // integral JSON number, so a producer re-encoding 1 as 1.0 keeps the same
-// epoch and seeds. holdoutType and unitType are informational (the arity
-// comes from the split, the arm from the covered experiment's unit), so a
-// value of the wrong type drops only that field rather than the holdout, as
-// an unknown field would.
+// epoch and seeds. name, holdoutType and unitType are informational (the
+// arity comes from the split, the arm from the covered experiment's unit), so
+// a value of the wrong type drops only that field rather than the holdout, as
+// an unknown field would; JavaScript keeps such a holdout too.
 type wireHoldout struct {
 	jsonmodels.Holdout
 	Split       json.RawMessage `json:"split"`
@@ -149,6 +149,7 @@ type wireHoldout struct {
 	Iteration   json.RawMessage `json:"iteration"`
 	SeedHi      json.RawMessage `json:"seedHi"`
 	SeedLo      json.RawMessage `json:"seedLo"`
+	Name        json.RawMessage `json:"name"`
 	HoldoutType json.RawMessage `json:"holdoutType"`
 	UnitType    json.RawMessage `json:"unitType"`
 }
@@ -182,6 +183,7 @@ func holdouts(raw json.RawMessage) []jsonmodels.Holdout {
 		holdout.Holdout.Iteration, _ = holdoutId(holdout.Iteration)
 		holdout.Holdout.SeedHi = holdoutSeed(holdout.SeedHi)
 		holdout.Holdout.SeedLo = holdoutSeed(holdout.SeedLo)
+		_ = json.Unmarshal(holdout.Name, &holdout.Holdout.Name)
 		_ = json.Unmarshal(holdout.HoldoutType, &holdout.Holdout.HoldoutType)
 		_ = json.Unmarshal(holdout.UnitType, &holdout.Holdout.UnitType)
 		result = append(result, holdout.Holdout)

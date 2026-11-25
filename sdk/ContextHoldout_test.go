@@ -5191,3 +5191,43 @@ func TestHoldout_NonParticipantWithoutHoldoutsIsNotExposed(t *testing.T) {
 		t.Fatal("the non-participant was claimed")
 	}
 }
+
+// A warmed variable read that visits a candidate which neither wins nor is
+// held out, in a context without holdouts or rules, takes no lock for it: it
+// has no holdout arms to fire and nothing can retire it.
+func TestHoldout_NonParticipantFastPathTakesNoLock(t *testing.T) {
+	var strict = hoWithVariables(hoExperiment(1, "exp_user", "user_id", 0), "color")
+	var h = hoCreateFor(t, hoUID, hoData(nil, strict))
+	expectValue(t, "default", h.variable("color"))
+	var calls = 0
+	beforeHoldoutArms = func() { calls++ }
+	defer func() { beforeHoldoutArms = nil }()
+	for i := 0; i < 10; i++ {
+		expectValue(t, "default", h.variable("color"))
+	}
+	expectInt(t, 0, calls)
+	h.expectPending(0)
+}
+
+// name, unitType and holdoutType are informational: a value of the wrong type
+// drops only that field, and the holdout still covers and publishes, as in
+// the JS SDK.
+func TestHoldout_InformationalFieldOfTheWrongTypeKeepsTheHoldout(t *testing.T) {
+	for _, field := range []string{`"name":5`, `"name":{"a":1}`, `"unitType":7`, `"holdoutType":3`} {
+		var payload = `{"experiments":[{"id":1,"name":"exp","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
+			"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"fullOnVariant":0,
+			"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
+			"holdouts":[{"id":11,"iteration":1,"seedHi":13,"seedLo":111,"split":[0.1,0.9],` + field + `}]}`
+		var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data.Holdouts) != 1 || data.Holdouts[0].Id != 11 {
+			t.Fatalf("%s: holdouts %+v, want holdout 11 kept", field, data.Holdouts)
+		}
+		var h = hoCreateFor(t, hoUID, data)
+		expectInt(t, 0, h.treatment("exp"))
+		var exposure = hoExposure(hoUnitType, 11, data.Holdouts[0].Name, 0)
+		h.expectPublished(exposure)
+	}
+}

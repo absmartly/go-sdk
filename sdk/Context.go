@@ -1563,10 +1563,13 @@ var (
 // settleExposure, between resolving the assignment and claiming its exposure.
 // beforeEligibleClaim and afterEligibleCAS run in claimEligible, under
 // ContextLock_, before the eligibility check and right after the claim.
+// beforeHoldoutArms runs as queueHoldoutArms starts, before it takes
+// ContextLock_.
 var (
 	afterEligibleCAS    func()
 	beforeSettleClaim   func()
 	beforeEligibleClaim func()
+	beforeHoldoutArms   func()
 )
 
 // QueueExposure queues the assignment's exposure once, then the exposures of
@@ -2061,6 +2064,9 @@ func (e *cachedAssignment) hasUnexposedArms() bool {
 // reading (EventLock_ is taken inside it, in the snapshot lock order). The
 // caller logs the returned exposures with no lock held.
 func (c *Context) queueHoldoutArms(entry *cachedAssignment, eligible func(*cachedAssignment) exposureStatus) (exposureStatus, []jsonmodels.Exposure) {
+	if beforeHoldoutArms != nil {
+		beforeHoldoutArms()
+	}
 	c = c.live()
 	c.ContextLock_.RLock()
 	defer c.ContextLock_.RUnlock()
