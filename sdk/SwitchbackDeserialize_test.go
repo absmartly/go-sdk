@@ -214,17 +214,36 @@ func TestSwitchback_CachedUnitReadsDoNotAllocateMore(t *testing.T) {
 	}
 }
 
-// A cached switchback read takes the read lock only and makes one
-// allocation, for its period's slot key.
+// A cached switchback read takes the read lock only and allocates nothing,
+// as a unit read: its period's slot key is built once per period.
 func TestSwitchback_CachedSwitchbackReadsDoNotAllocateMore(t *testing.T) {
 	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
 	h.at(sbAnchor + 5).treatment("exp_sb")
-	if n := hoLeastAllocs(func() { _, _ = h.ctx.GetTreatment("exp_sb") }); n > 1 {
-		t.Errorf("GetTreatment: %.0f allocations", n)
+	var reads = map[string]func(){
+		"GetTreatment":      func() { _, _ = h.ctx.GetTreatment("exp_sb") },
+		"PeekTreatment":     func() { _, _ = h.ctx.PeekTreatment("exp_sb") },
+		"GetVariableValue":  func() { _, _ = h.ctx.GetVariableValue("sb.arm", 0) },
+		"PeekVariableValue": func() { _, _ = h.ctx.PeekVariableValue("sb.arm", 0) },
 	}
-	if n := hoLeastAllocs(func() { _, _ = h.ctx.GetVariableValue("sb.arm", 0) }); n > 1 {
-		t.Errorf("GetVariableValue: %.0f allocations", n)
+	for name, read := range reads {
+		if n := hoLeastAllocs(read); n != 0 {
+			t.Errorf("%s: %.0f allocations", name, n)
+		}
 	}
+}
+
+// The slot key cached for one period is never used for another: alternating
+// between two cached periods serves and keeps each period's own slot.
+func TestSwitchback_SlotKeyCacheFollowsThePeriod(t *testing.T) {
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+	expectInt(t, sbExpected2Arms[0], h.at(sbAnchor+5).treatment("exp_sb"))
+	expectInt(t, sbExpected2Arms[1], h.at(sbAnchor+sbHour+5).treatment("exp_sb"))
+	for i := 0; i < 3; i++ {
+		expectInt(t, sbExpected2Arms[0], h.at(sbAnchor+6).treatment("exp_sb"))
+		expectInt(t, sbExpected2Arms[1], h.at(sbAnchor+sbHour+6).treatment("exp_sb"))
+	}
+	h.expectPublished(sbExposure(1, "exp_sb", sbExpected2Arms[0], sbAnchor+5, true, true),
+		sbExposure(1, "exp_sb", sbExpected2Arms[1], sbAnchor+sbHour+5, true, true))
 }
 
 // Every switchback scenario of the publish golden probe: a payload without

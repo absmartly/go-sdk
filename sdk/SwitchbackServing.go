@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
@@ -400,6 +401,16 @@ type switchbackDefinition struct {
 	// is unchanged, and fresh otherwise; cached slots of another generation
 	// are stale.
 	generation uint64
+	// slotKey holds the *switchbackSlotKeyCache of the period read last, so
+	// warmed reads of a period do not build its cache key again. Readers
+	// share the definition under the read lock, so it is replaced, never
+	// changed.
+	slotKey atomic.Value
+}
+
+type switchbackSlotKeyCache struct {
+	period int64
+	key    string
 }
 
 type switchbackSource struct {

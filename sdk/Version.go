@@ -6,6 +6,6 @@ package sdk
 // tag without its "v" prefix; the release workflow checks it.
 const (
 	SDKName    = "absmartly-go-sdk"
-	SDKVersion = "1.2.0"
+	SDKVersion = "1.3.0"
 	SDKAgent   = SDKName + "/" + SDKVersion
 )

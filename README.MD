@@ -24,7 +24,7 @@ The finalization event is still `sdk.Close` with the value `"Close"`; `sdk.Final
 ### Install the SDK
 
 ```bash
-go get github.com/absmartly/go-sdk/sdk@v1.2.0
+go get github.com/absmartly/go-sdk/sdk@latest
 ```
 
 ### Dependencies
@@ -1000,7 +1000,7 @@ Go modules are published by git tags. To release:
    `X-Agent` header) and move the `CHANGELOG.md` entry from unreleased to that
    version.
 2. Merge to `main`, then tag that commit and push the tag:
-   `git tag v1.2.0 && git push origin v1.2.0`.
+   `git tag vX.Y.Z && git push origin vX.Y.Z` (the version in `SDKVersion`).
 
 The `Release` workflow checks that the tag matches `SDKVersion`, runs the
 tests, creates the GitHub release and asks the Go module proxy to fetch the

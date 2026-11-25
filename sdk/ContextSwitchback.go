@@ -59,6 +59,17 @@ func switchbackSlotKey(experimentName string, period int64) string {
 	return experimentName + switchbackKeySeparator + strconv.FormatInt(period, 10)
 }
 
+// periodSlotKey is switchbackSlotKey for the definition's experiment, built
+// once per period rather than on every read.
+func (d *switchbackDefinition) periodSlotKey(experimentName string, period int64) string {
+	if cached, _ := d.slotKey.Load().(*switchbackSlotKeyCache); cached != nil && cached.period == period {
+		return cached.key
+	}
+	var key = switchbackSlotKey(experimentName, period)
+	d.slotKey.Store(&switchbackSlotKeyCache{period: period, key: key})
+	return key
+}
+
 // assignmentSlotFor is the slot an experiment resolves to at the clock
 // reading, which is taken only for a switchback.
 func assignmentSlotFor(experimentName string, indexed *indexedExperiment, at *clockReading) assignmentSlot {
@@ -66,7 +77,7 @@ func assignmentSlotFor(experimentName string, indexed *indexedExperiment, at *cl
 		return assignmentSlot{key: experimentName}
 	}
 	if period, ok := currentSwitchbackPeriod(indexed, at.now()); ok {
-		return assignmentSlot{key: switchbackSlotKey(experimentName, period), period: period, hasPeriod: true}
+		return assignmentSlot{key: indexed.switchback.periodSlotKey(experimentName, period), period: period, hasPeriod: true}
 	}
 	return assignmentSlot{key: experimentName}
 }
