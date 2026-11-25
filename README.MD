@@ -587,6 +587,10 @@ so unkeyed (positional) literals of `jsonmodels.ContextData` must become keyed
 
 ### Switchback Experiments
 
+Switchback serving needs v1.3.0 or later. Earlier versions ignore the
+switchback fields and serve such an experiment as a unit experiment on its
+`unitType`, which does not follow the schedule.
+
 A switchback experiment randomizes over *clusters* and time rather than over
 units: every unit in the same cluster (for example a store's city) gets the
 same variant within a period, and the variant changes on a fixed time grid.
