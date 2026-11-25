@@ -554,7 +554,9 @@ A holdout keeps a share of units out of a group of experiments, so their
 combined effect can be measured. The context payload lists the holdouts
 (`ContextData.Holdouts`) and each experiment names the holdouts covering it
 (`Experiment.HoldoutIds`). Nothing needs to be configured: the SDK applies
-them as the JavaScript SDK does.
+them following the JavaScript and Java SDKs. The few places where it differs
+(duplicate or malformed holdout entries, and decisions resolved again after a
+refresh edits an audience) are listed in the v1.3.0 CHANGELOG.
 
 - Each holdout puts the unit in an arm, drawn with the covered experiment's
   unit. Arm 0 holds the unit out. In a three-arm holdout (three values in its
@@ -579,6 +581,9 @@ nothing to the publish payload of experiments without holdouts (the
 `ruleOverride` flag every exposure now carries comes with assignment rules),
 and warmed cached reads and exposures allocate nothing more. Creating a
 context and rebuilding an assignment each allocate one small extra object.
+Once a context has seen holdouts, a `GetVariableValue` that passes an
+experiment the unit is not in briefly takes the context's read lock for it,
+to fire that experiment's holdouts and check that the decision is current.
 
 `ContextData` gained a `Holdouts` field and `Experiment` a `HoldoutIds` field,
 so unkeyed (positional) literals of `jsonmodels.ContextData` must become keyed

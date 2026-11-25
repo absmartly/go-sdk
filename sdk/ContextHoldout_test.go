@@ -4471,7 +4471,7 @@ func TestHoldout_ChangedCustomAssignmentStillRebuilds(t *testing.T) {
 	expectValue(t, "treatment", h.variable("v"))
 }
 
-// In a keyed context a custom assignment that becomes applicable between a
+// In a context that has seen holdouts, a custom assignment that becomes applicable between a
 // variable read's resolve and its claim (here a refresh makes the unit
 // traffic-eligible, or an attribute makes a strict audience match) leaves the
 // read's decision stale, so the read resolves again: it serves the custom
@@ -4485,7 +4485,7 @@ func TestHoldout_CustomBecomingApplicableDuringAReadIsResolvedAgain(t *testing.T
 		{"traffic refresh", func(e *jsonmodels.Experiment) { e.TrafficSplit = []float64{1, 0} },
 			func(h *hoContext, e jsonmodels.Experiment, r jsonmodels.Experiment) {
 				e.TrafficSplit = []float64{0, 1}
-				h.ctx.SetData(hoData(nil, e, r))
+				h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, e, r))
 			}},
 		{"strict audience attribute", func(e *jsonmodels.Experiment) {
 			e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
@@ -4497,7 +4497,7 @@ func TestHoldout_CustomBecomingApplicableDuringAReadIsResolvedAgain(t *testing.T
 			c.setup(&e)
 			var r = hoExperiment(2, "r", hoUnitType, 0)
 			r.AssignmentRules = hoUSRule
-			var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+			var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e, r))
 			if err := h.ctx.SetCustomAssignment("e", 1); err != nil {
 				t.Fatal(err)
 			}
@@ -5193,20 +5193,31 @@ func TestHoldout_NonParticipantWithoutHoldoutsIsNotExposed(t *testing.T) {
 }
 
 // A warmed variable read that visits a candidate which neither wins nor is
-// held out, in a context without holdouts or rules, takes no lock for it: it
-// has no holdout arms to fire and nothing can retire it.
+// held out, in a context that never saw holdouts (with or without rules),
+// takes no lock for it: it has no holdout arms to fire and nothing can retire
+// or rebuild it during the read.
 func TestHoldout_NonParticipantFastPathTakesNoLock(t *testing.T) {
-	var strict = hoWithVariables(hoExperiment(1, "exp_user", "user_id", 0), "color")
-	var h = hoCreateFor(t, hoUID, hoData(nil, strict))
-	expectValue(t, "default", h.variable("color"))
-	var calls = 0
-	beforeHoldoutArms = func() { calls++ }
-	defer func() { beforeHoldoutArms = nil }()
-	for i := 0; i < 10; i++ {
-		expectValue(t, "default", h.variable("color"))
+	for _, rules := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rules=%v", rules), func(t *testing.T) {
+			var user = hoWithVariables(hoExperiment(1, "exp_user", "user_id", 0), "color")
+			var experiments = []jsonmodels.Experiment{user}
+			if rules {
+				var r = hoExperiment(2, "r", hoUnitType, 0)
+				r.AssignmentRules = hoUSRule
+				experiments = append(experiments, r)
+			}
+			var h = hoCreateFor(t, hoUID, hoData(nil, experiments...))
+			expectValue(t, "default", h.variable("color"))
+			var calls = 0
+			beforeHoldoutArms = func() { calls++ }
+			defer func() { beforeHoldoutArms = nil }()
+			for i := 0; i < 10; i++ {
+				expectValue(t, "default", h.variable("color"))
+			}
+			expectInt(t, 0, calls)
+			h.expectPending(0)
+		})
 	}
-	expectInt(t, 0, calls)
-	h.expectPending(0)
 }
 
 // name, unitType and holdoutType are informational: a value of the wrong type
@@ -5349,4 +5360,33 @@ func TestHoldout_RulesOnlyAudienceRebuildKeepsTheOldCopyQueueable(t *testing.T) 
 	expectInt(t, 0, h.treatment("e"))
 	h.ctx.QueueExposure(old)
 	h.expectPending(2)
+}
+
+// With rules but no holdouts, a candidate that did not win at resolution
+// stays a non-participant for this read, even if an attribute changes right
+// afterwards (v1.2.0). The next read uses the new attributes.
+func TestHoldout_RulesOnlyNonParticipantReadKeepsItsResolvedDecision(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 1), "v")
+	e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+	e.AudienceStrict = true
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			h.setAttribute("country", "GB")
+		}
+	}
+	defer func() { afterReadResolve = nil }()
+	expectValue(t, "default", h.variable("v"))
+	h.expectPending(0)
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	expectValue(t, "treatment", h.variable("v"))
+	var own = hoOwn(hoUnitType, 1, "e", 1)
+	own.FullOn = true
+	h.expectPublished(own)
 }

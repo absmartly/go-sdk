@@ -2031,9 +2031,10 @@ func (c *Context) exposeVariableCandidate(experimentName string, key string, ent
 			}
 			status = exposureRetired
 		} else {
-			// Outside a keyed context nothing can retire the decision, so a
-			// non-participant without unexposed arms costs no lock.
-			if !entry.hasUnexposedArms() && !c.state().loadIndex().keyed {
+			// Until the context has seen holdouts nothing can retire or
+			// rebuild a non-participant during the read (as in v1.2.0), so one
+			// without unexposed arms costs no lock.
+			if !entry.hasUnexposedArms() && !c.state().loadIndex().heldOut {
 				return entry, true
 			}
 			var exposures []jsonmodels.Exposure
