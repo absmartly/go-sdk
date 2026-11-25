@@ -6,6 +6,7 @@ import (
 	"math"
 	"strconv"
 
+	v111 "github.com/absmartly/go-sdk/sdk/internal/v111"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
 
@@ -15,8 +16,15 @@ type DefaultContextDataDeserializer struct {
 
 func (d DefaultContextDataDeserializer) Deserialize(bytes []byte) (jsonmodels.ContextData, error) {
 	var wire wireContextData
-	var err = json.Unmarshal(bytes, &wire)
-	return wire.contextData(), err
+	if json.Unmarshal(bytes, &wire) == nil {
+		return wire.contextData(), nil
+	}
+	// The payload is invalid somewhere other than assignmentRules. Decode the
+	// caller's bytes into v1.1.1's model, which has no assignmentRules field,
+	// so the partial data and the error (text and offset) are v1.1.1's.
+	var legacy v111.ContextData
+	var err = json.Unmarshal(bytes, &legacy)
+	return legacy.Public(), err
 }
 
 // wireContextData is the context payload as the default deserializer decodes

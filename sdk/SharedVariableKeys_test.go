@@ -61,9 +61,9 @@ func TestSharedKeyPayloadOrderIgnored(t *testing.T) {
 	assertAny("low", res, t)
 }
 
-// (c) the first experiment does not assign the unit, so the value falls through
-// to the second; both experiments are exposed and the first records assigned:false.
-func TestSharedKeyFallsThroughAndExposesBoth(t *testing.T) {
+// (c) the first experiment does not assign the unit, so the second wins; only
+// the winner is exposed, never the candidate that was only checked.
+func TestSharedKeyUnassignedFirstIsNotExposed(t *testing.T) {
 	var ctx = sharedKeyContext(t, nil,
 		sharedKeyExperiment(1, "s_unassigned", "no_such_unit", 0, []string{"", `{"k":"low"}`}),
 		sharedKeyExperiment(2, "s_assigned", "session_id", 1, []string{"", `{"k":"high"}`}),
@@ -73,21 +73,9 @@ func TestSharedKeyFallsThroughAndExposesBoth(t *testing.T) {
 	assertAny(nil, err, t)
 	assertAny("high", res, t)
 
-	ctx.EventLock_.Lock()
-	defer ctx.EventLock_.Unlock()
-	var first, second bool
-	for _, exp := range ctx.Exposures_ {
-		switch exp.Name {
-		case "s_unassigned":
-			first = true
-			assertAny(false, exp.Assigned, t)
-		case "s_assigned":
-			second = true
-			assertAny(true, exp.Assigned, t)
-		}
-	}
-	assertAny(true, first, t)
-	assertAny(true, second, t)
+	var exposures = expectExposures(t, ctx, 1)
+	assertAny("s_assigned", exposures[0].Name, t)
+	assertAny(true, exposures[0].Assigned, t)
 }
 
 // (d) the first experiment is unassigned but overridden, so the override wins.
@@ -102,7 +90,8 @@ func TestSharedKeyOverrideWins(t *testing.T) {
 	assertAny("low", res, t)
 }
 
-// (e) the assigned variant's config lacks the key, so the value falls through.
+// (e) the winner's assigned variant lacks the key: the caller's default, and
+// no fall-through to the later experiment that has it.
 func TestSharedKeyAssignedVariantMissingKey(t *testing.T) {
 	var ctx = sharedKeyContext(t, nil,
 		sharedKeyExperiment(1, "s_otherkey", "session_id", 2, []string{"", `{"k":"low"}`, `{"other":"x"}`}),
@@ -111,7 +100,9 @@ func TestSharedKeyAssignedVariantMissingKey(t *testing.T) {
 
 	var res, err = ctx.GetVariableValue("k", "def")
 	assertAny(nil, err, t)
-	assertAny("high", res, t)
+	assertAny("def", res, t)
+	var exposures = expectExposures(t, ctx, 1)
+	assertAny("s_otherkey", exposures[0].Name, t)
 }
 
 // (f) peek returns the same values as get and queues no exposures.

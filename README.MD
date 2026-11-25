@@ -4,12 +4,12 @@ Go SDK for [ABsmartly](https://www.absmartly.com/) A/B testing platform.
 
 ## Compatibility
 
-The A/B Smartly Go SDK is compatible with Go versions 1.20 and later. CI builds and tests on Go 1.20, 1.23 and the latest stable Go. The module pins `resty` v2.16.5, the last release that supports Go 1.20; upgrading `resty` to v2.17+ in your own module raises your Go floor to 1.23.
+The A/B Smartly Go SDK is compatible with Go versions 1.17 and later. (v1.1.1's go.mod said 1.15, but it used `atomic.Value.CompareAndSwap` and so needed Go 1.17 to build.) CI builds and tests on Go 1.17, 1.20, 1.23 and the latest stable Go. The module requires `resty` v2.16.5; it builds with Go 1.17, which CI checks. Upgrading `resty` to v2.17+ in your own module raises your Go floor to 1.23.
 It provides both a blocking and an asynchronous interfaces.
 
-`Context.GetVariableKeys()` keeps its v1.1 signature (`map[string]string`), returning, for each key, the first experiment that defines it by experiment id. Use the new `Context.GetVariableKeysAll()` to get every experiment per key (`map[string][]string`, in experiment-id order), as the other ABsmartly SDKs return. When several experiments share a variable key, `GetVariableValue`/`PeekVariableValue` read from the first experiment, by id, that the unit is assigned to or overridden in; `GetVariableValue` exposes each experiment visited along the way and `PeekVariableValue` exposes none (v1.1.1 used the last experiment in the payload); this matches the JS SDK.
+`Context.GetVariableKeys()` keeps its v1.1 signature (`map[string]string`), returning, for each key, the first experiment that defines it by experiment id. Use the new `Context.GetVariableKeysAll()` to get every experiment per key (`map[string][]string`, in experiment-id order), as the other ABsmartly SDKs return. When several experiments share a variable key, see [Shared variable keys](#shared-variable-keys).
 
-**Behavior changes:** Read methods (`GetTreatment`, `PeekTreatment`, `GetVariableValue`, `PeekVariableValue`, `GetVariableKeys`, `GetExperiments`, `GetCustomFieldValueKeys`, `GetData`) return `sdk.ErrContextNotReady` (`ABSmartly Context is not yet ready`) before the context is ready; callers must not treat the zero value as a result. After close they return `sdk.ErrContextClosing`/`sdk.ErrContextClosed`; the texts are unchanged from v1.1 (`ABSmartly Context is closing`/`ABSmartly Context is closed`), and the errors can also be matched with `errors.Is`. `GetCustomFieldValue` keeps its signature and returns nil on any error; use the new `GetCustomFieldValueE` to receive the error. Refreshing a context whose initial load failed is now a successful no-op; it does not call the data provider or replace the failed context's data. Create a new context to retry initialization. Panics in event loggers are contained and do not change the publisher's success or failure result.
+**Behavior changes:** Read methods (`GetTreatment`, `PeekTreatment`, `GetVariableValue`, `PeekVariableValue`, `GetVariableKeys`, `GetExperiments`, `GetCustomFieldValueKeys`, `GetData`) return `sdk.ErrContextNotReady` (`ABSmartly Context is not yet ready`) before the context is ready; callers must not treat the zero value as a result. After close they return `sdk.ErrContextClosing`/`sdk.ErrContextClosed`; the texts are unchanged from v1.1 (`ABSmartly Context is closing`/`ABSmartly Context is closed`), and the errors can also be matched with `errors.Is`. `GetCustomFieldValue` keeps its signature and returns nil on any error; use the new `GetCustomFieldValueE` to receive the error. Refreshing a context whose initial load failed fetches and installs the data, as in v1.1.1. Panics in event loggers are contained and do not change the publisher's success or failure result.
 
 ## Finalization and event delivery
 
@@ -24,7 +24,7 @@ The finalization event is still `sdk.Close` with the value `"Close"`; `sdk.Final
 ### Install the SDK
 
 ```bash
-go get github.com/absmartly/go-sdk/sdk
+go get github.com/absmartly/go-sdk/sdk@v1.2.0
 ```
 
 ### Dependencies
@@ -426,6 +426,17 @@ if err != nil {
 }
 ```
 
+### Shared variable keys
+
+When several experiments define the same variable key, `GetVariableValue` and `PeekVariableValue` pick one winner:
+
+- The candidates are the experiments any of whose variants define the key, in experiment-id order.
+- The winner is the first candidate the unit is assigned to, overridden in or rule-assigned to. A unit outside a strict audience, or without a unit of the experiment's type, is not assigned.
+- The value comes from the winner's selected variant. If that variant does not define the key, you get your default; later experiments are not consulted. A key defined as `null`, `false`, `0` or `""` returns that value.
+- Only the winner is exposed. With no winner you get your default and nothing is exposed. `PeekVariableValue` never exposes.
+
+This matches the Java SDK. (v1.1.1 used the last experiment in the payload.)
+
 ### Peek at Treatment Variants
 
 Although generally not recommended, it is sometimes necessary to peek at a treatment or variable without triggering an exposure.
@@ -557,9 +568,11 @@ them as the JavaScript SDK does.
 - Every `GetTreatment` or `GetVariableValue` on a covered experiment also
   publishes each covering holdout's exposure, once per holdout and unit type,
   whatever the arm. `PeekTreatment` and `PeekVariableValue` publish nothing.
-- When experiments share a variable key, a held-out experiment never wins it
-  over one the unit is assigned to; if none is, the held-out experiment's
-  control value is returned rather than the default.
+- When experiments share a variable key (see "Shared variable keys"), a
+  held-out experiment never wins it; if no candidate wins, the first held-out
+  candidate's control value is returned rather than the default.
+  `GetVariableValue` publishes the holdout exposures of every candidate it
+  visits, as the Java SDK does, but only the winner's own exposure.
 
 A unit keeps its arm until the holdout's iteration changes. Holdouts add
 nothing to the publish payload of experiments without holdouts (the
@@ -667,7 +680,7 @@ import (
     "log"
 )
 
-var absmartlySDK *sdk.ABsmartly
+var absmartlySDK sdk.ABsmartly
 
 func main() {
     // Initialize SDK once at app startup
@@ -731,7 +744,7 @@ import (
     "log"
 )
 
-var absmartlySDK *sdk.ABsmartly
+var absmartlySDK sdk.ABsmartly
 
 func main() {
     // Initialize SDK once at app startup
@@ -794,7 +807,7 @@ import (
     "log"
 )
 
-var absmartlySDK *sdk.ABsmartly
+var absmartlySDK sdk.ABsmartly
 
 func main() {
     // Initialize SDK once at app startup
@@ -913,6 +926,8 @@ func createContextWithDeadline(absmartly sdk.ABsmartly, wait time.Duration) (*sd
 ```
 
 ## Releasing
+
+Run `./test.sh` and `go vet ./...` before releasing.
 
 Go modules are published by git tags. To release:
 
