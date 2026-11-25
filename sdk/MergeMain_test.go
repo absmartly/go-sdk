@@ -141,3 +141,47 @@ func TestHoldout_SharedKeyStrictMismatchIsNotTheFallback(t *testing.T) {
 	expectValue(t, "control", h.variable("color"))
 	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
 }
+
+// entryMatches checks each part of a switchback slot's identity on its own,
+// even where the generation would also catch the change: an iteration-only
+// or id-only edit of the installed definition, with the generation kept,
+// makes the cached slot stale.
+func TestSwitchback_EntryMatchesChecksIdAndIterationIndependently(t *testing.T) {
+	for name, edit := range map[string]func(*jsonmodels.Experiment){
+		"iteration": func(e *jsonmodels.Experiment) { e.Iteration++ },
+		"id":        func(e *jsonmodels.Experiment) { e.Id++ },
+	} {
+		var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+		h.at(sbAnchor + 5).peek("exp_sb")
+		var entry = h.ctx.getAssignment("exp_sb")
+		var indexed = h.ctx.state().indexedExperiment("exp_sb")
+		if !h.ctx.entryMatches(indexed, entry) {
+			t.Fatalf("%s: fixture: the cached slot does not match its own definition", name)
+		}
+		var edited = *indexed
+		edit(&edited.experiment.Data)
+		if h.ctx.entryMatches(&edited, entry) {
+			t.Errorf("%s: an edit of the same generation still matches the cached slot", name)
+		}
+	}
+}
+
+// A refresh that changes only a switchback's id or iteration starts a new
+// generation; the same definition keeps its generation.
+func TestSwitchback_IdentityIncludesIdAndIteration(t *testing.T) {
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+	var before = h.ctx.state().indexedExperiment("exp_sb")
+	if !sameSwitchbackIdentity(before, before) {
+		t.Fatal("a definition differs from itself")
+	}
+	for name, edit := range map[string]func(*jsonmodels.Experiment){
+		"iteration": func(e *jsonmodels.Experiment) { e.Iteration++ },
+		"id":        func(e *jsonmodels.Experiment) { e.Id++ },
+	} {
+		var edited = *before
+		edit(&edited.experiment.Data)
+		if sameSwitchbackIdentity(before, &edited) {
+			t.Errorf("%s: the edit kept the switchback identity", name)
+		}
+	}
+}
