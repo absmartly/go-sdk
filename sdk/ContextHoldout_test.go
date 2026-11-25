@@ -464,10 +464,10 @@ func TestHoldout_CustomAssignmentCannotOverrideHeldOutVariant(t *testing.T) {
 func TestHoldout_CachedHeldOutAssignmentWithCustomAssignmentIsReused(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()},
 		hoExperiment(1, "exp_holdout_custom_cache", hoUnitType, 0, 11)), hoCustom("exp_holdout_custom_cache", 3))
-	var first = h.ctx.GetAssignment("exp_holdout_custom_cache")
+	var first = h.ctx.getAssignment("exp_holdout_custom_cache")
 	expectInt(t, 0, h.treatment("exp_holdout_custom_cache"))
 	expectInt(t, 0, h.treatment("exp_holdout_custom_cache"))
-	if h.ctx.GetAssignment("exp_holdout_custom_cache") != first {
+	if h.ctx.getAssignment("exp_holdout_custom_cache") != first {
 		t.Fatal("the held-out assignment was rebuilt")
 	}
 	h.expectPending(1)
@@ -665,11 +665,11 @@ func TestHoldout_SetUnitKeepsAnExposedAssignment(t *testing.T) {
 		hoExperiment(1, "exp_exposed_before_unit", "user_id", 2, 11)))
 	expectInt(t, 2, h.treatment("exp_exposed_before_unit"))
 	h.expectPending(1)
-	var exposed = h.ctx.GetAssignment("exp_exposed_before_unit")
+	var exposed = h.ctx.getAssignment("exp_exposed_before_unit")
 	h.setUnit("user_id", hoUID)
 	expectInt(t, 2, h.treatment("exp_exposed_before_unit"))
 	h.expectPending(1)
-	if h.ctx.GetAssignment("exp_exposed_before_unit") != exposed {
+	if h.ctx.getAssignment("exp_exposed_before_unit") != exposed {
 		t.Fatal("an exposed assignment was evicted")
 	}
 }
@@ -690,7 +690,7 @@ func TestHoldout_SetUnitEvictsOnlyTheAffectedAssignment(t *testing.T) {
 		hoHoldout(12, "holdout_present", hoUnitType, hoSeedBHi, hoSeedBLo)},
 		hoExperiment(1, "exp_late_unit", "user_id", 2, 11), hoExperiment(2, "exp_present_unit", hoUnitType, 0, 12)))
 	expectInt(t, 2, h.peek("exp_late_unit"))
-	var present = h.ctx.GetAssignment("exp_present_unit")
+	var present = h.ctx.getAssignment("exp_present_unit")
 	expectInt(t, hoNormalVariant, h.treatment("exp_present_unit"))
 	h.expectPending(2)
 	h.setUnit("user_id", hoUID)
@@ -698,7 +698,7 @@ func TestHoldout_SetUnitEvictsOnlyTheAffectedAssignment(t *testing.T) {
 	h.expectPending(4)
 	expectInt(t, hoNormalVariant, h.treatment("exp_present_unit"))
 	h.expectPending(4)
-	if h.ctx.GetAssignment("exp_present_unit") != present {
+	if h.ctx.getAssignment("exp_present_unit") != present {
 		t.Fatal("an unaffected assignment was evicted")
 	}
 }
@@ -1113,7 +1113,7 @@ func TestHoldout_StaleHoldoutNeverReplacesANewerArm(t *testing.T) {
 	h.expectPending(3)
 
 	h.ctx.ContextLock_.Lock()
-	var arm = h.ctx.holdoutArm(&it1, hoUnitType)
+	var arm = h.ctx.holdoutArm(h.ctx.state(), &it1, hoUnitType)
 	h.ctx.ContextLock_.Unlock()
 	if arm.assignment.Iteration != 2 || arm.assignment.Variant != 1 || !arm.assignment.Exposed.Load().(bool) {
 		t.Fatalf("stale holdout gave arm %+v", arm.assignment)
@@ -1532,7 +1532,7 @@ func TestHoldout_CoveringHoldoutsAreUniqueAndSorted(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA(), hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)},
 		hoExperiment(1, "exp_dup", hoUnitType, 0, 12, 11, 999, 12, 11)))
 	var ids []int
-	for _, holdout := range h.ctx.indexedExperiment("exp_dup").holdouts {
+	for _, holdout := range h.ctx.state().indexedExperiment("exp_dup").holdouts {
 		ids = append(ids, holdout.Id)
 	}
 	expectValue(t, []int{11, 12}, ids)
@@ -1600,10 +1600,10 @@ func TestHoldout_UnchangedCoverageKeepsAnExposedRuleWin(t *testing.T) {
 	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
 	expectInt(t, 2, h.treatment("exp_rule"))
 	h.expectPending(1)
-	var before = h.ctx.GetAssignment("exp_rule")
+	var before = h.ctx.getAssignment("exp_rule")
 	h.setAttribute("split", true)
 	expectInt(t, 2, h.treatment("exp_rule"))
-	if h.ctx.GetAssignment("exp_rule") == before {
+	if h.ctx.getAssignment("exp_rule") == before {
 		t.Fatal("the assignment was not rebuilt")
 	}
 	h.expectPending(1)
@@ -1687,19 +1687,19 @@ func TestHoldout_QueueExposureOfASuppressedAssignment(t *testing.T) {
 	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
 }
 
-// A held-out experiment that a rule won is not suppressed, so it is never the
-// control-value fallback: the next suppressed experiment is.
+// A held-out experiment that a rule won is not suppressed: it wins the key
+// even when the variant the rule gives (1) lacks it, so the caller gets the
+// default and the later suppressed experiment is never the fallback, as in
+// the Java SDK.
 func TestHoldout_RuleWonHeldOutExperimentIsNotTheFallback(t *testing.T) {
 	var ruleWon = hoExperiment(1, "exp_rule_won", hoUnitType, 0, 11)
-	// It defines the key, so it is visited, but not in the variant the rule
-	// gives (1), so it does not win the key.
 	ruleWon.Variants[0].Config = `{"color":"rule_won_control"}`
 	ruleWon.Variants[1].Config = `{"other":"y"}`
 	ruleWon.AssignmentRules = hoUSRule
 	var suppressed = hoWithVariables(hoExperiment(2, "exp_suppressed", hoUnitType, 0, 11), "color")
 	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, ruleWon, suppressed))
 	h.setAttribute("country", "US")
-	expectValue(t, "control", h.peekVariable("color"))
+	expectValue(t, "default", h.peekVariable("color"))
 }
 
 // Holdout ids are integral numbers however written (10, 10.0, 1e1), as in
@@ -1793,7 +1793,7 @@ func TestHoldout_AbsentHoldoutFieldsAllocateNothing(t *testing.T) {
 	h.treatment("exp")
 	h.ctx.ContextLock_.RLock()
 	defer h.ctx.ContextLock_.RUnlock()
-	if h.ctx.holdoutArms_ != nil {
+	if h.ctx.state().holdoutArms_ != nil {
 		t.Fatal("holdout arm map created without holdouts")
 	}
 }
@@ -2256,14 +2256,14 @@ func TestHoldout_PopulatedModelRoundTrip(t *testing.T) {
 func TestHoldout_RejectedDecisionStillMissingItsUnitIsReopened(t *testing.T) {
 	var h = hoCreate(t, nil, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_user", "user_id", hoSeedBHi, hoSeedBLo)},
 		hoExperiment(1, "exp", "user_id", 2, 11)))
-	var assignment = h.ctx.GetAssignment("exp")
+	var entry = h.ctx.getAssignment("exp")
 	h.ctx.Closing_.Store(true)
-	h.ctx.QueueExposure(assignment)
+	h.ctx.QueueExposure(h.ctx.GetAssignment("exp"))
 	h.ctx.Closing_.Store(false)
-	if h.ctx.GetAssignment("exp") != assignment {
+	if h.ctx.getAssignment("exp") != entry {
 		t.Fatal("a rejected decision without its unit was rebuilt")
 	}
-	if assignment.Exposed.Load().(bool) {
+	if entry.assignment.Exposed.Load().(bool) {
 		t.Fatal("a rejected decision stayed marked exposed")
 	}
 }
@@ -2319,16 +2319,16 @@ func TestHoldout_QueueExposureOnALiteralContext(t *testing.T) {
 func TestHoldout_CoveredAndUncoveredExposureMappingsAgree(t *testing.T) {
 	for _, flag := range []bool{false, true} {
 		var assignment = &Assignment{Id: 7, Name: "exp", UnitType: "u", Variant: 2, Assigned: flag, Eligible: flag,
-			Overridden: flag, FullOn: flag, Custom: flag, AudienceMismatch: flag, RuleOverride: flag}
+			Overridden: flag, FullOn: flag, Custom: flag, AudienceMismatch: flag}
 		var exposed = &atomic.Value{}
 		exposed.Store(true)
 		assignment.Exposed = exposed
 		var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "other", hoUnitType, 0)))
-		if !h.ctx.enqueueExposure(assignment, h.ctx.Clock_.Millis()) {
+		if !h.ctx.enqueueExposure(assignment, flag, h.ctx.Clock_.Millis()) {
 			t.Fatal("not queued")
 		}
 		var queued = queuedExposures(h.ctx)
-		expectValue(t, []jsonmodels.Exposure{h.ctx.exposureFor(assignment, hoMillis)}, queued)
+		expectValue(t, []jsonmodels.Exposure{h.ctx.exposureFor(assignment, flag, hoMillis)}, queued)
 		expectValue(t, jsonmodels.Exposure{Id: 7, Name: "exp", Unit: "u", Variant: 2, ExposedAt: hoMillis, Assigned: flag,
 			Eligible: flag, Overridden: flag, FullOn: flag, Custom: flag, AudienceMismatch: flag, RuleOverride: flag}, queued[0])
 	}
@@ -2350,10 +2350,8 @@ type hoLockProbingClock struct {
 
 func (c hoLockProbingClock) Millis() int64 {
 	if ctx := *c.ctx; ctx != nil {
-		if !ctx.EventLock_.TryLock() {
+		if !lockFree(ctx.EventLock_) {
 			c.t.Error("the clock was read with EventLock_ held")
-		} else {
-			ctx.EventLock_.Unlock()
 		}
 	}
 	return hoMillis
@@ -3016,9 +3014,11 @@ func TestHoldout_RejectedReadIsNotRetried(t *testing.T) {
 
 // A SetUnit that evicts an assignment resolved without its unit, landing
 // after a read resolved it and before the claim, makes the read serve and
-// expose the assignment with the unit.
+// expose the assignment with the unit. A variable read never claims a
+// decision without its unit: it is not assigned, so it does not win the key
+// (TestHoldout_VariableReadWithoutTheUnitClaimsNothing).
 func TestHoldout_EvictionBeforeTheClaimServesTheResolvedAssignment(t *testing.T) {
-	for _, variable := range []bool{false, true} {
+	for _, variable := range []bool{false} {
 		var experiment = hoExperiment(1, "exp", "user_id", 0, 11)
 		experiment.Split = []float64{0, 1}
 		experiment.Variants[0].Config = `{"v":"control"}`
@@ -3058,10 +3058,10 @@ func TestHoldout_WarmedReadDoesNoClaim(t *testing.T) {
 		h.variable("color")
 	}
 	expectInt(t, 0, claims)
-	if n := hoLeastAllocs(func() { _, _ = h.ctx.GetTreatment("exp") }); n > 2 {
+	if n := hoLeastAllocs(func() { _, _ = h.ctx.GetTreatment("exp") }); n != 0 {
 		t.Errorf("warmed GetTreatment: %.0f allocations", n)
 	}
-	if n := hoLeastAllocs(func() { _, _ = h.ctx.GetVariableValue("color", "d") }); n > 2 {
+	if n := hoLeastAllocs(func() { _, _ = h.ctx.GetVariableValue("color", "d") }); n != 0 {
 		t.Errorf("warmed GetVariableValue: %.0f allocations", n)
 	}
 }
@@ -3168,7 +3168,7 @@ func TestHoldout_ReadClaimingBeforeTheEvictionKeepsItsClaim(t *testing.T) {
 	}
 	h.expectPending(1)
 	h.ctx.ContextLock_.RLock()
-	var cached = h.ctx.assignmentCache_["exp"]
+	var cached = h.ctx.state().assignmentCache_["exp"]
 	h.ctx.ContextLock_.RUnlock()
 	if cached != entry {
 		t.Fatal("the claimed entry was evicted")
@@ -3265,7 +3265,7 @@ func TestHoldout_VariableRetryDoesNotExposeARemovedExperiment(t *testing.T) {
 func TestHoldout_NeedsSettling(t *testing.T) {
 	var exposed = &atomic.Value{}
 	exposed.Store(true)
-	var entry = &cachedAssignment{assignment: &Assignment{Exposed: exposed}, retirement: &atomic.Bool{}}
+	var entry = &cachedAssignment{assignment: &Assignment{Exposed: exposed}, retirement: &atomicFlag{}}
 	if entry.needsSettling() {
 		t.Fatal("a warmed entry settles")
 	}
@@ -3386,7 +3386,7 @@ func TestHoldout_VariableEligibilityIsJudgedByTheInstalledDefinition(t *testing.
 // hoKeyed reports whether the installed index builds key sets, and
 // hoInstalledDefines whether experiment name as installed now defines key.
 func hoKeyed(ctx *Context) bool {
-	var index = ctx.index_.Load()
+	var index = ctx.state().loadIndex()
 	return index != nil && index.keyed
 }
 
@@ -3401,11 +3401,11 @@ func hoInstalledDefines(ctx *Context, name string, key string) bool {
 		var assignment = *entry.assignment
 		assignment.Variables = map[string]interface{}{}
 		probe.assignment = &assignment
-		ctx.assignmentCache_[name] = &probe
-		defer func() { ctx.assignmentCache_[name] = entry }()
-		return ctx.variableEligible(name, key)(&probe) == exposureClaimed
+		ctx.state().assignmentCache_[name] = &probe
+		defer func() { ctx.state().assignmentCache_[name] = entry }()
+		return ctx.variableEligible(ctx.state(), name, key)(&probe) == exposureClaimed
 	}
-	return ctx.variableEligible(name, key)(entry) == exposureClaimed
+	return ctx.variableEligible(ctx.state(), name, key)(entry) == exposureClaimed
 }
 
 // A variable read whose assignment is replaced, before its claim, by a
@@ -3667,7 +3667,7 @@ func TestHoldout_ConcurrentInstallKeepsTheKeySetGate(t *testing.T) {
 	ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoWithVariables(hoExperiment(1, "a", hoUnitType, 0, 11), "v")))
 	close(parser.release)
 	<-finished
-	if index := ctx.index_.Load(); index == nil || !index.keyed {
+	if index := ctx.state().loadIndex(); index == nil || !index.keyed {
 		t.Fatal("the plain install dropped the key set gate")
 	}
 }
@@ -3677,11 +3677,11 @@ func TestHoldout_ConcurrentInstallKeepsTheKeySetGate(t *testing.T) {
 func TestHoldout_OverriddenCoveredAssignmentStaysCached(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)), hoOverride("exp", 1))
 	h.treatment("exp")
-	var first = h.ctx.GetAssignment("exp")
+	var first = h.ctx.getAssignment("exp")
 	for i := 0; i < 4; i++ {
 		h.treatment("exp")
 	}
-	if h.ctx.GetAssignment("exp") != first {
+	if h.ctx.getAssignment("exp") != first {
 		t.Fatal("the overridden assignment was resolved again")
 	}
 	h.expectPending(2)
@@ -3691,7 +3691,8 @@ func TestHoldout_OverriddenCoveredAssignmentStaysCached(t *testing.T) {
 // one of them can install a version that no longer defines the key: that
 // experiment, and its holdout, are not exposed by the read.
 func TestHoldout_SharedKeyReadSkipsACandidateRefreshedWithoutTheKey(t *testing.T) {
-	var a = hoExperiment(1, "a", hoUnitType, 0)
+	// a is visited first and does not win the key: its unit is not set.
+	var a = hoExperiment(1, "a", "user_id", 0)
 	a.Split = []float64{1, 0}
 	a.Variants[0].Config = `{"w":"a"}`
 	a.Variants[1].Config = `{"v":"a"}`
@@ -3875,8 +3876,7 @@ func TestHoldout_EligibilityIsCheckedUnderTheContextLock(t *testing.T) {
 	var ran = false
 	beforeEligibleClaim = func() {
 		ran = true
-		if h.ctx.ContextLock_.TryLock() {
-			h.ctx.ContextLock_.Unlock()
+		if lockFree(h.ctx.ContextLock_) {
 			t.Error("a refresh could take the lock during the check")
 		}
 	}
@@ -3962,8 +3962,7 @@ func TestHoldout_EligibilityClaimCASStaysUnderTheContextLock(t *testing.T) {
 	var ran = false
 	afterEligibleCAS = func() {
 		ran = true
-		if h.ctx.ContextLock_.TryLock() {
-			h.ctx.ContextLock_.Unlock()
+		if lockFree(h.ctx.ContextLock_) {
 			t.Error("the claim is outside the context lock")
 		}
 	}
@@ -3986,7 +3985,10 @@ func TestHoldout_ReadinessCopyVariableExposureUsesTheLiveQueue(t *testing.T) {
 	}
 }
 
-func TestHoldout_VariableRetryRejectsAnOverrideWithoutVariables(t *testing.T) {
+// A retry onto an override whose variant has no variables serves the
+// default and exposes the override, which wins the key, with its holdout: a
+// winner without variables still wins (TestSharedKeyWinnerWithoutVariablesGivesDefault).
+func TestHoldout_VariableRetryOntoAnOverrideWithoutVariables(t *testing.T) {
 	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")))
 	h.ctx.GetAssignment("e")
 	var armed = true
@@ -4004,8 +4006,10 @@ func TestHoldout_VariableRetryRejectsAnOverrideWithoutVariables(t *testing.T) {
 	if armed {
 		t.Fatal("the hook did not run")
 	}
-	if exposures := queuedExposures(h.ctx); len(exposures) != 0 {
-		t.Fatalf("nil-variable replacement was exposed: %+v", exposures)
+	var exposures = queuedExposures(h.ctx)
+	if len(exposures) != 2 || exposures[0].Id != 1 || exposures[0].Variant != 5 || !exposures[0].Overridden ||
+		exposures[1].Id != 11 {
+		t.Fatalf("exposures %+v, want the override and its holdout", exposures)
 	}
 }
 
@@ -4024,15 +4028,14 @@ func TestHoldout_CheckAndClaimAreOneCriticalSection(t *testing.T) {
 			return
 		}
 		armed = false
-		seen = h.ctx.index_.Load()
+		seen = h.ctx.state().loadIndex()
 		go func() {
 			defer close(done)
 			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, without))
 		}()
 		var deadline = time.Now().Add(5 * time.Second)
-		// A queued writer makes TryRLock fail.
-		for h.ctx.ContextLock_.TryRLock() {
-			h.ctx.ContextLock_.RUnlock()
+		// A queued writer blocks new readers.
+		for readLockFree(h.ctx.ContextLock_) {
 			if time.Now().After(deadline) {
 				t.Fatal("the refresh never queued on the lock")
 			}
@@ -4044,7 +4047,7 @@ func TestHoldout_CheckAndClaimAreOneCriticalSection(t *testing.T) {
 		case <-done:
 		case <-time.After(20 * time.Millisecond):
 		}
-		if h.ctx.index_.Load() != seen {
+		if h.ctx.state().loadIndex() != seen {
 			t.Error("a refresh installed between the eligibility check and the claim")
 		}
 	}
@@ -4474,9 +4477,11 @@ func TestHoldout_ChangedCustomAssignmentStillRebuilds(t *testing.T) {
 
 // In a keyed context a custom assignment that becomes applicable between a
 // variable read's resolve and its claim (here a refresh makes the unit
-// traffic-eligible, or an attribute makes a strict audience match) leaves the
-// read's decision stale, so the read resolves again: it serves the custom
-// variant and exposes it once, with the custom flag.
+// traffic-eligible) leaves the read's decision stale, so the read resolves
+// again: it serves the custom variant and exposes it once, with the custom
+// flag. A strict-mismatched candidate is not assigned, so it never wins the
+// key and is never claimed: an attribute that makes it match during the read
+// takes effect on the next read (TestHoldout_StrictMismatchMatchingDuringAReadServesTheDefault).
 func TestHoldout_CustomBecomingApplicableDuringAReadIsResolvedAgain(t *testing.T) {
 	for _, c := range []struct {
 		name   string
@@ -4488,10 +4493,6 @@ func TestHoldout_CustomBecomingApplicableDuringAReadIsResolvedAgain(t *testing.T
 				e.TrafficSplit = []float64{0, 1}
 				h.ctx.SetData(hoData(nil, e, r))
 			}},
-		{"strict audience attribute", func(e *jsonmodels.Experiment) {
-			e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
-			e.AudienceStrict = true
-		}, func(h *hoContext, _ jsonmodels.Experiment, _ jsonmodels.Experiment) { h.setAttribute("country", "GB") }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
@@ -4519,6 +4520,40 @@ func TestHoldout_CustomBecomingApplicableDuringAReadIsResolvedAgain(t *testing.T
 				t.Fatalf("exposures %+v, want one custom variant 1", exposures)
 			}
 		})
+	}
+}
+
+// A strict-mismatched candidate does not win the key, so a read that sees it
+// unassigned serves the default and claims nothing, even if an attribute set
+// before the read finishes makes it match, as in the Java SDK. The next read
+// serves and exposes the custom variant.
+func TestHoldout_StrictMismatchMatchingDuringAReadServesTheDefault(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
+	e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+	e.AudienceStrict = true
+	var r = hoExperiment(2, "r", hoUnitType, 0)
+	r.AssignmentRules = hoUSRule
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	if err := h.ctx.SetCustomAssignment("e", 1); err != nil {
+		t.Fatal(err)
+	}
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			h.setAttribute("country", "GB")
+		}
+	}
+	defer func() { afterReadResolve = nil }()
+	expectValue(t, "default", h.variable("v"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	h.expectPending(0)
+	expectValue(t, "treatment", h.variable("v"))
+	var exposures = queuedExposures(h.ctx)
+	if len(exposures) != 1 || exposures[0].Variant != 1 || !exposures[0].Custom {
+		t.Fatalf("exposures %+v, want one custom variant 1", exposures)
 	}
 }
 
@@ -4607,10 +4642,9 @@ func TestHoldout_ClaimReleasesTheLockOnPanic(t *testing.T) {
 		h.ctx.GetVariableValue("v", "default")
 	}()
 	beforeEligibleClaim = nil
-	if !h.ctx.ContextLock_.TryLock() {
+	if !lockFree(h.ctx.ContextLock_) {
 		t.Fatal("the claim left the context lock held after a panic")
 	}
-	h.ctx.ContextLock_.Unlock()
 }
 
 // In a keyed context a refresh that edits an unexposed decision's audience
@@ -4772,7 +4806,7 @@ func TestHoldout_AudienceRebuildRetiresTheSupersededAssignment(t *testing.T) {
 	var strict = e
 	strict.AudienceStrict = true
 	h.ctx.SetData(hoData(nil, strict, r))
-	expectValue(t, "default", h.variable("v"))
+	expectInt(t, 0, h.treatment("e"))
 	h.ctx.QueueExposure(old)
 	var exposures = queuedExposures(h.ctx)
 	if len(exposures) != 1 || exposures[0].FullOn || exposures[0].Assigned {
@@ -4796,10 +4830,9 @@ func TestHoldout_RebuildReleasesTheWriteLockOnPanic(t *testing.T) {
 		defer func() { _ = recover() }()
 		h.ctx.GetVariableValue("v", "default")
 	}()
-	if !h.ctx.ContextLock_.TryLock() {
+	if !lockFree(h.ctx.ContextLock_) {
 		t.Fatal("the rebuild left the context write lock held after a panic")
 	}
-	h.ctx.ContextLock_.Unlock()
 }
 
 // A rule win never evaluated the audience, so an audience-only edit leaves it
@@ -4876,7 +4909,7 @@ func TestHoldout_VariableClaimDoesNotBorrowAnotherIteration(t *testing.T) {
 				} else {
 					expectInt(t, 1, h.peek("e"))
 				}
-				cached = h.ctx.assignmentCache_["e"]
+				cached = h.ctx.state().assignmentCache_["e"]
 				h.ctx.SetData(hoData(nil, e, r))
 			}
 			t.Cleanup(func() { afterReadResolve = nil })
@@ -4915,7 +4948,7 @@ func TestHoldout_EquivalentRebuildSharesTheServedAssignmentCopies(t *testing.T) 
 			var copy Assignment
 			afterReadResolve = func() {
 				afterReadResolve = nil
-				served = h.ctx.assignmentCache_["e"]
+				served = h.ctx.state().assignmentCache_["e"]
 				copy = *served.assignment
 			}
 			var rebuilt *cachedAssignment
@@ -4923,7 +4956,7 @@ func TestHoldout_EquivalentRebuildSharesTheServedAssignmentCopies(t *testing.T) 
 			beforeSettleClaim = func() {
 				claims++
 				h.peek("e")
-				rebuilt = h.ctx.assignmentCache_["e"]
+				rebuilt = h.ctx.state().assignmentCache_["e"]
 			}
 			t.Cleanup(func() { beforeSettleClaim, afterReadResolve = nil, nil })
 			expectValue(t, "treatment", h.variable("v"))
@@ -4970,7 +5003,7 @@ func TestHoldout_AudienceRebuildRetiresOlderEquivalentCopies(t *testing.T) {
 	var strict = e
 	strict.AudienceStrict = true
 	h.ctx.SetData(hoData(nil, strict, r))
-	expectValue(t, "default", h.variable("v"))
+	expectInt(t, 0, h.treatment("e"))
 	for i, entry := range retained {
 		if !entry.retirement.Load() {
 			t.Errorf("retained entry %d escaped audience retirement", i)
@@ -4993,14 +5026,14 @@ func TestHoldout_EquivalentAudienceRebuildHonorsATakenClaim(t *testing.T) {
 	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r), hoCustom("e", 0))
 	var served = h.ctx.getAssignment("e")
 	h.peek("e")
-	var status, claim = h.ctx.claimEligible(served, h.ctx.variableEligible("e", "v"))
+	var status, claim = h.ctx.claimEligible(served, h.ctx.variableEligible(h.ctx.state(), "e", "v"))
 	if status != exposureClaimed || claim != served {
 		t.Fatal("the retained read did not claim its own decision")
 	}
 	var strict = e
 	strict.AudienceStrict = true
 	h.ctx.SetData(hoData(nil, strict, r))
-	expectValue(t, "default", h.variable("v"))
+	expectInt(t, 0, h.treatment("e"))
 	if got := h.ctx.admitExposure(claim.assignment, claim); got != exposureQueued {
 		t.Fatalf("taken claim rejected: %v", got)
 	}
@@ -5025,7 +5058,7 @@ func TestHoldout_EquivalentRebuildRefreshesVariablesAndRuleStamps(t *testing.T) 
 	next.Variants = []jsonmodels.ExperimentVariant{{Name: "A"}, {Name: "B", Config: `{"v":"updated","added":42}`}}
 	h.ctx.SetData(hoData(nil, next))
 	h.peek("e")
-	var rebuilt = h.ctx.assignmentCache_["e"]
+	var rebuilt = h.ctx.state().assignmentCache_["e"]
 	if rebuilt == first || rebuilt.rules == first.rules || rebuilt.assignment.Exposed != copy.Exposed {
 		t.Fatal("the equivalent rebuild lost sharing or did not refresh rule stamps")
 	}
@@ -5060,7 +5093,7 @@ func TestHoldout_RebuildSharingIsScopedToTheExperimentRun(t *testing.T) {
 				t.Fatal("distinct iterations shared exposure identity")
 			}
 			expectInt(t, 1, h.treatment("e"))
-			h.expectPublished(h.ctx.exposureFor(second.assignment, hoMillis))
+			h.expectPublished(h.ctx.exposureFor(second.assignment, second.ruleOverride, hoMillis))
 		})
 	}
 }
@@ -5071,7 +5104,7 @@ func TestHoldout_SameDecisionComparison(t *testing.T) {
 		var exposed = &atomic.Value{}
 		exposed.Store(false)
 		return &cachedAssignment{assignment: &Assignment{Id: 1, Iteration: 1, Name: "e", UnitType: hoUnitType,
-			Variant: 1, Assigned: true, Eligible: true, Exposed: exposed}, retirement: &atomic.Bool{},
+			Variant: 1, Assigned: true, Eligible: true, Exposed: exposed}, retirement: &atomicFlag{},
 			resolvedId: 1, resolvedIteration: 1, resolvedUnitType: hoUnitType}
 	}
 	for _, c := range []struct {
@@ -5093,7 +5126,7 @@ func TestHoldout_SameDecisionComparison(t *testing.T) {
 		{"full on", func(e *cachedAssignment) { e.assignment.FullOn = true }},
 		{"custom", func(e *cachedAssignment) { e.assignment.Custom = true }},
 		{"audience", func(e *cachedAssignment) { e.assignment.AudienceMismatch = true }},
-		{"rule", func(e *cachedAssignment) { e.assignment.RuleOverride = true }},
+		{"rule", func(e *cachedAssignment) { e.ruleOverride = true }},
 		{"retired", func(e *cachedAssignment) { e.retirement.Store(true) }},
 		{"coverage", func(e *cachedAssignment) { e.holdouts = &assignmentHoldouts{} }},
 	} {

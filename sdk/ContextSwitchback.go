@@ -178,10 +178,10 @@ func (c *Context) entryMatches(indexed *indexedExperiment, entry *cachedAssignme
 	if entry.switchback == nil {
 		return indexed.switchback == nil && data.Id == assignment.Id && data.UnitType == assignment.UnitType &&
 			data.Iteration == assignment.Iteration && data.FullOnVariant == assignment.FullOnVariant &&
-			reflect.DeepEqual(data.TrafficSplit, assignment.TrafficSplit)
+			sameSplit(data.TrafficSplit, assignment.TrafficSplit)
 	}
 	return switchbackSlotMatches(indexed, entry) && data.Id == assignment.Id && data.Iteration == assignment.Iteration &&
-		data.FullOnVariant == assignment.FullOnVariant && reflect.DeepEqual(data.TrafficSplit, assignment.TrafficSplit)
+		data.FullOnVariant == assignment.FullOnVariant && sameSplit(data.TrafficSplit, assignment.TrafficSplit)
 }
 
 // ruleUnitType is the unit a split rule hashes: the experiment's unitType,
@@ -206,27 +206,27 @@ type switchbackEpoch struct {
 // switchbackEpochStale reports whether an experiment's cached switchback
 // slots belong to another definition: the installed one is absent, not a
 // switchback, or of another generation. The caller holds ContextLock_.
-func (c *Context) switchbackEpochStale(experimentName string, indexed *indexedExperiment) bool {
-	if c.switchbackEpochs_ == nil {
+func (st *contextState) switchbackEpochStale(experimentName string, indexed *indexedExperiment) bool {
+	if st.switchbackEpochs_ == nil {
 		return false
 	}
-	var epoch = c.switchbackEpochs_[experimentName]
+	var epoch = st.switchbackEpochs_[experimentName]
 	return epoch != nil && (indexed == nil || indexed.switchback == nil || epoch.generation != indexed.switchback.generation)
 }
 
 // dropSwitchbackEpoch drops every slot of an experiment's epoch, the one
 // without a period included. The caller holds ContextLock_ for writing.
-func (c *Context) dropSwitchbackEpoch(experimentName string) {
-	var epoch = c.switchbackEpochs_[experimentName]
+func (c *Context) dropSwitchbackEpoch(st *contextState, experimentName string) {
+	var epoch = st.switchbackEpochs_[experimentName]
 	if epoch == nil {
 		return
 	}
-	delete(c.switchbackEpochs_, experimentName)
+	delete(st.switchbackEpochs_, experimentName)
 	for _, period := range epoch.periods {
-		c.retireSwitchbackSlot(experimentName, switchbackSlotKey(experimentName, period))
+		c.retireSwitchbackSlot(st, experimentName, switchbackSlotKey(experimentName, period))
 	}
-	if entry := c.assignmentCache_[experimentName]; entry != nil && entry.switchback != nil {
-		c.retireSwitchbackSlot(experimentName, experimentName)
+	if entry := st.assignmentCache_[experimentName]; entry != nil && entry.switchback != nil {
+		c.retireSwitchbackSlot(st, experimentName, experimentName)
 	}
 }
 
@@ -254,14 +254,14 @@ func (c *Context) claimRetiredSwitchback(entry *cachedAssignment) {
 // are superseded like any replacement involving holdouts: a caller still
 // holding the old one must not publish it beside its replacement. The caller
 // holds ContextLock_ for writing.
-func (c *Context) retireAcrossRandomization(experimentName string, slot assignmentSlot, entry *cachedAssignment) {
+func (c *Context) retireAcrossRandomization(st *contextState, experimentName string, slot assignmentSlot, entry *cachedAssignment) {
 	if entry.switchback != nil {
-		if old, found := c.assignmentCache_[experimentName]; found && slot.key != experimentName &&
+		if old, found := st.assignmentCache_[experimentName]; found && slot.key != experimentName &&
 			old.switchback == nil {
 			if old.holdouts != nil {
 				c.claimRetiredSwitchback(old)
 			}
-			delete(c.assignmentCache_, experimentName)
+			delete(st.assignmentCache_, experimentName)
 		}
 		return
 	}
@@ -271,7 +271,7 @@ func (c *Context) retireAcrossRandomization(experimentName string, slot assignme
 	// A switchback replaced by a unit experiment changed its generation, so
 	// getAssignmentAt has already dropped its live slots into the retired
 	// window; only that window can still hold them.
-	for _, old := range c.retiredSwitchbackSlots_[experimentName] {
+	for _, old := range st.retiredSwitchbackSlots_[experimentName] {
 		c.claimRetiredSwitchback(old)
 	}
 }
@@ -282,16 +282,16 @@ func (c *Context) retireAcrossRandomization(experimentName string, slot assignme
 // exposure is stamped within the slot's period. The exposed flag is left
 // alone, so a read that resolved the slot just before it was removed still
 // exposes it. The caller holds ContextLock_ for writing.
-func (c *Context) retireSwitchbackSlot(experimentName string, key string) {
-	var entry, found = c.assignmentCache_[key]
+func (c *Context) retireSwitchbackSlot(st *contextState, experimentName string, key string) {
+	var entry, found = st.assignmentCache_[key]
 	if !found {
 		return
 	}
-	delete(c.assignmentCache_, key)
-	if c.retiredSwitchbackSlots_ == nil {
-		c.retiredSwitchbackSlots_ = map[string][]*cachedAssignment{}
+	delete(st.assignmentCache_, key)
+	if st.retiredSwitchbackSlots_ == nil {
+		st.retiredSwitchbackSlots_ = map[string][]*cachedAssignment{}
 	}
-	var retired = append(c.retiredSwitchbackSlots_[experimentName], entry)
+	var retired = append(st.retiredSwitchbackSlots_[experimentName], entry)
 	if len(retired) > switchbackRetiredSlots {
 		// Metadata is no longer available outside this bounded window.
 		// Fail closed rather than publishing a silent resolution, or an
@@ -303,7 +303,7 @@ func (c *Context) retireSwitchbackSlot(experimentName string, key string) {
 		}
 		retired = retired[len(retired)-switchbackRetiredSlots:]
 	}
-	c.retiredSwitchbackSlots_[experimentName] = retired
+	st.retiredSwitchbackSlots_[experimentName] = retired
 }
 
 // retainSwitchbackSlot records a switchback slot under the current epoch.
@@ -313,14 +313,14 @@ func (c *Context) retireSwitchbackSlot(experimentName string, key string) {
 // re-entering an evicted period (a clock rewind, or a caller delayed across
 // two boundaries) creates one new assignment for it, which is then cached
 // like any other. The caller holds ContextLock_ for writing.
-func (c *Context) retainSwitchbackSlot(experimentName string, indexed *indexedExperiment, slot assignmentSlot) {
-	var epoch = c.switchbackEpochs_[experimentName]
+func (c *Context) retainSwitchbackSlot(st *contextState, experimentName string, indexed *indexedExperiment, slot assignmentSlot) {
+	var epoch = st.switchbackEpochs_[experimentName]
 	if epoch == nil {
-		if c.switchbackEpochs_ == nil {
-			c.switchbackEpochs_ = map[string]*switchbackEpoch{}
+		if st.switchbackEpochs_ == nil {
+			st.switchbackEpochs_ = map[string]*switchbackEpoch{}
 		}
 		epoch = &switchbackEpoch{generation: indexed.switchback.generation}
-		c.switchbackEpochs_[experimentName] = epoch
+		st.switchbackEpochs_[experimentName] = epoch
 	}
 	if !slot.hasPeriod {
 		return
@@ -337,7 +337,7 @@ func (c *Context) retainSwitchbackSlot(experimentName string, indexed *indexedEx
 		if epoch.periods[0] == slot.period {
 			evict = 1
 		}
-		c.retireSwitchbackSlot(experimentName, switchbackSlotKey(experimentName, epoch.periods[evict]))
+		c.retireSwitchbackSlot(st, experimentName, switchbackSlotKey(experimentName, epoch.periods[evict]))
 		epoch.periods = append(epoch.periods[:evict], epoch.periods[evict+1:]...)
 	}
 }
@@ -429,14 +429,16 @@ func (c *Context) latestAttribute(name string, now int64) (jsonmodels.Attribute,
 // cluster key follow. Holdouts never apply. Only the draw needs a period:
 // before the start or with an unservable schedule the result is an
 // ineligible control that records nothing, while rules, the audience and
-// full-on are unaffected. The caller holds ContextLock_ for writing.
-func (c *Context) resolveSwitchback(entry *cachedAssignment, indexed *indexedExperiment, slot assignmentSlot) {
-	var data, assignment, resolved = indexed.experiment.Data, entry.assignment, entry.switchback
+// full-on are unaffected. It returns the experiment when its audience must
+// first be parsed with no lock held (see evaluateAudience). The caller holds
+// ContextLock_ for writing.
+func (c *Context) resolveSwitchback(st *contextState, entry *cachedAssignment, indexed *indexedExperiment, slot assignmentSlot,
+	last bool, parse *audienceParse) *jsonmodels.Experiment {
+	var data, assignment, resolved = &indexed.experiment.Data, entry.assignment, entry.switchback
 	assignment.Id = data.Id
 	assignment.Iteration = data.Iteration
 	assignment.TrafficSplit = data.TrafficSplit
 	assignment.FullOnVariant = data.FullOnVariant
-	assignment.AttrsSeq = entry.attrsSeq
 	assignment.Variant = 0
 
 	var serving = resolved.serving
@@ -445,44 +447,44 @@ func (c *Context) resolveSwitchback(entry *cachedAssignment, indexed *indexedExp
 		assignment.UnitType = resolved.unitType(indexed)
 		assignment.Eligible = false
 		resolved.silent = true
-		return
+		return nil
 	}
 	assignment.UnitType = serving.unitType
 	assignment.Assigned = true
 	if serving.status == switchbackIneligible {
 		assignment.Eligible = false
 		resolved.silent = true
-		return
+		return nil
 	}
 
-	if rule := c.resolveRule(data, indexed.rules, serving.unitType, false, true); rule != nil {
+	if rule := c.resolveRule(st, *data, indexed.rules, serving.unitType, false, true); rule != nil {
 		// Recorded like a unit experiment's rule win: not assigned.
 		assignment.Assigned = false
-		assignment.RuleOverride = true
+		entry.ruleOverride = true
 		assignment.Variant = rule.variant
 		entry.ruleMissingUnit = rule.missingUnit
-		return
+		return nil
 	}
 	if len(data.Audience) > 0 {
-		if match, err := c.AudienceMatcher_.Evaluate(data.Audience, c.evaluationAttributes()); err == nil {
-			assignment.AudienceMismatch = !match.Get()
+		if unparsed := c.evaluateAudience(st, assignment.Name, entry, data, last, parse); unparsed != nil {
+			return unparsed
 		}
 	}
 	if data.AudienceStrict && assignment.AudienceMismatch {
 		// Recorded like a unit experiment's strict mismatch: control, not
 		// assigned.
 		assignment.Assigned = false
-		return
+		return nil
 	}
 	if data.FullOnVariant != 0 {
 		assignment.Variant = data.FullOnVariant
 		assignment.FullOn = true
-		return
+		return nil
 	}
 	if !slot.hasPeriod {
 		assignment.Eligible = false
 		resolved.silent = true
-		return
+		return nil
 	}
 
 	var hash [22]byte
@@ -492,14 +494,15 @@ func (c *Context) resolveSwitchback(entry *cachedAssignment, indexed *indexedExp
 		// A traffic miss on an eligible cluster is recorded, as for a unit
 		// experiment.
 		assignment.Eligible = false
-		return
+		return nil
 	}
 	if resolved.customSet {
 		assignment.Variant = resolved.custom
 		assignment.Custom = true
-		return
+		return nil
 	}
 	assignment.Variant = switchbackAssign(serving.clusterKey, slot.period, switchbackSeed(data.SeedHi, data.SeedLo), len(data.Split))
+	return nil
 }
 
 // assignSwitchbackGenerations gives each installed switchback definition a
@@ -508,7 +511,7 @@ func (c *Context) resolveSwitchback(entry *cachedAssignment, indexed *indexedExp
 // definition breaks the chain, a switchback that returns later with an
 // identical definition gets a new generation. The caller holds ContextLock_
 // for writing.
-func (c *Context) assignSwitchbackGenerations(previous *contextIndex, installed map[string]*indexedExperiment) {
+func (c *Context) assignSwitchbackGenerations(st *contextState, previous *contextIndex, installed map[string]*indexedExperiment) {
 	for name, experiment := range installed {
 		if experiment.switchback == nil {
 			continue
@@ -520,8 +523,8 @@ func (c *Context) assignSwitchbackGenerations(previous *contextIndex, installed 
 		if sameSwitchbackIdentity(before, experiment) {
 			experiment.switchback.generation = before.switchback.generation
 		} else {
-			c.switchbackGeneration_++
-			experiment.switchback.generation = c.switchbackGeneration_
+			st.switchbackGeneration_++
+			experiment.switchback.generation = st.switchbackGeneration_
 		}
 	}
 }

@@ -3,7 +3,6 @@ package sdk
 import (
 	"errors"
 	"reflect"
-	"strings"
 	"testing"
 
 	"github.com/absmartly/go-sdk/sdk/future"
@@ -11,7 +10,7 @@ import (
 )
 
 func TestDefaultVariableParserParseCustomFieldValueAcceptsAnyJSONValue(t *testing.T) {
-	var parser = DefaultVariableParser{}
+	var parser, _ = customFieldValueParser(DefaultVariableParser{})
 	var cases = []struct {
 		name  string
 		input string
@@ -22,7 +21,7 @@ func TestDefaultVariableParserParseCustomFieldValueAcceptsAnyJSONValue(t *testin
 		{"number", `123`, 123.0},
 		{"string", `"hello"`, "hello"},
 		{"boolean", `true`, true},
-		{"null", `null`, nil},
+		{"null", `null`, map[string]interface{}(nil)},
 	}
 
 	for _, tc := range cases {
@@ -39,12 +38,13 @@ func TestDefaultVariableParserParseCustomFieldValueAcceptsAnyJSONValue(t *testin
 }
 
 func TestDefaultVariableParserParseCustomFieldValueRejectsInvalidJSON(t *testing.T) {
-	got, err := DefaultVariableParser{}.ParseCustomFieldValue(Context{}, "exp", "field", "invalid")
+	got, err := defaultCustomFieldValueParser{}.ParseCustomFieldValue(Context{}, "exp", "field", "invalid")
 	if err == nil {
 		t.Fatal("expected an error for invalid JSON")
 	}
-	if got != nil {
-		t.Errorf("got %#v, want nil", got)
+	// v1.1.1 returned a nil map[string]interface{} for invalid JSON.
+	if !reflect.DeepEqual(map[string]interface{}(nil), got) {
+		t.Errorf("got %#v, want a nil map", got)
 	}
 }
 
@@ -58,8 +58,9 @@ func TestDefaultVariableParserParseStillRequiresObjectForVariantConfig(t *testin
 	if got := (DefaultVariableParser{}).Parse(ctx, "exp", "B", `["red"]`); got != nil {
 		t.Errorf("non-object variant config: got %#v, want nil", got)
 	}
-	if len(logger.GetEvents()) != 1 || logger.GetEvents()[0].EventType != Error {
-		t.Errorf("expected one Error event for a non-object variant config, got %#v", logger.GetEvents())
+	// v1.1.1 logged nothing for a non-object variant config.
+	if len(logger.GetEvents()) != 0 {
+		t.Errorf("expected no events for a non-object variant config, got %#v", logger.GetEvents())
 	}
 }
 
@@ -139,7 +140,7 @@ func TestGetCustomFieldValueParsesNonObjectJSONValues(t *testing.T) {
 		{"json_number", "json", 123.0},
 		{"json_string", "json", "hello"},
 		{"json_boolean", "json", true},
-		{"json_null", "json", nil},
+		{"json_null", "json", map[string]interface{}(nil)},
 	}
 	for _, tc := range cases {
 		got := ctx.GetCustomFieldValue("exp_test_abc", tc.field)
@@ -158,47 +159,37 @@ func TestGetCustomFieldValueParsesNonObjectJSONValues(t *testing.T) {
 	assertAny(map[string][]string{"button.color": {"exp_test_abc"}}, keys, t)
 }
 
-func TestGetCustomFieldValueLogsInvalidJSONOnRead(t *testing.T) {
+// v1.1.1 returned a nil map for an invalid "json" custom field and logged no
+// event, either when the data was installed or when the field was read.
+func TestGetCustomFieldValueInvalidJSONIsANilMapWithoutEvents(t *testing.T) {
 	var logger = &MockEventLogger{}
 	var ctx = createJSONCustomFieldContext(t, DefaultVariableParser{}, logger)
 
+	var got = ctx.GetCustomFieldValue("exp_test_abc", "json_invalid")
+	if !reflect.DeepEqual(map[string]interface{}(nil), got) {
+		t.Errorf("GetCustomFieldValue(json_invalid) = %#v, want a nil map", got)
+	}
 	if errs := errorEvents(logger); len(errs) != 0 {
-		t.Fatalf("context creation logged %d error events, want 0: %#v", len(errs), errs)
-	}
-
-	if got := ctx.GetCustomFieldValue("exp_test_abc", "json_invalid"); got != nil {
-		t.Errorf("GetCustomFieldValue(json_invalid) = %#v, want nil", got)
-	}
-
-	var errs = errorEvents(logger)
-	if len(errs) != 1 {
-		t.Fatalf("got %d error events, want 1: %#v", len(errs), errs)
-	}
-	err, ok := errs[0].Data.(error)
-	if !ok {
-		t.Fatalf("error event data is %T, want error", errs[0].Data)
-	}
-	if !strings.Contains(err.Error(), "json_invalid") || !strings.Contains(err.Error(), "exp_test_abc") {
-		t.Errorf("error message %q does not name the field and experiment", err.Error())
+		t.Errorf("got %d error events, want 0: %#v", len(errs), errs)
 	}
 }
 
-func TestGetCustomFieldValueClearsParseErrorWhenDataChanges(t *testing.T) {
-	var logger = &MockEventLogger{}
-	var ctx = createJSONCustomFieldContext(t, DefaultVariableParser{}, logger)
+// A parser that embeds DefaultVariableParser and overrides Parse kept
+// receiving "json" custom fields in v1.1.1; it must not inherit the default
+// JSON custom field parsing instead.
+type embeddingVariableParser struct {
+	DefaultVariableParser
+}
 
-	var fixed = jsonCustomFieldContextData()
-	for i := range fixed.Experiments[0].CustomFieldValues {
-		if fixed.Experiments[0].CustomFieldValues[i].Name == "json_invalid" {
-			fixed.Experiments[0].CustomFieldValues[i].Value = `{"fixed":true}`
-		}
-	}
-	ctx.SetData(fixed)
+func (embeddingVariableParser) Parse(context Context, experimentName string, variantName string, config string) map[string]interface{} {
+	return map[string]interface{}{"own": config}
+}
 
-	assertAny(map[string]interface{}{"fixed": true}, ctx.GetCustomFieldValue("exp_test_abc", "json_invalid"), t)
-	if errs := errorEvents(logger); len(errs) != 0 {
-		t.Errorf("got %d error events after the field was fixed, want 0: %#v", len(errs), errs)
-	}
+func TestGetCustomFieldValueEmbeddingParserKeepsItsOwnParse(t *testing.T) {
+	var ctx = createJSONCustomFieldContext(t, embeddingVariableParser{}, &MockEventLogger{})
+
+	assertAny(map[string]interface{}{"own": `["hello", "world"]`},
+		ctx.GetCustomFieldValue("exp_test_abc", "json_array"), t)
 }
 
 // legacyVariableParser implements only VariableParser, as custom parsers
@@ -247,12 +238,7 @@ func TestGetCustomFieldValueUsesCustomFieldValueParser(t *testing.T) {
 
 	assertAny("custom:true", ctx.GetCustomFieldValue("exp_test_abc", "json_boolean"), t)
 	assertAny(nil, ctx.GetCustomFieldValue("exp_test_abc", "json_number"), t)
-
-	var errs = errorEvents(logger)
-	if len(errs) != 1 {
-		t.Fatalf("got %d error events, want 1: %#v", len(errs), errs)
-	}
-	if err, ok := errs[0].Data.(error); !ok || !strings.Contains(err.Error(), "custom failure") {
-		t.Errorf("error event data = %#v, want error containing %q", errs[0].Data, "custom failure")
+	if errs := errorEvents(logger); len(errs) != 0 {
+		t.Errorf("got %d error events, want 0: %#v", len(errs), errs)
 	}
 }

@@ -180,23 +180,24 @@ func TestSwitchback_PayloadWithoutSwitchbacksCostsNothing(t *testing.T) {
 	}
 	h.ctx.ContextLock_.RLock()
 	defer h.ctx.ContextLock_.RUnlock()
-	if h.ctx.switchbackEpochs_ != nil || h.ctx.switchbackGeneration_ != 0 {
+	if h.ctx.state().switchbackEpochs_ != nil || h.ctx.state().switchbackGeneration_ != 0 {
 		t.Fatal("switchback state created without switchbacks")
 	}
-	for name, indexed := range h.ctx.index_.Load().experiments {
+	for name, indexed := range h.ctx.state().loadIndex().experiments {
 		if indexed.switchback != nil {
 			t.Fatalf("%s has a switchback definition", name)
 		}
 	}
-	for key, entry := range h.ctx.assignmentCache_ {
+	for key, entry := range h.ctx.state().assignmentCache_ {
 		if entry.switchback != nil || key != entry.assignment.Name {
 			t.Fatalf("%s: switchback slot", key)
 		}
 	}
 }
 
-// The cached read of a unit experiment allocates as before switchbacks:
-// the clock reading is only taken, and only kept, for a switchback.
+// The cached read of a unit experiment allocates as before switchbacks,
+// that is not at all: the clock reading is only taken, and only kept, for a
+// switchback.
 func TestSwitchback_CachedUnitReadsDoNotAllocateMore(t *testing.T) {
 	var data = hoData(nil, hoWithVariables(hoExperiment(1, "exp", hoUnitType, 0), "color"))
 	var h = hoCreateFor(t, hoUID, data)
@@ -207,19 +208,22 @@ func TestSwitchback_CachedUnitReadsDoNotAllocateMore(t *testing.T) {
 		"GetVariableValue": func() { _, _ = h.ctx.GetVariableValue("color", 1) },
 	}
 	for name, read := range reads {
-		if n := hoLeastAllocs(read); n > 2 {
+		if n := hoLeastAllocs(read); n != 0 {
 			t.Errorf("%s: %.0f allocations", name, n)
 		}
 	}
 }
 
-// A cached switchback read takes the read lock only and does not allocate
-// more than a unit read.
+// A cached switchback read takes the read lock only and makes one
+// allocation, for its period's slot key.
 func TestSwitchback_CachedSwitchbackReadsDoNotAllocateMore(t *testing.T) {
 	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
 	h.at(sbAnchor + 5).treatment("exp_sb")
-	if n := hoLeastAllocs(func() { _, _ = h.ctx.GetTreatment("exp_sb") }); n > 3 {
+	if n := hoLeastAllocs(func() { _, _ = h.ctx.GetTreatment("exp_sb") }); n > 1 {
 		t.Errorf("GetTreatment: %.0f allocations", n)
+	}
+	if n := hoLeastAllocs(func() { _, _ = h.ctx.GetVariableValue("sb.arm", 0) }); n > 1 {
+		t.Errorf("GetVariableValue: %.0f allocations", n)
 	}
 }
 

@@ -98,7 +98,7 @@ func crResolve(t *testing.T, attributes map[string]interface{}, experiments []js
 	}
 	var assignment = entry.assignment
 	return &crAssigned{unit: assignment.UnitType, eligible: assignment.Eligible, silent: entry.switchback.silent,
-		variant: variant, fullOn: assignment.FullOn, ruleOverride: assignment.RuleOverride, config: config, exposures: exposures}
+		variant: variant, fullOn: assignment.FullOn, ruleOverride: entry.ruleOverride, config: config, exposures: exposures}
 }
 
 func crSbc(t *testing.T, experiment jsonmodels.Experiment, attributes map[string]interface{}, units map[string]string) *crAssigned {

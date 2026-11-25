@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 
 	"github.com/absmartly/go-sdk/sdk/future"
@@ -655,7 +654,7 @@ func TestSwitchback_UnitExperimentsAreUnaffected(t *testing.T) {
 	h.expectPending(2)
 	h.ctx.ContextLock_.RLock()
 	defer h.ctx.ContextLock_.RUnlock()
-	if h.ctx.switchbackEpochs_ != nil {
+	if h.ctx.state().switchbackEpochs_ != nil {
 		t.Fatal("unit experiments created switchback state")
 	}
 }
@@ -767,7 +766,7 @@ func TestSwitchback_HoldoutsNeverApply(t *testing.T) {
 		sbExposure(1, "exp_sb", sbExpected2Arms[2], sbAnchor+2*sbHour, true, true))
 	h.ctx.ContextLock_.RLock()
 	defer h.ctx.ContextLock_.RUnlock()
-	if h.ctx.holdoutArms_ != nil {
+	if h.ctx.state().holdoutArms_ != nil {
 		t.Fatal("a holdout arm was drawn for a switchback")
 	}
 }
@@ -921,11 +920,8 @@ func TestSwitchback_AudienceStrictMismatchWithAMissingOrUnreadableClusterMapReco
 }
 
 // A strict-mismatched switchback is not assigned, so on a shared variable
-// key it gives way to the next experiment, as a unit experiment does.
-// GetVariableValue exposes every experiment it visits (the JS rule this SDK
-// follows for unit experiments; the Java SDK exposes only the winner), so
-// the switchback's strict mismatch is recorded too, exactly as GetTreatment
-// records it.
+// key it gives way to the next experiment, as a unit experiment does. Only
+// that experiment is exposed, as in the Java SDK.
 func TestSwitchback_StrictMismatchedSwitchbackGivesWayOnASharedVariableKey(t *testing.T) {
 	var sb = sbDefault(2, sbHour)
 	sb.Audience, sb.AudienceStrict = sbStrictGoldAudience, true
@@ -940,14 +936,12 @@ func TestSwitchback_StrictMismatchedSwitchbackGivesWayOnASharedVariableKey(t *te
 	expectValue(t, 11, h.peekVariable("sb.arm"))
 	h.expectPending(0)
 	expectValue(t, 11, h.variable("sb.arm"))
-	h.expectPublished(sbStrictMismatchExposure(sbAnchor+sbHour+3),
-		jsonmodels.Exposure{Id: 2, Name: "exp_unit", Unit: sbUnitType, Variant: 1, ExposedAt: sbAnchor + sbHour + 3,
-			Assigned: true, Eligible: true, FullOn: true})
+	h.expectPublished(jsonmodels.Exposure{Id: 2, Name: "exp_unit", Unit: sbUnitType, Variant: 1, ExposedAt: sbAnchor + sbHour + 3,
+		Assigned: true, Eligible: true, FullOn: true})
 }
 
-// Alone on the key, a strict-mismatched switchback gives the default value;
-// GetVariableValue records the mismatch it visited, as for a unit
-// experiment.
+// Alone on the key, a strict-mismatched switchback gives the default value
+// and records nothing, as in the Java SDK.
 func TestSwitchback_StrictMismatchedSwitchbackAloneOnAVariableKeyReturnsTheDefault(t *testing.T) {
 	var sb = sbDefault(2, sbHour)
 	sb.Audience, sb.AudienceStrict = sbStrictGoldAudience, true
@@ -955,7 +949,7 @@ func TestSwitchback_StrictMismatchedSwitchbackAloneOnAVariableKeyReturnsTheDefau
 	expectValue(t, -1, h.peekVariable("sb.arm"))
 	h.expectPending(0)
 	expectValue(t, -1, h.variable("sb.arm"))
-	h.expectPublished(sbStrictMismatchExposure(sbAnchor + sbHour + 3))
+	h.expectPending(0)
 }
 
 // The SWITCHBACK.md "Exposure flags" table: every branch an eligible-cluster
@@ -1048,8 +1042,8 @@ func TestSwitchback_PerPeriodCacheIsBounded(t *testing.T) {
 		h.at(sbAnchor + i*sbHour).treatment("exp_sb")
 	}
 	h.ctx.ContextLock_.RLock()
-	expectInt(t, 2, len(h.ctx.assignmentCache_))
-	expectValue(t, []int64{48, 49}, h.ctx.switchbackEpochs_["exp_sb"].periods)
+	expectInt(t, 2, len(h.ctx.state().assignmentCache_))
+	expectValue(t, []int64{48, 49}, h.ctx.state().switchbackEpochs_["exp_sb"].periods)
 	h.ctx.ContextLock_.RUnlock()
 	h.expectPending(50)
 }
@@ -1220,8 +1214,8 @@ func TestSwitchback_GridRefreshToALowerIndexExposesOnce(t *testing.T) {
 	h.expectPending(3)
 	h.ctx.ContextLock_.RLock()
 	defer h.ctx.ContextLock_.RUnlock()
-	expectInt(t, 1, len(h.ctx.assignmentCache_))
-	expectValue(t, []int64{0}, h.ctx.switchbackEpochs_["exp_sb"].periods)
+	expectInt(t, 1, len(h.ctx.state().assignmentCache_))
+	expectValue(t, []int64{0}, h.ctx.state().switchbackEpochs_["exp_sb"].periods)
 }
 
 func TestSwitchback_PeriodLengthRefreshToALowerIndexExposesOnce(t *testing.T) {
@@ -1374,7 +1368,7 @@ func TestSwitchback_RulesAreNotReevaluatedForAnIneligibleOrAbsentSlot(t *testing
 	var h = sbCreateAt(t, sbAnchor+10, map[string]string{sbUnitType: sbUID}, sbData(ineligible, absent))
 	expectInt(t, 0, h.treatment("exp_ineligible"))
 	expectInt(t, 0, h.treatment("exp_absent"))
-	var before = h.ctx.GetAssignment("exp_ineligible")
+	var before = h.ctx.getAssignment("exp_ineligible")
 
 	h.setAttribute("x", 1)
 	var changed = `{"rules":[{"type":"assign","environments":[],"variant":1,"name":"changed"}]}`
@@ -1382,7 +1376,7 @@ func TestSwitchback_RulesAreNotReevaluatedForAnIneligibleOrAbsentSlot(t *testing
 	h.refresh(ineligible, absent)
 	expectInt(t, 0, h.treatment("exp_ineligible"))
 	expectInt(t, 0, h.treatment("exp_absent"))
-	if h.ctx.GetAssignment("exp_ineligible") != before {
+	if h.ctx.getAssignment("exp_ineligible") != before {
 		t.Fatal("the ineligible slot was resolved again")
 	}
 	h.expectPending(0)
@@ -1458,7 +1452,7 @@ func TestSwitchback_ConcurrentResolutionOfTheSamePeriodExposesOnce(t *testing.T)
 		}
 
 		var variants [3]int
-		var stop atomic.Bool
+		var stop atomicBool
 		var wg sync.WaitGroup
 		for i := 0; i < 3; i++ {
 			wg.Add(1)
@@ -1546,10 +1540,10 @@ func TestSwitchback_SplitRuleRevalidatesAgainstTheServingUnit(t *testing.T) {
 	for u := 0; u < 16; u++ {
 		var h = sbCreateAt(t, sbAnchor+5, map[string]string{sbUnitType: "store-" + strconv.Itoa(u), "user_id": "fixed-user"}, sbData(experiment))
 		h.peek("exp_sb")
-		var first = h.ctx.GetAssignment("exp_sb")
+		var first = h.ctx.getAssignment("exp_sb")
 		h.setAttribute("unrelated", u)
 		h.peek("exp_sb")
-		if h.ctx.GetAssignment("exp_sb") != first {
+		if h.ctx.getAssignment("exp_sb") != first {
 			t.Fatalf("store-%d: the slot was resolved again", u)
 		}
 	}
@@ -2070,7 +2064,7 @@ func TestSwitchback_ReadClaimingBeforeTheSetUnitEvictionKeepsItsClaim(t *testing
 	}
 	h.expectPending(1)
 	h.ctx.ContextLock_.RLock()
-	var cached = h.ctx.cachedEntryFor(entry.assignment)
+	var cached = h.ctx.state().cachedEntryFor(entry.assignment)
 	h.ctx.ContextLock_.RUnlock()
 	if cached != entry {
 		t.Fatal("the claimed slot was evicted")
@@ -2250,7 +2244,7 @@ func TestSwitchback_SwitchbackContextRebuildsAnUnexposedOverride(t *testing.T) {
 
 type sbCountingClock struct {
 	now   int64
-	reads atomic.Int32
+	reads atomicInt32
 }
 
 func (c *sbCountingClock) Millis() int64 {
@@ -2346,12 +2340,12 @@ func TestSwitchback_OverrideIgnoresAUnitTypeOnlyRefresh(t *testing.T) {
 	var h = sbCreate(t, sbData(sbDefault(2, sbHour)), sbOverride("exp_sb", 1))
 	h.at(sbAnchor + 5)
 	expectInt(t, 1, h.peek("exp_sb"))
-	var held = h.ctx.GetAssignment("exp_sb")
+	var held = h.ctx.getAssignment("exp_sb")
 	var edited = sbDefault(2, sbHour)
 	edited.UnitType = "anything"
 	h.refresh(edited)
 	expectValue(t, 1, h.variable("sb.arm"))
-	if h.ctx.GetAssignment("exp_sb") != held {
+	if h.ctx.getAssignment("exp_sb") != held {
 		t.Fatal("the override slot was rebuilt")
 	}
 	h.expectPublished(jsonmodels.Exposure{Id: 1, Name: "exp_sb", Unit: sbUnitType, Variant: 1, ExposedAt: sbAnchor + 5,
@@ -2512,10 +2506,9 @@ func TestSwitchback_ClockPanicReleasesTheReadLock(t *testing.T) {
 		_, _ = ctx.GetTreatment("exp_sb")
 	}()
 	clock.panics = false
-	if !ctx.ContextLock_.TryLock() {
+	if !lockFree(ctx.ContextLock_) {
 		t.Fatal("the context lock was left held")
 	}
-	ctx.ContextLock_.Unlock()
 	if err := ctx.SetUnit("other", "x"); err != nil {
 		t.Fatal(err)
 	}

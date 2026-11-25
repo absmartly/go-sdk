@@ -319,8 +319,8 @@ func TestSwitchbackCluster_RepeatedAttributeNamesResolveToTheLatest(t *testing.T
 func TestSwitchbackCluster_SystemAttributesAreNotVisibleToClusterPaths(t *testing.T) {
 	var experiment = sbAttributeSwitchback("environment")
 	var h = sbCreateBare(t, map[string]string{sbUnitType: sbUID}, sbData(experiment))
-	h.ctx.environment_ = "production"
-	h.ctx.application_ = "website"
+	h.ctx.state().environment_ = "production"
+	h.ctx.state().application_ = "website"
 	expectInt(t, 0, h.at(sbAnchor+10).treatment("exp_sb"))
 	h.expectPending(0)
 }
@@ -536,10 +536,10 @@ func TestSwitchbackCluster_IneligibleSlotNeverEvaluatesTheAudience(t *testing.T)
 	h.at(sbAnchor + 10)
 	for _, name := range []string{"exp_ineligible", "exp_absent"} {
 		expectInt(t, 0, h.treatment(name))
-		var first = h.ctx.GetAssignment(name)
+		var first = h.ctx.getAssignment(name)
 		h.setAttribute("tier", "gold")
 		expectInt(t, 0, h.treatment(name))
-		if h.ctx.GetAssignment(name) != first {
+		if h.ctx.getAssignment(name) != first {
 			t.Fatalf("%s was resolved again", name)
 		}
 	}
@@ -858,10 +858,9 @@ func TestSwitchbackCluster_MarshalerPanicReleasesTheContext(t *testing.T) {
 		}()
 		_, _ = h.ctx.GetTreatment("exp_sb")
 	}()
-	if !h.ctx.ContextLock_.TryLock() {
+	if !lockFree(h.ctx.ContextLock_) {
 		t.Fatal("the context lock was left held")
 	}
-	h.ctx.ContextLock_.Unlock()
 	h.setAttribute("city", "Lisboa")
 	expectInt(t, sbDraw("Lisboa", 0, sbClusterArms), h.at(sbAnchor+5).treatment("exp_sb"))
 }

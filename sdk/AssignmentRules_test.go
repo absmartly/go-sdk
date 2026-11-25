@@ -398,7 +398,7 @@ func TestRules_SplitWithoutUnitGivesNoUnitResultThenReResolves(t *testing.T) {
 	var variant, err = ctx.PeekTreatment("exp")
 	assertAny(nil, err, t)
 	assertAny(0, variant, t)
-	assertAny(true, ctx.GetAssignment("exp").RuleOverride, t)
+	assertAny(true, ctx.getAssignment("exp").ruleOverride, t)
 
 	assertAny(nil, ctx.SetUnit("session_id", ruleUnit), t)
 	assertAny(2, treatment(t, ctx, "exp"), t)
@@ -418,9 +418,9 @@ func TestRules_AssignRuleKeepsCachedAssignmentWhenUnitIsSetLater(t *testing.T) {
 	var ctx, _ = newRuleContext(t, "production", map[string]string{},
 		ruleExperiment("exp", rulesJSON(`{"type":"assign","variant":2}`)))
 
-	var before = ctx.GetAssignment("exp")
+	var before = ctx.getAssignment("exp").assignment
 	assertAny(nil, ctx.SetUnit("session_id", ruleUnit), t)
-	if ctx.GetAssignment("exp") != before {
+	if ctx.getAssignment("exp").assignment != before {
 		t.Error("setting the unit rebuilt an assign-rule assignment")
 	}
 }
@@ -545,6 +545,9 @@ func (panickingAudienceDeserializer) Deserialize([]byte, int, int) (map[string]i
 	panic("boom")
 }
 
+// Unparseable rules only drop that experiment's rules, without an error
+// event. Rules never reach the configured AudienceDeserializer, so one that
+// panics does not drop them.
 func TestRules_ParsingFailureOnlyDropsThatExperimentsRules(t *testing.T) {
 	var logger = &recordingLogger{}
 	var client = &systemAttrClient{application: "website", environment: "production"}
@@ -559,16 +562,93 @@ func TestRules_ParsingFailureOnlyDropsThatExperimentsRules(t *testing.T) {
 	config.Units_ = withUnit()
 	config.PublishDelay_ = -1
 	config.RefreshInterval_ = -1
-	var ctx = abs.CreateContextWith(config, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{
-		ruleExperiment("exp", rulesJSON(`{"type":"assign","variant":2}`)),
-	}})
+	var bad, good = ruleExperiment("bad", `{"rules":[`), ruleExperiment("good", rulesJSON(`{"type":"assign","variant":2}`))
+	bad.Id, good.Id = 1, 2
+	var ctx = abs.CreateContextWith(config, jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{bad, good}})
 	ctx.WaitUntilReady()
 
 	assertAny(false, ctx.IsFailed(), t)
-	assertAny(0, treatment(t, ctx, "exp"), t)
+	assertAny(0, treatment(t, ctx, "bad"), t)
+	assertAny(2, treatment(t, ctx, "good"), t)
 	// Malformed rules only drop that experiment's rules; like the JS SDK, they
 	// are not reported to the customer's logger as an error.
 	assertAny(0, len(logger.errors()), t)
+}
+
+// ruleCorruptingDeserializer returns one reused map, and for any document
+// with "rules" a different rule list, as a custom deserializer may.
+type ruleCorruptingDeserializer struct {
+	mu      sync.Mutex
+	calls   int
+	scratch map[string]interface{}
+}
+
+func (d *ruleCorruptingDeserializer) Deserialize(data []byte, offset int, length int) (map[string]interface{}, error) {
+	var decoded, err = DefaultAudienceDeserializer{}.Deserialize(data, offset, length)
+	if err != nil {
+		return nil, err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.calls++
+	if d.scratch == nil {
+		d.scratch = map[string]interface{}{}
+	}
+	for key := range d.scratch {
+		delete(d.scratch, key)
+	}
+	for key, value := range decoded {
+		d.scratch[key] = value
+	}
+	if _, ok := decoded["rules"]; ok {
+		d.scratch["rules"] = []interface{}{map[string]interface{}{"type": "assign", "variant": 1.0}}
+	}
+	return d.scratch, nil
+}
+
+func (d *ruleCorruptingDeserializer) callCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.calls
+}
+
+// Assignment rules are decoded as standard JSON: a custom AudienceDeserializer
+// that rewrites rule documents or reuses its result map neither changes rule
+// evaluation nor is called for rules, including from concurrent SetData.
+func TestRules_DecodedIndependentlyOfCustomAudienceDeserializer(t *testing.T) {
+	var d = &ruleCorruptingDeserializer{}
+	var client = &systemAttrClient{application: "website", environment: "production"}
+	var abs = Create(ABsmartlyConfig{
+		Client_:               client,
+		ContextDataProvider_:  DefaultContextDataProvider{client_: client},
+		ContextEventHandler_:  DefaultContextEventHandler{client_: client},
+		AudienceDeserializer_: d,
+	})
+	var config = CreateDefaultContextConfig()
+	config.Units_ = withUnit()
+	config.PublishDelay_ = -1
+	config.RefreshInterval_ = -1
+	var experiment = ruleExperiment("exp", rulesJSON(`{"type":"assign","variant":2}`))
+	var data = jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{experiment}}
+	var ctx = abs.CreateContextWith(config, data)
+	ctx.WaitUntilReady()
+	assertAny(0, d.callCount(), t)
+	assertAny(2, treatment(t, ctx, "exp"), t)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			var changed = experiment
+			changed.AssignmentRules = rulesJSON(fmt.Sprintf(`{"type":"assign","variant":2,"n":%d}`, i))
+			ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{changed}})
+		}(i)
+	}
+	wg.Wait()
+	assertAny(0, d.callCount(), t)
+	assertAny(2, treatment(t, ctx, "exp"), t)
+	assertAny(0, d.callCount(), t)
 }
 
 func TestRules_NonStringAssignmentRulesOnlySkipsThatExperiment(t *testing.T) {
@@ -613,17 +693,7 @@ func TestRules_NonStringAssignmentRulesInPayloadKeepsOtherExperimentsRules(t *te
 	assertAny(0, len(logger.errors()), t)
 }
 
-type numberAudienceDeserializer struct{}
-
-func (numberAudienceDeserializer) Deserialize(data []byte, _ int, _ int) (map[string]interface{}, error) {
-	var decoder = json.NewDecoder(strings.NewReader(string(data)))
-	decoder.UseNumber()
-	var out map[string]interface{}
-	return out, decoder.Decode(&out)
-}
-
-func TestRules_JSONNumberVariantFromCustomDeserializer(t *testing.T) {
-	var matcher = AudienceMatcher{Deserializer_: numberAudienceDeserializer{}}
+func TestRules_IntegralVariantForms(t *testing.T) {
 	for rules, want := range map[string]string{
 		rulesJSON(`{"type":"assign","variant":2}`):                                    "&{2 []}",
 		rulesJSON(`{"type":"assign","variant":2.0}`):                                  "&{2 []}",
@@ -632,9 +702,7 @@ func TestRules_JSONNumberVariantFromCustomDeserializer(t *testing.T) {
 		// the out-of-range -1 the caller falls back on.
 		rulesJSON(`{"type":"assign","variant":1e20}`, `{"type":"assign","variant":0}`): "&{-1 []}",
 	} {
-		var parsed, err = matcher.parseRules(rules)
-		assertAny(nil, err, t)
-		if got := fmt.Sprint(matcher.evaluateRules(parsed, "", nil)); got != want {
+		if got := fmt.Sprint(evaluate(t, rules, "", nil)); got != want {
 			t.Errorf("%s: got %s, want %s", rules, got, want)
 		}
 	}
@@ -692,22 +760,20 @@ func TestRules_PublishedExposureCarriesRuleOverride(t *testing.T) {
 }
 
 func TestRules_ParseRules(t *testing.T) {
-	var matcher = AudienceMatcher{Deserializer_: DefaultAudienceDeserializer{}}
-
-	var parsed, err = matcher.parseRules("")
+	var parsed, err = parseRules("")
 	assertAny((*assignmentRules)(nil), parsed, t)
 	assertAny(nil, err, t)
 
-	parsed, err = matcher.parseRules(`{"other":1}`)
+	parsed, err = parseRules(`{"other":1}`)
 	assertAny((*assignmentRules)(nil), parsed, t)
 	assertAny(nil, err, t)
 
-	_, err = matcher.parseRules(`{`)
+	_, err = parseRules(`{`)
 	if err == nil {
 		t.Error("invalid JSON parsed without an error")
 	}
 
-	_, err = matcher.parseRules(`null`)
+	_, err = parseRules(`null`)
 	if err == nil {
 		t.Error("null parsed without an error")
 	}
@@ -716,7 +782,7 @@ func TestRules_ParseRules(t *testing.T) {
 func evaluate(t *testing.T, rules string, environment string, attrs map[string]interface{}) *ruleAction {
 	t.Helper()
 	var matcher = AudienceMatcher{Deserializer_: DefaultAudienceDeserializer{}}
-	var parsed, err = matcher.parseRules(rules)
+	var parsed, err = parseRules(rules)
 	if err != nil {
 		t.Fatalf("parseRules(%s): %v", rules, err)
 	}
@@ -849,7 +915,7 @@ func TestRules_Concurrency(t *testing.T) {
 	assertAny(nil, ctx.SetAttribute("tier", "gold"), t)
 	var variant, _ = ctx.PeekTreatment("exp")
 	assertAny(splitVariant([]float64{0, 0.5, 0.5}, experiment.SeedHi, experiment.SeedLo), variant, t)
-	assertAny(true, ctx.GetAssignment("exp").RuleOverride, t)
+	assertAny(true, ctx.getAssignment("exp").ruleOverride, t)
 
 	assertAny(nil, ctx.SetAttribute("tier", "silver"), t)
 	variant, _ = ctx.PeekTreatment("exp")

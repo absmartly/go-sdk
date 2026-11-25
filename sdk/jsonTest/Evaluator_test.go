@@ -114,6 +114,16 @@ func TestCompareObjects(t *testing.T) {
 	assert(nil, eval.Compare(reflect.ValueOf([]interface{}{1, 2}), reflect.ValueOf([]interface{}{3, 4})), t)
 }
 
+type uncomparable struct{ s []int }
+
+// Values of a struct type that holds a slice cannot be compared with ==;
+// Compare must say whether they are deeply equal, without panicking.
+func TestCompareUncomparableStructs(t *testing.T) {
+	var eval = eval.Evaluator{}
+	assert(nil, eval.Compare(reflect.ValueOf(uncomparable{[]int{1}}), reflect.ValueOf(uncomparable{[]int{2}})), t)
+	assert(0, eval.Compare(reflect.ValueOf(uncomparable{[]int{1}}), reflect.ValueOf(uncomparable{[]int{1}})), t)
+}
+
 func TestCompareNull(t *testing.T) {
 	var eval = eval.Evaluator{}
 	assert(0, eval.Compare(reflect.ValueOf(nil), reflect.ValueOf(nil)), t)
@@ -589,6 +599,18 @@ func TestBooleanConvertEdgeCases(t *testing.T) {
 
 	assert(false, evaluator.BooleanConvert(reflect.ValueOf(0.0)), t)
 	assert(false, evaluator.BooleanConvert(reflect.ValueOf(-0.0)), t)
+}
+
+// Every sized integer and float converts by value, as int and float64 do: a
+// zero is false. v1.1.1 panicked on these kinds.
+func TestBooleanConvertSizedNumbers(t *testing.T) {
+	var evaluator = eval.Evaluator{}
+	for _, zero := range []interface{}{int8(0), int16(0), int32(0), int64(0), uint(0), uint8(0), uint16(0), uint32(0), uint64(0), float32(0)} {
+		assert(false, evaluator.BooleanConvert(reflect.ValueOf(zero)), t)
+	}
+	for _, one := range []interface{}{int8(1), int16(-1), int32(1), int64(1), uint(1), uint8(1), uint16(1), uint32(1), uint64(1), float32(0.5)} {
+		assert(true, evaluator.BooleanConvert(reflect.ValueOf(one)), t)
+	}
 }
 
 func TestExtractVarDeepNesting(t *testing.T) {

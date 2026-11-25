@@ -103,17 +103,32 @@ func TestCustomFieldValueEAfterFinalize(t *testing.T) {
 	}
 }
 
-func TestRefreshFailedContextIsNoOp(t *testing.T) {
+// v1.1.1 behaviour: refreshing a context whose initial load failed fetches
+// the data and installs it, logging a Refresh event; the context still
+// reports failed.
+func TestRefreshFailedContextInstallsData(t *testing.T) {
 	setUp()
+	var logger = &MockEventLogger{}
 	var client = &CapturingPublishClient{contextData: data}
-	var ctx = createCanonicalContext(t, client, dataFutureReady, nil)
+	var ctx = createCanonicalContext(t, client, dataFutureReady, logger)
+	// No refresh timer, so only the explicit refresh logs a Refresh event.
+	ctx.ClearRefreshTimer()
 	ctx.SetDataFailed(errors.New("initial load failed"))
-	ctx.DataProvider_ = nil
+	logger.Reset()
+
 	assertAny(nil, getWithTimeout(t, ctx.RefreshAsync()), t)
 	assertAny(true, ctx.IsFailed(), t)
 	var experiments, err = ctx.GetExperiments()
 	assertAny(nil, err, t)
-	assertAny(0, len(experiments), t)
+	assertAny(len(data.Experiments), len(experiments), t)
+
+	var refreshes = 0
+	for _, e := range logger.GetEvents() {
+		if e.EventType == Refresh {
+			refreshes++
+		}
+	}
+	assertAny(1, refreshes, t)
 }
 
 func TestTreatmentQueuesExposures(t *testing.T) {
@@ -623,7 +638,7 @@ func TestSetCustomAssignmentBeforeReady(t *testing.T) {
 	assertAny(2, res, t)
 }
 
-func TestSetCustomAssignmentAllowedAfterClose(t *testing.T) {
+func TestSetCustomAssignmentRejectedAfterClose(t *testing.T) {
 	setUp()
 	var config = CreateDefaultContextConfig()
 	config.Units_ = units
@@ -631,11 +646,11 @@ func TestSetCustomAssignmentAllowedAfterClose(t *testing.T) {
 
 	context.Close()
 
-	var err = context.SetCustomAssignment("exp_test", 2)
-	assertAny(nil, err, t)
-	var res, er = context.GetCustomAssignment("exp_test")
-	assertAny(nil, er, t)
-	assertAny(2, res, t)
+	assertAny("ABSmartly Context is closed", context.SetCustomAssignment("exp_test", 2).Error(), t)
+	assertAny("ABSmartly Context is closed", context.SetCustomAssignments(map[string]int{"exp_test": 2}).Error(), t)
+	var _, er = context.GetCustomAssignment("exp_test")
+	assertAny("customAssignment not found", er.Error(), t)
+	assertAny(nil, context.SetOverride("exp_test", 2), t)
 }
 
 func TestRefreshKeepsOverrides(t *testing.T) {
@@ -1538,23 +1553,19 @@ func TestVariableValueExposureIncludesAudienceMatchTrue(t *testing.T) {
 	context.EventLock_.Unlock()
 }
 
+// A unit outside a strict audience is not assigned, so, as in the Java SDK
+// (getVariableValueDoesNotQueuesExposure...InStrictMode), reading the
+// variable returns the default and queues no exposure.
 func TestVariableValueExposureAudienceMismatchStrict(t *testing.T) {
 	setUp()
 	var config = CreateDefaultContextConfig()
 	config.Units_ = units
 	var context = CreateTestContext(config, dataFutureSrict)
 
-	context.GetVariableValue("banner.border", 0)
-
-	context.EventLock_.Lock()
-	if len(context.Exposures_) > 0 {
-		exp := context.Exposures_[0]
-		assertAny(true, exp.AudienceMismatch, t)
-		assertAny(0, exp.Variant, t)
-	} else {
-		t.Error("Expected at least one exposure")
-	}
-	context.EventLock_.Unlock()
+	var res, err = context.GetVariableValue("banner.size", "small")
+	assertAny(nil, err, t)
+	assertAny("small", res, t)
+	assertAny(int32(0), context.GetPendingCount(), t)
 }
 
 func TestVariableValueReturnsDefaultOnUnknownVariable(t *testing.T) {
@@ -1984,11 +1995,12 @@ func TestUnknownExperimentExposureUnitIsNull(t *testing.T) {
 	setUp()
 	var config = CreateDefaultContextConfig()
 	config.Units_ = units
+	config.PublishDelay_ = -1
 	var context = CreateTestContext(config, dataFutureReady)
 
 	_, err := context.GetTreatment("not_found")
 	assertAny(nil, err, t)
-	var out, merr = json.Marshal(context.Exposures_[0])
+	var out, merr = json.Marshal(queuedExposures(context)[0])
 	assertAny(nil, merr, t)
 	var decoded map[string]interface{}
 	_ = json.Unmarshal(out, &decoded)
@@ -2049,7 +2061,7 @@ func TestReadyEventLoggedBeforeWaitUntilReadyReturns(t *testing.T) {
 	}
 }
 
-type orderLogger struct{ count atomic.Int32 }
+type orderLogger struct{ count atomicInt32 }
 
 func (l *orderLogger) HandleEvent(_ Context, event EventType, _ interface{}) {
 	if event == Ready {
@@ -2066,7 +2078,7 @@ func (asyncDataProvider) GetContextData() *future.Future {
 	return f
 }
 
-type refreshOrderLogger struct{ count atomic.Int32 }
+type refreshOrderLogger struct{ count atomicInt32 }
 
 func (l *refreshOrderLogger) HandleEvent(_ Context, event EventType, _ interface{}) {
 	if event == Refresh {
@@ -2093,7 +2105,7 @@ func TestRefreshEventLoggedBeforeRefreshReturns(t *testing.T) {
 type reentrantReadyLogger struct {
 	onEvent  EventType
 	call     func(ctx *Context)
-	returned atomic.Bool
+	returned atomicBool
 }
 
 func (l *reentrantReadyLogger) HandleEvent(ctx Context, event EventType, _ interface{}) {
