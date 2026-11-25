@@ -192,7 +192,8 @@ func (c *Context) entryMatches(indexed *indexedExperiment, entry *cachedAssignme
 			sameSplit(data.TrafficSplit, assignment.TrafficSplit)
 	}
 	return switchbackSlotMatches(indexed, entry) && data.Id == assignment.Id && data.Iteration == assignment.Iteration &&
-		data.FullOnVariant == assignment.FullOnVariant && sameSplit(data.TrafficSplit, assignment.TrafficSplit)
+		data.FullOnVariant == assignment.FullOnVariant && sameSplit(data.TrafficSplit, assignment.TrafficSplit) &&
+		sameSplit(data.Split, entry.resolvedSplit)
 }
 
 // ruleUnitType is the unit a split rule hashes: the experiment's unitType,
@@ -540,11 +541,9 @@ func (c *Context) assignSwitchbackGenerations(st *contextState, previous *contex
 	}
 }
 
-// sameSwitchbackIdentity compares what maps periods and clusters to
-// variants: the id, the iteration, the ordered cluster map, the allow-list,
-// the start, the period length and the design, plus the unitType when either
-// side takes the legacy path. Seed, split and the analysis-only fields are
-// left out, as they do not invalidate unit assignments either.
+// the start, the period length, the design and the arm grid, plus the
+// unitType when either side takes the legacy path. Analysis-only fields are
+// left out because they do not invalidate unit assignments.
 func sameSwitchbackIdentity(previous *indexedExperiment, installed *indexedExperiment) bool {
 	if previous == nil || previous.switchback == nil {
 		return false
@@ -556,6 +555,7 @@ func sameSwitchbackIdentity(previous *indexedExperiment, installed *indexedExper
 		equalInt64Pointers(a.SwitchbackStartAt, b.SwitchbackStartAt) &&
 		equalInt64Pointers(a.SwitchbackPeriodMs, b.SwitchbackPeriodMs) &&
 		a.SwitchbackDesignType == b.SwitchbackDesignType &&
+		sameSplit(a.Split, b.Split) &&
 		((previous.switchback.sources != nil && installed.switchback.sources != nil) || a.UnitType == b.UnitType)
 }
 

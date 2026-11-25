@@ -640,6 +640,8 @@ type cachedAssignment struct {
 	// them, so an audience edit is otherwise only seen once attributes change.
 	resolvedAudience       string
 	resolvedAudienceStrict bool
+	// resolvedSplit identifies the arm grid used by a switchback slot.
+	resolvedSplit []float64
 	// failed is assignment-local: revalidation keeps the original fallback,
 	// but another experiment (or deserializer) gets its own parse.
 	failed *audienceParse
@@ -3082,6 +3084,9 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string,
 		entry.resolvedUnitType = experiment.Data.UnitType
 		entry.resolvedAudience = experiment.Data.Audience
 		entry.resolvedAudienceStrict = experiment.Data.AudienceStrict
+		if indexed.switchback != nil {
+			entry.resolvedSplit = append([]float64(nil), experiment.Data.Split...)
+		}
 	}
 
 	// Resolved for overrides and rule wins too: the holdouts' exposures fire

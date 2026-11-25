@@ -2519,3 +2519,21 @@ func sbDrawSeeded(seedHi int, seedLo int, period int64) int {
 	var variant, _ = SwitchbackAssign(sbClusterKey, period, int64(switchbackSeed(seedHi, seedLo)), 2)
 	return variant
 }
+
+// A same-period refresh that changes the switchback arm grid invalidates the
+// cached slot and uses the refreshed variant variables and exposure metadata.
+func TestSwitchback_SamePeriodArmGridRefreshRebuildsTheSlot(t *testing.T) {
+	var original = sbDefault(2, sbHour)
+	original.Variants[1].Config = `{"sb.arm":"old"}`
+	var h = sbCreate(t, sbData(original))
+	h.at(sbAnchor + 5)
+	var old = h.peek("exp_sb")
+	var refreshed = sbDefault(3, sbHour)
+	refreshed.Variants[old].Config = `{"sb.arm":"new-grid"}`
+	h.refresh(refreshed)
+	expectValue(t, "new-grid", h.variable("sb.arm"))
+	var exposures = queuedExposures(h.ctx)
+	if len(exposures) != 1 || exposures[0].Variant != old || exposures[0].Id != refreshed.Id {
+		t.Fatalf("exposures %+v, want refreshed grid arm %d", exposures, old)
+	}
+}
