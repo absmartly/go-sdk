@@ -14,15 +14,22 @@ type ContextDataProvider interface {
 // DefaultContextDataProvider and Client give the payload themselves but do
 // not export GetContextPayload, so a type embedding either does not opt in
 // by promotion: one that overrides only GetContextData keeps that override in
-// use, and one that wants the payload declares GetContextPayload.
+// use, and one that wants the payload declares GetContextPayload, which can
+// delegate to the provider or client it wraps with ContextPayloadFuture.
 type ContextPayloadProvider interface {
 	GetContextPayload() *future.Future
 }
 
-// contextPayloadFuture is the future a context loads from provider: the full
-// payload from the default provider and client themselves (a value or
-// pointer, not a type embedding them) and from a provider declaring
-// GetContextPayload, and GetContextData from any other.
+// ContextPayloadFuture is the data future a context loads from provider: the
+// full jsonmodels.ContextPayload from DefaultContextDataProvider and Client
+// themselves (a value or pointer, not a type embedding them) and from a
+// ContextPayloadProvider, and GetContextData from any other. A wrapper's
+// GetContextPayload returns ContextPayloadFuture of the provider or client it
+// wraps to serve holdouts and switchbacks.
+func ContextPayloadFuture(provider ContextDataProvider) *future.Future {
+	return contextPayloadFuture(provider)
+}
+
 func contextPayloadFuture(provider ContextDataProvider) *future.Future {
 	switch p := provider.(type) {
 	case DefaultContextDataProvider:

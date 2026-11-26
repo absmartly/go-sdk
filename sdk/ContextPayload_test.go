@@ -574,3 +574,13 @@ func TestSettledInvalidDataFutureFailsTheContext(t *testing.T) {
 		t.Fatalf("logged %#v", errorsLogged[0])
 	}
 }
+
+// The default deserializer configured by pointer, as v1.2.0 allows, still
+// gives the payload: the context serves its holdouts.
+func TestPointerDefaultDeserializerGivesThePayload(t *testing.T) {
+	var client = CreateClient(ClientConfig{Deserializer_: &DefaultContextDataDeserializer{}, Endpoint_: "https://localhost/v1",
+		ApiKey_: "key"}, cpHTTP{HttpMock{bodyString: cpBody(t)}})
+	var ctx = Create(ABSmartlyConfig{Client_: client}).CreateContext(cpContextConfig())
+	ctx.WaitUntilReady()
+	cpExpectHeldOut(t, ctx)
+}

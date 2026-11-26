@@ -614,7 +614,9 @@ shared with the context and must not be modified.
 keep working with `ContextData`, which has no holdouts or switchbacks. A custom
 `ContextDataDeserializer` or `ContextDataProvider` gives contexts the payload
 by also declaring `DeserializePayload` (`ContextPayloadDeserializer`) or
-`GetContextPayload` (`ContextPayloadProvider`). Embedding
+`GetContextPayload` (`ContextPayloadProvider`); a wrapper's `GetContextPayload`
+can return `sdk.ContextPayloadFuture(wrapped)` to delegate to the provider or
+client it wraps. Embedding
 `DefaultContextDataDeserializer`, `DefaultContextDataProvider` or `Client` does
 not opt in by itself: a type that embeds one and overrides only `Deserialize`
 or `GetContextData` keeps that override in use, as in v1.2.0.
