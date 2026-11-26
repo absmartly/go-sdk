@@ -2115,8 +2115,6 @@ func (c *Context) logExposures(exposures []jsonmodels.Exposure) {
 	}
 }
 
-// wins reports whether the unit is assigned to, overridden in or
-// rule-assigned to the experiment, so it wins a shared variable key.
 func (e *cachedAssignment) wins() bool {
 	return e.assignment.Assigned || e.assignment.Overridden || e.ruleOverride
 }
@@ -3437,8 +3435,6 @@ func (st *contextState) experimentAndRules(experimentName string) (ExperimentVar
 	return ExperimentVariables{}, nil, false
 }
 
-// indexedExperiment returns the installed experiment with its parsed
-// assignment rules and covering holdouts, or nil.
 func (st *contextState) indexedExperiment(experimentName string) *indexedExperiment {
 	var index = st.loadIndex()
 	if index == nil {

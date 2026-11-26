@@ -1780,6 +1780,9 @@ func TestHoldout_WronglyTypedHoldoutTypeIsIgnored(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if len(data.Holdouts) != 1 || data.Holdouts[0].HoldoutType != "" {
+			t.Fatalf("holdoutType %s: decoded %+v, want the field dropped", holdoutType, data.Holdouts)
+		}
 		var h = hoCreateFor(t, hoUID, data)
 		expectInt(t, 0, h.treatment("exp"))
 		h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
@@ -1887,6 +1890,12 @@ func TestHoldout_WronglyTypedUnitTypeOrIterationIsIgnored(t *testing.T) {
 		var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
 		if err != nil {
 			t.Fatal(err)
+		}
+		if len(data.Holdouts) != 1 {
+			t.Fatalf("%s: decoded %+v, want one holdout", fields, data.Holdouts)
+		}
+		if fields != `"unitType":"session_id","iteration":"2"` && data.Holdouts[0].UnitType != "" {
+			t.Fatalf("%s: unitType %q, want the field dropped", fields, data.Holdouts[0].UnitType)
 		}
 		var h = hoCreateFor(t, hoUID, data)
 		expectInt(t, 0, h.treatment("exp"))
@@ -4102,8 +4111,6 @@ func TestHoldout_RestoredKeyDoesNotAuthorizeAnIntermediateIteration(t *testing.T
 						h.ctx.SetData(hoData([]jsonmodels.Holdout{restored}, last))
 					}
 				}
-				// The read resolves again onto the final definition and serves
-				// and exposes that decision, never the intermediate one.
 				expectValue(t, "control", h.variable("v"))
 				afterReadResolve, beforeSettleClaim = nil, nil
 				if armed || claims < 3 {
