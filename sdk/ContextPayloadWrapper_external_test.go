@@ -33,21 +33,7 @@ func (c payloadDecoratingClient) GetContextPayload() *future.Future {
 }
 
 func TestExternalClientWrapperOptsInThroughContextPayloadFuture(t *testing.T) {
-	var payload = jsonmodels.ContextPayload{
-		Experiments: []jsonmodels.ExperimentData{{Experiment: jsonmodels.Experiment{
-			Id: 1, Name: "exp", UnitType: "session_id", Iteration: 1, SeedHi: 100, SeedLo: 200,
-			Split: []float64{0.5, 0.5}, TrafficSeedHi: 1, TrafficSeedLo: 2, TrafficSplit: []float64{0, 1},
-			Applications: []jsonmodels.ExperimentApplication{{Name: "website"}},
-			Variants:     []jsonmodels.ExperimentVariant{{Name: "A"}, {Name: "B"}},
-		}, HoldoutIds: []int{11}}},
-		Holdouts: []jsonmodels.Holdout{{Id: 11, Name: "holdout_a", UnitType: "session_id", Iteration: 1,
-			SeedHi: 0, SeedLo: 0, Split: []float64{1, 0}, HoldoutType: "full"}},
-	}
-	var body, _ = json.Marshal(payload)
-	var server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(body)
-	}))
+	var server = heldOutServer(t)
 	defer server.Close()
 	var client = sdk.CreateDefaultClient(sdk.ClientConfig{Endpoint_: server.URL, ApiKey_: "key",
 		Application_: "website", Environment_: "dev"})
@@ -75,4 +61,57 @@ func TestExternalClientWrapperOptsInThroughContextPayloadFuture(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Wrappers of each default, by value and pointer, delegating through
+// sdk.ContextPayloadFuture, all serve the payload's holdout.
+type payloadWrapper struct {
+	inner sdk.ContextDataProvider
+}
+
+func (w payloadWrapper) GetContextData() *future.Future    { return w.inner.GetContextData() }
+func (w payloadWrapper) GetContextPayload() *future.Future { return sdk.ContextPayloadFuture(w.inner) }
+
+func TestContextPayloadFutureDelegatesForEveryDefault(t *testing.T) {
+	var server = heldOutServer(t)
+	defer server.Close()
+	var client = sdk.CreateDefaultClient(sdk.ClientConfig{Endpoint_: server.URL, ApiKey_: "key",
+		Application_: "website", Environment_: "dev"})
+	var provider = sdk.CreateDefaultContextDataProvider(client)
+	for name, inner := range map[string]sdk.ContextDataProvider{
+		"client": client, "client pointer": &client, "provider": provider, "provider pointer": &provider,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var config = sdk.CreateDefaultContextConfig()
+			config.Units_["session_id"] = "uid"
+			config.PublishDelay_, config.RefreshInterval_ = -1, -1
+			var ctx = sdk.Create(sdk.ABSmartlyConfig{Client_: client, ContextDataProvider_: payloadWrapper{inner}}).CreateContext(config)
+			ctx.WaitUntilReady()
+			var got, _ = ctx.GetPayload()
+			if ctx.IsFailed() || len(got.Holdouts) != 1 {
+				t.Fatalf("failed %v, installed %d holdouts; want 1", ctx.IsFailed(), len(got.Holdouts))
+			}
+		})
+	}
+}
+
+// heldOutServer serves a payload whose holdout holds every unit out of "exp".
+func heldOutServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	var payload = jsonmodels.ContextPayload{
+		Experiments: []jsonmodels.ExperimentData{{Experiment: jsonmodels.Experiment{
+			Id: 1, Name: "exp", UnitType: "session_id", Iteration: 1, SeedHi: 100, SeedLo: 200,
+			Split: []float64{0.5, 0.5}, TrafficSeedHi: 1, TrafficSeedLo: 2, TrafficSplit: []float64{0, 1},
+			Applications: []jsonmodels.ExperimentApplication{{Name: "website"}},
+			Variants:     []jsonmodels.ExperimentVariant{{Name: "A"}, {Name: "B"}},
+		}, HoldoutIds: []int{11}}},
+		Holdouts: []jsonmodels.Holdout{{Id: 11, Name: "holdout_a", UnitType: "session_id", Iteration: 1,
+			SeedHi: 0, SeedLo: 0, Split: []float64{1, 0}, HoldoutType: "full"}},
+	}
+	var body, _ = json.Marshal(payload)
+	var server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	return server
 }

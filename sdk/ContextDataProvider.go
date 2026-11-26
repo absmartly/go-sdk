@@ -25,7 +25,8 @@ type ContextPayloadProvider interface {
 // themselves (a value or pointer, not a type embedding them) and from a
 // ContextPayloadProvider, and GetContextData from any other. A wrapper's
 // GetContextPayload returns ContextPayloadFuture of the provider or client it
-// wraps to serve holdouts and switchbacks.
+// wraps to serve holdouts and switchbacks; it must pass the wrapped value,
+// never itself, or the call recurses without end.
 func ContextPayloadFuture(provider ContextDataProvider) *future.Future {
 	return contextPayloadFuture(provider)
 }
