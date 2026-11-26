@@ -17,13 +17,16 @@ type DefaultContextDataDeserializer struct {
 }
 
 func (d DefaultContextDataDeserializer) Deserialize(bytes []byte) (jsonmodels.ContextData, error) {
-	var payload, err = d.DeserializePayload(bytes)
+	var payload, err = DeserializeContextPayload(bytes)
 	return payload.ContextData(), err
 }
 
-// DeserializePayload decodes the full context payload, with holdouts and each
-// experiment's holdout and switchback fields (see ContextPayloadDeserializer).
-func (d DefaultContextDataDeserializer) DeserializePayload(bytes []byte) (jsonmodels.ContextPayload, error) {
+// DeserializeContextPayload decodes the full context payload as
+// DefaultContextDataDeserializer does, with holdouts and each experiment's
+// holdout and switchback fields. It is a function, not a method of the
+// default deserializer, so a type embedding that deserializer does not become
+// a ContextPayloadDeserializer by promotion (see there).
+func DeserializeContextPayload(bytes []byte) (jsonmodels.ContextPayload, error) {
 	var wire wireContextData
 	if json.Unmarshal(bytes, &wire) == nil {
 		return wire.contextPayload(), nil

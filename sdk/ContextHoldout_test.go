@@ -1079,7 +1079,7 @@ func TestHoldout_MalformedHoldoutEntriesAreIgnored(t *testing.T) {
 		var payload = `{"experiments":[{"id":1,"name":"exp_malformed","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
 			"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"fullOnVariant":0,
 			"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],"holdouts":` + holdouts + `}`
-		var data, err = DefaultContextDataDeserializer{}.DeserializePayload([]byte(payload))
+		var data, err = DeserializeContextPayload([]byte(payload))
 		if err != nil {
 			t.Fatalf("%s: %v", holdouts, err)
 		}
@@ -1397,7 +1397,7 @@ func TestHoldout_DefaultDecoderIgnoresUnknownHoldoutFields(t *testing.T) {
 		],
 		"futureHoldoutRoot":{"nested":[1]}
 	}`
-	var data, err = DefaultContextDataDeserializer{}.DeserializePayload([]byte(payload))
+	var data, err = DeserializeContextPayload([]byte(payload))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1469,7 +1469,7 @@ func hoPublishProbe(t *testing.T, data jsonmodels.ContextPayload) string {
 // this probe at main 54b4e8a.
 func TestHoldout_PublishWithoutHoldoutsIsUnchanged(t *testing.T) {
 	var raw, _ = os.ReadFile("testAssets/context.json")
-	var data, err = DefaultContextDataDeserializer{}.DeserializePayload(raw)
+	var data, err = DeserializeContextPayload(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1558,7 +1558,7 @@ func TestHoldout_MalformedHoldoutEntryDoesNotDropTheOthers(t *testing.T) {
 		"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"fullOnVariant":0,
 		"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
 		"holdouts":[null,5,"x",{"id":"bad"},{"id":11,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":[0.1,0.9]}]}`
-	var data, err = DefaultContextDataDeserializer{}.DeserializePayload([]byte(payload))
+	var data, err = DeserializeContextPayload([]byte(payload))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1711,7 +1711,7 @@ func TestHoldout_IntegralHoldoutIdsInAnyNotation(t *testing.T) {
 		"holdouts":[{"id":11.0,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":[0.1,0.9]},
 		{"id":1.2e1,"name":"holdout_b","iteration":1,"seedHi":1,"seedLo":222,"split":[0.1,0.9]},
 		{"id":"13","name":"holdout_string","iteration":1,"seedHi":13,"seedLo":111,"split":[0.1,0.9]}]}`
-	var data, err = DefaultContextDataDeserializer{}.DeserializePayload([]byte(payload))
+	var data, err = DeserializeContextPayload([]byte(payload))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1771,7 +1771,7 @@ func TestHoldout_WronglyTypedHoldoutTypeIsIgnored(t *testing.T) {
 		var payload = `{"experiments":[{"id":1,"name":"exp","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
 			"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
 			"holdouts":[{"id":11,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":[0.1,0.9],"holdoutType":` + holdoutType + `}]}`
-		var data, err = DefaultContextDataDeserializer{}.DeserializePayload([]byte(payload))
+		var data, err = DeserializeContextPayload([]byte(payload))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1879,7 +1879,7 @@ func TestHoldout_WronglyTypedUnitTypeOrIterationIsIgnored(t *testing.T) {
 		var payload = `{"experiments":[{"id":1,"name":"exp","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
 			"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
 			"holdouts":[{"id":11,"name":"holdout_a",` + fields + `,"seedHi":13,"seedLo":111,"split":[0.1,0.9]}]}`
-		var data, err = DefaultContextDataDeserializer{}.DeserializePayload([]byte(payload))
+		var data, err = DeserializeContextPayload([]byte(payload))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2244,7 +2244,7 @@ func TestHoldout_PopulatedModelRoundTrip(t *testing.T) {
 	}
 	expectValue(t, data.Holdouts, decoded.Holdouts)
 	expectValue(t, data.Experiments[0].HoldoutIds, decoded.Experiments[0].HoldoutIds)
-	var viaSDK, sdkErr = DefaultContextDataDeserializer{}.DeserializePayload(raw)
+	var viaSDK, sdkErr = DeserializeContextPayload(raw)
 	if sdkErr != nil {
 		t.Fatal(sdkErr)
 	}
@@ -2386,7 +2386,7 @@ func TestHoldout_EquivalentJSONNumbersKeepTheEpoch(t *testing.T) {
 			"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
 			"holdouts":[{"id":11,"name":"holdout_a","unitType":"session_id","iteration":` + iteration + `,"seedHi":` + seedHi +
 			`,"seedLo":1.11e2,"split":[0.1,0.9]}]}`
-		var data, err = DefaultContextDataDeserializer{}.DeserializePayload([]byte(raw))
+		var data, err = DeserializeContextPayload([]byte(raw))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2567,7 +2567,7 @@ func TestHoldout_SeedPayloadDecoding(t *testing.T) {
 	} {
 		t.Run(tc.raw, func(t *testing.T) {
 			var payload = `{"holdouts":[{"id":11,"seedHi":` + tc.raw + `,"seedLo":` + tc.raw + `}]}`
-			var data, err = (DefaultContextDataDeserializer{}).DeserializePayload([]byte(payload))
+			var data, err = DeserializeContextPayload([]byte(payload))
 			if err != nil || len(data.Holdouts) != 1 {
 				t.Fatalf("decode: %+v, %v", data, err)
 			}
@@ -2709,7 +2709,7 @@ func TestHoldout_MalformedDuplicateDoesNotCancelAValidHoldout(t *testing.T) {
 			var payload = `{"experiments":[{"id":1,"name":"exp","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
 				"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
 				"holdouts":[` + holdouts + `]}`
-			var data, err = DefaultContextDataDeserializer{}.DeserializePayload([]byte(payload))
+			var data, err = DeserializeContextPayload([]byte(payload))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2799,7 +2799,7 @@ func TestHoldout_ClaimReplacedBeforeCommitStillPublishes(t *testing.T) {
 func TestHoldout_NullSplitAndNullElementsAreKept(t *testing.T) {
 	var decode = func(split string) []jsonmodels.Holdout {
 		var payload = `{"holdouts":[{"id":11,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":` + split + `}]}`
-		var data, err = DefaultContextDataDeserializer{}.DeserializePayload([]byte(payload))
+		var data, err = DeserializeContextPayload([]byte(payload))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2820,7 +2820,7 @@ func TestHoldout_NullSplitAndNullElementsAreKept(t *testing.T) {
 		var payload = `{"experiments":[{"id":1,"name":"exp","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
 			"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
 			"holdouts":[{"id":11,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":` + c.split + `}]}`
-		var data, err = DefaultContextDataDeserializer{}.DeserializePayload([]byte(payload))
+		var data, err = DeserializeContextPayload([]byte(payload))
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -1123,8 +1123,9 @@ func (c *Context) GetPayload() (jsonmodels.ContextPayload, error) {
 		Holdouts: copyHoldouts(st.payloadHoldouts_)}, nil
 }
 
-// copyExperimentData and copyHoldouts copy a slice, keeping nil nil and
-// empty empty, so a copied payload encodes as the original did.
+// copyFloat64, copyExperimentData and copyHoldouts copy a slice, keeping nil
+// nil and empty empty: a copied payload encodes as the original did, and a
+// switchback's split snapshot compares equal to the split it was taken from.
 func copyFloat64(values []float64) []float64 {
 	if values == nil {
 		return nil
@@ -3911,18 +3912,19 @@ func (c *Context) setData(input contextInput, buffer *diagnosticBuffer) {
 		return nil
 	}
 
-	// The holdout and switchback fields of each experiment, by name as index
-	// is (a repeated name keeps the last); none for a plain ContextData. The
-	// copy keeps the installed definitions apart from the caller's slice.
+	// The holdout and switchback fields of each experiment, attached to its
+	// index entry below; none for a plain ContextData. The copy keeps the
+	// installed definitions apart from the caller's slice.
 	var extendedAt = copyExperimentData(input.experiments)
 	var payloads map[string]*jsonmodels.ExperimentData
-	if extendedAt != nil {
-		payloads = make(map[string]*jsonmodels.ExperimentData, len(extendedAt))
-	}
 	for i, experiment := range data.Experiments {
 		var extended *jsonmodels.ExperimentData
 		if extendedAt != nil {
 			extended = &extendedAt[i]
+			// By name as index is, so a repeated name keeps the last.
+			if payloads == nil {
+				payloads = make(map[string]*jsonmodels.ExperimentData, len(extendedAt))
+			}
 			payloads[experiment.Name] = extended
 		}
 		var experiemntVariables = ExperimentVariables{}

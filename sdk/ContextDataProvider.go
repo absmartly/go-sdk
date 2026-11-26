@@ -1,44 +1,40 @@
 package sdk
 
-import (
-	"reflect"
-
-	"github.com/absmartly/go-sdk/sdk/future"
-)
+import "github.com/absmartly/go-sdk/sdk/future"
 
 type ContextDataProvider interface {
 	GetContextData() *future.Future
 }
 
 // ContextPayloadProvider is an optional ContextDataProvider method set: a
-// provider that also implements GetContextPayload is asked for the full
+// provider that also declares GetContextPayload is asked for the full
 // payload, a future of jsonmodels.ContextPayload (or ContextData), when a
 // context loads or refreshes its data, so holdouts and switchbacks are
 // served. GetContextData keeps resolving to jsonmodels.ContextData.
-// DefaultContextDataProvider implements it.
+// DefaultContextDataProvider and Client give the payload themselves but do
+// not export GetContextPayload, so a type embedding either does not opt in
+// by promotion: one that overrides only GetContextData keeps that override in
+// use, and one that wants the payload declares GetContextPayload.
 type ContextPayloadProvider interface {
 	GetContextPayload() *future.Future
 }
 
-// contextPayloadFuture asks provider for the full payload when it can give
-// it, and for the ContextData otherwise.
+// contextPayloadFuture is the future a context loads from provider: the full
+// payload from the default provider and client themselves (a value or
+// pointer, not a type embedding them) and from a provider declaring
+// GetContextPayload, and GetContextData from any other.
 func contextPayloadFuture(provider ContextDataProvider) *future.Future {
-	if payloads, ok := payloadProviderOf(provider); ok {
-		return payloads.GetContextPayload()
+	switch p := provider.(type) {
+	case DefaultContextDataProvider:
+		return contextPayloadFuture(p.client_)
+	case *DefaultContextDataProvider:
+		return contextPayloadFuture(p.client_)
+	case Client:
+		return p.getContextData(true)
+	case *Client:
+		return p.getContextData(true)
+	case ContextPayloadProvider:
+		return p.GetContextPayload()
 	}
 	return provider.GetContextData()
-}
-
-// payloadProviderOf applies the explicit-opt-in rule to a client or provider
-// that embeds the default implementation and overrides GetContextData.
-func payloadProviderOf(value interface{}) (ContextPayloadProvider, bool) {
-	payloads, ok := value.(ContextPayloadProvider)
-	if !ok {
-		return nil, false
-	}
-	var t = reflect.TypeOf(value)
-	if embedsType(t, reflect.TypeOf(DefaultContextDataProvider{})) || embedsType(t, reflect.TypeOf(Client{})) {
-		return payloads, false
-	}
-	return payloads, true
 }

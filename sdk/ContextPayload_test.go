@@ -14,7 +14,7 @@ import (
 
 // The additive payload API: ContextData and Experiment keep their v1.2.0
 // layouts, and holdouts and switchbacks reach a context only through
-// ContextPayload (SetPayload, CreateContextWithPayload, DeserializePayload
+// ContextPayload (SetPayload, CreateContextWithPayload, DeserializeContextPayload
 // and the optional payload provider and client methods).
 
 // cpHeldOut is a payload whose holdout holds hoUID out of "exp": served, the
@@ -78,8 +78,8 @@ func cpContextConfig() ContextConfig {
 }
 
 // GetContextData keeps resolving to jsonmodels.ContextData, without the
-// holdouts, even with the default deserializer; GetContextPayload resolves
-// to the full payload.
+// holdouts, even with the default deserializer; the client's payload path
+// resolves to the full payload.
 func TestClientGetContextDataKeepsContextDataAndPayloadCarriesHoldouts(t *testing.T) {
 	var client = CreateClient(ClientConfig{Deserializer_: DefaultContextDataDeserializer{}, Endpoint_: "https://localhost/v1",
 		ApiKey_: "key", Application_: "website", Environment_: "dev"}, cpHTTP{HttpMock{bodyString: cpBody(t)}})
@@ -90,22 +90,22 @@ func TestClientGetContextDataKeepsContextDataAndPayloadCarriesHoldouts(t *testin
 	if _, ok := value.(jsonmodels.ContextData); !ok {
 		t.Fatalf("GetContextData resolved to %T, want jsonmodels.ContextData", value)
 	}
-	value, err = client.GetContextPayload().Get(context.Background())
+	value, err = client.getContextData(true).Get(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	var payload, ok = value.(jsonmodels.ContextPayload)
 	if !ok || len(payload.Holdouts) != 1 || len(payload.Experiments) != 1 || payload.Experiments[0].HoldoutIds[0] != 11 {
-		t.Fatalf("GetContextPayload resolved to %#v", value)
+		t.Fatalf("the payload path resolved to %#v", value)
 	}
 }
 
-// A deserializer without DeserializePayload still works: GetContextPayload
+// A deserializer without DeserializePayload still works: the payload path
 // falls back to its ContextData.
 func TestClientGetContextPayloadFallsBackToDeserialize(t *testing.T) {
 	var client = CreateClient(ClientConfig{Deserializer_: DeserMock{}, Endpoint_: "https://localhost/v1",
 		ApiKey_: "key", Application_: "website", Environment_: "dev"}, HttpMock{bodyString: "{}"})
-	var value, err = client.GetContextPayload().Get(context.Background())
+	var value, err = client.getContextData(true).Get(context.Background())
 	assertAny(nil, err, t)
 	assertAny(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{{}}}, value, t)
 }
@@ -115,11 +115,11 @@ func TestClientGetContextPayloadFallsBackToDeserialize(t *testing.T) {
 func TestDefaultContextDataProviderGetContextPayload(t *testing.T) {
 	var client = CreateClient(ClientConfig{Deserializer_: DefaultContextDataDeserializer{}, Endpoint_: "https://localhost/v1",
 		ApiKey_: "key", Application_: "website", Environment_: "dev"}, cpHTTP{HttpMock{bodyString: cpBody(t)}})
-	var value, err = CreateDefaultContextDataProvider(client).GetContextPayload().Get(context.Background())
+	var value, err = contextPayloadFuture(CreateDefaultContextDataProvider(client)).Get(context.Background())
 	if _, ok := value.(jsonmodels.ContextPayload); !ok || err != nil {
 		t.Fatalf("payload provider resolved to %T, %v", value, err)
 	}
-	value, err = CreateDefaultContextDataProvider(ClientABSMock{}).GetContextPayload().Get(context.Background())
+	value, err = contextPayloadFuture(CreateDefaultContextDataProvider(ClientABSMock{})).Get(context.Background())
 	if _, ok := value.(jsonmodels.ContextData); !ok || err != nil {
 		t.Fatalf("legacy client resolved to %T, %v", value, err)
 	}
@@ -350,28 +350,6 @@ func TestGetPayloadKeepsEmptyListsEmpty(t *testing.T) {
 	}
 }
 
-// Embedding the default deserializer while overriding only Deserialize is
-// not an explicit payload opt-in: the legacy hook must still run.
-type payloadLegacyDeserializer struct {
-	DefaultContextDataDeserializer
-	called bool
-}
-
-func (d *payloadLegacyDeserializer) Deserialize([]byte) (jsonmodels.ContextData, error) {
-	d.called = true
-	return jsonmodels.ContextData{}, errors.New("legacy hook called")
-}
-
-func TestEmbeddedLegacyDeserializerKeepsItsOverride(t *testing.T) {
-	var deserializer = &payloadLegacyDeserializer{}
-	var client = CreateClient(ClientConfig{Deserializer_: deserializer, Endpoint_: "https://localhost/v1",
-		ApiKey_: "key"}, cpHTTP{HttpMock{bodyString: cpBody(t)}})
-	var value, err = client.GetContextPayload().Get(context.Background())
-	if err == nil || !deserializer.called {
-		t.Fatalf("embedded legacy deserializer: value=%#v err=%v called=%v", value, err, deserializer.called)
-	}
-}
-
 func TestEmptyFullOnSwitchbackDoesNotDuplicateExposure(t *testing.T) {
 	var experiment = sbDefault(1, sbHour)
 	experiment.FullOnVariant = 1
@@ -389,27 +367,210 @@ func TestEmptyFullOnSwitchbackDoesNotDuplicateExposure(t *testing.T) {
 	}
 }
 
-// Embedding the default provider while overriding only GetContextData keeps
-// the legacy provider hook; the promoted GetContextPayload is not an implicit
-// payload opt-in.
-type payloadLegacyProvider struct {
-	DefaultContextDataProvider
-	called bool
+// A deserializer that embeds the default one and overrides only Deserialize
+// keeps its override in use for every embedding shape: by value, by pointer,
+// nested inside another wrapper, and with a pointer receiver. None of them
+// opts into the payload, so a context loads what the override returns.
+type cpValueEmbed struct {
+	DefaultContextDataDeserializer
+	calls *int
 }
 
-func (p *payloadLegacyProvider) GetContextData() *future.Future {
-	p.called = true
+func (d cpValueEmbed) Deserialize([]byte) (jsonmodels.ContextData, error) {
+	*d.calls++
+	return jsonmodels.ContextData{}, errors.New("rejected by the override")
+}
+
+type cpPointerEmbed struct {
+	*DefaultContextDataDeserializer
+	calls *int
+}
+
+func (d cpPointerEmbed) Deserialize([]byte) (jsonmodels.ContextData, error) {
+	*d.calls++
+	return jsonmodels.ContextData{}, errors.New("rejected by the override")
+}
+
+type cpNestedEmbed struct{ cpValueEmbed }
+
+type cpPointerReceiver struct {
+	DefaultContextDataDeserializer
+	calls int
+}
+
+func (d *cpPointerReceiver) Deserialize([]byte) (jsonmodels.ContextData, error) {
+	d.calls++
+	return jsonmodels.ContextData{}, errors.New("rejected by the override")
+}
+
+func TestEmbeddedDeserializerOverridesKeepRunning(t *testing.T) {
+	var value, pointer, nested int
+	var receiver = &cpPointerReceiver{}
+	for name, tc := range map[string]struct {
+		deserializer ContextDataDeserializer
+		calls        func() int
+	}{
+		"value embed":      {cpValueEmbed{calls: &value}, func() int { return value }},
+		"pointer embed":    {cpPointerEmbed{&DefaultContextDataDeserializer{}, &pointer}, func() int { return pointer }},
+		"nested embed":     {cpNestedEmbed{cpValueEmbed{calls: &nested}}, func() int { return nested }},
+		"pointer receiver": {receiver, func() int { return receiver.calls }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var client = CreateClient(ClientConfig{Deserializer_: tc.deserializer, Endpoint_: "https://localhost/v1",
+				ApiKey_: "key"}, cpHTTP{HttpMock{bodyString: cpBody(t)}})
+			var ctx = Create(ABSmartlyConfig{Client_: client}).CreateContext(cpContextConfig())
+			ctx.WaitUntilReady()
+			if !ctx.IsFailed() || tc.calls() != 1 {
+				t.Fatalf("failed %v after %d override calls; want the override's error after 1", ctx.IsFailed(), tc.calls())
+			}
+			ctx.Refresh()
+			if tc.calls() != 2 {
+				t.Fatalf("refresh made %d override calls in all, want 2", tc.calls())
+			}
+		})
+	}
+}
+
+// A deserializer that embeds the default one and declares DeserializePayload
+// opts in: its payload method, not the promoted Deserialize, loads the
+// context, so its holdouts are served.
+type cpExplicitPayload struct {
+	DefaultContextDataDeserializer
+	calls *int
+}
+
+func (d cpExplicitPayload) DeserializePayload(bytes []byte) (jsonmodels.ContextPayload, error) {
+	*d.calls++
+	return DeserializeContextPayload(bytes)
+}
+
+func TestEmbeddedDeserializerOptsInByDeclaringDeserializePayload(t *testing.T) {
+	var calls int
+	var client = CreateClient(ClientConfig{Deserializer_: cpExplicitPayload{calls: &calls}, Endpoint_: "https://localhost/v1",
+		ApiKey_: "key"}, cpHTTP{HttpMock{bodyString: cpBody(t)}})
+	var ctx = Create(ABSmartlyConfig{Client_: client}).CreateContext(cpContextConfig())
+	ctx.WaitUntilReady()
+	expectInt(t, 1, calls)
+	cpExpectHeldOut(t, ctx)
+}
+
+// A provider or client that embeds the default one and overrides only
+// GetContextData keeps that override in use on creation and refresh, by
+// value or pointer: the default's payload path is not promoted.
+type cpProviderEmbed struct {
+	DefaultContextDataProvider
+	calls *int
+}
+
+func (p cpProviderEmbed) GetContextData() *future.Future {
+	*p.calls++
 	var ft, done = future.New()
-	done(jsonmodels.ContextData{}, nil)
+	done(cpHeldOut().ContextData(), nil)
 	return ft
 }
 
-func TestEmbeddedLegacyProviderKeepsItsOverride(t *testing.T) {
-	var provider = &payloadLegacyProvider{}
-	var config = cpContextConfig()
-	var ctx = Create(ABSmartlyConfig{Client_: ClientABSMock{}, ContextDataProvider_: provider}).CreateContext(config)
-	ctx.WaitUntilReady()
-	if !provider.called || ctx.IsFailed() {
-		t.Fatalf("embedded legacy provider: called=%v failed=%v", provider.called, ctx.IsFailed())
+type cpProviderPointerEmbed struct {
+	*DefaultContextDataProvider
+	calls *int
+}
+
+func (p cpProviderPointerEmbed) GetContextData() *future.Future {
+	*p.calls++
+	var ft, done = future.New()
+	done(cpHeldOut().ContextData(), nil)
+	return ft
+}
+
+type cpClientEmbed struct {
+	Client
+	calls *int
+}
+
+func (c cpClientEmbed) GetContextData() *future.Future {
+	*c.calls++
+	var ft, done = future.New()
+	done(cpHeldOut().ContextData(), nil)
+	return ft
+}
+
+type cpClientPointerEmbed struct {
+	*Client
+	calls *int
+}
+
+func (c cpClientPointerEmbed) GetContextData() *future.Future {
+	*c.calls++
+	var ft, done = future.New()
+	done(cpHeldOut().ContextData(), nil)
+	return ft
+}
+
+func TestEmbeddedProviderOverridesKeepRunning(t *testing.T) {
+	var client = CreateClient(ClientConfig{Deserializer_: DefaultContextDataDeserializer{}, Endpoint_: "https://localhost/v1",
+		ApiKey_: "key"}, cpHTTP{HttpMock{bodyString: cpBody(t)}})
+	var provider, providerPointer, embeddedClient, clientPointer int
+	for name, tc := range map[string]struct {
+		config ABSmartlyConfig
+		calls  *int
+	}{
+		"provider value embed":   {ABSmartlyConfig{Client_: client, ContextDataProvider_: cpProviderEmbed{CreateDefaultContextDataProvider(client), &provider}}, &provider},
+		"provider pointer embed": {ABSmartlyConfig{Client_: client, ContextDataProvider_: cpProviderPointerEmbed{&DefaultContextDataProvider{client_: client}, &providerPointer}}, &providerPointer},
+		"client value embed":     {ABSmartlyConfig{Client_: cpClientEmbed{client, &embeddedClient}}, &embeddedClient},
+		"client pointer embed":   {ABSmartlyConfig{Client_: cpClientPointerEmbed{&client, &clientPointer}}, &clientPointer},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var ctx = Create(tc.config).CreateContext(cpContextConfig())
+			ctx.WaitUntilReady()
+			if *tc.calls != 1 {
+				t.Fatalf("creation made %d override calls, want 1", *tc.calls)
+			}
+			// The override's plain ContextData has no holdouts to serve.
+			cpExpectServedWithoutHoldout(t, ctx)
+			ctx.Refresh()
+			if *tc.calls != 2 {
+				t.Fatalf("refresh made %d override calls in all, want 2", *tc.calls)
+			}
+		})
+	}
+}
+
+// The default provider and client, by value or pointer, give the payload.
+func TestDefaultProviderAndClientGiveThePayload(t *testing.T) {
+	var client = CreateClient(ClientConfig{Deserializer_: DefaultContextDataDeserializer{}, Endpoint_: "https://localhost/v1",
+		ApiKey_: "key"}, cpHTTP{HttpMock{bodyString: cpBody(t)}})
+	var provider = CreateDefaultContextDataProvider(client)
+	for name, source := range map[string]ContextDataProvider{
+		"provider": provider, "provider pointer": &provider, "client": client, "client pointer": &client,
+	} {
+		var value, err = contextPayloadFuture(source).Get(context.Background())
+		if _, ok := value.(jsonmodels.ContextPayload); !ok || err != nil {
+			t.Errorf("%s: resolved to %T, %v; want a ContextPayload", name, value, err)
+		}
+	}
+}
+
+// An initial data future that has already settled with a value that is not
+// context data fails the context with a TypeError, as a pending one does.
+func TestSettledInvalidDataFutureFailsTheContext(t *testing.T) {
+	var logger = &hoLogger{}
+	var errorsLogged []interface{}
+	logger.onEvent = func(event EventType, data interface{}) {
+		if event == Error {
+			errorsLogged = append(errorsLogged, data)
+		}
+	}
+	var settled, done = future.New()
+	done(nil, nil)
+	var ctx = CreateContext(internal.FixedClock{Millis_: hoMillis}, cpContextConfig(), settled, &hoProvider{}, &hoPublisher{}, logger,
+		DefaultVariableParser{}, AudienceMatcher{DefaultAudienceDeserializer{}})
+	if !ctx.IsReady() || !ctx.IsFailed() {
+		t.Fatalf("ready %v, failed %v; want a failed context", ctx.IsReady(), ctx.IsFailed())
+	}
+	if len(errorsLogged) != 1 {
+		t.Fatalf("logged %d errors, want 1: %v", len(errorsLogged), errorsLogged)
+	}
+	var err, ok = errorsLogged[0].(*TypeError)
+	if !ok || err.Error() != "type assertion failed: expected jsonmodels.ContextData or jsonmodels.ContextPayload, got <nil>" {
+		t.Fatalf("logged %#v", errorsLogged[0])
 	}
 }

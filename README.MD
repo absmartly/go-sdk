@@ -601,7 +601,7 @@ payload with no code change. With prefetched data, or to hand a context's
 data to another context, use the payload variants:
 
 ```go
-var payload, _ = sdk.DefaultContextDataDeserializer{}.DeserializePayload(body)
+var payload, _ = sdk.DeserializeContextPayload(body)
 var ctx = absmartly.CreateContextWithPayload(contextConfig, payload)
 ctx.SetPayload(payload)          // the SetData of a ContextPayload
 payload, _ = ctx.GetPayload()    // the GetData of a ContextPayload
@@ -613,8 +613,11 @@ shared with the context and must not be modified.
 `Deserialize`, `GetContextData`, `GetData`, `SetData` and `CreateContextWith`
 keep working with `ContextData`, which has no holdouts or switchbacks. A custom
 `ContextDataDeserializer` or `ContextDataProvider` gives contexts the payload
-by also implementing `DeserializePayload` (`ContextPayloadDeserializer`) or
-`GetContextPayload` (`ContextPayloadProvider`).
+by also declaring `DeserializePayload` (`ContextPayloadDeserializer`) or
+`GetContextPayload` (`ContextPayloadProvider`). Embedding
+`DefaultContextDataDeserializer`, `DefaultContextDataProvider` or `Client` does
+not opt in by itself: a type that embeds one and overrides only `Deserialize`
+or `GetContextData` keeps that override in use, as in v1.2.0.
 
 ### Switchback Experiments
 

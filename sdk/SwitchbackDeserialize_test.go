@@ -22,7 +22,7 @@ func TestSwitchbackDeserialize_AllFieldsInDeclaredOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := DefaultContextDataDeserializer{}.DeserializePayload(raw)
+	data, err := DeserializeContextPayload(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestSwitchbackDeserialize_AllFieldsInDeclaredOrder(t *testing.T) {
 
 func TestSwitchbackDeserialize_WithoutSwitchbackFieldsLeavesThemUnset(t *testing.T) {
 	var raw, _ = os.ReadFile("testAssets/context.json")
-	var data, err = DefaultContextDataDeserializer{}.DeserializePayload(raw)
+	var data, err = DeserializeContextPayload(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestSwitchbackDeserialize_WronglyTypedFieldsDropOnlyThatField(t *testing.T)
 		`"switchbackEstimand":5`:             func(e jsonmodels.ExperimentData) bool { return e.SwitchbackEstimand == "" },
 		`"switchbackBurnInDurationMs":"600"`: func(e jsonmodels.ExperimentData) bool { return e.SwitchbackBurnInDurationMs == nil },
 	} {
-		var data, err = DefaultContextDataDeserializer{}.DeserializePayload([]byte(`{"experiments":[{` + base + `,` + fields + `}]}`))
+		var data, err = DeserializeContextPayload([]byte(`{"experiments":[{` + base + `,` + fields + `}]}`))
 		if err != nil || len(data.Experiments) != 1 || data.Experiments[0].Name != "exp_sb" {
 			t.Fatalf("%s: %v, %+v", fields, err, data)
 		}
@@ -120,7 +120,7 @@ func TestSwitchbackDeserialize_MalformedAllowListIsServedAsIneligible(t *testing
 		"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}],
 		"randomizationType":"switchback","switchbackClusters":{"store_id":"store_key"},"switchbackClusterValues":"store-42",
 		"switchbackStartAt":1767225600000,"switchbackPeriodMs":3600000}]}`
-	var data, _ = DefaultContextDataDeserializer{}.DeserializePayload([]byte(payload))
+	var data, _ = DeserializeContextPayload([]byte(payload))
 	var h = sbCreate(t, data)
 	expectInt(t, 0, h.at(sbAnchor+sbHour).treatment("exp_sb"))
 	h.expectPending(0)
@@ -135,7 +135,7 @@ func TestSwitchbackDeserialize_UnknownAndPhase1EFieldsAreIgnored(t *testing.T) {
 		"switchbackPeriodMs":3600000,"switchbackClusterUnitType":"user_id","switchbackClusterCount":50,
 		"switchbackClusterAttribute":"geo/city","switchback":{"period":60},"futureSwitchback":{"periodMinutes":5,"clusters":[1]},
 		"switchbackFutureField":{"nested":[1,2,3]}}],"futureRoot":[1]}`
-	var data, err = DefaultContextDataDeserializer{}.DeserializePayload([]byte(payload))
+	var data, err = DeserializeContextPayload([]byte(payload))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestSwitchback_PayloadWithoutSwitchbacksCostsNothing(t *testing.T) {
 	if n := hoLeastAllocs(withoutFields); n != 0 {
 		t.Errorf("absent switchback fields: %.0f allocations", n)
 	}
-	var data, _ = DefaultContextDataDeserializer{}.DeserializePayload(raw)
+	var data, _ = DeserializeContextPayload(raw)
 	var h = hoCreateFor(t, hoUID, data)
 	for _, experiment := range data.Experiments {
 		h.treatment(experiment.Name)
@@ -260,7 +260,7 @@ func TestSwitchback_SlotKeyCacheFollowsThePeriod(t *testing.T) {
 // randomizationType "unit" on every experiment publishes the same bytes.
 func TestSwitchback_ExplicitUnitRandomizationPublishesTheSameBytes(t *testing.T) {
 	var raw, _ = os.ReadFile("testAssets/context.json")
-	var data, _ = DefaultContextDataDeserializer{}.DeserializePayload(raw)
+	var data, _ = DeserializeContextPayload(raw)
 	var unit = jsonmodels.ContextPayload{Experiments: append([]jsonmodels.ExperimentData(nil), data.Experiments...)}
 	for i := range unit.Experiments {
 		unit.Experiments[i].RandomizationType = "unit"
