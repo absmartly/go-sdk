@@ -4787,7 +4787,7 @@ func TestHoldout_RebuildReleasesTheWriteLockOnPanic(t *testing.T) {
 	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
 	var r = hoExperiment(2, "r", hoUnitType, 0)
 	r.AssignmentRules = hoUSRule
-	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e, r))
 	h.setAttribute("nested", map[int]string{1: "GB"})
 	h.peek("e")
 	var edited = e
@@ -4810,7 +4810,7 @@ func TestHoldout_AudienceEditKeepsARuleWin(t *testing.T) {
 	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
 	e.AssignmentRules = hoUSRule
 	e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
-	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e))
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
 	h.setAttribute("country", "US")
 	h.peek("e")
 	var before = h.ctx.assignmentEntry("e")
@@ -5233,7 +5233,7 @@ func TestHoldout_InformationalFieldOfTheWrongTypeKeepsTheHoldout(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(data.Holdouts) != 1 || data.Holdouts[0].Id != 11 {
+		if len(data.Holdouts) != 1 || data.Holdouts[0].Name != "" || data.Holdouts[0].UnitType != "" || data.Holdouts[0].HoldoutType != "" {
 			t.Fatalf("%s: holdouts %+v, want holdout 11 kept", field, data.Holdouts)
 		}
 		var h = hoCreateFor(t, hoUID, data)

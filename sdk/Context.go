@@ -1517,7 +1517,7 @@ func (c *Context) sameDecision(a *cachedAssignment, b *cachedAssignment) bool {
 // replacement or an eviction without being recorded). A warmed, exposed,
 // unretired read skips settling, as before holdouts.
 func (e *cachedAssignment) needsSettling() bool {
-	return !e.assignment.Exposed.Load().(bool) || e.retirement.Load()
+	return !e.assignment.Exposed.Load().(bool) || (e.retirement != nil && e.retirement.Load())
 }
 
 // variableEligible is the variable read's claim check: once the context has
@@ -1532,8 +1532,8 @@ func (e *cachedAssignment) needsSettling() bool {
 // the read resolves again. Contexts with neither keep the released behaviour.
 // The caller holds ContextLock_.
 func (c *Context) variableEligible(experimentName string, key string) func(*cachedAssignment) exposureStatus {
+	var st = c.state()
 	return func(e *cachedAssignment) exposureStatus {
-		var st = c.state()
 		var index = st.loadIndex()
 		if index == nil || !index.keyed {
 			return exposureClaimed
@@ -1638,20 +1638,21 @@ func (c *Context) queueExposure(assignment *Assignment, entry *cachedAssignment)
 func (c *Context) admitExposure(assignment *Assignment, entry *cachedAssignment) exposureStatus {
 	var holdouts *assignmentHoldouts
 	var ruleOverride bool
+	var st = c.state()
 	if entry != nil {
 		holdouts, ruleOverride = entry.holdouts, entry.ruleOverride
 	} else {
-		// A copy returned by GetAssignment shares the cached assignment's
-		// exposed flag. Every rule-selected assignment's flag is recorded in
-		// ruleIdentities, which has its own lock, so a copy whose entry was
-		// replaced keeps its rule flag and no ContextLock_ is taken.
-		ruleOverride = c.state().ruleIdentities.contains(assignment.Exposed)
+		ruleOverride = st.ruleIdentities.contains(assignment.Exposed)
 	}
 	var status = c.admit(assignment, ruleOverride, holdouts)
 	if status == exposureRejected {
-		c.ContextLock_.Lock()
-		c.reopenExposure(assignment, entry)
-		c.ContextLock_.Unlock()
+		if c.ContextLock_ != nil {
+			c.ContextLock_.Lock()
+			c.reopenExposure(st, assignment, entry)
+			c.ContextLock_.Unlock()
+		} else {
+			assignment.Exposed.Store(false)
+		}
 	}
 	return status
 }
@@ -1698,16 +1699,13 @@ func (c *Context) admit(assignment *Assignment, ruleOverride bool, holdouts *ass
 // exposed by the next read. A decision resolved without its unit
 // is resolved again instead if the unit arrived meanwhile. The caller holds
 // ContextLock_ for writing.
-func (c *Context) reopenExposure(assignment *Assignment, claimed *cachedAssignment) {
-	if claimed != nil && claimed.retirement.Load() {
+func (c *Context) reopenExposure(st *contextState, assignment *Assignment, claimed *cachedAssignment) {
+	if claimed != nil && claimed.retirement != nil && claimed.retirement.Load() {
 		return
 	}
-	var st = c.state()
 	var entry = st.assignmentCache_[assignment.Name]
 	if entry != nil && entry.assignment.Exposed == assignment.Exposed {
 		if _, unitSet := c.Units_[assignment.UnitType]; unitSet && entry.missingUnit() {
-			// Retired, as an eviction is: it stays marked exposed, and a
-			// read already holding it resolves again with the unit.
 			entry.retirement.Store(true)
 			delete(st.assignmentCache_, assignment.Name)
 			delete(c.AssignmentCache, assignment.Name)
@@ -2074,9 +2072,8 @@ func (c *Context) queueHoldoutArms(entry *cachedAssignment, eligible func(*cache
 		beforeHoldoutArms()
 	}
 	c = c.live()
-	c.ContextLock_.RLock()
-	defer c.ContextLock_.RUnlock()
-	if entry.retirement.Load() || c.state().assignmentCache_[entry.assignment.Name] != entry {
+	var st = c.state()
+	if entry.retirement != nil && entry.retirement.Load() || st.assignmentCache_[entry.assignment.Name] != entry {
 		return exposureRetired, nil
 	}
 	if status := eligible(entry); status != exposureClaimed {
@@ -2086,6 +2083,11 @@ func (c *Context) queueHoldoutArms(entry *cachedAssignment, eligible func(*cache
 		return exposureQueued, nil
 	}
 	var exposedAt = c.Clock_.Millis()
+	c.ContextLock_.RLock()
+	defer c.ContextLock_.RUnlock()
+	if entry.retirement != nil && entry.retirement.Load() || st.assignmentCache_[entry.assignment.Name] != entry {
+		return exposureRetired, nil
+	}
 	c.EventLock_.Lock()
 	defer c.EventLock_.Unlock()
 	if c.CheckNotClosed() != nil {
@@ -3421,7 +3423,7 @@ func sameLiteralEntry(a, b ExperimentVariables) bool {
 		x.TrafficSeedLo == y.TrafficSeedLo && x.FullOnVariant == y.FullOnVariant &&
 		x.Audience == y.Audience && x.AudienceStrict == y.AudienceStrict &&
 		sameSplit(x.Split, y.Split) && sameSplit(x.TrafficSplit, y.TrafficSplit) &&
-		x.AssignmentRules == y.AssignmentRules &&
+		x.AssignmentRules == y.AssignmentRules && reflect.DeepEqual(x.HoldoutIds, y.HoldoutIds) &&
 		len(x.Variants) == len(y.Variants) && (len(x.Variants) == 0 || &x.Variants[0] == &y.Variants[0]) &&
 		len(a.Variables) == len(b.Variables) && (len(a.Variables) == 0 || &a.Variables[0] == &b.Variables[0])
 }
