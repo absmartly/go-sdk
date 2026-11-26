@@ -120,6 +120,18 @@ func applicationVersionHeader(version string) string {
 }
 
 func (c Client) GetContextData() *future.Future {
+	return c.getContextData(false)
+}
+
+// GetContextPayload is GetContextData resolving to the full
+// jsonmodels.ContextPayload, with holdouts and each experiment's holdout and
+// switchback fields, when the deserializer implements
+// ContextPayloadDeserializer; otherwise to the deserializer's ContextData.
+func (c Client) GetContextPayload() *future.Future {
+	return c.getContextData(true)
+}
+
+func (c Client) getContextData(payload bool) *future.Future {
 	var dataFuture = future.Call(func() (future.Value, error) {
 		var fut = c.httpClient_.Get(c.url_, c.query_, c.headers_)
 		var value, err = fut.Get(context.Background())
@@ -136,6 +148,9 @@ func (c Client) GetContextData() *future.Future {
 			return nil, errors.New(resp.Status())
 		}
 
+		if payloads, ok := c.deserializer_.(ContextPayloadDeserializer); ok && payload {
+			return payloads.DeserializePayload(resp.Body())
+		}
 		value, err = c.deserializer_.Deserialize(resp.Body())
 		return value, err
 	})

@@ -306,7 +306,7 @@ func TestHermeticWireSwitchbackExposureStamp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var data jsonmodels.ContextData
+	var data jsonmodels.ContextPayload
 	if err := json.Unmarshal(payload, &data); err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +319,7 @@ func TestHermeticWireSwitchbackExposureStamp(t *testing.T) {
 		Units_:        map[string]string{experiment.SwitchbackClusters[0].UnitType: "wire-unit"},
 		Attributes_:   map[string]interface{}{"store": map[string]interface{}{"key": "porto"}},
 		PublishDelay_: -1, RefreshInterval_: -1,
-	}, sdk.ContextDataProvider_.GetContextData(), sdk.ContextDataProvider_, sdk.ContextEventHandler_, nil,
+	}, contextPayloadFuture(sdk.ContextDataProvider_), sdk.ContextDataProvider_, sdk.ContextEventHandler_, nil,
 		sdk.VariableParser_, AudienceMatcher{sdk.AudienceDeserializer_}, application, environment)
 	t.Cleanup(func() { ctx.ClearTimeout(); ctx.ClearRefreshTimer() })
 	ctx.WaitUntilReady()

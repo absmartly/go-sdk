@@ -565,6 +565,9 @@ type indexedExperiment struct {
 	// switchback is set for a switchback experiment only. Holdouts never
 	// cover one.
 	switchback *switchbackDefinition
+	// payload holds the experiment's holdout and switchback fields, which
+	// jsonmodels.Experiment does not carry; nil when it has none.
+	payload *jsonmodels.ExperimentData
 }
 
 type holdoutKey struct {
@@ -861,7 +864,7 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 		var tmp = &cntx
 		dataFuture.Listen(func(val future.Value, err error) {
 			if err == nil {
-				var result = val.(jsonmodels.ContextData)
+				var result, _ = contextInputOf(val)
 				var diagnostics, panicErr = tmp.applyRefreshedData(result)
 				if panicErr != nil {
 					tmp.SetDataFailed(panicErr)
@@ -870,7 +873,7 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 					return
 				}
 				tmp.dispatchDiagnostics(diagnostics)
-				tmp.LogEvent(Ready, result)
+				tmp.LogEvent(Ready, result.data)
 			} else {
 				tmp.SetDataFailed(err)
 				tmp.LogError(err)
@@ -901,7 +904,7 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 			atomic.StoreUint64(state.readyDeliverer_, goroutineID())
 			defer atomic.StoreUint64(state.readyDeliverer_, 0)
 			if err == nil {
-				result, ok := val.(jsonmodels.ContextData)
+				result, ok := contextInputOf(val)
 				if !ok {
 					fail(&TypeError{Expected: "jsonmodels.ContextData", Actual: val}, nil, executed)
 					return
@@ -914,7 +917,7 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 				// Log before settling, so WaitUntilReady returns after the
 				// logger has seen the ready event.
 				tmp.dispatchDiagnostics(diagnostics)
-				tmp.LogEvent(Ready, result)
+				tmp.LogEvent(Ready, result.data)
 				// Finish everything that reads the context before releasing
 				// waiters: once WaitUntilReady returns, the caller may replace
 				// Clock_. ReadyFuture_ stays installed until then, so a waiter
@@ -924,7 +927,7 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 				}
 				cntx.setReadyFutureWith(state, nil)
 				executed()
-				readyFutureDone(result, nil)
+				readyFutureDone(result.data, nil)
 			} else {
 				fail(err, nil, executed)
 			}
@@ -2362,11 +2365,11 @@ func (c *Context) refreshAsync() (*future.Future, *refreshOperation) {
 		var executed = st.customAudiences.execute(&op.gate)
 		defer executed()
 		var outcome = err
-		var result jsonmodels.ContextData
+		var result contextInput
 		var diagnostics []bufferedEvent
 		if outcome == nil {
 			var ok bool
-			result, ok = value.(jsonmodels.ContextData)
+			result, ok = contextInputOf(value)
 			if !ok {
 				outcome = &TypeError{Expected: "jsonmodels.ContextData", Actual: value}
 			} else {
@@ -2391,7 +2394,7 @@ func (c *Context) refreshAsync() (*future.Future, *refreshOperation) {
 		// settlement local, and preserve logger-before-return ordering.
 		c.dispatchDiagnostics(diagnostics)
 		if outcome == nil {
-			c.LogEvent(Refresh, result)
+			c.LogEvent(Refresh, result.data)
 		} else {
 			c.LogError(outcome)
 		}
@@ -2403,7 +2406,35 @@ func (c *Context) refreshAsync() (*future.Future, *refreshOperation) {
 	return tempfuture, op
 }
 
-func (c *Context) applyRefreshedData(data jsonmodels.ContextData) (diagnostics []bufferedEvent, panicErr error) {
+// contextInput is data to install: the v1.2.0 ContextData, and for a
+// ContextPayload its experiments with the holdout and switchback fields
+// (experiments[i].Experiment is data.Experiments[i]) and its holdouts. A
+// plain ContextData has neither and installs with no conversion.
+type contextInput struct {
+	data        jsonmodels.ContextData
+	experiments []jsonmodels.ExperimentData
+	holdouts    []jsonmodels.Holdout
+}
+
+func payloadInput(payload jsonmodels.ContextPayload) contextInput {
+	return contextInput{data: payload.ContextData(), experiments: payload.Experiments, holdouts: payload.Holdouts}
+}
+
+// contextInputOf normalises a value a data future delivered: a
+// jsonmodels.ContextData (v1.2.0 and custom providers) or a
+// jsonmodels.ContextPayload (holdouts and switchbacks). It reports false for
+// anything else.
+func contextInputOf(value future.Value) (contextInput, bool) {
+	switch data := value.(type) {
+	case jsonmodels.ContextPayload:
+		return payloadInput(data), true
+	case jsonmodels.ContextData:
+		return contextInput{data: data}, true
+	}
+	return contextInput{}, false
+}
+
+func (c *Context) applyRefreshedData(data contextInput) (diagnostics []bufferedEvent, panicErr error) {
 	var buffer = &diagnosticBuffer{}
 	defer func() {
 		if r := recover(); r != nil {
@@ -3683,6 +3714,16 @@ func (c *Context) CheckReady(expectNotClosed bool) error {
 }
 
 func (c *Context) SetData(data jsonmodels.ContextData) {
+	c.installData(contextInput{data: data})
+}
+
+// SetPayload is SetData for a full context payload, with holdouts and each
+// experiment's holdout and switchback fields.
+func (c *Context) SetPayload(data jsonmodels.ContextPayload) {
+	c.installData(payloadInput(data))
+}
+
+func (c *Context) installData(data contextInput) {
 	var receiver, root = c, c.live()
 	var buffer = &diagnosticBuffer{}
 	root.setData(data, buffer)
@@ -3747,7 +3788,8 @@ func (c *Context) dispatchDiagnostics(events []bufferedEvent) {
 	}
 }
 
-func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer) {
+func (c *Context) setData(input contextInput, buffer *diagnosticBuffer) {
+	var data = input.data
 	c = c.live()
 	var st = c.state()
 	var self = c.snapshot()
@@ -3757,10 +3799,10 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 	var contextCustomFields = map[string]map[string]ContextCustomFieldValue{}
 	var rules = map[string]*experimentRules{}
 	var holdoutsById map[int]*jsonmodels.Holdout
-	if len(data.Holdouts) > 0 {
+	if len(input.holdouts) > 0 {
 		// A copy, so assignments pin the holdouts as installed even if the
 		// caller reuses its slice.
-		var installed = append([]jsonmodels.Holdout(nil), data.Holdouts...)
+		var installed = append([]jsonmodels.Holdout(nil), input.holdouts...)
 		holdoutsById = make(map[int]*jsonmodels.Holdout, len(installed))
 		// An id defined more than once with definitions that draw different
 		// arms (iteration, seeds or split) covers nothing, so the outcome never
@@ -3804,7 +3846,20 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		return nil
 	}
 
-	for _, experiment := range data.Experiments {
+	// The holdout and switchback fields of each experiment, by name as index
+	// is (a repeated name keeps the last); none for a plain ContextData. The
+	// copy keeps the installed definitions apart from the caller's slice.
+	var extendedAt = append([]jsonmodels.ExperimentData(nil), input.experiments...)
+	var payloads map[string]*jsonmodels.ExperimentData
+	if extendedAt != nil {
+		payloads = make(map[string]*jsonmodels.ExperimentData, len(extendedAt))
+	}
+	for i, experiment := range data.Experiments {
+		var extended *jsonmodels.ExperimentData
+		if extendedAt != nil {
+			extended = &extendedAt[i]
+			payloads[experiment.Name] = extended
+		}
 		var experiemntVariables = ExperimentVariables{}
 		var experimentCustomFields = map[string]ContextCustomFieldValue{}
 		experiemntVariables.Data = experiment
@@ -3858,13 +3913,13 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		if len(experiment.AssignmentRules) > 0 {
 			rules[experiment.Name] = c.experimentRulesFor(previousRules(experiment.Name), experiment.AssignmentRules)
 		}
-		if isSwitchback(experiment) {
+		if isSwitchback(extended) {
 			if switchbacks == nil {
 				switchbacks = map[string]*switchbackDefinition{}
 			}
-			switchbacks[experiment.Name] = newSwitchbackDefinition(experiment.SwitchbackClusters)
-		} else if len(experiment.HoldoutIds) > 0 && len(holdoutsById) > 0 {
-			if covering := coveringHoldouts(experiment.HoldoutIds, holdoutsById); len(covering) > 0 {
+			switchbacks[experiment.Name] = newSwitchbackDefinition(extended.SwitchbackClusters)
+		} else if extended != nil && len(extended.HoldoutIds) > 0 && len(holdoutsById) > 0 {
+			if covering := coveringHoldouts(extended.HoldoutIds, holdoutsById); len(covering) > 0 {
 				if coverage == nil {
 					coverage = map[string][]*jsonmodels.Holdout{}
 				}
@@ -3917,7 +3972,7 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 			}
 		}
 		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name], holdouts: coverage[name], variableKeys: keys,
-			switchback: switchbacks[name]}
+			switchback: switchbacks[name], payload: payloads[name]}
 	}
 	if switchbacks != nil {
 		// Under ContextLock_, so the generations follow the index this
@@ -4312,7 +4367,7 @@ func (c *Context) callDataProvider() (loaded *future.Future) {
 			loaded = failed
 		}
 	}()
-	loaded = c.DataProvider_.GetContextData()
+	loaded = contextPayloadFuture(c.DataProvider_)
 	if loaded == nil {
 		var failed, fail = future.New()
 		fail(nil, errors.New("data provider returned no future"))

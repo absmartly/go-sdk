@@ -220,7 +220,7 @@ func TestSwitchbackServing_ManySourcesKeepTheDeclaredOrder(t *testing.T) {
 		"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}],
 		"randomizationType":"switchback","switchbackClusters":{"zone_id":"zone","alpha_id":"alpha","mid_id":"mid"},
 		"switchbackStartAt":1767225600000,"switchbackPeriodMs":3600000}]}`
-	var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
+	var data, err = DefaultContextDataDeserializer{}.DeserializePayload([]byte(payload))
 	if err != nil {
 		t.Fatal(err)
 	}

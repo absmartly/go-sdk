@@ -26,8 +26,8 @@ const (
 	switchbackRetiredSlots = 8
 )
 
-func isSwitchback(experiment jsonmodels.Experiment) bool {
-	return experiment.RandomizationType == randomizationSwitchback
+func isSwitchback(experiment *jsonmodels.ExperimentData) bool {
+	return experiment != nil && experiment.RandomizationType == randomizationSwitchback
 }
 
 // clockReading is one reading of the context clock, taken on first use, so
@@ -87,8 +87,8 @@ func assignmentSlotFor(experimentName string, indexed *indexedExperiment, at *cl
 // 10000-01-01) (used as served, never rounded), a period > 0 and at least two
 // arms. An unservable schedule only replaces the draw: assignment rules and
 // full-on still apply.
-func switchbackScheduleServable(data jsonmodels.Experiment) bool {
-	if data.SwitchbackStartAt == nil || data.SwitchbackPeriodMs == nil {
+func switchbackScheduleServable(data *jsonmodels.ExperimentData) bool {
+	if data == nil || data.SwitchbackStartAt == nil || data.SwitchbackPeriodMs == nil {
 		return false
 	}
 	var startAt = *data.SwitchbackStartAt
@@ -103,7 +103,7 @@ func switchbackScheduleServable(data jsonmodels.Experiment) bool {
 // the start, for an unservable schedule and for a cluster map taking the
 // legacy path.
 func currentSwitchbackPeriod(indexed *indexedExperiment, now int64) (int64, bool) {
-	var data = indexed.experiment.Data
+	var data = indexed.payload
 	if indexed.switchback.sources == nil || !switchbackScheduleServable(data) {
 		return 0, false
 	}
@@ -364,7 +364,7 @@ func (c *Context) newSwitchbackSlot(indexed *indexedExperiment, previous *cached
 	var resolved = &switchbackSlot{generation: indexed.switchback.generation, period: slot.period,
 		hasPeriod: slot.hasPeriod, resolvedAt: now}
 	if slot.hasPeriod {
-		resolved.startAt, resolved.periodMs = *indexed.experiment.Data.SwitchbackStartAt, *indexed.experiment.Data.SwitchbackPeriodMs
+		resolved.startAt, resolved.periodMs = *indexed.payload.SwitchbackStartAt, *indexed.payload.SwitchbackPeriodMs
 	}
 	if previous != nil && previous.switchback != nil && previous.switchback.generation == resolved.generation &&
 		previous.switchback.serving.status != switchbackAbsent {
@@ -385,7 +385,7 @@ func (c *Context) resolveSwitchbackServing(indexed *indexedExperiment, now int64
 	if indexed.switchback.sources == nil {
 		return legacySwitchbackServing(data.UnitType, c.Units_)
 	}
-	return resolveSwitchbackServing(indexed.switchback, data.SwitchbackClusterValues, c.Units_,
+	return resolveSwitchbackServing(indexed.switchback, indexed.payload.SwitchbackClusterValues, c.Units_,
 		func(path *switchbackPath) string {
 			if attribute, found := c.latestAttribute(path.rootKey(), now); found {
 				return path.resolveAttribute(attribute.Value)
@@ -549,12 +549,13 @@ func sameSwitchbackIdentity(previous *indexedExperiment, installed *indexedExper
 		return false
 	}
 	var a, b = previous.experiment.Data, installed.experiment.Data
+	var pa, pb = previous.payload, installed.payload
 	return a.Id == b.Id && a.Iteration == b.Iteration &&
-		reflect.DeepEqual(a.SwitchbackClusters, b.SwitchbackClusters) &&
-		reflect.DeepEqual(a.SwitchbackClusterValues, b.SwitchbackClusterValues) &&
-		equalInt64Pointers(a.SwitchbackStartAt, b.SwitchbackStartAt) &&
-		equalInt64Pointers(a.SwitchbackPeriodMs, b.SwitchbackPeriodMs) &&
-		a.SwitchbackDesignType == b.SwitchbackDesignType &&
+		reflect.DeepEqual(pa.SwitchbackClusters, pb.SwitchbackClusters) &&
+		reflect.DeepEqual(pa.SwitchbackClusterValues, pb.SwitchbackClusterValues) &&
+		equalInt64Pointers(pa.SwitchbackStartAt, pb.SwitchbackStartAt) &&
+		equalInt64Pointers(pa.SwitchbackPeriodMs, pb.SwitchbackPeriodMs) &&
+		pa.SwitchbackDesignType == pb.SwitchbackDesignType &&
 		sameSplit(a.Split, b.Split) &&
 		((previous.switchback.sources != nil && installed.switchback.sources != nil) || a.UnitType == b.UnitType)
 }

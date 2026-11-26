@@ -22,15 +22,15 @@ func TestSwitchbackDeserialize_AllFieldsInDeclaredOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := DefaultContextDataDeserializer{}.Deserialize(raw)
+	data, err := DefaultContextDataDeserializer{}.DeserializePayload(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var switchback = jsonmodels.Experiment{
+	var switchback = jsonmodels.ExperimentData{Experiment: jsonmodels.Experiment{
 		Id: 1, Name: "exp_test_switchback", UnitType: "store_id", Iteration: 1, SeedHi: 3603515, SeedLo: 233373850,
 		Split: []float64{0.5, 0.5}, TrafficSeedHi: 449867249, TrafficSeedLo: 455443629, TrafficSplit: []float64{0, 1},
-		Applications:      []jsonmodels.ExperimentApplication{{Name: "website"}},
-		Variants:          []jsonmodels.ExperimentVariant{{Name: "A"}, {Name: "B", Config: `{"banner.border":1}`}},
+		Applications: []jsonmodels.ExperimentApplication{{Name: "website"}},
+		Variants:     []jsonmodels.ExperimentVariant{{Name: "A"}, {Name: "B", Config: `{"banner.border":1}`}}},
 		RandomizationType: "switchback", SwitchbackClusters: sbClusters("store_id", "store/key", "device_id", "geo/city"),
 		SwitchbackClusterValues: []string{"porto", "lisbon"}, SwitchbackStartAt: sbInt64(1767225600000),
 		SwitchbackPeriodMs: sbInt64(3600000), SwitchbackCarryoverDurationMs: sbInt64(900000),
@@ -45,7 +45,7 @@ func TestSwitchbackDeserialize_AllFieldsInDeclaredOrder(t *testing.T) {
 
 func TestSwitchbackDeserialize_WithoutSwitchbackFieldsLeavesThemUnset(t *testing.T) {
 	var raw, _ = os.ReadFile("testAssets/context.json")
-	var data, err = DefaultContextDataDeserializer{}.Deserialize(raw)
+	var data, err = DefaultContextDataDeserializer{}.DeserializePayload(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,40 +66,44 @@ func TestSwitchbackDeserialize_WithoutSwitchbackFieldsLeavesThemUnset(t *testing
 func TestSwitchbackDeserialize_WronglyTypedFieldsDropOnlyThatField(t *testing.T) {
 	var base = `"id":1,"name":"exp_sb","unitType":"store_id","iteration":1,"seedHi":-5,"seedLo":-7,"split":[0.5,0.5],
 		"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}]`
-	for fields, check := range map[string]func(jsonmodels.Experiment) bool{
-		`"randomizationType":1`: func(e jsonmodels.Experiment) bool { return e.RandomizationType == "" },
-		`"randomizationType":"switchback","switchbackStartAt":"1767225600000"`:      func(e jsonmodels.Experiment) bool { return e.SwitchbackStartAt == nil },
-		`"switchbackStartAt":1767225600000.5`:                                       func(e jsonmodels.Experiment) bool { return e.SwitchbackStartAt == nil },
-		`"switchbackStartAt":1.7672256e12`:                                          func(e jsonmodels.Experiment) bool { return *e.SwitchbackStartAt == 1767225600000 },
-		`"switchbackStartAt":null`:                                                  func(e jsonmodels.Experiment) bool { return e.SwitchbackStartAt == nil },
-		`"switchbackStartAt":3600000.0000000001`:                                    func(e jsonmodels.Experiment) bool { return e.SwitchbackStartAt == nil },
-		`"switchbackStartAt":3600000.000`:                                           func(e jsonmodels.Experiment) bool { return *e.SwitchbackStartAt == 3600000 },
-		`"switchbackPeriodMs":1.00000000000000001`:                                  func(e jsonmodels.Experiment) bool { return e.SwitchbackPeriodMs == nil },
-		`"switchbackPeriodMs":36e5`:                                                 func(e jsonmodels.Experiment) bool { return *e.SwitchbackPeriodMs == 3600000 },
-		`"switchbackPeriodMs":36e0005`:                                              func(e jsonmodels.Experiment) bool { return e.SwitchbackPeriodMs == nil },
-		`"switchbackStartAt":1e999999`:                                              func(e jsonmodels.Experiment) bool { return e.SwitchbackStartAt == nil },
-		`"switchbackStartAt":3600000.000000000000000000000000000000000000000000000`: func(e jsonmodels.Experiment) bool { return e.SwitchbackStartAt == nil },
-		`"switchbackPeriodMs":{"a":1}`:                                              func(e jsonmodels.Experiment) bool { return e.SwitchbackPeriodMs == nil },
-		`"switchbackPeriodMs":99999999999999999999`:                                 func(e jsonmodels.Experiment) bool { return e.SwitchbackPeriodMs == nil },
-		`"switchbackClusters":["store_id"]`:                                         func(e jsonmodels.Experiment) bool { return e.SwitchbackClusters == nil },
-		`"switchbackClusters":{"store_id":{"a":1}}`:                                 func(e jsonmodels.Experiment) bool { return e.SwitchbackClusters == nil },
+	for fields, check := range map[string]func(jsonmodels.ExperimentData) bool{
+		`"randomizationType":1`: func(e jsonmodels.ExperimentData) bool { return e.RandomizationType == "" },
+		`"randomizationType":"switchback","switchbackStartAt":"1767225600000"`:      func(e jsonmodels.ExperimentData) bool { return e.SwitchbackStartAt == nil },
+		`"switchbackStartAt":1767225600000.5`:                                       func(e jsonmodels.ExperimentData) bool { return e.SwitchbackStartAt == nil },
+		`"switchbackStartAt":1.7672256e12`:                                          func(e jsonmodels.ExperimentData) bool { return *e.SwitchbackStartAt == 1767225600000 },
+		`"switchbackStartAt":null`:                                                  func(e jsonmodels.ExperimentData) bool { return e.SwitchbackStartAt == nil },
+		`"switchbackStartAt":3600000.0000000001`:                                    func(e jsonmodels.ExperimentData) bool { return e.SwitchbackStartAt == nil },
+		`"switchbackStartAt":3600000.000`:                                           func(e jsonmodels.ExperimentData) bool { return *e.SwitchbackStartAt == 3600000 },
+		`"switchbackPeriodMs":1.00000000000000001`:                                  func(e jsonmodels.ExperimentData) bool { return e.SwitchbackPeriodMs == nil },
+		`"switchbackPeriodMs":36e5`:                                                 func(e jsonmodels.ExperimentData) bool { return *e.SwitchbackPeriodMs == 3600000 },
+		`"switchbackPeriodMs":36e0005`:                                              func(e jsonmodels.ExperimentData) bool { return e.SwitchbackPeriodMs == nil },
+		`"switchbackStartAt":1e999999`:                                              func(e jsonmodels.ExperimentData) bool { return e.SwitchbackStartAt == nil },
+		`"switchbackStartAt":3600000.000000000000000000000000000000000000000000000`: func(e jsonmodels.ExperimentData) bool { return e.SwitchbackStartAt == nil },
+		`"switchbackPeriodMs":{"a":1}`:                                              func(e jsonmodels.ExperimentData) bool { return e.SwitchbackPeriodMs == nil },
+		`"switchbackPeriodMs":99999999999999999999`:                                 func(e jsonmodels.ExperimentData) bool { return e.SwitchbackPeriodMs == nil },
+		`"switchbackClusters":["store_id"]`:                                         func(e jsonmodels.ExperimentData) bool { return e.SwitchbackClusters == nil },
+		`"switchbackClusters":{"store_id":{"a":1}}`:                                 func(e jsonmodels.ExperimentData) bool { return e.SwitchbackClusters == nil },
 		// A repeated key keeps its first position and its last value, so an
 		// overwritten malformed value leaves the map readable.
-		`"switchbackClusters":{"store_id":null,"device_id":"store_key","store_id":"store_key"}`: func(e jsonmodels.Experiment) bool {
+		`"switchbackClusters":{"store_id":null,"device_id":"store_key","store_id":"store_key"}`: func(e jsonmodels.ExperimentData) bool {
 			return reflect.DeepEqual(e.SwitchbackClusters, jsonmodels.SwitchbackClusters{{UnitType: "store_id", Path: "store_key"}, {UnitType: "device_id", Path: "store_key"}})
 		},
-		`"switchbackClusters":{"store_id":"store_key","store_id":null}`: func(e jsonmodels.Experiment) bool { return e.SwitchbackClusters == nil },
-		`"switchbackClusterValues":"porto"`:                             func(e jsonmodels.Experiment) bool { return reflect.DeepEqual(e.SwitchbackClusterValues, []string{""}) },
-		`"switchbackClusterValues":["a",7,true,null,{}]`: func(e jsonmodels.Experiment) bool {
+		`"switchbackClusters":{"store_id":"store_key","store_id":null}`: func(e jsonmodels.ExperimentData) bool { return e.SwitchbackClusters == nil },
+		`"switchbackClusterValues":"porto"`: func(e jsonmodels.ExperimentData) bool {
+			return reflect.DeepEqual(e.SwitchbackClusterValues, []string{""})
+		},
+		`"switchbackClusterValues":["a",7,true,null,{}]`: func(e jsonmodels.ExperimentData) bool {
 			return reflect.DeepEqual(e.SwitchbackClusterValues, []string{"a", "7", "true", "", ""})
 		},
-		`"switchbackClusterValues":null`:     func(e jsonmodels.Experiment) bool { return e.SwitchbackClusterValues == nil },
-		`"switchbackClusterValues":[]`:       func(e jsonmodels.Experiment) bool { return reflect.DeepEqual(e.SwitchbackClusterValues, []string{}) },
-		`"switchbackDesignType":["x"]`:       func(e jsonmodels.Experiment) bool { return e.SwitchbackDesignType == "" },
-		`"switchbackEstimand":5`:             func(e jsonmodels.Experiment) bool { return e.SwitchbackEstimand == "" },
-		`"switchbackBurnInDurationMs":"600"`: func(e jsonmodels.Experiment) bool { return e.SwitchbackBurnInDurationMs == nil },
+		`"switchbackClusterValues":null`: func(e jsonmodels.ExperimentData) bool { return e.SwitchbackClusterValues == nil },
+		`"switchbackClusterValues":[]`: func(e jsonmodels.ExperimentData) bool {
+			return reflect.DeepEqual(e.SwitchbackClusterValues, []string{})
+		},
+		`"switchbackDesignType":["x"]`:       func(e jsonmodels.ExperimentData) bool { return e.SwitchbackDesignType == "" },
+		`"switchbackEstimand":5`:             func(e jsonmodels.ExperimentData) bool { return e.SwitchbackEstimand == "" },
+		`"switchbackBurnInDurationMs":"600"`: func(e jsonmodels.ExperimentData) bool { return e.SwitchbackBurnInDurationMs == nil },
 	} {
-		var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(`{"experiments":[{` + base + `,` + fields + `}]}`))
+		var data, err = DefaultContextDataDeserializer{}.DeserializePayload([]byte(`{"experiments":[{` + base + `,` + fields + `}]}`))
 		if err != nil || len(data.Experiments) != 1 || data.Experiments[0].Name != "exp_sb" {
 			t.Fatalf("%s: %v, %+v", fields, err, data)
 		}
@@ -116,7 +120,7 @@ func TestSwitchbackDeserialize_MalformedAllowListIsServedAsIneligible(t *testing
 		"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}],
 		"randomizationType":"switchback","switchbackClusters":{"store_id":"store_key"},"switchbackClusterValues":"store-42",
 		"switchbackStartAt":1767225600000,"switchbackPeriodMs":3600000}]}`
-	var data, _ = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
+	var data, _ = DefaultContextDataDeserializer{}.DeserializePayload([]byte(payload))
 	var h = sbCreate(t, data)
 	expectInt(t, 0, h.at(sbAnchor+sbHour).treatment("exp_sb"))
 	h.expectPending(0)
@@ -131,7 +135,7 @@ func TestSwitchbackDeserialize_UnknownAndPhase1EFieldsAreIgnored(t *testing.T) {
 		"switchbackPeriodMs":3600000,"switchbackClusterUnitType":"user_id","switchbackClusterCount":50,
 		"switchbackClusterAttribute":"geo/city","switchback":{"period":60},"futureSwitchback":{"periodMinutes":5,"clusters":[1]},
 		"switchbackFutureField":{"nested":[1,2,3]}}],"futureRoot":[1]}`
-	var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
+	var data, err = DefaultContextDataDeserializer{}.DeserializePayload([]byte(payload))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,15 +149,17 @@ func TestSwitchbackDeserialize_UnknownAndPhase1EFieldsAreIgnored(t *testing.T) {
 // UnmarshalJSON on Experiment.
 func TestSwitchbackDeserialize_StandardDecoderReadsTheModel(t *testing.T) {
 	var raw, _ = os.ReadFile("testAssets/switchback_context.json")
-	var data jsonmodels.ContextData
+	var data jsonmodels.ContextPayload
 	if err := json.Unmarshal(raw, &data); err != nil {
 		t.Fatal(err)
 	}
 	expectValue(t, sbClusters("store_id", "store/key", "device_id", "geo/city"), data.Experiments[0].SwitchbackClusters)
 	expectValue(t, int64(3600000), *data.Experiments[0].SwitchbackPeriodMs)
 	// The decoder looks up UnmarshalJSON on the pointer's method set.
-	if _, ok := reflect.TypeOf(&jsonmodels.Experiment{}).MethodByName("UnmarshalJSON"); ok {
-		t.Fatal("Experiment has an UnmarshalJSON method")
+	for _, model := range []interface{}{&jsonmodels.Experiment{}, &jsonmodels.ExperimentData{}} {
+		if _, ok := reflect.TypeOf(model).MethodByName("UnmarshalJSON"); ok {
+			t.Fatalf("%T has an UnmarshalJSON method", model)
+		}
 	}
 }
 
@@ -163,12 +169,13 @@ func TestSwitchback_PayloadWithoutSwitchbacksCostsNothing(t *testing.T) {
 	var raw, _ = os.ReadFile("testAssets/context.json")
 	var withoutFields = func() {
 		var wire wireExperiment
-		wire.switchbackFields(&wire.Experiment)
+		var experiment jsonmodels.ExperimentData
+		wire.switchbackFields(&experiment)
 	}
 	if n := hoLeastAllocs(withoutFields); n != 0 {
 		t.Errorf("absent switchback fields: %.0f allocations", n)
 	}
-	var data, _ = DefaultContextDataDeserializer{}.Deserialize(raw)
+	var data, _ = DefaultContextDataDeserializer{}.DeserializePayload(raw)
 	var h = hoCreateFor(t, hoUID, data)
 	for _, experiment := range data.Experiments {
 		h.treatment(experiment.Name)
@@ -253,8 +260,8 @@ func TestSwitchback_SlotKeyCacheFollowsThePeriod(t *testing.T) {
 // randomizationType "unit" on every experiment publishes the same bytes.
 func TestSwitchback_ExplicitUnitRandomizationPublishesTheSameBytes(t *testing.T) {
 	var raw, _ = os.ReadFile("testAssets/context.json")
-	var data, _ = DefaultContextDataDeserializer{}.Deserialize(raw)
-	var unit = jsonmodels.ContextData{Experiments: append([]jsonmodels.Experiment(nil), data.Experiments...)}
+	var data, _ = DefaultContextDataDeserializer{}.DeserializePayload(raw)
+	var unit = jsonmodels.ContextPayload{Experiments: append([]jsonmodels.ExperimentData(nil), data.Experiments...)}
 	for i := range unit.Experiments {
 		unit.Experiments[i].RandomizationType = "unit"
 	}

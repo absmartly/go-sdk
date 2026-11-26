@@ -552,8 +552,8 @@ apply.
 
 A holdout keeps a share of units out of a group of experiments, so their
 combined effect can be measured. The context payload lists the holdouts
-(`ContextData.Holdouts`) and each experiment names the holdouts covering it
-(`Experiment.HoldoutIds`). Nothing needs to be configured: the SDK applies
+(`ContextPayload.Holdouts`) and each experiment names the holdouts covering it
+(`ExperimentData.HoldoutIds`). Nothing needs to be configured: the SDK applies
 them as the JavaScript SDK does.
 
 - Each holdout puts the unit in an arm, drawn with the covered experiment's
@@ -581,9 +581,25 @@ nothing to the publish payload of experiments without holdouts (the
 and warmed cached reads and exposures allocate nothing more. Creating a
 context and rebuilding an assignment each allocate one small extra object.
 
-`ContextData` gained a `Holdouts` field and `Experiment` a `HoldoutIds` field,
-so unkeyed (positional) literals of `jsonmodels.ContextData` must become keyed
-(`jsonmodels.ContextData{Experiments: experiments}`), as for `Experiment`.
+Holdouts, and the switchback experiments below, reach a context only through
+the full payload, `jsonmodels.ContextPayload`, whose experiments are
+`jsonmodels.ExperimentData` values: the v1.2.0 `Experiment` plus `HoldoutIds`
+and the switchback fields. `jsonmodels.ContextData` and `jsonmodels.Experiment`
+keep their v1.2.0 layouts, so existing code, positional literals included,
+keeps compiling. `CreateContext` and refreshes with the default client get the
+payload with no code change. With prefetched data, use the payload variants:
+
+```go
+var payload, _ = sdk.DefaultContextDataDeserializer{}.DeserializePayload(body)
+var ctx = sd.CreateContextWithPayload(contextConfig, payload)
+ctx.SetPayload(payload) // the SetData of a ContextPayload
+```
+
+`Deserialize`, `GetContextData`, `GetData`, `SetData` and `CreateContextWith`
+keep working with `ContextData`, which has no holdouts or switchbacks. A custom
+`ContextDataDeserializer` or `ContextDataProvider` gives contexts the payload
+by also implementing `DeserializePayload` (`ContextPayloadDeserializer`) or
+`GetContextPayload` (`ContextPayloadProvider`).
 
 ### Switchback Experiments
 
@@ -594,13 +610,14 @@ switchback fields and serve such an experiment as a unit experiment on its
 A switchback experiment randomizes over *clusters* and time rather than over
 units: every unit in the same cluster (for example a store's city) gets the
 same variant within a period, and the variant changes on a fixed time grid.
-The context payload marks it with `Experiment.RandomizationType ==
-"switchback"`; nothing needs to be configured. The SDK serves it as the
+The context payload marks it with `ExperimentData.RandomizationType ==
+"switchback"`; nothing needs to be configured beyond giving the context the
+full payload (see [Holdouts](#holdouts)). The SDK serves it as the
 collector and the other ABsmartly SDKs do (see the Java SDK's
 [`SWITCHBACK.md`](https://github.com/absmartly/java-sdk/blob/main/SWITCHBACK.md)
 for the full rules):
 
-- `Experiment.SwitchbackClusters` lists, in order, the unit types linked to
+- `ExperimentData.SwitchbackClusters` lists, in order, the unit types linked to
   the experiment and the attribute path holding each one's cluster value
   (`"city"`, `"geo/city"`, `"items/0/city"`). For each linked type in that
   order, the context's unit of that type reads the attribute at its path. The
@@ -624,7 +641,7 @@ for the full rules):
   struct (written as `3`) keys a cluster.
 - With no unit of a linked type set, the experiment does not apply. When no
   unit yields a value, linked units disagree, or the value is not in
-  `Experiment.SwitchbackClusterValues`, the unit gets variant `0` and no
+  `ExperimentData.SwitchbackClusterValues`, the unit gets variant `0` and no
   exposure is published; only an override (`SetOverride`) still applies.
 - Otherwise overrides, assignment rules, strict audiences, full-on, traffic
   (on the serving unit) and custom assignments apply as for a unit

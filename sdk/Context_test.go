@@ -1481,7 +1481,6 @@ func TestExperimentMatchesDefinitionFields(t *testing.T) {
 		{"separately validated fields", func(e *jsonmodels.Experiment) {
 			e.Audience = "changed"
 			e.AssignmentRules = "changed"
-			e.HoldoutIds = []int{11}
 		}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
