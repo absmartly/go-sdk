@@ -349,3 +349,67 @@ func TestGetPayloadKeepsEmptyListsEmpty(t *testing.T) {
 		t.Fatalf("nil lists became non-nil: %#v", payload)
 	}
 }
+
+// Embedding the default deserializer while overriding only Deserialize is
+// not an explicit payload opt-in: the legacy hook must still run.
+type payloadLegacyDeserializer struct {
+	DefaultContextDataDeserializer
+	called bool
+}
+
+func (d *payloadLegacyDeserializer) Deserialize([]byte) (jsonmodels.ContextData, error) {
+	d.called = true
+	return jsonmodels.ContextData{}, errors.New("legacy hook called")
+}
+
+func TestEmbeddedLegacyDeserializerKeepsItsOverride(t *testing.T) {
+	var deserializer = &payloadLegacyDeserializer{}
+	var client = CreateClient(ClientConfig{Deserializer_: deserializer, Endpoint_: "https://localhost/v1",
+		ApiKey_: "key"}, cpHTTP{HttpMock{bodyString: cpBody(t)}})
+	var value, err = client.GetContextPayload().Get(context.Background())
+	if err == nil || !deserializer.called {
+		t.Fatalf("embedded legacy deserializer: value=%#v err=%v called=%v", value, err, deserializer.called)
+	}
+}
+
+func TestEmptyFullOnSwitchbackDoesNotDuplicateExposure(t *testing.T) {
+	var experiment = sbDefault(1, sbHour)
+	experiment.FullOnVariant = 1
+	experiment.Split = []float64{}
+	var h = sbCreate(t, sbData(experiment))
+	for i := 0; i < 3; i++ {
+		var got, err = h.ctx.GetTreatment("exp_sb")
+		if err != nil || got != 1 {
+			t.Fatalf("read %d: got %d, want full-on arm 1", i, got)
+		}
+	}
+	var exposures = queuedExposures(h.ctx)
+	if len(exposures) != 1 {
+		t.Fatalf("queued %d exposures, want 1: %+v", len(exposures), exposures)
+	}
+}
+
+// Embedding the default provider while overriding only GetContextData keeps
+// the legacy provider hook; the promoted GetContextPayload is not an implicit
+// payload opt-in.
+type payloadLegacyProvider struct {
+	DefaultContextDataProvider
+	called bool
+}
+
+func (p *payloadLegacyProvider) GetContextData() *future.Future {
+	p.called = true
+	var ft, done = future.New()
+	done(jsonmodels.ContextData{}, nil)
+	return ft
+}
+
+func TestEmbeddedLegacyProviderKeepsItsOverride(t *testing.T) {
+	var provider = &payloadLegacyProvider{}
+	var config = cpContextConfig()
+	var ctx = Create(ABSmartlyConfig{Client_: ClientABSMock{}, ContextDataProvider_: provider}).CreateContext(config)
+	ctx.WaitUntilReady()
+	if !provider.called || ctx.IsFailed() {
+		t.Fatalf("embedded legacy provider: called=%v failed=%v", provider.called, ctx.IsFailed())
+	}
+}

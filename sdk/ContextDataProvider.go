@@ -1,6 +1,10 @@
 package sdk
 
-import "github.com/absmartly/go-sdk/sdk/future"
+import (
+	"reflect"
+
+	"github.com/absmartly/go-sdk/sdk/future"
+)
 
 type ContextDataProvider interface {
 	GetContextData() *future.Future
@@ -19,8 +23,22 @@ type ContextPayloadProvider interface {
 // contextPayloadFuture asks provider for the full payload when it can give
 // it, and for the ContextData otherwise.
 func contextPayloadFuture(provider ContextDataProvider) *future.Future {
-	if payloads, ok := provider.(ContextPayloadProvider); ok {
+	if payloads, ok := payloadProviderOf(provider); ok {
 		return payloads.GetContextPayload()
 	}
 	return provider.GetContextData()
+}
+
+// payloadProviderOf applies the explicit-opt-in rule to a client or provider
+// that embeds the default implementation and overrides GetContextData.
+func payloadProviderOf(value interface{}) (ContextPayloadProvider, bool) {
+	payloads, ok := value.(ContextPayloadProvider)
+	if !ok {
+		return nil, false
+	}
+	var t = reflect.TypeOf(value)
+	if embedsType(t, reflect.TypeOf(DefaultContextDataProvider{})) || embedsType(t, reflect.TypeOf(Client{})) {
+		return payloads, false
+	}
+	return payloads, true
 }

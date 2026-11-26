@@ -20,7 +20,7 @@ func (dfc DefaultContextDataProvider) GetContextData() *future.Future {
 // GetContextPayload is the client's GetContextPayload when it has one, and
 // its GetContextData otherwise.
 func (dfc DefaultContextDataProvider) GetContextPayload() *future.Future {
-	if payloads, ok := dfc.client_.(ContextPayloadProvider); ok {
+	if payloads, ok := payloadProviderOf(dfc.client_); ok {
 		return payloads.GetContextPayload()
 	}
 	return dfc.client_.GetContextData()

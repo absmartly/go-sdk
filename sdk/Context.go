@@ -871,7 +871,13 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 		var tmp = &cntx
 		dataFuture.Listen(func(val future.Value, err error) {
 			if err == nil {
-				var result, _ = contextInputOf(val)
+				var result, ok = contextInputOf(val)
+				if !ok {
+					var invalid = &TypeError{Expected: "jsonmodels.ContextData or jsonmodels.ContextPayload", Actual: val}
+					tmp.SetDataFailed(invalid)
+					tmp.LogError(invalid)
+					return
+				}
 				var diagnostics, panicErr = tmp.applyRefreshedData(result)
 				if panicErr != nil {
 					tmp.SetDataFailed(panicErr)
@@ -1119,6 +1125,13 @@ func (c *Context) GetPayload() (jsonmodels.ContextPayload, error) {
 
 // copyExperimentData and copyHoldouts copy a slice, keeping nil nil and
 // empty empty, so a copied payload encodes as the original did.
+func copyFloat64(values []float64) []float64 {
+	if values == nil {
+		return nil
+	}
+	return append(make([]float64, 0, len(values)), values...)
+}
+
 func copyExperimentData(experiments []jsonmodels.ExperimentData) []jsonmodels.ExperimentData {
 	if experiments == nil {
 		return nil
@@ -3167,7 +3180,7 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string,
 		entry.resolvedAudience = experiment.Data.Audience
 		entry.resolvedAudienceStrict = experiment.Data.AudienceStrict
 		if indexed.switchback != nil {
-			entry.resolvedSplit = append([]float64(nil), experiment.Data.Split...)
+			entry.resolvedSplit = copyFloat64(experiment.Data.Split)
 		}
 	}
 

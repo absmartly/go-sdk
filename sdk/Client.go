@@ -148,7 +148,7 @@ func (c Client) getContextData(payload bool) *future.Future {
 			return nil, errors.New(resp.Status())
 		}
 
-		if payloads, ok := c.deserializer_.(ContextPayloadDeserializer); ok && payload {
+		if payloads, ok := payloadDeserializerOf(c.deserializer_); ok && payload {
 			return payloads.DeserializePayload(resp.Body())
 		}
 		value, err = c.deserializer_.Deserialize(resp.Body())
