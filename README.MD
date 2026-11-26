@@ -24,7 +24,7 @@ The finalization event is still `sdk.Close` with the value `"Close"`; `sdk.Final
 ### Install the SDK
 
 ```bash
-go get github.com/absmartly/go-sdk/sdk@latest
+go get github.com/absmartly/go-sdk/sdk@v1.3.0
 ```
 
 ### Dependencies
@@ -327,8 +327,9 @@ if serverCtx.IsFailed() {
     log.Fatal("Failed to initialize context: could not load experiment data")
 }
 
-// Get the context data to send to client
-contextData, err := serverCtx.GetData()
+// Get the context payload to send to client. GetPayload keeps holdouts and
+// switchback experiments; GetData returns the v1.2.0 ContextData without them.
+contextPayload, err := serverCtx.GetPayload()
 if err != nil {
     log.Fatalf("Failed to read context data: %v", err)
 }
@@ -341,7 +342,7 @@ clientConfig := sdk.ContextConfig{
     },
 }
 
-clientCtx := absmartly.CreateContextWith(clientConfig, contextData)
+clientCtx := absmartly.CreateContextWithPayload(clientConfig, contextPayload)
 // Context is immediately ready, no need to wait
 ```
 
@@ -554,7 +555,9 @@ A holdout keeps a share of units out of a group of experiments, so their
 combined effect can be measured. The context payload lists the holdouts
 (`ContextPayload.Holdouts`) and each experiment names the holdouts covering it
 (`ExperimentData.HoldoutIds`). Nothing needs to be configured: the SDK applies
-them as the JavaScript SDK does.
+them following the JavaScript and Java SDKs. The few places where it differs
+(duplicate or malformed holdout entries, and decisions resolved again after a
+refresh edits an audience) are listed in the v1.3.0 CHANGELOG.
 
 - Each holdout puts the unit in an arm, drawn with the covered experiment's
   unit. Arm 0 holds the unit out. In a three-arm holdout (three values in its
@@ -580,6 +583,13 @@ nothing to the publish payload of experiments without holdouts (the
 `ruleOverride` flag every exposure now carries comes with assignment rules),
 and warmed cached reads and exposures allocate nothing more. Creating a
 context and rebuilding an assignment each allocate one small extra object.
+Once a context has seen holdouts, a `GetVariableValue` that passes an
+experiment the unit is not in briefly takes the context's read lock for it,
+to fire that experiment's holdouts and check that the decision is current.
+This also applies when the context has assignment rules but no holdout covers
+that particular experiment: keyed validation is retained so a refresh cannot
+authorize an obsolete decision. The measured cost is about 7% in a serial
+synthetic read and 27% in parallel; warmed reads still make 0 allocations.
 
 Holdouts, and the switchback experiments below, reach a context only through
 the full payload, `jsonmodels.ContextPayload`, whose experiments are
@@ -587,12 +597,14 @@ the full payload, `jsonmodels.ContextPayload`, whose experiments are
 and the switchback fields. `jsonmodels.ContextData` and `jsonmodels.Experiment`
 keep their v1.2.0 layouts, so existing code, positional literals included,
 keeps compiling. `CreateContext` and refreshes with the default client get the
-payload with no code change. With prefetched data, use the payload variants:
+payload with no code change. With prefetched data, or to hand a context's data to another context, use the
+payload variants:
 
 ```go
 var payload, _ = sdk.DefaultContextDataDeserializer{}.DeserializePayload(body)
 var ctx = sd.CreateContextWithPayload(contextConfig, payload)
-ctx.SetPayload(payload) // the SetData of a ContextPayload
+ctx.SetPayload(payload)          // the SetData of a ContextPayload
+payload, _ = ctx.GetPayload()    // the GetData of a ContextPayload
 ```
 
 `Deserialize`, `GetContextData`, `GetData`, `SetData` and `CreateContextWith`

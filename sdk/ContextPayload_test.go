@@ -3,9 +3,12 @@ package sdk
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/absmartly/go-sdk/sdk/future"
+	"github.com/absmartly/go-sdk/sdk/internal"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
 
@@ -218,4 +221,78 @@ func TestSetDataOverAPayloadDropsTheHoldoutsAndSwitchbacks(t *testing.T) {
 		t.Fatalf("SetData kept payload fields: %+v", index)
 	}
 	cpExpectServedWithoutHoldout(t, h.ctx)
+}
+
+// The README's server-to-client handoff: GetPayload carries the holdouts, so
+// a client context created from it holds the unit out as the server does;
+// GetData, the v1.2.0 handoff, drops them.
+func TestGetPayloadHandsOffHoldouts(t *testing.T) {
+	var abs = Create(ABSmartlyConfig{Client_: ClientABSMock{}})
+	var server = abs.CreateContextWithPayload(cpContextConfig(), cpHeldOut())
+	var payload, err = server.GetPayload()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(payload, cpHeldOut()) {
+		t.Fatalf("GetPayload = %+v, want the installed payload", payload)
+	}
+	cpExpectHeldOut(t, abs.CreateContextWithPayload(cpContextConfig(), payload))
+	data, err := server.GetData()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cpExpectServedWithoutHoldout(t, abs.CreateContextWith(cpContextConfig(), data))
+}
+
+// GetPayload after a plain ContextData is that data; after a failed load it
+// is empty; before ready and after close it fails as GetData does; and the
+// caller cannot edit the installed definitions through it.
+func TestGetPayloadStates(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, cpHeldOut())
+	var payload, _ = h.ctx.GetPayload()
+	payload.Experiments[0].HoldoutIds[0] = 99
+	payload.Experiments[0].Name = "edited"
+	payload.Holdouts[0].Id = 99
+	payload, _ = h.ctx.GetPayload()
+	if payload.Experiments[0].Name != "exp" || payload.Holdouts[0].Id != 11 {
+		t.Fatalf("GetPayload exposed the installed slices: %+v", payload)
+	}
+	h.ctx.SetData(cpHeldOut().ContextData())
+	payload, _ = h.ctx.GetPayload()
+	assertAny(jsonmodels.PayloadOf(cpHeldOut().ContextData()), payload, t)
+	h.ctx.SetPayload(cpHeldOut())
+	h.ctx.SetDataFailed(errors.New("load failed"))
+	payload, err := h.ctx.GetPayload()
+	assertAny(nil, err, t)
+	assertAny(jsonmodels.ContextPayload{}, payload, t)
+
+	var pending, _ = future.New()
+	var notReady = CreateContext(internal.FixedClock{Millis_: hoMillis}, cpContextConfig(), pending, &hoProvider{}, &hoPublisher{}, nil,
+		DefaultVariableParser{}, AudienceMatcher{DefaultAudienceDeserializer{}})
+	if _, err := notReady.GetPayload(); err != ErrContextNotReady {
+		t.Fatalf("GetPayload before ready: %v", err)
+	}
+	var closed = hoCreateFor(t, hoUID, cpHeldOut())
+	closed.ctx.Close()
+	_, dataErr := closed.ctx.GetData()
+	if _, err := closed.ctx.GetPayload(); err == nil || err.Error() != dataErr.Error() {
+		t.Fatalf("GetPayload after close: %v, GetData: %v", err, dataErr)
+	}
+}
+
+// setData keeps its own copy of the payload's experiments: editing the
+// caller's slice after SetPayload changes nothing served.
+func TestSetPayloadCopiesTheCallersExperiments(t *testing.T) {
+	var data = sbData(sbDefault(2, sbHour))
+	var h = sbCreate(t, sbData())
+	h.ctx.SetPayload(data)
+	data.Experiments[0].SwitchbackPeriodMs = nil
+	data.Experiments[0].RandomizationType = ""
+	// Period 1 draws arm 1; a unit experiment would draw otherwise or the
+	// unservable schedule would give 0.
+	expectInt(t, sbExpected2Arms[1], h.at(sbAnchor+sbHour+5).peek("exp_sb"))
+	var payload, _ = h.ctx.GetPayload()
+	if payload.Experiments[0].SwitchbackPeriodMs == nil || payload.Experiments[0].RandomizationType != "switchback" {
+		t.Fatalf("the installed definition followed the caller's edit: %+v", payload.Experiments[0])
+	}
 }

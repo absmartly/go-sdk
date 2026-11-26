@@ -131,6 +131,12 @@ type contextState struct {
 	// it, in experiment-id order. Guarded by DataLock.
 	indexVariables_ map[string][]ExperimentVariables
 
+	// payloadExperiments_ and payloadHoldouts_ are the holdout and switchback
+	// parts of the installed data, as GetPayload returns them; both nil when
+	// a plain ContextData was installed. Guarded by DataLock.
+	payloadExperiments_ []jsonmodels.ExperimentData
+	payloadHoldouts_    []jsonmodels.Holdout
+
 	// index_ is the installed experiment index and parsed assignment rules,
 	// replaced as a whole by setData under DataLock. The assignment read path
 	// loads it atomically instead of taking DataLock, so a cached read costs
@@ -906,7 +912,7 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 			if err == nil {
 				result, ok := contextInputOf(val)
 				if !ok {
-					fail(&TypeError{Expected: "jsonmodels.ContextData", Actual: val}, nil, executed)
+					fail(&TypeError{Expected: "jsonmodels.ContextData or jsonmodels.ContextPayload", Actual: val}, nil, executed)
 					return
 				}
 				var diagnostics, panicErr = tmp.applyRefreshedData(result)
@@ -1082,6 +1088,30 @@ func (c *Context) GetData() (jsonmodels.ContextData, error) {
 	defer c.DataLock.RUnlock()
 	return c.Data_, nil
 
+}
+
+// GetPayload is GetData for the full context payload, with holdouts and each
+// experiment's holdout and switchback fields, as installed: pass it to
+// CreateContextWithPayload or SetPayload to hand the context's data over
+// without losing them. After a plain ContextData was installed (SetData,
+// CreateContextWith, or a provider without GetContextPayload) it is that
+// data with no holdouts or switchbacks. It fails as GetData does.
+func (c *Context) GetPayload() (jsonmodels.ContextPayload, error) {
+	c = c.live()
+	if err := c.CheckReady(true); err != nil {
+		return jsonmodels.ContextPayload{}, err
+	}
+	var st = c.state()
+	c.DataLock.RLock()
+	defer c.DataLock.RUnlock()
+	if st.payloadExperiments_ == nil {
+		return jsonmodels.PayloadOf(c.Data_), nil
+	}
+	// Copies, so the caller cannot edit the installed definitions.
+	return jsonmodels.ContextPayload{
+		Experiments: append([]jsonmodels.ExperimentData(nil), st.payloadExperiments_...),
+		Holdouts:    append([]jsonmodels.Holdout(nil), st.payloadHoldouts_...),
+	}, nil
 }
 
 // SetOverride is allowed after the context is finalized, like the other
@@ -2371,7 +2401,7 @@ func (c *Context) refreshAsync() (*future.Future, *refreshOperation) {
 			var ok bool
 			result, ok = contextInputOf(value)
 			if !ok {
-				outcome = &TypeError{Expected: "jsonmodels.ContextData", Actual: value}
+				outcome = &TypeError{Expected: "jsonmodels.ContextData or jsonmodels.ContextPayload", Actual: value}
 			} else {
 				var panicErr error
 				diagnostics, panicErr = c.applyRefreshedData(result)
@@ -3799,10 +3829,11 @@ func (c *Context) setData(input contextInput, buffer *diagnosticBuffer) {
 	var contextCustomFields = map[string]map[string]ContextCustomFieldValue{}
 	var rules = map[string]*experimentRules{}
 	var holdoutsById map[int]*jsonmodels.Holdout
+	// A copy, so assignments and GetPayload keep the holdouts as installed
+	// even if the caller reuses its slice.
+	var installedHoldouts = append([]jsonmodels.Holdout(nil), input.holdouts...)
 	if len(input.holdouts) > 0 {
-		// A copy, so assignments pin the holdouts as installed even if the
-		// caller reuses its slice.
-		var installed = append([]jsonmodels.Holdout(nil), input.holdouts...)
+		var installed = installedHoldouts
 		holdoutsById = make(map[int]*jsonmodels.Holdout, len(installed))
 		// An id defined more than once with definitions that draw different
 		// arms (iteration, seeds or split) covers nothing, so the outcome never
@@ -3988,6 +4019,7 @@ func (c *Context) setData(input contextInput, buffer *diagnosticBuffer) {
 	st.indexVariables_ = indexVariables
 	c.IndexVariables_ = legacyIndexVariables(indexVariables)
 	c.Data_ = data
+	st.payloadExperiments_, st.payloadHoldouts_ = extendedAt, installedHoldouts
 	c.Ready_.Store(true)
 
 	c.setRefreshTimer(st)
@@ -4098,6 +4130,7 @@ func (c *Context) SetDataFailed(err error) {
 	st.indexVariables_ = map[string][]ExperimentVariables{}
 	c.IndexVariables_ = map[interface{}]interface{}{}
 	c.Data_ = jsonmodels.ContextData{}
+	st.payloadExperiments_, st.payloadHoldouts_ = nil, nil
 	c.Ready_.Store(true)
 	c.Failed_.Store(true)
 	c.DataLock.Unlock()
