@@ -296,3 +296,38 @@ func TestSetPayloadCopiesTheCallersExperiments(t *testing.T) {
 		t.Fatalf("the installed definition followed the caller's edit: %+v", payload.Experiments[0])
 	}
 }
+
+// A copy of the context reads the live payload, as GetData does: data
+// installed on the original after the copy is what the copy returns.
+func TestGetPayloadThroughACopyReadsTheLiveData(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData(nil))
+	var copied = *h.ctx
+	h.ctx.SetPayload(cpHeldOut())
+	var payload, err = copied.GetPayload()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAny(cpHeldOut(), payload, t)
+	// A plain ContextData is read from the live context's Data_, not the
+	// copy's.
+	h.ctx.SetData(cpHeldOut().ContextData())
+	payload, _ = copied.GetPayload()
+	assertAny(jsonmodels.PayloadOf(cpHeldOut().ContextData()), payload, t)
+}
+
+// GetPayload returns the holdouts as installed, not the caller's slice, and
+// keeps them when the payload has no experiments.
+func TestGetPayloadKeepsTheInstalledHoldouts(t *testing.T) {
+	var data = cpHeldOut()
+	var h = hoCreateFor(t, hoUID, hoData(nil))
+	h.ctx.SetPayload(data)
+	data.Holdouts[0].Name = "edited"
+	var payload, _ = h.ctx.GetPayload()
+	expectValue(t, "holdout_a", payload.Holdouts[0].Name)
+
+	h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}))
+	payload, _ = h.ctx.GetPayload()
+	if len(payload.Holdouts) != 1 || len(payload.Experiments) != 0 {
+		t.Fatalf("payload without experiments: %+v", payload)
+	}
+}

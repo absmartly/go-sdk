@@ -131,9 +131,10 @@ type contextState struct {
 	// it, in experiment-id order. Guarded by DataLock.
 	indexVariables_ map[string][]ExperimentVariables
 
-	// payloadExperiments_ and payloadHoldouts_ are the holdout and switchback
-	// parts of the installed data, as GetPayload returns them; both nil when
-	// a plain ContextData was installed. Guarded by DataLock.
+	// payloadExperiments_ and payloadHoldouts_ are the installed payload, as
+	// GetPayload returns it, when payloadInstalled_ is set; it is clear when a
+	// plain ContextData was installed. Guarded by DataLock.
+	payloadInstalled_   bool
 	payloadExperiments_ []jsonmodels.ExperimentData
 	payloadHoldouts_    []jsonmodels.Holdout
 
@@ -1096,6 +1097,10 @@ func (c *Context) GetData() (jsonmodels.ContextData, error) {
 // without losing them. After a plain ContextData was installed (SetData,
 // CreateContextWith, or a provider without GetContextPayload) it is that
 // data with no holdouts or switchbacks. It fails as GetData does.
+//
+// The experiment and holdout slices are copies, but, as with GetData, the
+// values inside them (variants, splits, holdout ids, schedule numbers and
+// cluster maps) are shared with the context and must not be modified.
 func (c *Context) GetPayload() (jsonmodels.ContextPayload, error) {
 	c = c.live()
 	if err := c.CheckReady(true); err != nil {
@@ -1104,10 +1109,9 @@ func (c *Context) GetPayload() (jsonmodels.ContextPayload, error) {
 	var st = c.state()
 	c.DataLock.RLock()
 	defer c.DataLock.RUnlock()
-	if st.payloadExperiments_ == nil {
+	if !st.payloadInstalled_ {
 		return jsonmodels.PayloadOf(c.Data_), nil
 	}
-	// Copies, so the caller cannot edit the installed definitions.
 	return jsonmodels.ContextPayload{
 		Experiments: append([]jsonmodels.ExperimentData(nil), st.payloadExperiments_...),
 		Holdouts:    append([]jsonmodels.Holdout(nil), st.payloadHoldouts_...),
@@ -2441,13 +2445,15 @@ func (c *Context) refreshAsync() (*future.Future, *refreshOperation) {
 // (experiments[i].Experiment is data.Experiments[i]) and its holdouts. A
 // plain ContextData has neither and installs with no conversion.
 type contextInput struct {
+	payload     bool // a ContextPayload, which GetPayload returns as installed
 	data        jsonmodels.ContextData
 	experiments []jsonmodels.ExperimentData
 	holdouts    []jsonmodels.Holdout
 }
 
 func payloadInput(payload jsonmodels.ContextPayload) contextInput {
-	return contextInput{data: payload.ContextData(), experiments: payload.Experiments, holdouts: payload.Holdouts}
+	return contextInput{payload: true, data: payload.ContextData(), experiments: payload.Experiments,
+		holdouts: payload.Holdouts}
 }
 
 // contextInputOf normalises a value a data future delivered: a
@@ -4019,6 +4025,7 @@ func (c *Context) setData(input contextInput, buffer *diagnosticBuffer) {
 	st.indexVariables_ = indexVariables
 	c.IndexVariables_ = legacyIndexVariables(indexVariables)
 	c.Data_ = data
+	st.payloadInstalled_ = input.payload
 	st.payloadExperiments_, st.payloadHoldouts_ = extendedAt, installedHoldouts
 	c.Ready_.Store(true)
 
@@ -4130,7 +4137,7 @@ func (c *Context) SetDataFailed(err error) {
 	st.indexVariables_ = map[string][]ExperimentVariables{}
 	c.IndexVariables_ = map[interface{}]interface{}{}
 	c.Data_ = jsonmodels.ContextData{}
-	st.payloadExperiments_, st.payloadHoldouts_ = nil, nil
+	st.payloadInstalled_, st.payloadExperiments_, st.payloadHoldouts_ = false, nil, nil
 	c.Ready_.Store(true)
 	c.Failed_.Store(true)
 	c.DataLock.Unlock()

@@ -597,12 +597,12 @@ the full payload, `jsonmodels.ContextPayload`, whose experiments are
 and the switchback fields. `jsonmodels.ContextData` and `jsonmodels.Experiment`
 keep their v1.2.0 layouts, so existing code, positional literals included,
 keeps compiling. `CreateContext` and refreshes with the default client get the
-payload with no code change. With prefetched data, or to hand a context's data to another context, use the
-payload variants:
+payload with no code change. With prefetched data, or to hand a context's
+data to another context, use the payload variants:
 
 ```go
 var payload, _ = sdk.DefaultContextDataDeserializer{}.DeserializePayload(body)
-var ctx = sd.CreateContextWithPayload(contextConfig, payload)
+var ctx = absmartly.CreateContextWithPayload(contextConfig, payload)
 ctx.SetPayload(payload)          // the SetData of a ContextPayload
 payload, _ = ctx.GetPayload()    // the GetData of a ContextPayload
 ```
