@@ -2537,3 +2537,17 @@ func TestSwitchback_SamePeriodArmGridRefreshRebuildsTheSlot(t *testing.T) {
 		t.Fatalf("exposures %+v, want refreshed grid arm %d", exposures, old)
 	}
 }
+
+// A same-period arm-grid edit also changes the switchback generation identity,
+// even before a cached entry is claimed.
+func TestSwitchback_IdentityIncludesArmGrid(t *testing.T) {
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+	var before = h.ctx.state().indexedExperiment("exp_sb")
+	var edited = *before
+	edited.experiment.Data.Split = []float64{1.0 / 3, 1.0 / 3, 1.0 / 3}
+	edited.experiment.Data.Variants = append(edited.experiment.Data.Variants,
+		jsonmodels.ExperimentVariant{Name: "C", Config: `{"sb.arm":"new"}`})
+	if sameSwitchbackIdentity(before, &edited) {
+		t.Fatal("arm-grid edit kept the switchback identity")
+	}
+}
