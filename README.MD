@@ -607,6 +607,9 @@ ctx.SetPayload(payload)          // the SetData of a ContextPayload
 payload, _ = ctx.GetPayload()    // the GetData of a ContextPayload
 ```
 
+As with `GetData`, the values inside the payload `GetPayload` returns are
+shared with the context and must not be modified.
+
 `Deserialize`, `GetContextData`, `GetData`, `SetData` and `CreateContextWith`
 keep working with `ContextData`, which has no holdouts or switchbacks. A custom
 `ContextDataDeserializer` or `ContextDataProvider` gives contexts the payload

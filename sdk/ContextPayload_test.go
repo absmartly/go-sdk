@@ -331,3 +331,21 @@ func TestGetPayloadKeepsTheInstalledHoldouts(t *testing.T) {
 		t.Fatalf("payload without experiments: %+v", payload)
 	}
 }
+
+// GetPayload keeps an installed empty list empty, so a handed-off payload
+// encodes as it was received ([] rather than null), and nil stays nil.
+func TestGetPayloadKeepsEmptyListsEmpty(t *testing.T) {
+	var h = hoCreateFor(t, hoUID, hoData(nil))
+	h.ctx.SetPayload(jsonmodels.ContextPayload{Experiments: []jsonmodels.ExperimentData{}, Holdouts: []jsonmodels.Holdout{}})
+	var payload, _ = h.ctx.GetPayload()
+	var raw, _ = json.Marshal(payload)
+	expectValue(t, `{"experiments":[]}`, string(raw))
+	if payload.Holdouts == nil {
+		t.Fatal("an installed empty holdouts list became nil")
+	}
+	h.ctx.SetPayload(jsonmodels.ContextPayload{})
+	payload, _ = h.ctx.GetPayload()
+	if payload.Experiments != nil || payload.Holdouts != nil {
+		t.Fatalf("nil lists became non-nil: %#v", payload)
+	}
+}

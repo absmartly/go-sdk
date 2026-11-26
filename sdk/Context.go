@@ -1112,10 +1112,25 @@ func (c *Context) GetPayload() (jsonmodels.ContextPayload, error) {
 	if !st.payloadInstalled_ {
 		return jsonmodels.PayloadOf(c.Data_), nil
 	}
-	return jsonmodels.ContextPayload{
-		Experiments: append([]jsonmodels.ExperimentData(nil), st.payloadExperiments_...),
-		Holdouts:    append([]jsonmodels.Holdout(nil), st.payloadHoldouts_...),
-	}, nil
+	// An installed empty list stays empty, so it encodes as [] and not null.
+	return jsonmodels.ContextPayload{Experiments: copyExperimentData(st.payloadExperiments_),
+		Holdouts: copyHoldouts(st.payloadHoldouts_)}, nil
+}
+
+// copyExperimentData and copyHoldouts copy a slice, keeping nil nil and
+// empty empty, so a copied payload encodes as the original did.
+func copyExperimentData(experiments []jsonmodels.ExperimentData) []jsonmodels.ExperimentData {
+	if experiments == nil {
+		return nil
+	}
+	return append(make([]jsonmodels.ExperimentData, 0, len(experiments)), experiments...)
+}
+
+func copyHoldouts(holdouts []jsonmodels.Holdout) []jsonmodels.Holdout {
+	if holdouts == nil {
+		return nil
+	}
+	return append(make([]jsonmodels.Holdout, 0, len(holdouts)), holdouts...)
 }
 
 // SetOverride is allowed after the context is finalized, like the other
@@ -3837,7 +3852,7 @@ func (c *Context) setData(input contextInput, buffer *diagnosticBuffer) {
 	var holdoutsById map[int]*jsonmodels.Holdout
 	// A copy, so assignments and GetPayload keep the holdouts as installed
 	// even if the caller reuses its slice.
-	var installedHoldouts = append([]jsonmodels.Holdout(nil), input.holdouts...)
+	var installedHoldouts = copyHoldouts(input.holdouts)
 	if len(input.holdouts) > 0 {
 		var installed = installedHoldouts
 		holdoutsById = make(map[int]*jsonmodels.Holdout, len(installed))
@@ -3886,7 +3901,7 @@ func (c *Context) setData(input contextInput, buffer *diagnosticBuffer) {
 	// The holdout and switchback fields of each experiment, by name as index
 	// is (a repeated name keeps the last); none for a plain ContextData. The
 	// copy keeps the installed definitions apart from the caller's slice.
-	var extendedAt = append([]jsonmodels.ExperimentData(nil), input.experiments...)
+	var extendedAt = copyExperimentData(input.experiments)
 	var payloads map[string]*jsonmodels.ExperimentData
 	if extendedAt != nil {
 		payloads = make(map[string]*jsonmodels.ExperimentData, len(extendedAt))
