@@ -1356,6 +1356,19 @@ func TestSwitchback_LegacySwitchbackUnitTypeChangeIsIdentity(t *testing.T) {
 	h.expectPending(0)
 }
 
+// A legacy switchback with an empty unitType does not apply, even with a
+// context unit keyed "": the empty type identifies no unit, so the
+// experiment is absent (variable default) rather than an ineligible control.
+func TestSwitchback_LegacySwitchbackWithEmptyUnitTypeDoesNotApply(t *testing.T) {
+	var legacy = sbDefault(2, sbHour)
+	legacy.SwitchbackClusters = nil
+	legacy.UnitType = ""
+	var h = sbCreateAt(t, sbAnchor+10, map[string]string{"": sbUID}, sbData(legacy))
+	expectInt(t, 0, h.treatment("exp_sb"))
+	expectValue(t, -1, h.variable("sb.arm"))
+	h.expectPending(0)
+}
+
 // An ineligible or absent switchback slot never consulted its rules, so
 // neither a set attribute nor a rules refresh changes its result.
 func TestSwitchback_RulesAreNotReevaluatedForAnIneligibleOrAbsentSlot(t *testing.T) {
