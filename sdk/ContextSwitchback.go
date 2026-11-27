@@ -37,11 +37,6 @@ type clockReading struct {
 	clock internal.Clock
 	read  bool
 	value int64
-	// serving is the serving unit and cluster key resolved for a slot during
-	// this read, kept across the read's cold-audience parse attempts so the
-	// cluster is read once at the period's first read: an attribute's
-	// marshaler is not asked again by the retry.
-	serving *readServing
 }
 
 // readServing is a serving result for one definition generation. That
@@ -401,7 +396,7 @@ func (c *Context) retainSwitchbackSlot(st *contextState, experimentName string, 
 // same epoch, after an attribute or custom assignment change, keeps the
 // previous resolution's cluster unless no linked unit was set then. The
 // caller holds ContextLock_ for writing.
-func (c *Context) newSwitchbackSlot(indexed *indexedExperiment, previous *cachedAssignment, slot assignmentSlot, at *clockReading) *switchbackSlot {
+func (c *Context) newSwitchbackSlot(indexed *indexedExperiment, previous *cachedAssignment, slot assignmentSlot, at *clockReading, serving **readServing) *switchbackSlot {
 	var now = at.now()
 	var resolved = &switchbackSlot{generation: indexed.switchback.generation, period: slot.period,
 		hasPeriod: slot.hasPeriod, resolvedAt: now}
@@ -411,12 +406,12 @@ func (c *Context) newSwitchbackSlot(indexed *indexedExperiment, previous *cached
 	if previous != nil && previous.switchback != nil && previous.switchback.generation == resolved.generation &&
 		previous.switchback.serving.status != switchbackAbsent {
 		resolved.serving = previous.switchback.serving
-	} else if kept := at.serving; kept != nil && kept.generation == resolved.generation {
+	} else if kept := *serving; kept != nil && kept.generation == resolved.generation {
 		// A retry of the same read, after a cold audience parse.
 		resolved.serving = kept.serving
 	} else {
 		resolved.serving = c.resolveSwitchbackServing(indexed, now)
-		at.serving = &readServing{generation: resolved.generation, serving: resolved.serving}
+		*serving = &readServing{generation: resolved.generation, serving: resolved.serving}
 	}
 	return resolved
 }

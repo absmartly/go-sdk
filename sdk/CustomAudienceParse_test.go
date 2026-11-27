@@ -449,7 +449,8 @@ func TestQueuedAudienceAttemptsRecheckBeforeDecode(t *testing.T) {
 	var counter = &countingDeserializer{}
 	ctx.AudienceMatcher_ = AudienceMatcher{counter}
 	var st = ctx.state()
-	var first, requested = ctx.buildAssignmentLocked(st, "exp_app", &clockReading{clock: ctx.Clock_}, false, nil)
+	var serving *readServing
+	var first, requested = ctx.buildAssignmentLocked(st, "exp_app", &clockReading{clock: ctx.Clock_}, false, nil, &serving)
 	if first != nil || requested == nil {
 		t.Fatal("expected a cold assignment requesting a parse")
 	}
@@ -457,7 +458,8 @@ func TestQueuedAudienceAttemptsRecheckBeforeDecode(t *testing.T) {
 	var done = make(chan int, readers)
 	for i := 0; i < readers; i++ {
 		go func() {
-			var entry, pending = ctx.buildAudienceAttempt(st, "exp_app", &clockReading{clock: ctx.Clock_}, false)
+			var serving *readServing
+			var entry, pending = ctx.buildAudienceAttempt(st, "exp_app", &clockReading{clock: ctx.Clock_}, false, &serving)
 			if pending != nil || entry == nil {
 				done <- -1
 				return

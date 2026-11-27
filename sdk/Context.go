@@ -2838,7 +2838,13 @@ func (c *Context) validEntry(st *contextState, experimentName string, indexed *i
 		// A matching rule wins over a custom assignment, and a holdout
 		// suppression forces control, so a custom assignment that differs
 		// from either variant is not staleness.
-		if !c.entryMatches(indexed, entry) || !holdoutSetMatches(holdouts, entry.holdouts) {
+		var matches bool
+		if entry.switchback == nil {
+			matches = indexed.switchback == nil && experimentMatches(&experiment.Data, assignment)
+		} else {
+			matches = c.entryMatches(indexed, entry)
+		}
+		if !matches || !holdoutSetMatches(holdouts, entry.holdouts) {
 			return rules, assignmentStale
 		}
 		if (ignoreCustom || !assignment.Exposed.Load().(bool)) && st.heldOut() &&
@@ -3052,9 +3058,11 @@ func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cach
 	c.ContextLock_.RLock()
 	var indexed = st.indexedExperiment(experimentName)
 	if indexed == nil || indexed.switchback == nil {
-		if entry, _, state := c.validCachedAssignment(st, experimentName, indexed, assignmentSlot{key: experimentName}, nil); state == assignmentValid {
-			c.ContextLock_.RUnlock()
-			return entry
+		if entry := st.assignmentCache_[experimentName]; entry != nil {
+			if _, state := c.validEntry(st, experimentName, indexed, entry, false, nil); state == assignmentValid {
+				c.ContextLock_.RUnlock()
+				return entry
+			}
 		}
 		c.ContextLock_.RUnlock()
 	} else {
@@ -3100,9 +3108,12 @@ func (c *Context) cachedAssignmentAt(st *contextState, experimentName string, at
 // lent it the gate, so that operation's parser and loggers run nested, as
 // v1.1.1 ran refresh callbacks on the joining goroutine.
 func (c *Context) buildAssignment(st *contextState, experimentName string, at *clockReading) *cachedAssignment {
-	var entry, unparsed = c.buildAssignmentLocked(st, experimentName, at, false, nil)
+	// Provisional cluster state belongs to this build, not to warmed reads.
+	// Keep it across cold-audience parses without enlarging clockReading.
+	var serving *readServing
+	var entry, unparsed = c.buildAssignmentLocked(st, experimentName, at, false, nil, &serving)
 	for attempt := 0; unparsed != nil; attempt++ {
-		entry, unparsed = c.buildAudienceAttempt(st, experimentName, at, attempt >= maxAudienceAttempts)
+		entry, unparsed = c.buildAudienceAttempt(st, experimentName, at, attempt >= maxAudienceAttempts, &serving)
 	}
 	return entry
 }
@@ -3110,17 +3121,17 @@ func (c *Context) buildAssignment(st *contextState, experimentName string, at *c
 // buildAudienceAttempt owns the gate for one decode and its consuming locked
 // evaluation only. Waiting readers recheck the assignment before decoding:
 // another reader may have installed it while they waited.
-func (c *Context) buildAudienceAttempt(st *contextState, experimentName string, at *clockReading, last bool) (*cachedAssignment, *jsonmodels.Experiment) {
+func (c *Context) buildAudienceAttempt(st *contextState, experimentName string, at *clockReading, last bool, serving **readServing) (*cachedAssignment, *jsonmodels.Experiment) {
 	if !builtinDeserializer(c.AudienceMatcher_.Deserializer_) {
 		st.customAudiences.lock()
 		defer st.customAudiences.unlock()
 	}
-	var entry, unparsed = c.buildAssignmentLocked(st, experimentName, at, last, nil)
+	var entry, unparsed = c.buildAssignmentLocked(st, experimentName, at, last, nil, serving)
 	if unparsed == nil {
 		return entry, nil
 	}
 	var parsed = c.parseAudienceUnlocked(st, experimentName, *unparsed)
-	return c.buildAssignmentLocked(st, experimentName, at, last, parsed)
+	return c.buildAssignmentLocked(st, experimentName, at, last, parsed, serving)
 }
 
 // audienceParse is the parse one build made of an experiment run's audience,
@@ -3167,7 +3178,7 @@ const maxAudienceAttempts = 4
 // attribute's own JSON or text marshaler, and the audience evaluator can
 // panic; neither may strand the lock.
 func (c *Context) buildAssignmentLocked(st *contextState, experimentName string, at *clockReading, last bool,
-	parse *audienceParse) (*cachedAssignment, *jsonmodels.Experiment) {
+	parse *audienceParse, serving **readServing) (*cachedAssignment, *jsonmodels.Experiment) {
 	// Cache miss, out of date, or revalidated. Check again under the write
 	// lock: another goroutine may have rebuilt the assignment meanwhile, and
 	// replacing it would lose its exposed flag and queue a second exposure.
@@ -3236,7 +3247,7 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string,
 	}
 
 	if efound && indexed.switchback != nil {
-		entry.switchback = c.newSwitchbackSlot(indexed, previous, slot, at)
+		entry.switchback = c.newSwitchbackSlot(indexed, previous, slot, at, serving)
 	}
 
 	if ofound {
