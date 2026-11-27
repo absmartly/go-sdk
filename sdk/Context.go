@@ -2138,10 +2138,15 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 	var at = clockReading{clock: c.Clock_}
 	for i := range experiments {
 		var name = experiments[i].Data.Name
-		var entry = c.getAssignmentAt(name, &at)
+		var entry = c.getAssignmentFor(st, name, &at)
 		if expose {
 			if afterReadResolve != nil {
 				afterReadResolve()
+			}
+			// An exposed winner needs no claim or arm check. Keep this
+			// ordinary warmed path inline; replacements still settle below.
+			if entry.wins() && !entry.needsSettling() {
+				return variableOf(entry, key, defaultValue), nil
 			}
 			var current bool
 			if entry, current = c.exposeVariableCandidate(name, key, entry, &at); !current {
@@ -3050,6 +3055,11 @@ func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cach
 	} else {
 		c.syncLiteralExperiment(st, experimentName)
 	}
+	return c.getAssignmentFor(st, experimentName, at)
+}
+
+// getAssignmentFor resolves against an already normalised live context.
+func (c *Context) getAssignmentFor(st *contextState, experimentName string, at *clockReading) *cachedAssignment {
 	// A valid cached assignment only needs the read lock, so concurrent reads
 	// of a shared context do not serialise. An ordinary experiment's lookup
 	// calls no injected code, so it stays inline with explicit unlocks; a

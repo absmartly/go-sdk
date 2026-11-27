@@ -697,3 +697,24 @@ type sbOpaqueNote struct {
 	Key  string
 	Note string
 }
+
+// A switchback transition invalidates the ordinary slot even with unchanged
+// experiment identity and no usable period.
+func TestSwitchbackLoad_OrdinaryToUnservableSwitchbackSameIdentity(t *testing.T) {
+	sb := sbDefault(2, sbHour)
+	sb.SwitchbackStartAt = nil
+	ordinary := sb
+	ordinary.RandomizationType = ""
+	h := sbCreate(t, sbData(ordinary))
+	before := h.ctx.getAssignment("exp_sb")
+	if before.switchback != nil {
+		t.Fatal("fixture did not start ordinary")
+	}
+	h.refresh(sb)
+	after := h.ctx.getAssignment("exp_sb")
+	if after.switchback == nil || !after.switchback.silent {
+		t.Fatalf("served cached ordinary decision after switchback transition: slot=%+v variant=%d", after.switchback, after.assignment.Variant)
+	}
+	h.ctx.QueueExposure(after.assignment)
+	h.expectPending(0)
+}
