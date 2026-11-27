@@ -151,3 +151,49 @@ func TestSwitchbackLoad_SettledInvalidDataFutureFailsTheContext(t *testing.T) {
 		t.Fatalf("logged %#v", errorsLogged[0])
 	}
 }
+
+// A literal whose switchback's Index_ entry is edited keeps serving the
+// schedule: periods 0 to 3 draw the same arms before and after an audience
+// edit. An edit to its switchback identity (the period) starts a new
+// generation, so the cached slot is not reused.
+func TestSwitchbackLoad_LiteralIndexEditKeepsServingTheSchedule(t *testing.T) {
+	var sb = sbDefault(2, sbHour)
+	var literal = audienceLiteral(sb)
+	var clock = &sbClock{now: sbAnchor + 5}
+	literal.Clock_ = clock
+	literal.Units_ = map[string]string{sbUnitType: sbUID}
+	literal.Attributes_ = []interface{}{}
+	literal.SetData(sbData(sb))
+	if err := literal.SetAttribute(sbClusterPath, sbClusterKey); err != nil {
+		t.Fatal(err)
+	}
+	var schedule = func() []int {
+		var arms = make([]int, 4)
+		for period := range arms {
+			clock.set(sbAnchor + int64(period)*sbHour + 5)
+			arms[period] = treatmentPeek(t, literal, "exp_sb")
+		}
+		return arms
+	}
+	expectValue(t, sbExpected2Arms[:4], schedule())
+	var generation = literal.state().indexedExperiment("exp_sb").switchback.generation
+
+	var edited = literal.Index_["exp_sb"]
+	edited.Data.Audience = `{"filter":[{"value":true}]}`
+	literal.Index_["exp_sb"] = edited
+	expectValue(t, sbExpected2Arms[:4], schedule())
+	var indexed = literal.state().indexedExperiment("exp_sb")
+	if indexed.switchback == nil || indexed.switchback.generation != generation {
+		t.Fatalf("an audience edit changed the switchback: %+v, generation %d", indexed.switchback, generation)
+	}
+
+	var period = int64(2 * sbHour)
+	edited = literal.Index_["exp_sb"]
+	edited.Data.SwitchbackPeriodMs = &period
+	literal.Index_["exp_sb"] = edited
+	clock.set(sbAnchor + 5)
+	treatmentPeek(t, literal, "exp_sb")
+	if indexed = literal.state().indexedExperiment("exp_sb"); indexed.switchback.generation == generation {
+		t.Fatal("a period edit kept the switchback generation")
+	}
+}

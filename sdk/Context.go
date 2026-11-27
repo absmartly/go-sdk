@@ -3648,11 +3648,17 @@ func (st *contextState) hasAudience(text string) bool {
 // treatments. No customer code runs here: an edited entry keeps the rules
 // SetData parsed for it only while its assignmentRules text is unchanged,
 // and otherwise has none, as an entry present at the first read has none
-// (v1.1.1 had no rules). Contexts the SDK created keep their own index.
+// (v1.1.1 had no rules). An edited switchback keeps its generation, and so
+// its cached slots, while its switchback identity is unchanged, as a refresh
+// does. Contexts the SDK created keep their own index.
 func (c *Context) syncLiteralExperiment(st *contextState, experimentName string) {
 	// indexLock_, not DataLock: setData holds it while it writes Index_ and
 	// installs the index, so the two are read consistently and race-free,
-	// and a caller holding DataLock can still read treatments.
+	// and a caller holding DataLock can still read treatments. ContextLock_
+	// first, as setData takes them, because a switchback's generation is
+	// assigned under it.
+	c.ContextLock_.Lock()
+	defer c.ContextLock_.Unlock()
 	st.indexLock_.Lock()
 	defer st.indexLock_.Unlock()
 	var experiment, found = c.Index_[experimentName]
@@ -3683,14 +3689,21 @@ func (c *Context) syncLiteralExperiment(st *contextState, experimentName string)
 	if found {
 		var entry = &indexedExperiment{experiment: experiment, rules: rules,
 			holdoutIds: append([]int(nil), experiment.Data.HoldoutIds...)}
-		// Holdouts never cover a switchback.
-		if !isSwitchback(&experiment.Data) && len(next.holdouts) > 0 {
+		if isSwitchback(&experiment.Data) {
+			// An edited switchback is still one, so it keeps serving the
+			// schedule. Holdouts never cover a switchback.
+			entry.switchback = newSwitchbackDefinition(experiment.Data.SwitchbackClusters)
+			next.keyed, next.heldOut = true, true
+		} else if len(next.holdouts) > 0 {
 			entry.holdouts = coveringHoldouts(experiment.Data.HoldoutIds, next.holdouts)
 		}
 		if next.keyed {
 			entry.variableKeys = variableKeysOf(experiment)
 		}
 		indexed[experimentName] = entry
+		if entry.switchback != nil {
+			c.assignSwitchbackGenerations(st, st.loadIndex(), map[string]*indexedExperiment{experimentName: entry})
+		}
 	} else {
 		delete(indexed, experimentName)
 	}
@@ -3708,9 +3721,22 @@ func sameLiteralEntry(a, b ExperimentVariables) bool {
 		x.TrafficSeedLo == y.TrafficSeedLo && x.FullOnVariant == y.FullOnVariant &&
 		x.Audience == y.Audience && x.AudienceStrict == y.AudienceStrict &&
 		sameSplit(x.Split, y.Split) && sameSplit(x.TrafficSplit, y.TrafficSplit) &&
-		x.AssignmentRules == y.AssignmentRules &&
+		x.AssignmentRules == y.AssignmentRules && sameLiteralSwitchback(&x, &y) &&
 		len(x.Variants) == len(y.Variants) && (len(x.Variants) == 0 || &x.Variants[0] == &y.Variants[0]) &&
 		len(a.Variables) == len(b.Variables) && (len(a.Variables) == 0 || &a.Variables[0] == &b.Variables[0])
+}
+
+// sameLiteralSwitchback reports whether two definitions agree in the
+// switchback fields an assignment reads. Slices compare by identity, as in
+// sameLiteralEntry: an entry copied from Index_ shares them.
+func sameLiteralSwitchback(x, y *jsonmodels.Experiment) bool {
+	return x.RandomizationType == y.RandomizationType && x.SwitchbackDesignType == y.SwitchbackDesignType &&
+		equalInt64Pointers(x.SwitchbackStartAt, y.SwitchbackStartAt) &&
+		equalInt64Pointers(x.SwitchbackPeriodMs, y.SwitchbackPeriodMs) &&
+		len(x.SwitchbackClusters) == len(y.SwitchbackClusters) &&
+		(len(x.SwitchbackClusters) == 0 || &x.SwitchbackClusters[0] == &y.SwitchbackClusters[0]) &&
+		len(x.SwitchbackClusterValues) == len(y.SwitchbackClusterValues) &&
+		(len(x.SwitchbackClusterValues) == 0 || &x.SwitchbackClusterValues[0] == &y.SwitchbackClusterValues[0])
 }
 
 // sameHoldoutIds compares holdout ids element by element, without reflection
