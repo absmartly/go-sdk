@@ -3658,7 +3658,7 @@ func (c *Context) syncLiteralExperiment(st *contextState, experimentName string)
 	st.indexLock_.Lock()
 	var experiment, found = c.Index_[experimentName]
 	var installedEntry = st.indexedExperiment(experimentName)
-	var unchanged = literalEntryMatches(installedEntry, experiment, found)
+	var unchanged = literalEntryMatches(installedEntry, &experiment, found)
 	st.indexLock_.Unlock()
 	if unchanged {
 		return
@@ -3675,7 +3675,7 @@ func (c *Context) syncLiteralExperiment(st *contextState, experimentName string)
 	if installed {
 		current, rules = installedEntry.experiment, installedEntry.rules
 	}
-	if literalEntryMatches(installedEntry, experiment, found) {
+	if literalEntryMatches(installedEntry, &experiment, found) {
 		return
 	}
 	var indexed = map[string]*indexedExperiment{}
@@ -3717,8 +3717,8 @@ func (c *Context) syncLiteralExperiment(st *contextState, experimentName string)
 
 // literalEntryMatches is checked under indexLock_, both before and after
 // acquiring the rebuild locks.
-func literalEntryMatches(installed *indexedExperiment, experiment ExperimentVariables, found bool) bool {
-	return found == (installed != nil) && (!found || sameLiteralEntry(installed.experiment, experiment) &&
+func literalEntryMatches(installed *indexedExperiment, experiment *ExperimentVariables, found bool) bool {
+	return found == (installed != nil) && (!found || sameLiteralEntry(&installed.experiment, experiment) &&
 		sameHoldoutIds(installed.holdoutIds, experiment.Data.HoldoutIds))
 }
 
@@ -3726,14 +3726,14 @@ func literalEntryMatches(installed *indexedExperiment, experiment ExperimentVari
 // copy in the fields an assignment reads, without reflection on the cached
 // read path. Slices compare by identity: an entry copied from Index_ shares
 // them, and a replaced one has new ones.
-func sameLiteralEntry(a, b ExperimentVariables) bool {
-	var x, y = a.Data, b.Data
+func sameLiteralEntry(a, b *ExperimentVariables) bool {
+	var x, y = &a.Data, &b.Data
 	return x.Id == y.Id && x.Name == y.Name && x.UnitType == y.UnitType && x.Iteration == y.Iteration &&
 		x.SeedHi == y.SeedHi && x.SeedLo == y.SeedLo && x.TrafficSeedHi == y.TrafficSeedHi &&
 		x.TrafficSeedLo == y.TrafficSeedLo && x.FullOnVariant == y.FullOnVariant &&
 		x.Audience == y.Audience && x.AudienceStrict == y.AudienceStrict &&
 		sameSplit(x.Split, y.Split) && sameSplit(x.TrafficSplit, y.TrafficSplit) &&
-		x.AssignmentRules == y.AssignmentRules && sameLiteralSwitchback(&x, &y) &&
+		x.AssignmentRules == y.AssignmentRules && sameLiteralSwitchback(x, y) &&
 		len(x.Variants) == len(y.Variants) && (len(x.Variants) == 0 || &x.Variants[0] == &y.Variants[0]) &&
 		len(a.Variables) == len(b.Variables) && (len(a.Variables) == 0 || &a.Variables[0] == &b.Variables[0])
 }
@@ -3742,6 +3742,11 @@ func sameLiteralEntry(a, b ExperimentVariables) bool {
 // switchback fields an assignment reads. Slices compare by identity, as in
 // sameLiteralEntry: an entry copied from Index_ shares them.
 func sameLiteralSwitchback(x, y *jsonmodels.Experiment) bool {
+	// Ordinary experiments never consult switchback-only fields. Detect a
+	// transition by type, without comparing unused schedule metadata.
+	if !isSwitchback(x) && !isSwitchback(y) {
+		return true
+	}
 	return x.RandomizationType == y.RandomizationType && x.SwitchbackDesignType == y.SwitchbackDesignType &&
 		equalInt64Pointers(x.SwitchbackStartAt, y.SwitchbackStartAt) &&
 		equalInt64Pointers(x.SwitchbackPeriodMs, y.SwitchbackPeriodMs) &&

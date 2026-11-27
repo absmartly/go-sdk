@@ -274,3 +274,20 @@ func TestSwitchbackLoad_LiteralTransitionEnablesRebuildGates(t *testing.T) {
 	literal.Index_["exp_sb"] = edited
 	expectInt(t, 0, treatmentPeek(t, literal, "exp_sb"))
 }
+
+// Unused schedule metadata on an ordinary experiment does not require
+// switchback identity work; a transition into a switchback still does.
+func TestSwitchbackLoad_OrdinaryLiteralIgnoresUnusedSchedule(t *testing.T) {
+	var a = jsonmodels.Experiment{Name: "unit"}
+	var b = a
+	b.SwitchbackStartAt = sbInt64(sbAnchor)
+	b.SwitchbackPeriodMs = sbInt64(sbHour)
+	b.SwitchbackClusters = sbClusters(sbUnitType, sbClusterPath)
+	if !sameLiteralSwitchback(&a, &b) {
+		t.Fatal("ordinary definition compared unused schedule fields")
+	}
+	b.RandomizationType = "switchback"
+	if sameLiteralSwitchback(&a, &b) {
+		t.Fatal("ordinary-to-switchback transition was ignored")
+	}
+}
