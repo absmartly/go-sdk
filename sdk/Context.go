@@ -3652,25 +3652,30 @@ func (st *contextState) hasAudience(text string) bool {
 // its cached slots, while its switchback identity is unchanged, as a refresh
 // does. Contexts the SDK created keep their own index.
 func (c *Context) syncLiteralExperiment(st *contextState, experimentName string) {
-	// indexLock_, not DataLock: setData holds it while it writes Index_ and
-	// installs the index, so the two are read consistently and race-free,
-	// and a caller holding DataLock can still read treatments. ContextLock_
-	// first, as setData takes them, because a switchback's generation is
-	// assigned under it.
+	// Unchanged entries need only indexLock_, as in v1.3.0. Release it
+	// before taking ContextLock_: a rebuild uses setData's lock order and
+	// checks again, since another install may have landed meanwhile.
+	st.indexLock_.Lock()
+	var experiment, found = c.Index_[experimentName]
+	var installedEntry = st.indexedExperiment(experimentName)
+	var unchanged = literalEntryMatches(installedEntry, experiment, found)
+	st.indexLock_.Unlock()
+	if unchanged {
+		return
+	}
 	c.ContextLock_.Lock()
 	defer c.ContextLock_.Unlock()
 	st.indexLock_.Lock()
 	defer st.indexLock_.Unlock()
-	var experiment, found = c.Index_[experimentName]
-	var installedEntry = st.indexedExperiment(experimentName)
+	experiment, found = c.Index_[experimentName]
+	installedEntry = st.indexedExperiment(experimentName)
 	var installed = installedEntry != nil
 	var current ExperimentVariables
 	var rules *experimentRules
 	if installed {
 		current, rules = installedEntry.experiment, installedEntry.rules
 	}
-	if found == installed && (!found || sameLiteralEntry(current, experiment) &&
-		sameHoldoutIds(installedEntry.holdoutIds, experiment.Data.HoldoutIds)) {
+	if literalEntryMatches(installedEntry, experiment, found) {
 		return
 	}
 	var indexed = map[string]*indexedExperiment{}
@@ -3708,6 +3713,13 @@ func (c *Context) syncLiteralExperiment(st *contextState, experimentName string)
 		delete(indexed, experimentName)
 	}
 	st.index_.Store(next)
+}
+
+// literalEntryMatches is checked under indexLock_, both before and after
+// acquiring the rebuild locks.
+func literalEntryMatches(installed *indexedExperiment, experiment ExperimentVariables, found bool) bool {
+	return found == (installed != nil) && (!found || sameLiteralEntry(installed.experiment, experiment) &&
+		sameHoldoutIds(installed.holdoutIds, experiment.Data.HoldoutIds))
 }
 
 // sameLiteralEntry reports whether an Index_ entry still matches the private

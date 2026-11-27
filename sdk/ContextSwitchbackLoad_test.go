@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/absmartly/go-sdk/sdk/future"
 	"github.com/absmartly/go-sdk/sdk/internal"
@@ -196,4 +197,80 @@ func TestSwitchbackLoad_LiteralIndexEditKeepsServingTheSchedule(t *testing.T) {
 	if indexed = literal.state().indexedExperiment("exp_sb"); indexed.switchback.generation == generation {
 		t.Fatal("a period edit kept the switchback generation")
 	}
+}
+
+// An unchanged entry synchronizes while another reader holds ContextLock_:
+// only a rebuild needs that lock exclusively.
+func TestSwitchbackLoad_UnchangedLiteralSyncTakesNoExclusiveContextLock(t *testing.T) {
+	var literal = audienceLiteral(sbUnit(sbDefault(2, sbHour)))
+	var state = literal.state()
+	literal.syncLiteralExperiment(state, "exp_sb")
+	literal.ContextLock_.RLock()
+	var done = make(chan struct{})
+	go func() {
+		literal.syncLiteralExperiment(state, "exp_sb")
+		close(done)
+	}()
+	select {
+	case <-done:
+		literal.ContextLock_.RUnlock()
+	case <-time.After(time.Second):
+		literal.ContextLock_.RUnlock()
+		<-done
+		t.Fatal("unchanged literal synchronization waited for an exclusive context lock")
+	}
+}
+
+func TestSwitchbackLoad_LiteralIdentityEdits(t *testing.T) {
+	for name, edit := range map[string]func(*jsonmodels.Experiment){
+		"start":      func(e *jsonmodels.Experiment) { e.SwitchbackStartAt = sbInt64(sbAnchor - sbHour) },
+		"clusters":   func(e *jsonmodels.Experiment) { e.SwitchbackClusters = sbClusters(sbUnitType, "other") },
+		"allow list": func(e *jsonmodels.Experiment) { e.SwitchbackClusterValues = []string{"other"} },
+		"design":     func(e *jsonmodels.Experiment) { e.SwitchbackDesignType = "other" },
+		"unit":       func(e *jsonmodels.Experiment) { e.RandomizationType = "unit" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			var sb = sbDefault(2, sbHour)
+			var literal = audienceLiteral(sb)
+			literal.Clock_ = &sbClock{now: sbAnchor + sbHour + 5}
+			literal.Units_ = map[string]string{sbUnitType: sbUID}
+			literal.SetData(sbData(sb))
+			_ = literal.SetAttribute(sbClusterPath, sbClusterKey)
+			treatmentPeek(t, literal, "exp_sb")
+			var generation = literal.state().indexedExperiment("exp_sb").switchback.generation
+			var edited = literal.Index_["exp_sb"]
+			edit(&edited.Data)
+			literal.Index_["exp_sb"] = edited
+			treatmentPeek(t, literal, "exp_sb")
+			var next = literal.state().indexedExperiment("exp_sb").switchback
+			if name == "unit" {
+				if next != nil {
+					t.Fatal("unit edit kept the switchback")
+				}
+			} else if next == nil || next.generation == generation {
+				t.Fatal("switchback identity edit kept its generation")
+			}
+		})
+	}
+}
+
+// A unit-only literal edited into a switchback enables the rebuild gates,
+// so a later audience edit before exposure is observed.
+func TestSwitchbackLoad_LiteralTransitionEnablesRebuildGates(t *testing.T) {
+	var sb = sbDefault(2, sbHour)
+	sb.RandomizationType = "unit"
+	var literal = audienceLiteral(sb)
+	literal.Clock_ = &sbClock{now: sbAnchor + sbHour + 5}
+	literal.Units_ = map[string]string{sbUnitType: sbUID}
+	literal.SetData(sbData(sb))
+	_ = literal.SetAttribute(sbClusterPath, sbClusterKey)
+	var edited = literal.Index_["exp_sb"]
+	edited.Data.RandomizationType = "switchback"
+	literal.Index_["exp_sb"] = edited
+	expectInt(t, 1, treatmentPeek(t, literal, "exp_sb"))
+	edited = literal.Index_["exp_sb"]
+	edited.Data.AudienceStrict = true
+	edited.Data.Audience = `{"filter":[{"value":false}]}`
+	literal.Index_["exp_sb"] = edited
+	expectInt(t, 0, treatmentPeek(t, literal, "exp_sb"))
 }
