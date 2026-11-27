@@ -2661,3 +2661,35 @@ func TestSwitchback_SharedKeyReadUsesOneClockReading(t *testing.T) {
 		}
 	}
 }
+
+// The holdout-arm check accepts a switchback slot that dropped out of the
+// two-period window while the check ran: other reads step exp_a through
+// periods 1 to 3, retiring the period-0 slot this read resolved, and the read
+// still serves exp_b's period-0 arm rather than resolving again later.
+func TestSwitchback_ArmCheckAcceptsASlotThatLeftTheWindow(t *testing.T) {
+	var first = sbExperiment(1, "exp_a", 2, sbHour)
+	first.Audience, first.AudienceStrict = sbStrictGoldAudience, true
+	var second = sbExperiment(2, "exp_b", 2, sbHour)
+	second.SeedHi, second.SeedLo = 77, 88
+	if sbDrawSeeded(77, 88, 0) == sbDrawSeeded(77, 88, 3) {
+		t.Fatal("fixture: exp_b draws the same arm in periods 0 and 3")
+	}
+	var h = sbCreateAt(t, sbAnchor+5, map[string]string{sbUnitType: sbUID}, sbData(first, second))
+	var armed = true
+	beforeHoldoutArms = func() {
+		if armed {
+			armed = false
+			for period := int64(1); period <= 3; period++ {
+				h.clock.set(sbAnchor + period*sbHour + 5)
+				h.peek("exp_a")
+			}
+		}
+	}
+	defer func() { beforeHoldoutArms = nil }()
+	h.clock.set(sbAnchor + 3*sbHour + 5)
+	h.clock.setNextRead(sbAnchor + 5)
+	expectValue(t, sbDrawSeeded(77, 88, 0), h.variable("sb.arm"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+}
