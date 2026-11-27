@@ -533,6 +533,12 @@ type contextIndex struct {
 	// since an entry resolved under them may be retired by any later
 	// replacement.
 	keyed bool
+	// heldOut is set once any install had holdouts or switchbacks. Only then
+	// is an unexposed decision resolved again when its audience definition
+	// or, for an override, its experiment's identity changes, so a context
+	// with neither (rules only included) keeps v1.2.0's cached decisions, as
+	// the JS and Java SDKs do.
+	heldOut bool
 
 	// audiences is the set of audience texts in experiments, built once per
 	// snapshot on first use: a snapshot is never changed after it is stored.
@@ -1563,40 +1569,39 @@ func (c *Context) queueEligibleExposureAt(entry *cachedAssignment, eligible func
 		return c.queueExposureAt(entry.assignment, entry, at)
 	}
 	c = c.live()
-	var status, claimed = c.claimEligible(entry, eligible)
-	if status != exposureClaimed {
+	if status := c.claimEligible(entry, eligible); status != exposureClaimed {
 		return status
 	}
-	return c.admitExposureAt(claimed.assignment, claimed, at)
+	return c.admitExposureAt(entry.assignment, entry, at)
 }
 
 // claimEligible checks eligibility and claims the exposure in one step under
 // ContextLock_, so no refresh can land between the check and the claim. The
 // lock is released on unwind too: the audience evaluator can panic. A claim
 // already taken is honoured.
-func (c *Context) claimEligible(entry *cachedAssignment, eligible func(*cachedAssignment) exposureStatus) (exposureStatus, *cachedAssignment) {
+func (c *Context) claimEligible(entry *cachedAssignment, eligible func(*cachedAssignment) exposureStatus) exposureStatus {
 	c.ContextLock_.RLock()
 	defer c.ContextLock_.RUnlock()
 	if beforeEligibleClaim != nil {
 		beforeEligibleClaim()
 	}
 	if entry.retirement.Load() {
-		return exposureRetired, nil
+		return exposureRetired
 	}
 	if entry.assignment.Exposed.Load().(bool) {
-		return exposureQueued, nil
+		return exposureQueued
 	}
 	if status := eligible(entry); status != exposureClaimed {
-		return status, nil
+		return status
 	}
 	var claimed = entry.assignment.Exposed.CompareAndSwap(false, true)
 	if afterEligibleCAS != nil {
 		afterEligibleCAS()
 	}
 	if claimed {
-		return exposureClaimed, entry
+		return exposureClaimed
 	}
-	return exposureQueued, nil
+	return exposureQueued
 }
 
 // sameDecision compares the resolved experiment run as well as its exposures:
@@ -1642,27 +1647,37 @@ func (e *cachedAssignment) needsSettling() bool {
 // exposureIneligible when the experiment is no longer a candidate for key, and
 // exposureRetired when it still is but this decision is no longer current, so
 // the read resolves again. Contexts with none of them keep the released behaviour.
-// st is resolved by the caller: the check runs under ContextLock_.
-func (c *Context) variableEligible(st *contextState, experimentName string, key string) func(*cachedAssignment) exposureStatus {
+// The caller holds ContextLock_.
+func (c *Context) variableEligible(experimentName string, key string) func(*cachedAssignment) exposureStatus {
+	// The live root, so a readiness copy is validated against the live
+	// attributes, and state resolved before the caller takes ContextLock_.
+	c = c.live()
+	var st = c.state()
 	return func(e *cachedAssignment) exposureStatus {
-		var index = st.loadIndex()
-		if index == nil || !index.keyed {
-			return exposureClaimed
-		}
-		var indexed = index.experiments[experimentName]
-		if indexed == nil {
-			return exposureIneligible
-		}
-		if _, defined := indexed.variableKeys[key]; !defined {
-			return exposureIneligible
-		}
-		if _, state := c.validEntry(st, experimentName, indexed, e, true, nil); state == assignmentStale {
-			// Still a candidate, but this decision is no longer the current
-			// one: resolve again rather than claim it or skip the experiment.
-			return exposureRetired
-		}
+		return c.keyEligible(st, experimentName, key, e)
+	}
+}
+
+// keyEligible is variableEligible's check, as a method so the arm-only read
+// can run it without building a closure. The caller holds ContextLock_.
+func (c *Context) keyEligible(st *contextState, experimentName string, key string, e *cachedAssignment) exposureStatus {
+	var index = st.loadIndex()
+	if index == nil || !index.keyed {
 		return exposureClaimed
 	}
+	var indexed = index.experiments[experimentName]
+	if indexed == nil {
+		return exposureIneligible
+	}
+	if _, defined := indexed.variableKeys[key]; !defined {
+		return exposureIneligible
+	}
+	if _, state := c.validEntry(st, experimentName, indexed, e, true, nil); state == assignmentStale {
+		// Still a candidate, but this decision is no longer the current one:
+		// resolve again rather than claim it or skip the experiment.
+		return exposureRetired
+	}
+	return exposureClaimed
 }
 
 // afterEvictionClaim, when set by a test, runs right after an eviction marks
@@ -1681,10 +1696,13 @@ var (
 // settleExposure, between resolving the assignment and claiming its exposure.
 // beforeEligibleClaim and afterEligibleCAS run in claimEligible, under
 // ContextLock_, before the eligibility check and right after the claim.
+// beforeHoldoutArms runs as queueHoldoutArms starts, before it takes
+// ContextLock_.
 var (
 	afterEligibleCAS    func()
 	beforeSettleClaim   func()
 	beforeEligibleClaim func()
+	beforeHoldoutArms   func()
 )
 
 // QueueExposure queues the assignment's exposure once, then the exposures of
@@ -1785,12 +1803,13 @@ func (c *Context) admitExposureAt(assignment *Assignment, entry *cachedAssignmen
 	var holdouts *assignmentHoldouts
 	var slot *switchbackSlot
 	var ruleOverride bool
+	var st = c.state()
 	if entry != nil {
 		holdouts, slot, ruleOverride = entry.holdouts, entry.switchback, entry.ruleOverride
 	} else {
 		// No cache entry holds it any more: the rule flag of every assignment
 		// handed out is remembered by its exposed flag.
-		ruleOverride = c.state().ruleIdentities.contains(assignment.Exposed)
+		ruleOverride = st.ruleIdentities.contains(assignment.Exposed)
 	}
 	var status = c.admit(assignment, ruleOverride, holdouts, slot, at)
 	if status == exposureRejected {
@@ -1799,7 +1818,6 @@ func (c *Context) admitExposureAt(assignment *Assignment, entry *cachedAssignmen
 			assignment.Exposed.Store(false)
 			return status
 		}
-		var st = c.state()
 		c.ContextLock_.Lock()
 		c.reopenExposure(st, assignment, entry)
 		c.ContextLock_.Unlock()
@@ -1880,8 +1898,6 @@ func (c *Context) reopenExposure(st *contextState, assignment *Assignment, claim
 	var entry = st.assignmentCache_[assignment.Name]
 	if entry != nil && entry.assignment.Exposed == assignment.Exposed {
 		if _, unitSet := c.Units_[assignment.UnitType]; unitSet && entry.missingUnit() {
-			// Retired, as an eviction is: it stays marked exposed, and a
-			// read already holding it resolves again with the unit.
 			entry.retirement.Store(true)
 			delete(st.assignmentCache_, assignment.Name)
 			delete(c.AssignmentCache, assignment.Name)
@@ -2158,80 +2174,172 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 	var experiments = st.indexVariables_[key]
 	c.DataLock.RUnlock()
 
-	// The suppressed candidates met, in order: when nothing wins, the first
-	// one that is still a candidate for key when claimed supplies the value.
-	var suppressed []*cachedAssignment
+	var suppressedFallback *cachedAssignment
 	// One clock reading resolves and stamps every experiment on the key.
 	var at = clockReading{clock: c.Clock_}
 	for i := range experiments {
 		var name = experiments[i].Data.Name
 		var entry = c.getAssignmentAt(name, &at)
-		if expose && afterReadResolve != nil {
-			afterReadResolve()
-		}
-		if !entry.wins() {
-			if expose {
-				c.queueHoldoutExposures(entry)
-			}
-			if entry.holdouts.isSuppressed() {
-				suppressed = append(suppressed, entry)
-			}
-			continue
-		}
 		if expose {
-			var eligible bool
-			if entry, eligible = c.exposeVariable(st, key, entry, &at); !eligible {
+			if afterReadResolve != nil {
+				afterReadResolve()
+			}
+			var current bool
+			if entry, current = c.exposeVariableCandidate(name, key, entry, &at); !current {
 				// No longer a candidate for key: the next one is.
 				continue
 			}
-			if !entry.wins() {
-				// Resolved again by a retry into a decision that does not
-				// win the key.
-				if entry.holdouts.isSuppressed() {
-					suppressed = append(suppressed, entry)
-				}
-				continue
-			}
 		}
-		return variableOf(entry, key, defaultValue), nil
+		if entry.wins() {
+			return variableOf(entry, key, defaultValue), nil
+		}
+		if suppressedFallback == nil && entry.holdouts.isSuppressed() {
+			suppressedFallback = entry
+		}
 	}
-	for _, entry := range suppressed {
-		if expose {
-			var eligible bool
-			if entry, eligible = c.exposeVariable(st, key, entry, &at); !eligible {
-				continue
-			}
-		}
-		return variableOf(entry, key, defaultValue), nil
+	if suppressedFallback != nil {
+		return variableOf(suppressedFallback, key, defaultValue), nil
 	}
 	return defaultValue, nil
+}
+
+// exposeVariableCandidate exposes a candidate the exposing variable read
+// visits, and returns the decision the read must use and whether the
+// experiment is still a candidate for key. A winner publishes its own
+// exposure and its holdouts'; a suppressed candidate only its holdouts'. A
+// candidate that neither wins nor is suppressed claims nothing: only its
+// holdouts' exposures fire, as in the Java SDK, so a later GetTreatment still
+// exposes it. Once the context has seen holdouts, switchbacks or assignment
+// rules, a decision a refresh, SetUnit or attribute change superseded during
+// the read is resolved again and the current one used instead, up to
+// maxExposureAttempts times, each retry at a fresh clock reading.
+func (c *Context) exposeVariableCandidate(experimentName string, key string, entry *cachedAssignment,
+	at *clockReading) (*cachedAssignment, bool) {
+	// Built only once a claim or an arm check needs it, so a warmed read that
+	// returns at once allocates no closure.
+	var eligible func(*cachedAssignment) exposureStatus
+	for attempt := 1; ; attempt++ {
+		var status exposureStatus
+		if entry.wins() || entry.holdouts.isSuppressed() {
+			if !entry.needsSettling() {
+				return entry, true
+			}
+			if eligible == nil {
+				eligible = c.variableEligible(experimentName, key)
+			}
+			var demoted = false
+			var current bool
+			entry, current = c.settleExposureAt(experimentName, entry, func(e *cachedAssignment) exposureStatus {
+				if !e.wins() && !e.holdouts.isSuppressed() {
+					// Resolved again into a non-participant, which claims
+					// nothing: only its holdouts fire, below.
+					demoted = true
+					return exposureIneligible
+				}
+				return eligible(e)
+			}, at)
+			if !demoted {
+				return entry, current
+			}
+			status = exposureRetired
+		} else {
+			// Until the context has seen holdouts or switchbacks nothing can
+			// retire or rebuild a non-participant during the read (as in
+			// v1.2.0), so one without unexposed arms costs no lock.
+			if !entry.hasUnexposedArms() && !c.state().loadIndex().heldOut {
+				return entry, true
+			}
+			var exposures []jsonmodels.Exposure
+			status, exposures = c.queueHoldoutArms(experimentName, key, entry)
+			c.logExposures(exposures)
+			if status == exposureIneligible {
+				return entry, false
+			}
+		}
+		if status != exposureRetired || attempt >= maxExposureAttempts {
+			return entry, true
+		}
+		*at = clockReading{clock: c.Clock_}
+		entry = c.getAssignmentAt(experimentName, at)
+	}
+}
+
+// hasUnexposedArms reports whether any holdout arm the entry pinned is still
+// unexposed.
+func (e *cachedAssignment) hasUnexposedArms() bool {
+	if e.holdouts == nil {
+		return false
+	}
+	for _, arm := range e.holdouts.arms {
+		if arm != nil && !arm.assignment.Exposed.Load().(bool) {
+			return true
+		}
+	}
+	return false
+}
+
+// queueHoldoutArms queues entry's unexposed holdout arms for a read of key.
+// The caller's clock is read first, with no context lock held, since a clock
+// may call back into the context, and only when an arm is still unexposed:
+// a warmed read has nothing to timestamp. Every mutable read then happens
+// under ContextLock_: the entry must still be the cached, unretired decision,
+// and keyEligible validates it against the installed definitions, so a
+// refresh that lands while the clock runs (a holdout iteration bump, for one)
+// is seen and no superseded arm is admitted. EventLock_ is taken inside
+// ContextLock_, in the snapshot lock order. The caller logs the returned
+// exposures with no lock held.
+func (c *Context) queueHoldoutArms(experimentName string, key string, entry *cachedAssignment) (exposureStatus, []jsonmodels.Exposure) {
+	if beforeHoldoutArms != nil {
+		beforeHoldoutArms()
+	}
+	c = c.live()
+	var st = c.state()
+	var exposedAt int64
+	if entry.hasUnexposedArms() {
+		exposedAt = c.Clock_.Millis()
+	}
+	c.ContextLock_.RLock()
+	defer c.ContextLock_.RUnlock()
+	if entry.retirement.Load() || st.assignmentCache_[experimentName] != entry {
+		return exposureRetired, nil
+	}
+	if status := c.keyEligible(st, experimentName, key, entry); status != exposureClaimed {
+		return status, nil
+	}
+	if !entry.hasUnexposedArms() {
+		return exposureQueued, nil
+	}
+	c.EventLock_.Lock()
+	defer c.EventLock_.Unlock()
+	if c.CheckNotClosed() != nil {
+		return exposureRejected, nil
+	}
+	var exposures []jsonmodels.Exposure
+	for _, arm := range entry.holdouts.arms {
+		if arm != nil && arm.assignment.Exposed.CompareAndSwap(false, true) {
+			exposures = append(exposures, c.exposureFor(arm.assignment, false, exposedAt))
+		}
+	}
+	c.PendingCount_.Store(c.PendingCount_.Load().(int32) + int32(len(exposures)))
+	c.Exposures_ = append(c.Exposures_, exposures...)
+	return exposureQueued, exposures
+}
+
+// logExposures logs queued exposures and arms the publish timeout. The caller
+// holds no context lock.
+func (c *Context) logExposures(exposures []jsonmodels.Exposure) {
+	for _, exposure := range exposures {
+		c.LogEvent(Exposure, exposure)
+	}
+	if len(exposures) != 0 {
+		c.SetTimeout()
+	}
 }
 
 // wins reports whether the assignment can win a variable key: the unit is
 // assigned to, overridden in or rule-assigned to its experiment.
 func (e *cachedAssignment) wins() bool {
 	return e.assignment.Assigned || e.assignment.Overridden || e.ruleOverride
-}
-
-// exposeVariable settles the exposure of a variable read's selected entry,
-// claiming it only while the experiment is still a candidate for key (see
-// variableEligible). It returns the entry to serve, and false when the
-// experiment is no longer a candidate, in which case nothing was claimed.
-func (c *Context) exposeVariable(st *contextState, key string, entry *cachedAssignment, at *clockReading) (*cachedAssignment, bool) {
-	if !entry.needsSettling() {
-		return entry, true
-	}
-	var name = entry.assignment.Name
-	return c.settleExposureAt(name, entry, c.variableEligible(st, name, key), at)
-}
-
-// queueHoldoutExposures queues the exposures of the holdouts covering a
-// variable-key candidate that did not win, without the candidate's own.
-func (c *Context) queueHoldoutExposures(entry *cachedAssignment) {
-	if entry.holdouts == nil {
-		return
-	}
-	c.admit(entry.assignment, false, &assignmentHoldouts{arms: entry.holdouts.arms, suppressed: true}, nil, nil)
 }
 
 // variableOf is the assignment's value for key, or defaultValue when its
@@ -2243,15 +2351,6 @@ func variableOf(entry *cachedAssignment, key string, defaultValue interface{}) i
 	return defaultValue
 }
 
-// variableFrom exposes the selected assignment when expose is set and returns
-// its value for key, or defaultValue when its variables lack key.
-func (c *Context) variableFrom(entry *cachedAssignment, key string, defaultValue interface{}, expose bool) interface{} {
-	if expose && !entry.assignment.Exposed.Load().(bool) {
-		c.queueExposure(entry.assignment, entry)
-	}
-	return variableOf(entry, key, defaultValue)
-}
-
 // resolveLiteralVariableValue is v1.1.1's GetVariableValue/PeekVariableValue
 // for a Context{...} literal.
 func (c *Context) resolveLiteralVariableValue(key string, defaultValue interface{}, expose bool) (interface{}, error) {
@@ -2259,7 +2358,11 @@ func (c *Context) resolveLiteralVariableValue(key string, defaultValue interface
 	if err != nil {
 		return defaultValue, nil
 	}
-	return c.variableFrom(c.getAssignment(experiment.Data.Name), key, defaultValue, expose), nil
+	var entry = c.getAssignment(experiment.Data.Name)
+	if expose && !entry.assignment.Exposed.Load().(bool) {
+		c.queueExposure(entry.assignment, entry)
+	}
+	return variableOf(entry, key, defaultValue), nil
 }
 
 func (c *Context) Track(goalName string, properties map[string]interface{}) error {
@@ -2784,7 +2887,7 @@ func (c *Context) validEntry(st *contextState, experimentName string, indexed *i
 		// resolves an overridden slot again like any other.
 		// A still-unclaimed override needs current variables and resolved
 		// identity before a variable read can claim it in the new epoch.
-		if efound && !assignment.Exposed.Load().(bool) && st.loadIndex().keyed &&
+		if efound && !assignment.Exposed.Load().(bool) && st.loadIndex().heldOut &&
 			!entry.resolvedExperimentMatches(experiment.Data) {
 			return rules, assignmentStale
 		}
@@ -2807,7 +2910,7 @@ func (c *Context) validEntry(st *contextState, experimentName string, indexed *i
 		if !c.entryMatches(indexed, entry) || !holdoutSetMatches(holdouts, entry.holdouts) {
 			return rules, assignmentStale
 		}
-		if (ignoreCustom || !assignment.Exposed.Load().(bool) && st.loadIndex().keyed) &&
+		if (ignoreCustom || !assignment.Exposed.Load().(bool)) && st.loadIndex().heldOut &&
 			entry.audienceChanged(experiment.Data) {
 			return rules, assignmentStale
 		}
@@ -3285,7 +3388,7 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string,
 	if efound {
 		c.keepExposedRuleAssignment(indexed, previous, entry)
 	}
-	var keyed = st.loadIndex().keyed
+	var keyed, heldOut = st.loadIndex().keyed, st.loadIndex().heldOut
 	// Share before publishing the entry: retained pointers and Assignment copies
 	// must observe the same claim and any later retirement. An already exposed
 	// unapplied custom assignment still starts a new exposure, as in v1.1.1.
@@ -3295,11 +3398,11 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string,
 		entry.retirement = previous.retirement
 	}
 	var rebuiltOverride = previous != nil && previous.assignment.Overridden && efound &&
-		keyed && !previous.resolvedExperimentMatches(experiment.Data)
+		heldOut && !previous.resolvedExperimentMatches(experiment.Data)
 	// An unexposed keyed decision rebuilt because its audience was edited is
 	// superseded the same way: a caller still holding it must not publish it.
 	var rebuiltAudience = previous != nil && !previous.assignment.Exposed.Load().(bool) && efound &&
-		keyed && previous.audienceChanged(experiment.Data)
+		heldOut && previous.audienceChanged(experiment.Data)
 	if previous != nil && (previous.holdouts != nil || entry.holdouts != nil || rebuiltOverride || rebuiltAudience) &&
 		previous.assignment.Exposed != assignment.Exposed {
 		// Retire the replaced assignment, as eviction does: a caller still
@@ -3627,25 +3730,47 @@ func (c *Context) syncLiteralExperiment(st *contextState, experimentName string)
 	st.indexLock_.Lock()
 	defer st.indexLock_.Unlock()
 	var experiment, found = c.Index_[experimentName]
-	var current, rules, installed = st.experimentAndRules(experimentName)
+	var installedEntry = st.indexedExperiment(experimentName)
+	var installed = installedEntry != nil
+	var current ExperimentVariables
+	var rules *experimentRules
+	if installed {
+		current, rules = installedEntry.experiment, installedEntry.rules
+	}
 	if found == installed && (!found || sameLiteralEntry(current, experiment)) {
 		return
 	}
 	var indexed = map[string]*indexedExperiment{}
+	// The edited entry keeps the installed holdouts, its payload's coverage
+	// and the gates, so an Index_ edit never drops holdout coverage.
+	// jsonmodels.Experiment carries no HoldoutIds: coverage comes from the
+	// payload SetPayload installed for the experiment.
+	var next = &contextIndex{experiments: indexed}
 	if previous := st.loadIndex(); previous != nil {
 		for name, entry := range previous.experiments {
 			indexed[name] = entry
 		}
+		next.holdouts, next.keyed, next.heldOut = previous.holdouts, previous.keyed, previous.heldOut
 	}
 	if !installed || current.Data.AssignmentRules != experiment.Data.AssignmentRules {
 		rules = nil
 	}
 	if found {
-		indexed[experimentName] = &indexedExperiment{experiment: experiment, rules: rules}
+		var entry = &indexedExperiment{experiment: experiment, rules: rules}
+		if installed {
+			entry.payload = installedEntry.payload
+		}
+		if entry.payload != nil && !isSwitchback(entry.payload) && len(next.holdouts) > 0 {
+			entry.holdouts = coveringHoldouts(entry.payload.HoldoutIds, next.holdouts)
+		}
+		if next.keyed {
+			entry.variableKeys = variableKeysOf(experiment)
+		}
+		indexed[experimentName] = entry
 	} else {
 		delete(indexed, experimentName)
 	}
-	st.index_.Store(&contextIndex{experiments: indexed})
+	st.index_.Store(next)
 }
 
 // sameLiteralEntry reports whether an Index_ entry still matches the private
@@ -3664,6 +3789,21 @@ func sameLiteralEntry(a, b ExperimentVariables) bool {
 		len(a.Variables) == len(b.Variables) && (len(a.Variables) == 0 || &a.Variables[0] == &b.Variables[0])
 }
 
+// variableKeysOf returns the variable keys an experiment defines in any
+// variant. The keys are copied, so the set never retains the parsed variant
+// maps.
+func variableKeysOf(experiment ExperimentVariables) variableKeySet {
+	var keys = variableKeySet{}
+	for _, variables := range experiment.Variables {
+		for key := range variables {
+			if _, found := keys[key]; !found {
+				keys[string(append([]byte(nil), key...))] = struct{}{}
+			}
+		}
+	}
+	return keys
+}
+
 // experimentAndRules is GetExperiment plus the experiment's parsed assignment
 // rules, read from the same installed index.
 func (st *contextState) experimentAndRules(experimentName string) (ExperimentVariables, *experimentRules, bool) {
@@ -3673,8 +3813,6 @@ func (st *contextState) experimentAndRules(experimentName string) (ExperimentVar
 	return ExperimentVariables{}, nil, false
 }
 
-// indexedExperiment returns the installed experiment with its parsed
-// assignment rules and covering holdouts, or nil.
 func (st *contextState) indexedExperiment(experimentName string) *indexedExperiment {
 	var index = st.loadIndex()
 	if index == nil {
@@ -3921,6 +4059,9 @@ func (c *Context) setData(input contextInput, buffer *diagnosticBuffer) {
 		var extended *jsonmodels.ExperimentData
 		if extendedAt != nil {
 			extended = &extendedAt[i]
+			// A private copy, so an in-place edit of the caller's slice never
+			// changes the coverage installed (or recomputed) from it.
+			extended.HoldoutIds = append([]int(nil), extended.HoldoutIds...)
 			// By name as index is, so a repeated name keeps the last.
 			if payloads == nil {
 				payloads = make(map[string]*jsonmodels.ExperimentData, len(extendedAt))
@@ -4025,18 +4166,11 @@ func (c *Context) setData(input contextInput, buffer *diagnosticBuffer) {
 	// finished while this one was parsing does not lose the gate.
 	var current = st.loadIndex()
 	var keyed = len(holdoutsById) > 0 || len(rules) > 0 || len(switchbacks) > 0 || (current != nil && current.keyed)
+	var heldOut = len(holdoutsById) > 0 || len(switchbacks) > 0 || (current != nil && current.heldOut)
 	for name, experiment := range index {
 		var keys variableKeySet
 		if keyed {
-			keys = variableKeySet{}
-			for _, variables := range experiment.Variables {
-				for key := range variables {
-					if _, found := keys[key]; !found {
-						// A copy, so the set does not retain the parsed variables.
-						keys[string(append([]byte(nil), key...))] = struct{}{}
-					}
-				}
-			}
+			keys = variableKeysOf(experiment)
 		}
 		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name], holdouts: coverage[name], variableKeys: keys,
 			switchback: switchbacks[name], payload: payloads[name]}
@@ -4048,7 +4182,7 @@ func (c *Context) setData(input contextInput, buffer *diagnosticBuffer) {
 	}
 	st.indexLock_.Lock()
 	c.Index_ = index
-	st.index_.Store(&contextIndex{experiments: indexed, holdouts: holdoutsById, keyed: keyed})
+	st.index_.Store(&contextIndex{experiments: indexed, holdouts: holdoutsById, keyed: keyed, heldOut: heldOut})
 	st.indexLock_.Unlock()
 	st.pruneAudiences()
 	c.ContextCustomFields_ = contextCustomFields
@@ -4158,11 +4292,11 @@ func (c *Context) SetDataFailed(err error) {
 	c.DataLock.Lock()
 	st.indexLock_.Lock()
 	c.Index_ = map[string]ExperimentVariables{}
-	var keyed = false
+	var keyed, heldOut = false, false
 	if previous := st.loadIndex(); previous != nil {
-		keyed = previous.keyed
+		keyed, heldOut = previous.keyed, previous.heldOut
 	}
-	st.index_.Store(&contextIndex{keyed: keyed})
+	st.index_.Store(&contextIndex{keyed: keyed, heldOut: heldOut})
 	st.indexLock_.Unlock()
 	st.indexVariables_ = map[string][]ExperimentVariables{}
 	c.IndexVariables_ = map[interface{}]interface{}{}

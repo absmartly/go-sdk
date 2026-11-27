@@ -581,15 +581,22 @@ refresh edits an audience) are listed in the v1.3.0 CHANGELOG.
 A unit keeps its arm until the holdout's iteration changes. Holdouts add
 nothing to the publish payload of experiments without holdouts (the
 `ruleOverride` flag every exposure now carries comes with assignment rules),
-and warmed cached reads and exposures allocate nothing more. Creating a
-context and rebuilding an assignment each allocate one small extra object.
-Once a context has seen holdouts, a `GetVariableValue` that passes an
-experiment the unit is not in briefly takes the context's read lock for it,
-to fire that experiment's holdouts and check that the decision is current.
-This also applies when the context has assignment rules but no holdout covers
-that particular experiment: keyed validation is retained so a refresh cannot
-authorize an obsolete decision. The measured cost is about 7% in a serial
-synthetic read and 27% in parallel; warmed reads still make 0 allocations.
+and warmed cached reads and exposures allocate nothing more. On a
+four-experiment payload without holdouts, `Deserialize` takes about 3.7 KiB
+more and one more allocation (it decodes the full payload, then copies out the
+`ContextData`), and `CreateContextWith` about 0.4 KiB more with the same number
+of allocations; rebuilding an assignment allocates one more small object, its
+retirement token.
+Once a context has seen holdouts or switchbacks, a `GetVariableValue` that passes an
+experiment the unit is not in (a strict-audience mismatch, or no unit of its
+type) briefly takes the context's read lock for that experiment. It fires the
+experiment's holdouts and checks that the decision is still current, so a
+refresh cannot authorize an obsolete one. This applies whether or not a
+holdout covers that experiment. A warmed read of that kind still makes 0
+allocations and reads no clock, but it takes about 220 ns where v1.2.0 takes
+about 135 ns (+60%, a synthetic single-threaded benchmark on linux/arm64).
+Contexts that never saw holdouts or switchbacks, with or without assignment
+rules, take no lock for it.
 
 Holdouts, and the switchback experiments below, reach a context only through
 the full payload, `jsonmodels.ContextPayload`, whose experiments are
