@@ -2300,7 +2300,9 @@ func (c *Context) queueHoldoutArms(experimentName string, key string, entry *cac
 	}
 	c.ContextLock_.RLock()
 	defer c.ContextLock_.RUnlock()
-	if entry.retirement.Load() || st.assignmentCache_[experimentName] != entry {
+	// cachedEntryFor, not the name: a switchback's entry is under its
+	// period slot's key.
+	if entry.retirement.Load() || st.cachedEntryFor(entry.assignment) != entry {
 		return exposureRetired, nil
 	}
 	if status := c.keyEligible(st, experimentName, key, entry); status != exposureClaimed {

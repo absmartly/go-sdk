@@ -2564,3 +2564,100 @@ func TestSwitchback_IdentityIncludesArmGrid(t *testing.T) {
 		t.Fatal("arm-grid edit kept the switchback identity")
 	}
 }
+
+// A variable read whose non-participant switchback is retired while its
+// holdout-arm check runs resolves again at a fresh clock reading: the clock
+// moves to the next period and a refresh changes the experiment's iteration
+// (a new generation) before the check, so the retry draws and stamps the new
+// period's arm, never the discarded reading's.
+func TestSwitchback_VariableRetryResolvesAtAFreshReading(t *testing.T) {
+	var sb = sbDefault(2, sbHour)
+	sb.Audience, sb.AudienceStrict = sbStrictGoldAudience, true
+	var h = sbCreate(t, sbData(sb))
+	h.at(sbAnchor + 5)
+	var later = sbAnchor + sbHour + 5
+	var armed = true
+	beforeHoldoutArms = func() {
+		if armed {
+			armed = false
+			var next = sbDefault(2, sbHour)
+			next.Iteration++
+			h.clock.set(later)
+			h.refresh(next)
+		}
+	}
+	defer func() { beforeHoldoutArms = nil }()
+	expectValue(t, sbExpected2Arms[1], h.variable("sb.arm"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	expectValue(t, sbExpected2Arms[1], h.peekVariable("sb.arm"))
+	for _, exposure := range queuedExposures(h.ctx) {
+		if exposure.ExposedAt != later {
+			t.Fatalf("%s stamped %d, want the retry reading %d", exposure.Name, exposure.ExposedAt, later)
+		}
+	}
+	if len(queuedExposures(h.ctx)) != 1 {
+		t.Fatalf("queued %+v, want the retry's exposure", queuedExposures(h.ctx))
+	}
+}
+
+// A literal switchback never takes holdout coverage from its payload, even
+// when that payload lists holdout ids: an Index_ edit that recomputes the
+// literal's entry keeps it uncovered, so no holdout exposure is queued.
+func TestSwitchback_LiteralIndexEditTakesNoHoldoutCoverage(t *testing.T) {
+	var sb = sbDefault(2, sbHour)
+	sb.HoldoutIds = []int{11}
+	var literal = audienceLiteral(sb.Experiment)
+	literal.Clock_ = &sbClock{now: sbAnchor + 5}
+	literal.Units_ = map[string]string{sbUnitType: sbUID}
+	literal.Attributes_ = []interface{}{}
+	literal.SetPayload(jsonmodels.ContextPayload{Experiments: []jsonmodels.ExperimentData{sb},
+		Holdouts: []jsonmodels.Holdout{hoHoldoutA()}})
+	if err := literal.SetAttribute(sbClusterPath, sbClusterKey); err != nil {
+		t.Fatal(err)
+	}
+	var edited = literal.Index_["exp_sb"]
+	edited.Data.Audience = `{"filter":[{"value":true}]}`
+	literal.Index_["exp_sb"] = edited
+	if _, err := literal.GetTreatment("exp_sb"); err != nil {
+		t.Fatal(err)
+	}
+	for _, exposure := range literal.Exposures_ {
+		if exposure.Id == 11 {
+			t.Fatalf("the switchback took holdout coverage: %+v", literal.Exposures_)
+		}
+	}
+	if covered := literal.state().indexedExperiment("exp_sb").holdouts; covered != nil {
+		t.Fatalf("the edited switchback entry is covered by %+v", covered)
+	}
+}
+
+// One clock reading resolves every experiment a shared key visits: the first
+// switchback is a strict audience mismatch, so the read falls through to the
+// second. The first read is in period 0 and any later read in period 1, so a
+// read per experiment would draw the second in period 1 and stamp it there.
+func TestSwitchback_SharedKeyReadUsesOneClockReading(t *testing.T) {
+	var first = sbExperiment(1, "exp_a", 2, sbHour)
+	first.Audience, first.AudienceStrict = sbStrictGoldAudience, true
+	var second = sbExperiment(2, "exp_b", 2, sbHour)
+	second.SeedHi, second.SeedLo = 77, 88
+	if sbDrawSeeded(77, 88, 0) == sbDrawSeeded(77, 88, 1) {
+		t.Fatal("fixture: exp_b draws the same arm in periods 0 and 1")
+	}
+	var h = sbCreateAt(t, sbAnchor+5, map[string]string{sbUnitType: sbUID}, sbData(first, second))
+	// The read's first clock reading is in period 0; any later one would be
+	// in period 1.
+	h.clock.set(sbAnchor + sbHour + 5)
+	h.clock.setNextRead(sbAnchor + 5)
+	expectValue(t, sbDrawSeeded(77, 88, 0), h.variable("sb.arm"))
+	var queued = queuedExposures(h.ctx)
+	if len(queued) == 0 {
+		t.Fatal("the read queued nothing")
+	}
+	for _, exposure := range queued {
+		if exposure.ExposedAt != sbAnchor+5 {
+			t.Fatalf("%s stamped %d, want the read's one reading %d", exposure.Name, exposure.ExposedAt, sbAnchor+5)
+		}
+	}
+}

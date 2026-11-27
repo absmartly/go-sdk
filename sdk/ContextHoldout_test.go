@@ -1693,6 +1693,8 @@ func TestHoldout_QueueExposureOfASuppressedAssignment(t *testing.T) {
 // the Java SDK.
 func TestHoldout_RuleWonHeldOutExperimentIsNotTheFallback(t *testing.T) {
 	var ruleWon = hoExperiment(1, "exp_rule_won", hoUnitType, 0, 11)
+	// It defines the key, so it is visited, but not in the variant the rule
+	// gives (1).
 	ruleWon.Variants[0].Config = `{"color":"rule_won_control"}`
 	ruleWon.Variants[1].Config = `{"other":"y"}`
 	ruleWon.AssignmentRules = hoUSRule
@@ -1700,6 +1702,8 @@ func TestHoldout_RuleWonHeldOutExperimentIsNotTheFallback(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, ruleWon, suppressed))
 	h.setAttribute("country", "US")
 	expectValue(t, "default", h.peekVariable("color"))
+	expectValue(t, "default", h.variable("color"))
+	h.expectPending(2)
 }
 
 // Holdout ids are integral numbers however written (10, 10.0, 1e1), as in
@@ -3036,25 +3040,33 @@ func TestHoldout_RejectedReadIsNotRetried(t *testing.T) {
 // decision without its unit: it is not assigned, so it does not win the key
 // (TestHoldout_VariableReadWithoutTheUnitClaimsNothing).
 func TestHoldout_EvictionBeforeTheClaimServesTheResolvedAssignment(t *testing.T) {
-	for _, variable := range []bool{false} {
+	for _, variable := range []bool{false, true} {
 		var experiment = hoExperiment(1, "exp", "user_id", 0, 11)
 		experiment.Split = []float64{0, 1}
 		experiment.Variants[0].Config = `{"v":"control"}`
 		experiment.Variants[1].Config = `{"v":"treatment"}`
 		var h = hoCreate(t, map[string]string{}, hoData([]jsonmodels.Holdout{hoHoldout(11, "holdout_u", "user_id", hoSeedBHi, hoSeedBLo)}, experiment))
 		var armed = true
-		beforeSettleClaim = func() {
+		var setUnit = func() {
 			if armed {
 				armed = false
 				h.setUnit("user_id", hoUID)
 			}
 		}
+		// Resolved without the unit, the variable read's candidate is no
+		// participant, so it claims nothing; the unit arrives right after
+		// the resolution instead of before a claim.
 		if variable {
+			afterReadResolve = setUnit
 			expectValue(t, "treatment", h.variable("v"))
 		} else {
+			beforeSettleClaim = setUnit
 			expectInt(t, 1, h.treatment("exp"))
 		}
-		beforeSettleClaim = nil
+		beforeSettleClaim, afterReadResolve = nil, nil
+		if armed {
+			t.Fatal("the hook did not run")
+		}
 		var exposures = queuedExposures(h.ctx)
 		if len(exposures) != 2 || exposures[0].Name != "exp" || exposures[0].Variant != 1 || exposures[1].Id != 11 {
 			t.Fatalf("exposures %+v", exposures)
@@ -4465,15 +4477,21 @@ func TestHoldout_CustomBecomingApplicableDuringAReadIsResolvedAgain(t *testing.T
 		{"traffic refresh", func(e *jsonmodels.ExperimentData) { e.TrafficSplit = []float64{1, 0} },
 			func(h *hoContext, e jsonmodels.ExperimentData, r jsonmodels.ExperimentData) {
 				e.TrafficSplit = []float64{0, 1}
-				h.ctx.SetPayload(hoData(nil, e, r))
+				h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, e, r))
 			}},
+		{"strict audience attribute", func(e *jsonmodels.ExperimentData) {
+			e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+			e.AudienceStrict = true
+		}, func(h *hoContext, _ jsonmodels.ExperimentData, _ jsonmodels.ExperimentData) {
+			h.setAttribute("country", "GB")
+		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
 			c.setup(&e)
 			var r = hoExperiment(2, "r", hoUnitType, 0)
 			r.AssignmentRules = hoUSRule
-			var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r))
+			var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e, r))
 			if err := h.ctx.SetCustomAssignment("e", 1); err != nil {
 				t.Fatal(err)
 			}
@@ -4780,6 +4798,8 @@ func TestHoldout_AudienceRebuildRetiresTheSupersededAssignment(t *testing.T) {
 	var strict = e
 	strict.AudienceStrict = true
 	h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, strict, r))
+	expectValue(t, "default", h.variable("v"))
+	h.expectPending(0)
 	expectInt(t, 0, h.treatment("e"))
 	h.ctx.QueueExposure(old)
 	var exposures = queuedExposures(h.ctx)
@@ -4977,6 +4997,8 @@ func TestHoldout_AudienceRebuildRetiresOlderEquivalentCopies(t *testing.T) {
 	var strict = e
 	strict.AudienceStrict = true
 	h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, strict, r))
+	expectValue(t, "default", h.variable("v"))
+	h.expectPending(0)
 	expectInt(t, 0, h.treatment("e"))
 	for i, entry := range retained {
 		if !entry.retirement.Load() {
@@ -5008,6 +5030,8 @@ func TestHoldout_EquivalentAudienceRebuildHonorsATakenClaim(t *testing.T) {
 	var strict = e
 	strict.AudienceStrict = true
 	h.ctx.SetPayload(hoData(nil, strict, r))
+	expectValue(t, "default", h.variable("v"))
+	h.expectPending(0)
 	expectInt(t, 0, h.treatment("e"))
 	if got := h.ctx.admitExposure(claim.assignment, claim); got != exposureQueued {
 		t.Fatalf("taken claim rejected: %v", got)
