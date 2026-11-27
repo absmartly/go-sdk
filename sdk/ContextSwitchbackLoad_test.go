@@ -3,6 +3,7 @@ package sdk
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -289,5 +290,71 @@ func TestSwitchbackLoad_OrdinaryLiteralIgnoresUnusedSchedule(t *testing.T) {
 	b.RandomizationType = "switchback"
 	if sameLiteralSwitchback(&a, &b) {
 		t.Fatal("ordinary-to-switchback transition was ignored")
+	}
+}
+
+type sbReentrantClock struct {
+	ctx      *Context
+	now      int64
+	callback func()
+}
+
+func (c *sbReentrantClock) Millis() int64 {
+	if c.callback != nil {
+		var callback = c.callback
+		c.callback = nil
+		callback()
+	}
+	_ = c.ctx.SetOverride("other", 1)
+	return c.now
+}
+
+// Both cached lookup and a cold build read customer clocks without holding
+// ContextLock_. A refresh from that callback must be seen by the read.
+func TestSwitchbackLoad_ReentrantClockDoesNotHoldContextLock(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cached=%v", cached), func(t *testing.T) {
+			var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+			if cached {
+				h.peek("exp_sb")
+			}
+			var clock = &sbReentrantClock{ctx: h.ctx, now: sbAnchor + sbHour + 5}
+			clock.callback = func() {
+				var fresh = sbDefault(2, sbHour)
+				fresh.Iteration = 2
+				h.ctx.SetData(sbData(fresh))
+			}
+			h.ctx.Clock_.(*contextClock).Clock = clock
+			var done = make(chan int, 1)
+			go func() { v, _ := h.ctx.GetTreatment("exp_sb"); done <- v }()
+			select {
+			case v := <-done:
+				expectInt(t, sbExpected2Arms[1], v)
+			case <-time.After(time.Second):
+				t.Fatal("clock callback deadlocked against the context lock")
+			}
+			if a := h.ctx.GetAssignment("exp_sb"); a.Iteration != 2 {
+				t.Fatalf("served stale iteration %d", a.Iteration)
+			}
+		})
+	}
+}
+
+// A unit lookup can miss its cache just before a refresh installs a
+// switchback. The build path must read its clock unlocked too.
+func TestSwitchbackLoad_ColdBuildReadsReentrantClockUnlocked(t *testing.T) {
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+	var clock = &sbReentrantClock{ctx: h.ctx, now: sbAnchor + sbHour + 5}
+	h.ctx.Clock_.(*contextClock).Clock = clock
+	var done = make(chan *cachedAssignment, 1)
+	go func() {
+		var at = clockReading{clock: h.ctx.Clock_}
+		done <- h.ctx.buildAssignment(h.ctx.state(), "exp_sb", &at)
+	}()
+	select {
+	case entry := <-done:
+		expectInt(t, sbExpected2Arms[1], entry.assignment.Variant)
+	case <-time.After(time.Second):
+		t.Fatal("cold build read the clock under ContextLock_")
 	}
 }

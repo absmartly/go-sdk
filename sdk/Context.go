@@ -3061,13 +3061,19 @@ func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cach
 	return c.buildAssignment(st, experimentName, at)
 }
 
-// cachedAssignmentAt is the valid cached assignment, or nil. The read lock
-// is released on unwind too: the slot lookup reads an injected clock, which
-// may panic.
+// cachedAssignmentAt is the valid cached assignment, or nil. Read an injected
+// clock outside ContextLock_: it may call back into the context. Reload the
+// definition after the callback, which may have installed new data.
 func (c *Context) cachedAssignmentAt(st *contextState, experimentName string, at *clockReading) *cachedAssignment {
 	c.ContextLock_.RLock()
-	defer c.ContextLock_.RUnlock()
 	var indexed = st.indexedExperiment(experimentName)
+	if indexed != nil && indexed.switchback != nil && !at.read {
+		c.ContextLock_.RUnlock()
+		at.now()
+		c.ContextLock_.RLock()
+		indexed = st.indexedExperiment(experimentName)
+	}
+	defer c.ContextLock_.RUnlock()
 	if entry, _, state := c.validCachedAssignment(st, experimentName, indexed, assignmentSlotFor(experimentName, indexed, at), nil); state == assignmentValid {
 		return entry
 	}
@@ -3164,10 +3170,16 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string,
 	// lock: another goroutine may have rebuilt the assignment meanwhile, and
 	// replacing it would lose its exposed flag and queue a second exposure.
 	c.ContextLock_.Lock()
-	defer c.ContextLock_.Unlock()
-	// The index may have been replaced between the locks; setData publishes
-	// it under this lock, so it is stable from here on.
 	var indexed = st.indexedExperiment(experimentName)
+	if indexed != nil && indexed.switchback != nil && !at.read {
+		c.ContextLock_.Unlock()
+		at.now()
+		c.ContextLock_.Lock()
+		indexed = st.indexedExperiment(experimentName)
+	}
+	defer c.ContextLock_.Unlock()
+	// The index is stable under this lock, including after a clock callback
+	// that refreshed a unit experiment into a switchback or replaced its grid.
 	var slot = assignmentSlotFor(experimentName, indexed, at)
 	if st.switchbackEpochStale(experimentName, indexed) {
 		c.dropSwitchbackEpoch(st, experimentName)
