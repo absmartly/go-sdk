@@ -579,8 +579,11 @@ refresh edits an audience) are listed in the v1.3.0 CHANGELOG.
 A unit keeps its arm until the holdout's iteration changes. Holdouts add
 nothing to the publish payload of experiments without holdouts (the
 `ruleOverride` flag every exposure now carries comes with assignment rules),
-and warmed cached reads and exposures allocate nothing more. Creating a
-context and rebuilding an assignment each allocate one small extra object.
+and warmed cached reads and exposures allocate nothing more. On a
+four-experiment payload without holdouts, decoding takes about 0.55 KiB more
+and creating a context about 1 KiB more (the decoded and installed structs
+are wider), with the same number of allocations; rebuilding an assignment
+allocates one more small object, its retirement token.
 Once a context has seen holdouts, a `GetVariableValue` that passes an
 experiment the unit is not in (a strict-audience mismatch, or no unit of its
 type) briefly takes the context's read lock for that experiment. It fires the

@@ -240,3 +240,22 @@ func TestRound22_WarmedNonParticipantReadReadsNoClockAndAllocatesNothing(t *test
 		}
 	}
 }
+
+// A held-out experiment with an audience never evaluated that audience, so an
+// attribute change does not recompute its decision: the cached entry survives
+// SetAttribute.
+func TestRound22_HeldOutDecisionSkipsAudienceRevalidation(t *testing.T) {
+	var e = hoExperiment(1, "exp", hoUnitType, 0, 11)
+	e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
+	expectInt(t, 0, h.peek("exp"))
+	var before = h.ctx.assignmentEntry("exp")
+	if !before.holdouts.isSuppressed() {
+		t.Fatal("the experiment is not held out")
+	}
+	h.setAttribute("country", "GB")
+	expectInt(t, 0, h.peek("exp"))
+	if h.ctx.assignmentEntry("exp") != before {
+		t.Fatal("the held-out decision was recomputed after an attribute change")
+	}
+}
