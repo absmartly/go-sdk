@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.3.0 (unreleased)
+## v1.3.0 (2026-11-27)
 
 Go versions are released as git tags only; this entry lists the changes since v1.2.0. v1.2.0 code keeps compiling and behaving as before, except for the changes listed under Changed. Every v1.2.0 struct keeps its layout, `jsonmodels.ContextData` and `jsonmodels.Experiment` included, so unkeyed (positional) literals that compiled against v1.2.0 still compile; holdouts and switchbacks travel in the new payload types below instead.
 
