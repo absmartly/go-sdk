@@ -358,3 +358,68 @@ func TestSwitchbackLoad_ColdBuildReadsReentrantClockUnlocked(t *testing.T) {
 		t.Fatal("cold build read the clock under ContextLock_")
 	}
 }
+
+// A clock callback that refreshes the definition is seen by the read that
+// called the clock: a cached switchback made strict and mismatched serves
+// the new definition's control, and a cold build draws on the new grid.
+func TestSwitchbackLoad_ReadUsesTheDefinitionInstalledByTheClock(t *testing.T) {
+	t.Run("cached", func(t *testing.T) {
+		var h = sbCreateAt(t, sbAnchor+sbHour+5, map[string]string{sbUnitType: sbUID}, sbData(sbDefault(2, sbHour)))
+		h.peek("exp_sb")
+		var fresh = sbDefault(2, sbHour)
+		fresh.Audience, fresh.AudienceStrict = `{"filter":[{"value":false}]}`, true
+		var clock = &sbReentrantClock{ctx: h.ctx, now: sbAnchor + sbHour + 5}
+		clock.callback = func() { h.ctx.SetData(sbData(fresh)) }
+		h.ctx.Clock_.(*contextClock).Clock = clock
+		var done = make(chan int, 1)
+		go func() { v, _ := h.ctx.GetTreatment("exp_sb"); done <- v }()
+		select {
+		case v := <-done:
+			if v != 0 || !h.ctx.GetAssignment("exp_sb").AudienceMismatch {
+				t.Fatalf("served the superseded definition: variant %d", v)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("clock callback deadlocked against the context lock")
+		}
+	})
+	t.Run("cold build", func(t *testing.T) {
+		var h = sbCreateAt(t, sbAnchor+sbHour+5, map[string]string{sbUnitType: sbUID}, sbData(sbDefault(2, sbHour)))
+		var clock = &sbReentrantClock{ctx: h.ctx, now: sbAnchor + sbHour + 5}
+		clock.callback = func() { h.ctx.SetData(sbData(sbDefault(2, 2*sbHour))) }
+		h.ctx.Clock_.(*contextClock).Clock = clock
+		var at = clockReading{clock: h.ctx.Clock_}
+		var entry = h.ctx.buildAssignment(h.ctx.state(), "exp_sb", &at)
+		if entry.switchback.period != 0 || entry.assignment.Variant != sbExpected2Arms[0] {
+			t.Fatalf("built on the superseded grid: period %d variant %d", entry.switchback.period, entry.assignment.Variant)
+		}
+	})
+}
+
+// A literal entry edited while another reader waits for the rebuild locks is
+// installed once: the reader that gets the locks second finds the first
+// one's index and keeps it.
+func TestSwitchbackLoad_LiteralRebuildRechecksAfterTheLocks(t *testing.T) {
+	var sb = sbDefault(2, sbHour)
+	var literal = audienceLiteral(sb)
+	literal.Clock_ = &sbClock{now: sbAnchor + 5}
+	literal.Units_ = map[string]string{sbUnitType: sbUID}
+	literal.SetData(sbData(sb))
+	var state = literal.state()
+	var edited = literal.Index_["exp_sb"]
+	edited.Data.Audience = `{"filter":[{"value":true}]}`
+	literal.Index_["exp_sb"] = edited
+	literal.ContextLock_.Lock()
+	var installed = make(chan *contextIndex, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			literal.syncLiteralExperiment(state, "exp_sb")
+			installed <- state.loadIndex()
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	literal.ContextLock_.Unlock()
+	var first, second = <-installed, <-installed
+	if first != second {
+		t.Fatal("both waiting readers installed their own index")
+	}
+}

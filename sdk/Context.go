@@ -3065,15 +3065,12 @@ func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cach
 // clock outside ContextLock_: it may call back into the context. Reload the
 // definition after the callback, which may have installed new data.
 func (c *Context) cachedAssignmentAt(st *contextState, experimentName string, at *clockReading) *cachedAssignment {
+	// The caller found a switchback and holds no lock: read the clock now,
+	// before taking the lock, then load the definition installed after it.
+	at.now()
 	c.ContextLock_.RLock()
-	var indexed = st.indexedExperiment(experimentName)
-	if indexed != nil && indexed.switchback != nil && !at.read {
-		c.ContextLock_.RUnlock()
-		at.now()
-		c.ContextLock_.RLock()
-		indexed = st.indexedExperiment(experimentName)
-	}
 	defer c.ContextLock_.RUnlock()
+	var indexed = st.indexedExperiment(experimentName)
 	if entry, _, state := c.validCachedAssignment(st, experimentName, indexed, assignmentSlotFor(experimentName, indexed, at), nil); state == assignmentValid {
 		return entry
 	}
