@@ -263,8 +263,10 @@ func switchbackEncodable(value reflect.Value, path map[switchbackContainer]bool,
 		return true
 	}
 	if switchbackOpaque(value) || value.Type() == jsonNumberType {
-		var _, err = json.Marshal(jsonElement(value).Interface())
-		return err == nil
+		// encoding/json does not bound nesting, so the encoding's own
+		// containers spend what is left of this value's depth budget.
+		var encoded, err = json.Marshal(jsonElement(value).Interface())
+		return err == nil && jsonNestingDepth(encoded) <= switchbackMaxDepth-depth
 	}
 	switch value.Kind() {
 	case reflect.Map, reflect.Slice, reflect.Array:
@@ -277,14 +279,16 @@ func switchbackEncodable(value reflect.Value, path map[switchbackContainer]bool,
 	default:
 		return true
 	}
+	// A nil map or slice encodes as null, not as a container, so it spends
+	// no depth.
+	if value.Kind() != reflect.Array && value.IsNil() {
+		return true
+	}
 	if depth >= switchbackMaxDepth {
 		return false
 	}
 	var container switchbackContainer
 	if value.Kind() != reflect.Array {
-		if value.IsNil() {
-			return true
-		}
 		container.pointer = value.Pointer()
 		if value.Kind() == reflect.Slice {
 			container.length = value.Len()
@@ -310,6 +314,35 @@ func switchbackEncodable(value reflect.Value, path map[switchbackContainer]bool,
 		}
 	}
 	return true
+}
+
+// jsonNestingDepth is the deepest object or array nesting in encoded JSON.
+// Brackets inside strings are skipped.
+func jsonNestingDepth(encoded []byte) int {
+	var depth, deepest = 0, 0
+	var inString, escaped = false, false
+	for _, b := range encoded {
+		switch {
+		case escaped:
+			escaped = false
+		case inString:
+			if b == '\\' {
+				escaped = true
+			} else if b == '"' {
+				inString = false
+			}
+		case b == '"':
+			inString = true
+		case b == '{' || b == '[':
+			depth++
+			if depth > deepest {
+				deepest = depth
+			}
+		case b == '}' || b == ']':
+			depth--
+		}
+	}
+	return deepest
 }
 
 // switchbackClusterKey is the Collector's SwitchbackClusterKeys.normalize: a

@@ -423,3 +423,170 @@ func TestSwitchbackLoad_LiteralRebuildRechecksAfterTheLocks(t *testing.T) {
 		t.Fatal("both waiting readers installed their own index")
 	}
 }
+
+// Reads made while the initial data future is pending do not panic, as in
+// v1.3.0: before any index is installed both gates are off and the read
+// returns the unassigned fallback.
+func TestSwitchbackLoad_ReadsWhileTheInitialLoadIsPending(t *testing.T) {
+	var pending, _ = future.New()
+	var ctx = CreateContext(internal.FixedClock{Millis_: hoMillis}, CreateDefaultContextConfig(), pending, nil, nil, nil,
+		DefaultVariableParser{}, AudienceMatcher{DefaultAudienceDeserializer{}})
+	var assignment = ctx.GetAssignment("exp_sb")
+	if assignment.Assigned || assignment.Variant != 0 {
+		t.Fatalf("pending read assigned %+v", *assignment)
+	}
+	if keyed, heldOut := ctx.state().gates(); keyed || heldOut {
+		t.Fatalf("gates on before any install: keyed %v, heldOut %v", keyed, heldOut)
+	}
+}
+
+// A payload that repeats an experiment name serves the last entry, as the
+// index does: a full-on unit experiment after a switchback of the same name
+// serves its full-on variant, and a switchback after a covered unit
+// experiment takes no holdout coverage from it.
+func TestSwitchbackLoad_RepeatedNameKeepsTheLastEntrysServing(t *testing.T) {
+	t.Run("switchback then unit", func(t *testing.T) {
+		var unit = sbUnit(sbDefault(2, sbHour))
+		unit.FullOnVariant = 1
+		var h = sbCreate(t, sbData(sbDefault(2, sbHour), unit))
+		if h.ctx.state().indexedExperiment("exp_sb").switchback != nil {
+			t.Fatal("the later unit entry kept the earlier switchback definition")
+		}
+		expectInt(t, 1, h.at(sbAnchor+5).peek("exp_sb"))
+	})
+	t.Run("covered unit then switchback", func(t *testing.T) {
+		var unit = sbUnit(sbDefault(2, sbHour))
+		unit.HoldoutIds = []int{11}
+		var data = sbData(unit, sbDefault(2, sbHour))
+		data.Holdouts = []jsonmodels.Holdout{hoHoldoutA()}
+		var h = sbCreate(t, data)
+		var indexed = h.ctx.state().indexedExperiment("exp_sb")
+		if indexed.switchback == nil || indexed.holdouts != nil {
+			t.Fatalf("the later switchback kept the earlier coverage: %+v", indexed.holdouts)
+		}
+	})
+}
+
+// A variable read that resolved a switchback before its linked unit was set
+// sees SetUnit's eviction while it checks the non-participant's holdout arms,
+// resolves again with the unit, and serves and exposes the scheduled arm.
+func TestSwitchbackLoad_InFlightVariableReadSeesSetUnit(t *testing.T) {
+	var h = sbCreateAt(t, sbAnchor+5, map[string]string{}, sbData(sbDefault(2, sbHour)))
+	var armed = true
+	beforeHoldoutArms = func() {
+		if armed {
+			armed = false
+			if err := h.ctx.SetUnit(sbUnitType, sbUID); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	defer func() { beforeHoldoutArms = nil }()
+	expectValue(t, sbExpected2Arms[0], h.variable("sb.arm"))
+	if armed {
+		t.Fatal("the hook did not run")
+	}
+	var queued = queuedExposures(h.ctx)
+	if len(queued) != 1 || queued[0].Name != "exp_sb" || queued[0].Variant != sbExpected2Arms[0] || !queued[0].Assigned {
+		t.Fatalf("queued %+v, want the scheduled arm's exposure", queued)
+	}
+}
+
+// Equivalent same-period rebuilds share the exposed flag and retirement
+// with their predecessor. Expiring the oldest of them from the retired window
+// must not claim and retire those shared flags while the current slot still
+// holds them: an Assignment the caller got before the expiry is still the
+// current decision and exposes once.
+func TestSwitchbackLoad_ExpiryKeepsASharedClaimTheCurrentSlotHolds(t *testing.T) {
+	var experiment = sbDefault(2, sbHour)
+	experiment.FullOnVariant = 1
+	var h = sbCreate(t, sbData(experiment))
+	h.at(sbAnchor + 5)
+	var held = h.ctx.GetAssignment("exp_sb")
+	for i := 0; i < switchbackRetiredSlots+3; i++ {
+		_ = h.ctx.SetCustomAssignment("exp_sb", i%2)
+		h.ctx.GetAssignment("exp_sb")
+	}
+	if held.Exposed != h.ctx.getAssignment("exp_sb").assignment.Exposed {
+		t.Fatal("fixture: the rebuilds no longer share the exposed flag")
+	}
+	h.ctx.QueueExposure(held)
+	h.expectPending(1)
+}
+
+// sbResolutionKey publishes a different cluster for each cluster
+// resolution. One resolution marshals the attribute twice (once to check it
+// is encodable, once to read the key), so calls/2 counts resolutions.
+type sbResolutionKey struct{ calls *int }
+
+func (k sbResolutionKey) MarshalJSON() ([]byte, error) {
+	*k.calls++
+	if (*k.calls-1)/2 == 0 {
+		return []byte(`"porto"`), nil
+	}
+	return []byte(`"lisbon"`), nil
+}
+
+// A cold audience makes the first build return a parse request before the
+// slot is cached; the retry reuses the cluster it already read, so the slot
+// is keyed by the first resolution, as the README promises (the cluster is
+// read once, at the period's first read).
+func TestSwitchbackLoad_ColdAudienceRetryKeepsTheFirstClusterRead(t *testing.T) {
+	var sb = sbDefault(2, sbHour)
+	sb.Audience = `{"filter":[{"value":true}]}`
+	var calls int
+	var h = sbCreate(t, sbData(sb))
+	h.setAttribute(sbClusterPath, sbResolutionKey{&calls})
+	h.at(sbAnchor + 5).peek("exp_sb")
+	var slot = h.ctx.getAssignment("exp_sb").switchback
+	if slot.serving.clusterKey != "porto" || calls != 2 {
+		t.Fatalf("the slot is keyed %q after %d marshal calls, want the first resolution %q from 2", slot.serving.clusterKey, calls, "porto")
+	}
+}
+
+// sbOpaqueStore is a struct cluster attribute: encoding/json, not the SDK's
+// own walk, encodes it, so its nesting is checked from that encoding.
+type sbOpaqueStore struct {
+	Key  string
+	Deep interface{}
+}
+
+func sbNestedMaps(n int) interface{} {
+	var value interface{} = "leaf"
+	for i := 0; i < n; i++ {
+		value = map[string]interface{}{"next": value}
+	}
+	return value
+}
+
+// The 64-container nesting limit holds for a value encoding/json encodes
+// itself (a struct), as it does for maps and slices: a key beside a branch
+// nested 65 containers deep gives no cluster, and one 63 deep (64 with the
+// struct) still does.
+func TestSwitchbackLoad_OpaqueValueObeysTheDepthLimit(t *testing.T) {
+	var path = parseSwitchbackPath("store/Key")
+	if got := path.resolveAttribute(sbOpaqueStore{Key: "store-42", Deep: sbNestedMaps(63)}); got != "store-42" {
+		t.Fatalf("a struct within the limit gave %q", got)
+	}
+	if got := path.resolveAttribute(sbOpaqueStore{Key: "store-42", Deep: sbNestedMaps(64)}); got != "" {
+		t.Fatalf("a struct over the limit gave %q, want no cluster", got)
+	}
+}
+
+// A typed nil map or slice encodes as null, as an untyped nil does, so it
+// spends no container depth: at the limit it does not suppress a sibling key.
+func TestSwitchbackLoad_TypedNilContainerSpendsNoDepth(t *testing.T) {
+	var path = parseSwitchbackPath("store/key")
+	for name, leaf := range map[string]interface{}{"untyped nil": nil, "nil map": map[string]interface{}(nil), "nil slice": []interface{}(nil)} {
+		var deep interface{} = leaf
+		for i := 0; i < switchbackMaxDepth-1; i++ {
+			deep = map[string]interface{}{"next": deep}
+		}
+		// The attribute value is the root container (depth 1); deep adds
+		// switchbackMaxDepth-1 more, so a nil leaf would be the 65th.
+		var value = map[string]interface{}{"key": "store-42", "deep": deep}
+		if got := path.resolveAttribute(value); got != "store-42" {
+			t.Errorf("%s at the limit gave %q, want the sibling key", name, got)
+		}
+	}
+}

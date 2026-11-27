@@ -57,11 +57,13 @@ func probeLock(lock func(), unlock func()) bool {
 	var abandon = make(chan struct{})
 	go func() {
 		lock()
+		// Released before reporting: a caller that sees true finds the lock
+		// free again, as lockFree and readLockFree promise.
+		unlock()
 		select {
 		case granted <- struct{}{}:
 		case <-abandon:
 		}
-		unlock()
 	}()
 	select {
 	case <-granted:

@@ -1252,7 +1252,12 @@ func (c *Context) evictAssignmentsMissingUnit(st *contextState, unitType string)
 			// resolved it and loses the claim resolves again and exposes the
 			// replacement; an exposed one is kept.
 			var evict = !assignment.Overridden
-			if !evict {
+			if evict {
+				// Never published, so retiring it loses nothing: a read already
+				// holding it sees the retirement and resolves again with the
+				// unit, instead of serving the superseded non-participant.
+				entry.retirement.Store(true)
+			} else {
 				c.EventLock_.Lock()
 				var retired = entry.retirement.Swap(true)
 				if beforeEvictionClaim != nil {
@@ -2200,7 +2205,7 @@ func (c *Context) exposeVariableCandidate(experimentName string, key string, ent
 			// Until the context has seen holdouts or switchbacks nothing can
 			// retire or rebuild a non-participant during the read (as in
 			// v1.2.0), so one without unexposed arms costs no lock.
-			if !entry.hasUnexposedArms() && !c.state().loadIndex().heldOut {
+			if !entry.hasUnexposedArms() && !c.state().heldOut() {
 				return entry, true
 			}
 			var exposures []jsonmodels.Exposure
@@ -2813,7 +2818,7 @@ func (c *Context) validEntry(st *contextState, experimentName string, indexed *i
 		// resolves an overridden slot again like any other.
 		// A still-unclaimed override needs current variables and resolved
 		// identity before a variable read can claim it in the new epoch.
-		if efound && !assignment.Exposed.Load().(bool) && st.loadIndex().heldOut &&
+		if efound && !assignment.Exposed.Load().(bool) && st.heldOut() &&
 			!entry.resolvedExperimentMatches(experiment.Data) {
 			return rules, assignmentStale
 		}
@@ -2836,7 +2841,7 @@ func (c *Context) validEntry(st *contextState, experimentName string, indexed *i
 		if !c.entryMatches(indexed, entry) || !holdoutSetMatches(holdouts, entry.holdouts) {
 			return rules, assignmentStale
 		}
-		if (ignoreCustom || !assignment.Exposed.Load().(bool)) && st.loadIndex().heldOut &&
+		if (ignoreCustom || !assignment.Exposed.Load().(bool)) && st.heldOut() &&
 			entry.audienceChanged(experiment.Data) {
 			return rules, assignmentStale
 		}
@@ -3323,7 +3328,7 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string,
 	if efound {
 		c.keepExposedRuleAssignment(indexed, previous, entry)
 	}
-	var keyed, heldOut = st.loadIndex().keyed, st.loadIndex().heldOut
+	var keyed, heldOut = st.gates()
 	// Share before publishing the entry: retained pointers and Assignment copies
 	// must observe the same claim and any later retirement. An already exposed
 	// unapplied custom assignment still starts a new exposure, as in v1.1.1.
@@ -3803,6 +3808,20 @@ func (st *contextState) experimentAndRules(experimentName string) (ExperimentVar
 	return ExperimentVariables{}, nil, false
 }
 
+// gates are the installed index's keyed and heldOut flags, both false until
+// the first install (an assignment read while the data future is pending).
+func (st *contextState) gates() (keyed bool, heldOut bool) {
+	if index := st.loadIndex(); index != nil {
+		return index.keyed, index.heldOut
+	}
+	return false, false
+}
+
+func (st *contextState) heldOut() bool {
+	var _, heldOut = st.gates()
+	return heldOut
+}
+
 func (st *contextState) indexedExperiment(experimentName string) *indexedExperiment {
 	var index = st.loadIndex()
 	if index == nil {
@@ -4079,6 +4098,12 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 				experimentCustomFields[value.Name] = value
 			}
 		}
+		// A repeated name keeps the last entry, as index does: drop what an
+		// earlier entry of that name set, so a unit experiment never keeps a
+		// switchback definition, nor a switchback holdout coverage or rules.
+		delete(rules, experiment.Name)
+		delete(switchbacks, experiment.Name)
+		delete(coverage, experiment.Name)
 		if len(experiment.AssignmentRules) > 0 {
 			rules[experiment.Name] = c.experimentRulesFor(previousRules(experiment.Name), experiment.AssignmentRules)
 		}

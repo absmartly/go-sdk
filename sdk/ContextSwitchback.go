@@ -37,6 +37,18 @@ type clockReading struct {
 	clock internal.Clock
 	read  bool
 	value int64
+	// serving is the serving unit and cluster key resolved for a slot during
+	// this read, kept across the read's cold-audience parse attempts so the
+	// cluster is read once at the period's first read: an attribute's
+	// marshaler is not asked again by the retry.
+	serving *readServing
+}
+
+// readServing is a serving result for one definition generation and slot.
+type readServing struct {
+	generation uint64
+	key        string
+	serving    switchbackServing
 }
 
 func (r *clockReading) now() int64 {
@@ -310,12 +322,41 @@ func (c *Context) retireSwitchbackSlot(st *contextState, experimentName string, 
 		// old variant stamped in the current period, as a unit exposure:
 		// the exposure is claimed, and its retirement keeps a rejected
 		// admission from reopening it.
+		var kept = retired[len(retired)-switchbackRetiredSlots:]
 		for _, expired := range retired[:len(retired)-switchbackRetiredSlots] {
-			c.claimRetiredSwitchback(expired)
+			// An equivalent rebuild shares the exposed flag and retirement
+			// with its predecessor: while a cached or retained slot still
+			// holds them, expiring the old entry must not claim them, or the
+			// current decision could never be exposed.
+			if !st.switchbackClaimHeld(experimentName, expired, kept) {
+				c.claimRetiredSwitchback(expired)
+			}
 		}
-		retired = retired[len(retired)-switchbackRetiredSlots:]
+		retired = kept
 	}
 	st.retiredSwitchbackSlots_[experimentName] = retired
+}
+
+// switchbackClaimHeld reports whether a cached slot of the experiment, or a
+// retained one, shares expired's exposed flag. The caller holds ContextLock_.
+func (st *contextState) switchbackClaimHeld(experimentName string, expired *cachedAssignment, retained []*cachedAssignment) bool {
+	var flag = expired.assignment.Exposed
+	for _, entry := range retained {
+		if entry.assignment.Exposed == flag {
+			return true
+		}
+	}
+	if entry, found := st.assignmentCache_[experimentName]; found && entry.assignment.Exposed == flag {
+		return true
+	}
+	if epoch := st.switchbackEpochs_[experimentName]; epoch != nil {
+		for _, period := range epoch.periods {
+			if entry := st.assignmentCache_[switchbackSlotKey(experimentName, period)]; entry != nil && entry.assignment.Exposed == flag {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // retainSwitchbackSlot records a switchback slot under the current epoch.
@@ -369,8 +410,12 @@ func (c *Context) newSwitchbackSlot(indexed *indexedExperiment, previous *cached
 	if previous != nil && previous.switchback != nil && previous.switchback.generation == resolved.generation &&
 		previous.switchback.serving.status != switchbackAbsent {
 		resolved.serving = previous.switchback.serving
+	} else if kept := at.serving; kept != nil && kept.generation == resolved.generation && kept.key == slot.key {
+		// A retry of the same read, after a cold audience parse.
+		resolved.serving = kept.serving
 	} else {
 		resolved.serving = c.resolveSwitchbackServing(indexed, now)
+		at.serving = &readServing{generation: resolved.generation, key: slot.key, serving: resolved.serving}
 	}
 	return resolved
 }

@@ -2476,10 +2476,13 @@ func TestSwitchback_SharedKeyCandidateUsesTheRetryReading(t *testing.T) {
 		t.Fatal("the hook did not run")
 	}
 	expectValue(t, sbDrawSeeded(77, 88, 1), value)
-	for _, exposure := range queuedExposures(h.ctx) {
-		if exposure.ExposedAt != retryAt {
-			t.Fatalf("%s stamped %d, want the retry reading %d", exposure.Name, exposure.ExposedAt, retryAt)
-		}
+	var queued = queuedExposures(h.ctx)
+	if len(queued) != 1 {
+		t.Fatalf("queued %+v, want exactly exp_b's exposure", queued)
+	}
+	var exposure = queued[0]
+	if exposure.Name != "exp_b" || exposure.Variant != sbDrawSeeded(77, 88, 1) || exposure.ExposedAt != retryAt {
+		t.Fatalf("queued %+v, want exp_b variant %d stamped at the retry reading %d", exposure, sbDrawSeeded(77, 88, 1), retryAt)
 	}
 }
 
