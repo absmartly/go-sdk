@@ -927,3 +927,21 @@ func TestRules_Concurrency(t *testing.T) {
 	variant, _ = ctx.PeekTreatment("exp")
 	assertAny(2, variant, t)
 }
+
+// A split rule resolved without its unit, whose exposure a close rejected
+// after the unit was set, is resolved again with the unit.
+func TestRules_RejectedMissingUnitSplitRuleIsResolvedAgain(t *testing.T) {
+	var e = ruleExperiment("exp", rulesJSON(`{"type":"split","percentages":"0/0/100"}`))
+	e.FullOnVariant = 1
+	var ctx, _ = newRuleContext(t, "production", map[string]string{}, e)
+	var assignment = ctx.GetAssignment("exp")
+	assignment.Exposed.Store(true)
+	if err := ctx.SetUnit("session_id", ruleUnit); err != nil {
+		t.Fatal(err)
+	}
+	assignment.Exposed.Store(false)
+	ctx.Closing_.Store(true)
+	ctx.QueueExposure(assignment)
+	ctx.Closing_.Store(false)
+	assertAny(2, treatment(t, ctx, "exp"), t)
+}

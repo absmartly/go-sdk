@@ -1464,6 +1464,42 @@ func createTrackedContext(clk internal.Clock, config ContextConfig, dataFuture *
 	return trackContext(CreateContext(clk, config, dataFuture, dp, eh, el, vp, am))
 }
 
+func TestExperimentMatchesDefinitionFields(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*jsonmodels.Experiment)
+		want   bool
+	}{
+		{"unchanged", func(*jsonmodels.Experiment) {}, true},
+		{"id", func(e *jsonmodels.Experiment) { e.Id++ }, false},
+		{"unit", func(e *jsonmodels.Experiment) { e.UnitType = "other" }, false},
+		{"iteration", func(e *jsonmodels.Experiment) { e.Iteration++ }, false},
+		{"full on", func(e *jsonmodels.Experiment) { e.FullOnVariant++ }, false},
+		{"traffic values", func(e *jsonmodels.Experiment) { e.TrafficSplit = []float64{1, 0} }, false},
+		{"equal traffic values", func(e *jsonmodels.Experiment) { e.TrafficSplit = []float64{0, 1} }, true},
+		{"missing traffic", func(e *jsonmodels.Experiment) { e.TrafficSplit = nil }, false},
+		{"separately validated fields", func(e *jsonmodels.Experiment) {
+			e.Audience = "changed"
+			e.AssignmentRules = "changed"
+			e.HoldoutIds = []int{11}
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var definition = jsonmodels.Experiment{Id: 1, UnitType: "session_id", Iteration: 2,
+				FullOnVariant: 0, TrafficSplit: []float64{0, 1}}
+			var assignment = Assignment{Id: definition.Id, UnitType: definition.UnitType,
+				Iteration: definition.Iteration, FullOnVariant: definition.FullOnVariant, TrafficSplit: definition.TrafficSplit}
+			tc.change(&definition)
+			if got := experimentMatches(&definition, &assignment); got != tc.want {
+				t.Errorf("private comparison = %v, want %v", got, tc.want)
+			}
+			if got := (&Context{}).ExperimentMatches(definition, assignment); got != tc.want {
+				t.Errorf("public comparison = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCachedAssignmentUsesReadLock(t *testing.T) {
 	setUp()
 	var config = CreateDefaultContextConfig()

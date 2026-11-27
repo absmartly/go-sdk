@@ -97,7 +97,7 @@ func (c Client) GetApplicationVersion() string {
 }
 
 // GetAgent returns the value sent as the X-Agent header, for example
-// "absmartly-go-sdk/1.2.0".
+// "absmartly-go-sdk/1.3.0".
 func (c Client) GetAgent() string {
 	return c.headers_["X-Agent"]
 }

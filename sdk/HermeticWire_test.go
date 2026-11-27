@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -171,5 +172,100 @@ func TestHermeticWireContract(t *testing.T) {
 	}
 	if _, ok := putBody["goals"]; !ok {
 		t.Error("PUT body missing goals (a goal was tracked)")
+	}
+}
+
+func TestHermeticWireContractSuppressedHoldoutExposure(t *testing.T) {
+	for _, arm := range []int{0, 1} {
+		t.Run(fmt.Sprintf("arm%d", arm), func(t *testing.T) {
+			hermeticSuppressedHoldoutExposure(t, arm)
+		})
+	}
+}
+
+// hermeticSuppressedHoldoutExposure publishes a suppressed read over HTTP with
+// the unit in the given arm of a three-arm holdout (arm 1 holds out only
+// non-full-on experiments, which the covered one is), so the holdout record's
+// variant is the arm, not the experiment's control variant.
+func hermeticSuppressedHoldoutExposure(t *testing.T, arm int) {
+	var split = "[1,0,0]"
+	if arm == 1 {
+		split = "[0,1,0]"
+	}
+	var payload = `{"experiments":[{"id":1,"name":"covered_experiment","unitType":"session_id","iteration":1,
+		"seedHi":100,"seedLo":200,"split":[0,1],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],
+		"variants":[{"name":"A","config":"{\"v\":\"control\"}"},{"name":"B","config":"{\"v\":\"treatment\"}"}],"holdoutIds":[11]}],
+		"holdouts":[{"id":11,"name":"wire_holdout","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":` + split + `}]}`
+	var mu sync.Mutex
+	var published []map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/context" {
+			t.Errorf("request path = %q, want /context", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = io.WriteString(w, payload)
+		case http.MethodPut:
+			var body map[string]interface{}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode published JSON: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			published = append(published, body)
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	sdk, err := NewBuilder().Endpoint(server.URL).ApiKey("test-api-key").
+		Application("website").Environment("development").Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := sdk.CreateContext(ContextConfig{
+		Units_: map[string]string{"session_id": "wire-user"}, PublishDelay_: -1, RefreshInterval_: -1,
+	})
+	t.Cleanup(func() { ctx.ClearTimeout(); ctx.ClearRefreshTimer() })
+	ctx.WaitUntilReady()
+	if !ctx.IsReady() || ctx.IsFailed() {
+		t.Fatal("HTTP context did not become ready")
+	}
+	if variant, err := ctx.GetTreatment("covered_experiment"); err != nil || variant != 0 {
+		t.Fatalf("suppressed treatment = %d, %v; want 0", variant, err)
+	}
+	if value, err := ctx.GetVariableValue("v", "default"); err != nil || value != "control" {
+		t.Fatalf("suppressed variable = %v, %v; want control", value, err)
+	}
+	if err := ctx.Publish(); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(published) != 1 {
+		t.Fatalf("PUT requests = %d, want 1", len(published))
+	}
+	exposures, ok := published[0]["exposures"].([]interface{})
+	if !ok || len(exposures) != 1 {
+		t.Fatalf("wire exposures = %+v, want exactly one holdout record", published[0]["exposures"])
+	}
+	exposure, ok := exposures[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("wire exposure is not an object: %+v", exposures[0])
+	}
+	for field, want := range map[string]interface{}{
+		"id": float64(11), "name": "wire_holdout", "unit": "session_id", "variant": float64(arm),
+		"assigned": true, "eligible": true, "overridden": false, "ruleOverride": false,
+	} {
+		if got := exposure[field]; got != want {
+			t.Errorf("wire exposure %s = %v, want %v (record=%+v)", field, got, want, exposure)
+		}
 	}
 }

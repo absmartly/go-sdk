@@ -24,7 +24,7 @@ The finalization event is still `sdk.Close` with the value `"Close"`; `sdk.Final
 ### Install the SDK
 
 ```bash
-go get github.com/absmartly/go-sdk/sdk@v1.2.0
+go get github.com/absmartly/go-sdk/sdk@v1.3.0
 ```
 
 ### Dependencies
@@ -548,6 +548,57 @@ Older SDK versions ignore assignment rules, so their units fall through to
 normal assignment and are analysed. Use this version or later where rules must
 apply.
 
+### Holdouts
+
+A holdout keeps a share of units out of a group of experiments, so their
+combined effect can be measured. The context payload lists the holdouts
+(`ContextData.Holdouts`) and each experiment names the holdouts covering it
+(`Experiment.HoldoutIds`). Nothing needs to be configured: the SDK applies
+them following the JavaScript and Java SDKs. The few places where it differs
+(duplicate or malformed holdout entries, and decisions resolved again after a
+refresh edits an audience) are listed in the v1.3.0 CHANGELOG.
+
+- Each holdout puts the unit in an arm, drawn with the covered experiment's
+  unit. Arm 0 holds the unit out. In a three-arm holdout (three values in its
+  split) arm 1 holds the unit out of experiments that are not full-on, and a
+  full-on experiment is served as usual.
+- A unit held out by any of the holdouts covering an experiment gets
+  variant `0` and the control variant's variables, and the experiment
+  publishes no exposure of its own. An override (`SetOverride`) or a matching
+  assignment rule still wins; custom assignments, audiences, traffic and
+  full-on do not.
+- Every `GetTreatment` or `GetVariableValue` on a covered experiment also
+  publishes each covering holdout's exposure, once per holdout and unit type,
+  whatever the arm. `PeekTreatment` and `PeekVariableValue` publish nothing.
+- When experiments share a variable key (see "Shared variable keys"), a
+  held-out experiment never wins it; if no candidate wins, the first held-out
+  candidate's control value is returned rather than the default.
+  `GetVariableValue` publishes the holdout exposures of every candidate it
+  visits, as the Java SDK does, but only the winner's own exposure.
+
+A unit keeps its arm until the holdout's iteration changes. Holdouts add
+nothing to the publish payload of experiments without holdouts (the
+`ruleOverride` flag every exposure now carries comes with assignment rules),
+and warmed cached reads and exposures allocate nothing more. On a
+four-experiment payload without holdouts, decoding takes about 0.55 KiB more
+and creating a context about 1 KiB more (the decoded and installed structs
+are wider), with the same number of allocations; rebuilding an assignment
+allocates one more small object, its retirement token.
+Once a context has seen holdouts, a `GetVariableValue` that passes an
+experiment the unit is not in (a strict-audience mismatch, or no unit of its
+type) briefly takes the context's read lock for that experiment. It fires the
+experiment's holdouts and checks that the decision is still current, so a
+refresh cannot authorize an obsolete one. This applies whether or not a
+holdout covers that experiment. A warmed read of that kind still makes 0
+allocations and reads no clock, but it takes about 220 ns where v1.2.0 takes
+about 135 ns (+60%, a synthetic single-threaded benchmark on linux/arm64).
+Contexts that never saw holdouts, with or without assignment rules, take no
+lock for it.
+
+`ContextData` gained a `Holdouts` field and `Experiment` a `HoldoutIds` field,
+so unkeyed (positional) literals of `jsonmodels.ContextData` must become keyed
+(`jsonmodels.ContextData{Experiments: experiments}`), as for `Experiment`.
+
 ### Custom Assignments
 
 Sometimes it may be necessary to override the automatic selection of a
@@ -899,7 +950,7 @@ Go modules are published by git tags. To release:
    `X-Agent` header) and move the `CHANGELOG.md` entry from unreleased to that
    version.
 2. Merge to `main`, then tag that commit and push the tag:
-   `git tag v1.2.0 && git push origin v1.2.0`.
+   `git tag v1.3.0 && git push origin v1.3.0`.
 
 The `Release` workflow checks that the tag matches `SDKVersion`, runs the
 tests, creates the GitHub release and asks the Go module proxy to fetch the
