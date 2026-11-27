@@ -426,12 +426,13 @@ func (c *Context) literalState() *contextState {
 	for name, experiment := range c.Index_ {
 		// Manually supplied v1.1.1 indexes have no parsed-rule metadata.
 		// SetData installs it; don't call a user deserializer under this lock.
-		indexed[name] = &indexedExperiment{experiment: experiment}
+		indexed[name] = &indexedExperiment{experiment: experiment,
+			holdoutIds: append([]int(nil), experiment.Data.HoldoutIds...)}
 	}
 	state.index_.Store(&contextIndex{experiments: indexed})
 	for name, assignment := range c.AssignmentCache {
 		var assignment = assignment
-		state.assignmentCache_[name] = &cachedAssignment{assignment: &assignment}
+		state.assignmentCache_[name] = &cachedAssignment{assignment: &assignment, retirement: &retirement{}}
 	}
 	if c.Assigners_ == nil {
 		c.Assigners_ = map[interface{}]interface{}{}
@@ -551,6 +552,10 @@ type indexedExperiment struct {
 	experiment   ExperimentVariables
 	rules        *experimentRules
 	holdouts     []*jsonmodels.Holdout
+	// holdoutIds is a private copy of the HoldoutIds the coverage was
+	// resolved from. experiment shares the caller's backing array, so a
+	// literal's in-place edit to Index_ is seen only against this copy.
+	holdoutIds []int
 }
 
 type holdoutKey struct {
@@ -1451,40 +1456,39 @@ func (c *Context) queueEligibleExposure(entry *cachedAssignment, eligible func(*
 		return c.queueExposure(entry.assignment, entry)
 	}
 	c = c.live()
-	var status, claimed = c.claimEligible(entry, eligible)
-	if status != exposureClaimed {
+	if status := c.claimEligible(entry, eligible); status != exposureClaimed {
 		return status
 	}
-	return c.admitExposure(claimed.assignment, claimed)
+	return c.admitExposure(entry.assignment, entry)
 }
 
 // claimEligible checks eligibility and claims the exposure in one step under
 // ContextLock_, so no refresh can land between the check and the claim. The
 // lock is released on unwind too: the audience evaluator can panic. A claim
 // already taken is honoured.
-func (c *Context) claimEligible(entry *cachedAssignment, eligible func(*cachedAssignment) exposureStatus) (exposureStatus, *cachedAssignment) {
+func (c *Context) claimEligible(entry *cachedAssignment, eligible func(*cachedAssignment) exposureStatus) exposureStatus {
 	c.ContextLock_.RLock()
 	defer c.ContextLock_.RUnlock()
 	if beforeEligibleClaim != nil {
 		beforeEligibleClaim()
 	}
 	if entry.retirement.Load() {
-		return exposureRetired, nil
+		return exposureRetired
 	}
 	if entry.assignment.Exposed.Load().(bool) {
-		return exposureQueued, nil
+		return exposureQueued
 	}
 	if status := eligible(entry); status != exposureClaimed {
-		return status, nil
+		return status
 	}
 	var claimed = entry.assignment.Exposed.CompareAndSwap(false, true)
 	if afterEligibleCAS != nil {
 		afterEligibleCAS()
 	}
 	if claimed {
-		return exposureClaimed, entry
+		return exposureClaimed
 	}
-	return exposureQueued, nil
+	return exposureQueued
 }
 
 // sameDecision compares the resolved experiment run as well as its exposures:
@@ -1517,7 +1521,7 @@ func (c *Context) sameDecision(a *cachedAssignment, b *cachedAssignment) bool {
 // replacement or an eviction without being recorded). A warmed, exposed,
 // unretired read skips settling, as before holdouts.
 func (e *cachedAssignment) needsSettling() bool {
-	return !e.assignment.Exposed.Load().(bool) || (e.retirement != nil && e.retirement.Load())
+	return !e.assignment.Exposed.Load().(bool) || e.retirement.Load()
 }
 
 // variableEligible is the variable read's claim check: once the context has
@@ -1532,6 +1536,9 @@ func (e *cachedAssignment) needsSettling() bool {
 // the read resolves again. Contexts with neither keep the released behaviour.
 // The caller holds ContextLock_.
 func (c *Context) variableEligible(experimentName string, key string) func(*cachedAssignment) exposureStatus {
+	// The live root, so a readiness copy is validated against the live
+	// attributes, and state resolved before the caller takes ContextLock_.
+	c = c.live()
 	var st = c.state()
 	return func(e *cachedAssignment) exposureStatus {
 		var index = st.loadIndex()
@@ -1550,6 +1557,20 @@ func (c *Context) variableEligible(experimentName string, key string) func(*cach
 		}
 		return exposureClaimed
 	}
+}
+
+// armsEligible is the arm-only read's check: the entry must still be the
+// cached, unretired decision and pass the cache's own validation against the
+// installed definitions, so a refresh that changes a holdout's iteration is
+// seen. The caller holds ContextLock_.
+func (c *Context) armsEligible(st *contextState, experimentName string, entry *cachedAssignment) exposureStatus {
+	if entry.retirement.Load() || st.assignmentCache_[experimentName] != entry {
+		return exposureRetired
+	}
+	if _, state := c.validEntry(st, experimentName, entry, nil, true); state == assignmentStale {
+		return exposureRetired
+	}
+	return exposureClaimed
 }
 
 // afterEvictionClaim, when set by a test, runs right after an eviction marks
@@ -1700,7 +1721,7 @@ func (c *Context) admit(assignment *Assignment, ruleOverride bool, holdouts *ass
 // is resolved again instead if the unit arrived meanwhile. The caller holds
 // ContextLock_ for writing.
 func (c *Context) reopenExposure(st *contextState, assignment *Assignment, claimed *cachedAssignment) {
-	if claimed != nil && claimed.retirement != nil && claimed.retirement.Load() {
+	if claimed != nil && claimed.retirement.Load() {
 		return
 	}
 	var entry = st.assignmentCache_[assignment.Name]
@@ -2006,12 +2027,17 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 // is resolved again and the current one used instead, up to
 // maxExposureAttempts times.
 func (c *Context) exposeVariableCandidate(experimentName string, key string, entry *cachedAssignment) (*cachedAssignment, bool) {
-	var eligible = c.variableEligible(experimentName, key)
+	// Built only once a claim or an arm check needs it, so a warmed read that
+	// returns at once allocates no closure.
+	var eligible func(*cachedAssignment) exposureStatus
 	for attempt := 1; ; attempt++ {
 		var status exposureStatus
 		if entry.wins() || entry.holdouts.isSuppressed() {
 			if !entry.needsSettling() {
 				return entry, true
+			}
+			if eligible == nil {
+				eligible = c.variableEligible(experimentName, key)
 			}
 			var demoted = false
 			var current bool
@@ -2035,8 +2061,11 @@ func (c *Context) exposeVariableCandidate(experimentName string, key string, ent
 			if !entry.hasUnexposedArms() && !c.state().loadIndex().heldOut {
 				return entry, true
 			}
+			if eligible == nil {
+				eligible = c.variableEligible(experimentName, key)
+			}
 			var exposures []jsonmodels.Exposure
-			status, exposures = c.queueHoldoutArms(entry, eligible)
+			status, exposures = c.queueHoldoutArms(experimentName, entry, eligible)
 			c.logExposures(exposures)
 			if status == exposureIneligible {
 				return entry, false
@@ -2063,30 +2092,33 @@ func (e *cachedAssignment) hasUnexposedArms() bool {
 	return false
 }
 
-// queueHoldoutArms checks that entry is still the cached decision and passes
-// eligible, then queues its unexposed holdout arms, all under ContextLock_ for
-// reading (EventLock_ is taken inside it, in the snapshot lock order). The
-// caller logs the returned exposures with no lock held.
-func (c *Context) queueHoldoutArms(entry *cachedAssignment, eligible func(*cachedAssignment) exposureStatus) (exposureStatus, []jsonmodels.Exposure) {
+// queueHoldoutArms queues entry's unexposed holdout arms. The caller's clock
+// is read first, with no context lock held: a clock may call back into the
+// context. Every mutable read then happens under ContextLock_: the entry must
+// still be the cached, unretired decision, eligible for the read's key and
+// current by the cache's own validation against the installed definitions,
+// so a refresh that lands while the clock runs (a holdout iteration bump, for
+// one) is seen and no superseded arm is admitted. EventLock_ is taken inside
+// ContextLock_, in the snapshot lock order. The caller logs the returned
+// exposures with no lock held.
+func (c *Context) queueHoldoutArms(experimentName string, entry *cachedAssignment,
+	eligible func(*cachedAssignment) exposureStatus) (exposureStatus, []jsonmodels.Exposure) {
 	if beforeHoldoutArms != nil {
 		beforeHoldoutArms()
 	}
 	c = c.live()
 	var st = c.state()
-	if entry.retirement != nil && entry.retirement.Load() || st.assignmentCache_[entry.assignment.Name] != entry {
-		return exposureRetired, nil
+	var exposedAt = c.Clock_.Millis()
+	c.ContextLock_.RLock()
+	defer c.ContextLock_.RUnlock()
+	if status := c.armsEligible(st, experimentName, entry); status != exposureClaimed {
+		return status, nil
 	}
 	if status := eligible(entry); status != exposureClaimed {
 		return status, nil
 	}
 	if !entry.hasUnexposedArms() {
 		return exposureQueued, nil
-	}
-	var exposedAt = c.Clock_.Millis()
-	c.ContextLock_.RLock()
-	defer c.ContextLock_.RUnlock()
-	if entry.retirement != nil && entry.retirement.Load() || st.assignmentCache_[entry.assignment.Name] != entry {
-		return exposureRetired, nil
 	}
 	c.EventLock_.Lock()
 	defer c.EventLock_.Unlock()
@@ -2126,19 +2158,6 @@ func valueOr(variables map[string]interface{}, key string, defaultValue interfac
 	return defaultValue
 }
 
-// variableFrom exposes the selected assignment when expose is set and returns
-// its value for key, or defaultValue when its variables lack key.
-func (c *Context) variableFrom(entry *cachedAssignment, key string, defaultValue interface{}, expose bool) interface{} {
-	var assignment = entry.assignment
-	if expose && !assignment.Exposed.Load().(bool) {
-		c.queueExposure(assignment, entry)
-	}
-	if value, exist := assignment.Variables[key]; exist {
-		return value
-	}
-	return defaultValue
-}
-
 // resolveLiteralVariableValue is v1.1.1's GetVariableValue/PeekVariableValue
 // for a Context{...} literal.
 func (c *Context) resolveLiteralVariableValue(key string, defaultValue interface{}, expose bool) (interface{}, error) {
@@ -2146,7 +2165,11 @@ func (c *Context) resolveLiteralVariableValue(key string, defaultValue interface
 	if err != nil {
 		return defaultValue, nil
 	}
-	return c.variableFrom(c.assignmentEntry(experiment.Data.Name), key, defaultValue, expose), nil
+	var entry = c.assignmentEntry(experiment.Data.Name)
+	if expose && !entry.assignment.Exposed.Load().(bool) {
+		c.queueExposure(entry.assignment, entry)
+	}
+	return valueOr(entry.assignment.Variables, key, defaultValue), nil
 }
 
 func (c *Context) Track(goalName string, properties map[string]interface{}) error {
@@ -2925,12 +2948,7 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string,
 	// replacing it would lose its exposed flag and queue a second exposure.
 	// The lock is released on unwind too: the audience evaluator can panic.
 	c.ContextLock_.Lock()
-	var locked = true
-	defer func() {
-		if locked {
-			c.ContextLock_.Unlock()
-		}
-	}()
+	defer c.ContextLock_.Unlock()
 	var previous, validated, state = c.validCachedAssignment(st, experimentName, parse)
 	if state == assignmentValid {
 		return previous, nil
@@ -3024,8 +3042,6 @@ func (c *Context) buildAssignmentLocked(st *contextState, experimentName string,
 				} else if !last {
 					// The data changed between the unlocked parse and this
 					// lock: parse the new audience unlocked and start over.
-					locked = false
-					c.ContextLock_.Unlock()
 					var data = experiment.Data
 					return nil, &data
 				}
@@ -3378,8 +3394,15 @@ func (c *Context) syncLiteralExperiment(st *contextState, experimentName string)
 	st.indexLock_.Lock()
 	defer st.indexLock_.Unlock()
 	var experiment, found = c.Index_[experimentName]
-	var current, rules, installed = st.experimentAndRules(experimentName)
-	if found == installed && (!found || sameLiteralEntry(current, experiment)) {
+	var installedEntry = st.indexedExperiment(experimentName)
+	var installed = installedEntry != nil
+	var current ExperimentVariables
+	var rules *experimentRules
+	if installed {
+		current, rules = installedEntry.experiment, installedEntry.rules
+	}
+	if found == installed && (!found || sameLiteralEntry(current, experiment) &&
+		sameHoldoutIds(installedEntry.holdoutIds, experiment.Data.HoldoutIds)) {
 		return
 	}
 	var indexed = map[string]*indexedExperiment{}
@@ -3396,7 +3419,8 @@ func (c *Context) syncLiteralExperiment(st *contextState, experimentName string)
 		rules = nil
 	}
 	if found {
-		var entry = &indexedExperiment{experiment: experiment, rules: rules}
+		var entry = &indexedExperiment{experiment: experiment, rules: rules,
+			holdoutIds: append([]int(nil), experiment.Data.HoldoutIds...)}
 		if len(next.holdouts) > 0 {
 			entry.holdouts = coveringHoldouts(experiment.Data.HoldoutIds, next.holdouts)
 		}
@@ -3421,9 +3445,23 @@ func sameLiteralEntry(a, b ExperimentVariables) bool {
 		x.TrafficSeedLo == y.TrafficSeedLo && x.FullOnVariant == y.FullOnVariant &&
 		x.Audience == y.Audience && x.AudienceStrict == y.AudienceStrict &&
 		sameSplit(x.Split, y.Split) && sameSplit(x.TrafficSplit, y.TrafficSplit) &&
-		x.AssignmentRules == y.AssignmentRules && reflect.DeepEqual(x.HoldoutIds, y.HoldoutIds) &&
+		x.AssignmentRules == y.AssignmentRules &&
 		len(x.Variants) == len(y.Variants) && (len(x.Variants) == 0 || &x.Variants[0] == &y.Variants[0]) &&
 		len(a.Variables) == len(b.Variables) && (len(a.Variables) == 0 || &a.Variables[0] == &b.Variables[0])
+}
+
+// sameHoldoutIds compares holdout ids element by element, without reflection
+// on the cached read path.
+func sameHoldoutIds(a []int, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // experimentAndRules is GetExperiment plus the experiment's parsed assignment
@@ -3758,7 +3796,8 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 		if keyed {
 			keys = variableKeysOf(experiment)
 		}
-		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name], holdouts: coverage[name], variableKeys: keys}
+		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name], holdouts: coverage[name], variableKeys: keys,
+			holdoutIds: append([]int(nil), experiment.Data.HoldoutIds...)}
 	}
 	st.indexLock_.Lock()
 	c.Index_ = index

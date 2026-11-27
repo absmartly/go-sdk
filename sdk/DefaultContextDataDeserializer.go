@@ -143,7 +143,6 @@ func holdoutSplit(raw json.RawMessage) ([]float64, bool) {
 // a value of the wrong type drops only that field rather than the holdout, as
 // an unknown field would; JavaScript keeps such a holdout too.
 type wireHoldout struct {
-	jsonmodels.Holdout
 	Split       json.RawMessage `json:"split"`
 	Id          json.RawMessage `json:"id"`
 	Iteration   json.RawMessage `json:"iteration"`
@@ -178,15 +177,13 @@ func holdouts(raw json.RawMessage) []jsonmodels.Holdout {
 		if !ok {
 			continue
 		}
-		holdout.Holdout.Split = split
-		holdout.Holdout.Id = id
-		holdout.Holdout.Iteration, _ = holdoutId(holdout.Iteration)
-		holdout.Holdout.SeedHi = holdoutSeed(holdout.SeedHi)
-		holdout.Holdout.SeedLo = holdoutSeed(holdout.SeedLo)
-		_ = json.Unmarshal(holdout.Name, &holdout.Holdout.Name)
-		_ = json.Unmarshal(holdout.HoldoutType, &holdout.Holdout.HoldoutType)
-		_ = json.Unmarshal(holdout.UnitType, &holdout.Holdout.UnitType)
-		result = append(result, holdout.Holdout)
+		var decoded = jsonmodels.Holdout{Id: id, Split: split,
+			SeedHi: holdoutSeed(holdout.SeedHi), SeedLo: holdoutSeed(holdout.SeedLo)}
+		decoded.Iteration, _ = holdoutId(holdout.Iteration)
+		_ = json.Unmarshal(holdout.Name, &decoded.Name)
+		_ = json.Unmarshal(holdout.HoldoutType, &decoded.HoldoutType)
+		_ = json.Unmarshal(holdout.UnitType, &decoded.UnitType)
+		result = append(result, decoded)
 	}
 	return result
 }

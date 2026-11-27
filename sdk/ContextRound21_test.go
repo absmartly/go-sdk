@@ -1,6 +1,8 @@
 package sdk
 
 import (
+	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,8 +13,9 @@ import (
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
 
-// withinDeadline fails the test if f does not return within five seconds, so
-// a lock-order regression is a failure rather than a hung suite.
+// withinDeadline exits the test binary if f has not returned after five
+// seconds. A wedged read can hold a lock that test cleanup also needs, so
+// failing the test alone would still hang the suite.
 func withinDeadline(t *testing.T, what string, f func()) {
 	t.Helper()
 	var done = make(chan struct{})
@@ -23,7 +26,8 @@ func withinDeadline(t *testing.T, what string, f func()) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatalf("%s did not return", what)
+		fmt.Fprintf(os.Stderr, "--- FAIL: %s: %s did not return\n", t.Name(), what)
+		os.Exit(1)
 	}
 }
 
@@ -108,8 +112,6 @@ func TestRound21_ImportedLiteralAssignmentsDoNotPanic(t *testing.T) {
 	})
 }
 
-// A queue-only literal without ContextLock_ clears its claim when a close
-// rejects the exposure, without needing a context mutex.
 func TestRound21_QueueOnlyLiteralRejectedClaimIsCleared(t *testing.T) {
 	var boolValue = func(value bool) *atomic.Value {
 		var result = &atomic.Value{}

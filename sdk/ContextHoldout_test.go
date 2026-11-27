@@ -1897,6 +1897,10 @@ func TestHoldout_WronglyTypedUnitTypeOrIterationIsIgnored(t *testing.T) {
 		if fields != `"unitType":"session_id","iteration":"2"` && data.Holdouts[0].UnitType != "" {
 			t.Fatalf("%s: unitType %q, want the field dropped", fields, data.Holdouts[0].UnitType)
 		}
+		if fields != `"unitType":5,"iteration":1` && fields != `"unitType":{"a":1},"iteration":1` &&
+			data.Holdouts[0].Iteration != 0 {
+			t.Fatalf("%s: iteration %d, want the field dropped to 0", fields, data.Holdouts[0].Iteration)
+		}
 		var h = hoCreateFor(t, hoUID, data)
 		expectInt(t, 0, h.treatment("exp"))
 		h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
@@ -5003,8 +5007,9 @@ func TestHoldout_EquivalentAudienceRebuildHonorsATakenClaim(t *testing.T) {
 	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, e, r), hoCustom("e", 0))
 	var served = h.ctx.assignmentEntry("e")
 	h.peek("e")
-	var status, claim = h.ctx.claimEligible(served, h.ctx.variableEligible("e", "v"))
-	if status != exposureClaimed || claim != served {
+	var status = h.ctx.claimEligible(served, h.ctx.variableEligible("e", "v"))
+	var claim = served
+	if status != exposureClaimed {
 		t.Fatal("the retained read did not claim its own decision")
 	}
 	var strict = e
