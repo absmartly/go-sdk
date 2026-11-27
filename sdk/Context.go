@@ -1541,33 +1541,25 @@ func (c *Context) variableEligible(experimentName string, key string) func(*cach
 	c = c.live()
 	var st = c.state()
 	return func(e *cachedAssignment) exposureStatus {
-		var index = st.loadIndex()
-		if index == nil || !index.keyed {
-			return exposureClaimed
-		}
-		var indexed = index.experiments[experimentName]
-		if indexed == nil {
-			return exposureIneligible
-		}
-		if _, defined := indexed.variableKeys[key]; !defined {
-			return exposureIneligible
-		}
-		if _, state := c.validEntry(st, experimentName, e, nil, true); state == assignmentStale {
-			return exposureRetired
-		}
-		return exposureClaimed
+		return c.keyEligible(st, experimentName, key, e)
 	}
 }
 
-// armsEligible is the arm-only read's check: the entry must still be the
-// cached, unretired decision and pass the cache's own validation against the
-// installed definitions, so a refresh that changes a holdout's iteration is
-// seen. The caller holds ContextLock_.
-func (c *Context) armsEligible(st *contextState, experimentName string, entry *cachedAssignment) exposureStatus {
-	if entry.retirement.Load() || st.assignmentCache_[experimentName] != entry {
-		return exposureRetired
+// keyEligible is variableEligible's check, as a method so the arm-only read
+// can run it without building a closure. The caller holds ContextLock_.
+func (c *Context) keyEligible(st *contextState, experimentName string, key string, e *cachedAssignment) exposureStatus {
+	var index = st.loadIndex()
+	if index == nil || !index.keyed {
+		return exposureClaimed
 	}
-	if _, state := c.validEntry(st, experimentName, entry, nil, true); state == assignmentStale {
+	var indexed = index.experiments[experimentName]
+	if indexed == nil {
+		return exposureIneligible
+	}
+	if _, defined := indexed.variableKeys[key]; !defined {
+		return exposureIneligible
+	}
+	if _, state := c.validEntry(st, experimentName, e, nil, true); state == assignmentStale {
 		return exposureRetired
 	}
 	return exposureClaimed
@@ -2061,11 +2053,8 @@ func (c *Context) exposeVariableCandidate(experimentName string, key string, ent
 			if !entry.hasUnexposedArms() && !c.state().loadIndex().heldOut {
 				return entry, true
 			}
-			if eligible == nil {
-				eligible = c.variableEligible(experimentName, key)
-			}
 			var exposures []jsonmodels.Exposure
-			status, exposures = c.queueHoldoutArms(experimentName, entry, eligible)
+			status, exposures = c.queueHoldoutArms(experimentName, key, entry)
 			c.logExposures(exposures)
 			if status == exposureIneligible {
 				return entry, false
@@ -2092,29 +2081,32 @@ func (e *cachedAssignment) hasUnexposedArms() bool {
 	return false
 }
 
-// queueHoldoutArms queues entry's unexposed holdout arms. The caller's clock
-// is read first, with no context lock held: a clock may call back into the
-// context. Every mutable read then happens under ContextLock_: the entry must
-// still be the cached, unretired decision, eligible for the read's key and
-// current by the cache's own validation against the installed definitions,
-// so a refresh that lands while the clock runs (a holdout iteration bump, for
-// one) is seen and no superseded arm is admitted. EventLock_ is taken inside
+// queueHoldoutArms queues entry's unexposed holdout arms for a read of key.
+// The caller's clock is read first, with no context lock held, since a clock
+// may call back into the context, and only when an arm is still unexposed:
+// a warmed read has nothing to timestamp. Every mutable read then happens
+// under ContextLock_: the entry must still be the cached, unretired decision,
+// and keyEligible validates it against the installed definitions, so a
+// refresh that lands while the clock runs (a holdout iteration bump, for one)
+// is seen and no superseded arm is admitted. EventLock_ is taken inside
 // ContextLock_, in the snapshot lock order. The caller logs the returned
 // exposures with no lock held.
-func (c *Context) queueHoldoutArms(experimentName string, entry *cachedAssignment,
-	eligible func(*cachedAssignment) exposureStatus) (exposureStatus, []jsonmodels.Exposure) {
+func (c *Context) queueHoldoutArms(experimentName string, key string, entry *cachedAssignment) (exposureStatus, []jsonmodels.Exposure) {
 	if beforeHoldoutArms != nil {
 		beforeHoldoutArms()
 	}
 	c = c.live()
 	var st = c.state()
-	var exposedAt = c.Clock_.Millis()
+	var exposedAt int64
+	if entry.hasUnexposedArms() {
+		exposedAt = c.Clock_.Millis()
+	}
 	c.ContextLock_.RLock()
 	defer c.ContextLock_.RUnlock()
-	if status := c.armsEligible(st, experimentName, entry); status != exposureClaimed {
-		return status, nil
+	if entry.retirement.Load() || st.assignmentCache_[experimentName] != entry {
+		return exposureRetired, nil
 	}
-	if status := eligible(entry); status != exposureClaimed {
+	if status := c.keyEligible(st, experimentName, key, entry); status != exposureClaimed {
 		return status, nil
 	}
 	if !entry.hasUnexposedArms() {

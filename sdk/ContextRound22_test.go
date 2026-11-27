@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"fmt"
+	"sync/atomic"
 	"testing"
 
 	"github.com/absmartly/go-sdk/sdk/future"
@@ -187,6 +188,55 @@ func TestRound22_WarmedVariableReadAllocatesNothing(t *testing.T) {
 		}
 		if n := hoLeastAllocs(func() { _, _ = h.ctx.GetVariableValue("v", "default") }); n != 0 {
 			t.Fatalf("a warmed variable read made %.0f allocations, want 0", n)
+		}
+	}
+}
+
+// nonParticipantContext is a context that has seen holdouts, where the key's
+// only candidate is an experiment the unit is not in (strict audience
+// mismatch), covered or not by the holdout, with the given clock.
+func nonParticipantContext(t *testing.T, clock interface{ Millis() int64 }, covered bool) *Context {
+	t.Helper()
+	var ids []int
+	if covered {
+		ids = []int{12}
+	}
+	var strict = hoWithVariables(hoExperiment(1, "exp_strict", hoUnitType, 0, ids...), "color")
+	strict.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
+	strict.AudienceStrict = true
+	var config = CreateDefaultContextConfig()
+	config.Units_ = map[string]string{hoUnitType: hoUIDNotHeldOut}
+	config.PublishDelay_, config.RefreshInterval_ = -1, -1
+	var ft, done = future.New()
+	done(hoData([]jsonmodels.Holdout{hoHoldout(12, "holdout_b", hoUnitType, hoSeedBHi, hoSeedBLo)}, strict), nil)
+	var ctx = CreateContext(clock, config, ft, &hoProvider{}, &hoPublisher{}, nil,
+		DefaultVariableParser{}, AudienceMatcher{DefaultAudienceDeserializer{}})
+	ctx.WaitUntilReady()
+	t.Cleanup(func() { ctx.ClearRefreshTimer() })
+	return ctx
+}
+
+// A warmed variable read past a non-participant candidate, in a context that
+// has seen holdouts, reads no clock and allocates nothing: there is no
+// unexposed arm left to timestamp.
+func TestRound22_WarmedNonParticipantReadReadsNoClockAndAllocatesNothing(t *testing.T) {
+	for _, covered := range []bool{false, true} {
+		var clock = &countingClock{}
+		var ctx = nonParticipantContext(t, clock, covered)
+		if _, err := ctx.GetVariableValue("color", "default"); err != nil {
+			t.Fatal(err)
+		}
+		var before = atomic.LoadInt64(&clock.n)
+		for i := 0; i < 10; i++ {
+			if _, err := ctx.GetVariableValue("color", "default"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if calls := atomic.LoadInt64(&clock.n) - before; calls != 0 {
+			t.Fatalf("covered=%v: 10 warmed reads made %d clock calls, want 0", covered, calls)
+		}
+		if n := hoLeastAllocs(func() { _, _ = ctx.GetVariableValue("color", "default") }); n != 0 {
+			t.Fatalf("covered=%v: a warmed non-participant read made %.0f allocations, want 0", covered, n)
 		}
 	}
 }
