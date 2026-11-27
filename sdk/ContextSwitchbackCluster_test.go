@@ -18,7 +18,7 @@ import (
 
 const sbClusterArms = 3
 
-func sbAttributeSwitchback(path string) jsonmodels.ExperimentData {
+func sbAttributeSwitchback(path string) jsonmodels.Experiment {
 	var experiment = sbDefault(sbClusterArms, sbHour)
 	experiment.SwitchbackClusters = sbClusters(sbUnitType, path)
 	return experiment
@@ -33,7 +33,7 @@ func sbExpectedSchedule(key string) []int {
 }
 
 // sbCreateBare creates a context with the given units and no attributes.
-func sbCreateBare(t *testing.T, units map[string]string, data jsonmodels.ContextPayload) *sbContext {
+func sbCreateBare(t *testing.T, units map[string]string, data jsonmodels.ContextData) *sbContext {
 	t.Helper()
 	return sbCreateAt(t, sbAnchor, units, data, sbNoClusterAttribute())
 }
@@ -249,7 +249,7 @@ func TestSwitchbackCluster_UnencodableAttributeValuesAreIneligible(t *testing.T)
 // Unservable configurations serve an ineligible control to linked units,
 // never a unit-assignment draw, and record nothing.
 func TestSwitchbackCluster_UnservableConfigurationsAreIneligible(t *testing.T) {
-	var experiments []jsonmodels.ExperimentData
+	var experiments []jsonmodels.Experiment
 	for _, path := range []string{"items/0", "items/-1/city", "", "geo.city", "'city", `"city`} {
 		experiments = append(experiments, sbAttributeSwitchback(path))
 	}
@@ -502,7 +502,7 @@ func TestSwitchbackCluster_UnitExperimentsIgnoreClusterFields(t *testing.T) {
 		reference.RandomizationType = randomization
 
 		var published [2][]jsonmodels.Exposure
-		for e, experiment := range []jsonmodels.ExperimentData{unit, reference} {
+		for e, experiment := range []jsonmodels.Experiment{unit, reference} {
 			var h = sbCreateBare(t, map[string]string{sbUnitType: sbUID, "user_id": "u"}, sbData(experiment))
 			h.setAttribute("city", "Lisboa")
 			h.at(sbAnchor - sbHour)

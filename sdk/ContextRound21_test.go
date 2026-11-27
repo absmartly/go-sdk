@@ -74,7 +74,7 @@ func TestRound21_ReplacedClockRejectedQueueExposureReturns(t *testing.T) {
 // already holds the experiment's assignment, as a caller may import it.
 func literalWithCachedAssignment(exposed bool) *Context {
 	var e = hoWithVariables(hoExperiment(1, "exp", hoUnitType, 0), "v")
-	var literal = audienceLiteral(e.Experiment)
+	var literal = audienceLiteral(e)
 	literal.Units_ = map[string]string{hoUnitType: hoUID}
 	var flag = &atomic.Value{}
 	flag.Store(exposed)
@@ -169,17 +169,16 @@ func TestRound21_ArmOnlyReadCallsTheClockOutsideTheContextLock(t *testing.T) {
 
 // Clearing only a literal experiment's HoldoutIds removes its coverage at the
 // next read: a full-on experiment held out by arm 0 serves its full-on
-// variant and queues its own exposure, not the holdout's. jsonmodels.Experiment
-// carries no HoldoutIds, so the edit is a payload re-install.
+// variant and queues its own exposure, not the holdout's.
 func TestRound21_LiteralHoldoutIdsOnlyEditRecomputesCoverage(t *testing.T) {
 	var e = hoExperiment(1, "exp", hoUnitType, 1, 11)
-	var literal = audienceLiteral(e.Experiment)
+	var literal = audienceLiteral(e)
 	literal.Units_ = map[string]string{hoUnitType: hoUID}
-	literal.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
+	literal.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
 	expectInt(t, 0, treatmentPeek(t, literal, "exp"))
-	var edited = e
-	edited.HoldoutIds = nil
-	literal.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, edited))
+	var edited = literal.Index_["exp"]
+	edited.Data.HoldoutIds = nil
+	literal.Index_["exp"] = edited
 	var variant, err = literal.GetTreatment("exp")
 	if err != nil {
 		t.Fatal(err)

@@ -14,14 +14,14 @@ import (
 // between resolving the decision and admitting it.
 type refreshingClock struct {
 	ctx  **Context
-	data jsonmodels.ContextPayload
+	data jsonmodels.ContextData
 	done bool
 }
 
 func (c *refreshingClock) Millis() int64 {
 	if ctx := *c.ctx; ctx != nil && !c.done {
 		c.done = true
-		ctx.SetPayload(c.data)
+		ctx.SetData(c.data)
 	}
 	return hoMillis
 }
@@ -99,25 +99,22 @@ func TestRound22_ImportedLiteralAssignmentRebuildsWhenCoverageIsAdded(t *testing
 		var literal = literalWithCachedAssignment(exposed)
 		literal.GetAssignment("exp")
 		var covered = hoWithVariables(hoExperiment(1, "exp", hoUnitType, 0, 11), "v")
-		literal.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, covered))
+		literal.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, covered))
 		expectInt(t, 0, treatmentPeek(t, literal, "exp"))
 	}
 }
 
-// The installed HoldoutIds are a private copy: an in-place edit of the
-// caller's slice after SetPayload never changes the literal's coverage, even
-// when an Index_ edit makes the next read recompute it from the payload.
-func TestRound22_LiteralInPlaceHoldoutIdsEditKeepsInstalledCoverage(t *testing.T) {
+// An in-place edit to a literal experiment's HoldoutIds element (to a holdout
+// that is not installed) removes its coverage at the next read, as replacing
+// the slice does.
+func TestRound22_LiteralInPlaceHoldoutIdsEditRecomputesCoverage(t *testing.T) {
 	var e = hoExperiment(1, "exp", hoUnitType, 1, 11)
-	var literal = audienceLiteral(e.Experiment)
+	var literal = audienceLiteral(e)
 	literal.Units_ = map[string]string{hoUnitType: hoUID}
-	literal.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
+	literal.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
 	expectInt(t, 0, treatmentPeek(t, literal, "exp"))
-	e.HoldoutIds[0] = 999
-	var edited = literal.Index_["exp"]
-	edited.Data.Iteration++
-	literal.Index_["exp"] = edited
-	expectInt(t, 0, treatmentPeek(t, literal, "exp"))
+	literal.Index_["exp"].Data.HoldoutIds[0] = 999
+	expectInt(t, 1, treatmentPeek(t, literal, "exp"))
 }
 
 // A quoted iteration is not an integral number, so it decodes as iteration 0:
@@ -126,7 +123,7 @@ func TestRound22_LiteralInPlaceHoldoutIdsEditKeepsInstalledCoverage(t *testing.T
 func TestRound22_QuotedHoldoutIterationDecodesAsZero(t *testing.T) {
 	var payload = `{"experiments":[],"holdouts":[{"id":11,"name":"holdout_a","unitType":"session_id",
 		"iteration":"2","seedHi":13,"seedLo":111,"split":[0.1,0.9]}]}`
-	var data, err = DeserializeContextPayload([]byte(payload))
+	var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +139,7 @@ func TestRound22_ArmOnlyReadDoesNotRaceWithAssignmentWrites(t *testing.T) {
 	var strict = hoWithVariables(hoExperiment(1, "exp_strict", hoUnitType, 0, 12), "color")
 	strict.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
 	strict.AudienceStrict = true
-	var others []jsonmodels.ExperimentData
+	var others []jsonmodels.Experiment
 	others = append(others, strict)
 	for i := 2; i < 40; i++ {
 		others = append(others, hoExperiment(i, fmt.Sprintf("other_%d", i), hoUnitType, 0))
@@ -180,7 +177,7 @@ func TestRound22_ArmOnlyReadDoesNotRaceWithAssignmentWrites(t *testing.T) {
 func TestRound22_WarmedVariableReadAllocatesNothing(t *testing.T) {
 	var r = hoExperiment(2, "r", hoUnitType, 0)
 	r.AssignmentRules = hoUSRule
-	for _, data := range []jsonmodels.ContextPayload{
+	for _, data := range []jsonmodels.ContextData{
 		hoData(nil, hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")),
 		hoData(nil, hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v"), r),
 		hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v"), r),

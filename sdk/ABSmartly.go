@@ -52,24 +52,13 @@ func Create(config ABSmartlyConfig) ABSmartly {
 // CreateContext
 func (abs ABSmartly) CreateContext(config ContextConfig) *Context {
 	var application, environment = abs.systemAttributes()
-	return createContext(internal.SystemClockUTC{}, config, contextPayloadFuture(abs.ContextDataProvider_), abs.ContextDataProvider_,
+	return createContext(internal.SystemClockUTC{}, config, abs.ContextDataProvider_.GetContextData(), abs.ContextDataProvider_,
 		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_},
 		application, environment)
 }
 
 // CreateContextWith
 func (abs ABSmartly) CreateContextWith(config ContextConfig, data jsonmodels.ContextData) *Context {
-	var application, environment = abs.systemAttributes()
-	var ft, done = future.New()
-	done(data, nil)
-	return createContext(internal.SystemClockUTC{}, config, ft, abs.ContextDataProvider_,
-		abs.ContextEventHandler_, abs.ContextEventLogger_, abs.VariableParser_, AudienceMatcher{abs.AudienceDeserializer_},
-		application, environment)
-}
-
-// CreateContextWithPayload is CreateContextWith for a full context payload,
-// with holdouts and each experiment's holdout and switchback fields.
-func (abs ABSmartly) CreateContextWithPayload(config ContextConfig, data jsonmodels.ContextPayload) *Context {
 	var application, environment = abs.systemAttributes()
 	var ft, done = future.New()
 	done(data, nil)

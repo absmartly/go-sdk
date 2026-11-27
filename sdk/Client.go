@@ -120,13 +120,6 @@ func applicationVersionHeader(version string) string {
 }
 
 func (c Client) GetContextData() *future.Future {
-	return c.getContextData(false)
-}
-
-// getContextData resolves to the deserializer's ContextData, or with payload
-// to the full jsonmodels.ContextPayload when the deserializer can decode it
-// (see payloadDecoderOf).
-func (c Client) getContextData(payload bool) *future.Future {
 	var dataFuture = future.Call(func() (future.Value, error) {
 		var fut = c.httpClient_.Get(c.url_, c.query_, c.headers_)
 		var value, err = fut.Get(context.Background())
@@ -143,9 +136,6 @@ func (c Client) getContextData(payload bool) *future.Future {
 			return nil, errors.New(resp.Status())
 		}
 
-		if decode, ok := payloadDecoderOf(c.deserializer_); ok && payload {
-			return decode(resp.Body())
-		}
 		value, err = c.deserializer_.Deserialize(resp.Body())
 		return value, err
 	})

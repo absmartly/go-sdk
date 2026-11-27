@@ -26,19 +26,19 @@ const (
 	crUser          = "user_id"
 )
 
-func crExperiment(clusters jsonmodels.SwitchbackClusters) jsonmodels.ExperimentData {
+func crExperiment(clusters jsonmodels.SwitchbackClusters) jsonmodels.Experiment {
 	var variants = make([]jsonmodels.ExperimentVariant, 3)
 	for i := range variants {
 		variants[i] = jsonmodels.ExperimentVariant{Name: strconv.Itoa(i), Config: `{"sbc.config":"test config ` + strconv.Itoa(i) + `"}`}
 	}
-	return jsonmodels.ExperimentData{Experiment: jsonmodels.Experiment{Id: 900, Name: "sbc", UnitType: crUser, Iteration: 1, SeedHi: crSeedHi, SeedLo: crSeedLo,
+	return jsonmodels.Experiment{Id: 900, Name: "sbc", UnitType: crUser, Iteration: 1, SeedHi: crSeedHi, SeedLo: crSeedLo,
 		Split: []float64{0.34, 0.33, 0.33}, TrafficSeedHi: 7, TrafficSeedLo: 11, TrafficSplit: []float64{0, 1},
-		Applications: []jsonmodels.ExperimentApplication{{Name: "website"}}, Variants: variants},
+		Applications: []jsonmodels.ExperimentApplication{{Name: "website"}}, Variants: variants,
 		RandomizationType: "switchback", SwitchbackClusters: clusters, SwitchbackStartAt: sbInt64(sbAnchor),
 		SwitchbackPeriodMs: sbInt64(sbHour), SwitchbackDesignType: "balanced_block"}
 }
 
-func crDefault() jsonmodels.ExperimentData {
+func crDefault() jsonmodels.Experiment {
 	return crExperiment(sbClusters(crSession, "session_store", crUser, "profile/store"))
 }
 
@@ -67,7 +67,7 @@ type crAssigned struct {
 // crResolve creates a context with the attributes and units, resolves every
 // other experiment first, then "sbc" through GetTreatment and
 // GetVariableValue, and reports what the Collector would list for it.
-func crResolve(t *testing.T, attributes map[string]interface{}, experiments []jsonmodels.ExperimentData, units map[string]string) *crAssigned {
+func crResolve(t *testing.T, attributes map[string]interface{}, experiments []jsonmodels.Experiment, units map[string]string) *crAssigned {
 	t.Helper()
 	var h = sbCreateAt(t, crNow, units, sbData(experiments...), sbNoClusterAttribute())
 	for name, value := range attributes {
@@ -101,14 +101,14 @@ func crResolve(t *testing.T, attributes map[string]interface{}, experiments []js
 		variant: variant, fullOn: assignment.FullOn, ruleOverride: entry.ruleOverride, config: config, exposures: exposures}
 }
 
-func crSbc(t *testing.T, experiment jsonmodels.ExperimentData, attributes map[string]interface{}, units map[string]string) *crAssigned {
+func crSbc(t *testing.T, experiment jsonmodels.Experiment, attributes map[string]interface{}, units map[string]string) *crAssigned {
 	t.Helper()
-	return crResolve(t, attributes, []jsonmodels.ExperimentData{experiment}, units)
+	return crResolve(t, attributes, []jsonmodels.Experiment{experiment}, units)
 }
 
 // crExpectIneligible: an ineligible cluster is still an assignment, as
 // control under the first linked unit in declared order, and records nothing.
-func crExpectIneligible(t *testing.T, experiment jsonmodels.ExperimentData, attributes map[string]interface{}, unit string, units map[string]string) {
+func crExpectIneligible(t *testing.T, experiment jsonmodels.Experiment, attributes map[string]interface{}, unit string, units map[string]string) {
 	t.Helper()
 	var assignment = crSbc(t, experiment, attributes, units)
 	if assignment == nil || assignment.unit != unit || assignment.eligible || !assignment.silent || assignment.variant != 0 ||
@@ -161,7 +161,7 @@ func TestSwitchbackClusterRule_TrafficUsesServingUidNotExperimentUid(t *testing.
 			serving, other = other, serving
 		}
 		var assignment = crResolve(t, map[string]interface{}{"session_store": key, "profile": crStore(key)},
-			[]jsonmodels.ExperimentData{experiment, ordinary}, map[string]string{crSession: serving, crUser: other})
+			[]jsonmodels.Experiment{experiment, ordinary}, map[string]string{crSession: serving, crUser: other})
 		var want = 0
 		if servingEligible {
 			want = crScheduled(key)
@@ -328,7 +328,7 @@ func TestSwitchbackClusterRule_ValidClusterWithoutLinkedUnitDoesNotFallBackToExp
 // test transcribes it: the period from the anchor (re-ceiled to the hour),
 // traffic on the serving uid's hash, then the draw over the cluster key. An
 // empty key has no draw. It returns the variant and whether it is eligible.
-func crOracle(experiment jsonmodels.ExperimentData, uid string, key string, now int64) (int, bool) {
+func crOracle(experiment jsonmodels.Experiment, uid string, key string, now int64) (int, bool) {
 	if experiment.SwitchbackStartAt == nil || experiment.SwitchbackPeriodMs == nil || *experiment.SwitchbackPeriodMs <= 0 ||
 		len(experiment.Split) < 2 || len(key) == 0 {
 		return 0, false

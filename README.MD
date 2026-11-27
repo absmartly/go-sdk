@@ -24,7 +24,7 @@ The finalization event is still `sdk.Close` with the value `"Close"`; `sdk.Final
 ### Install the SDK
 
 ```bash
-go get github.com/absmartly/go-sdk/sdk@v1.3.0
+go get github.com/absmartly/go-sdk/sdk@v1.4.0
 ```
 
 ### Dependencies
@@ -327,9 +327,8 @@ if serverCtx.IsFailed() {
     log.Fatal("Failed to initialize context: could not load experiment data")
 }
 
-// Get the context payload to send to client. GetPayload keeps holdouts and
-// switchback experiments; GetData returns the v1.2.0 ContextData without them.
-contextPayload, err := serverCtx.GetPayload()
+// Get the context data to send to client
+contextData, err := serverCtx.GetData()
 if err != nil {
     log.Fatalf("Failed to read context data: %v", err)
 }
@@ -342,7 +341,7 @@ clientConfig := sdk.ContextConfig{
     },
 }
 
-clientCtx := absmartly.CreateContextWithPayload(clientConfig, contextPayload)
+clientCtx := absmartly.CreateContextWith(clientConfig, contextData)
 // Context is immediately ready, no need to wait
 ```
 
@@ -553,8 +552,8 @@ apply.
 
 A holdout keeps a share of units out of a group of experiments, so their
 combined effect can be measured. The context payload lists the holdouts
-(`ContextPayload.Holdouts`) and each experiment names the holdouts covering it
-(`ExperimentData.HoldoutIds`). Nothing needs to be configured: the SDK applies
+(`ContextData.Holdouts`) and each experiment names the holdouts covering it
+(`Experiment.HoldoutIds`). Nothing needs to be configured: the SDK applies
 them following the JavaScript and Java SDKs. The few places where it differs
 (duplicate or malformed holdout entries, and decisions resolved again after a
 refresh edits an audience) are listed in the v1.3.0 CHANGELOG.
@@ -571,23 +570,21 @@ refresh edits an audience) are listed in the v1.3.0 CHANGELOG.
 - Every `GetTreatment` or `GetVariableValue` on a covered experiment also
   publishes each covering holdout's exposure, once per holdout and unit type,
   whatever the arm. `PeekTreatment` and `PeekVariableValue` publish nothing.
-- When experiments share a variable key (see
-  [Shared variable keys](#shared-variable-keys)), a held-out experiment is not
-  assigned, so it never wins the key; if no experiment wins, the first
-  held-out one supplies its control value rather than the default, and
-  `GetVariableValue` publishes the holdout exposures of every experiment it
-  checked before the winner, as in the Java SDK.
+- When experiments share a variable key (see "Shared variable keys"), a
+  held-out experiment never wins it; if no candidate wins, the first held-out
+  candidate's control value is returned rather than the default.
+  `GetVariableValue` publishes the holdout exposures of every candidate it
+  visits, as the Java SDK does, but only the winner's own exposure.
 
 A unit keeps its arm until the holdout's iteration changes. Holdouts add
 nothing to the publish payload of experiments without holdouts (the
 `ruleOverride` flag every exposure now carries comes with assignment rules),
 and warmed cached reads and exposures allocate nothing more. On a
-four-experiment payload without holdouts, `Deserialize` takes about 3.7 KiB
-more and one more allocation (it decodes the full payload, then copies out the
-`ContextData`), and `CreateContextWith` about 0.4 KiB more with the same number
-of allocations; rebuilding an assignment allocates one more small object, its
-retirement token.
-Once a context has seen holdouts or switchbacks, a `GetVariableValue` that passes an
+four-experiment payload without holdouts, decoding takes about 0.55 KiB more
+and creating a context about 1 KiB more (the decoded and installed structs
+are wider), with the same number of allocations; rebuilding an assignment
+allocates one more small object, its retirement token.
+Once a context has seen holdouts, a `GetVariableValue` that passes an
 experiment the unit is not in (a strict-audience mismatch, or no unit of its
 type) briefly takes the context's read lock for that experiment. It fires the
 experiment's holdouts and checks that the decision is still current, so a
@@ -595,56 +592,29 @@ refresh cannot authorize an obsolete one. This applies whether or not a
 holdout covers that experiment. A warmed read of that kind still makes 0
 allocations and reads no clock, but it takes about 220 ns where v1.2.0 takes
 about 135 ns (+60%, a synthetic single-threaded benchmark on linux/arm64).
-Contexts that never saw holdouts or switchbacks, with or without assignment
-rules, take no lock for it.
+Contexts that never saw holdouts, with or without assignment rules, take no
+lock for it.
 
-Holdouts, and the switchback experiments below, reach a context only through
-the full payload, `jsonmodels.ContextPayload`, whose experiments are
-`jsonmodels.ExperimentData` values: the v1.2.0 `Experiment` plus `HoldoutIds`
-and the switchback fields. `jsonmodels.ContextData` and `jsonmodels.Experiment`
-keep their v1.2.0 layouts, so existing code, positional literals included,
-keeps compiling. `CreateContext` and refreshes with the default client get the
-payload with no code change. With prefetched data, or to hand a context's
-data to another context, use the payload variants:
-
-```go
-var payload, _ = sdk.DeserializeContextPayload(body)
-var ctx = absmartly.CreateContextWithPayload(contextConfig, payload)
-ctx.SetPayload(payload)          // the SetData of a ContextPayload
-payload, _ = ctx.GetPayload()    // the GetData of a ContextPayload
-```
-
-As with `GetData`, the values inside the payload `GetPayload` returns are
-shared with the context and must not be modified.
-
-`Deserialize`, `GetContextData`, `GetData`, `SetData` and `CreateContextWith`
-keep working with `ContextData`, which has no holdouts or switchbacks. A custom
-`ContextDataDeserializer` or `ContextDataProvider` gives contexts the payload
-by also declaring `DeserializePayload` (`ContextPayloadDeserializer`) or
-`GetContextPayload` (`ContextPayloadProvider`); a wrapper's `GetContextPayload`
-can return `sdk.ContextPayloadFuture(wrapped)` to delegate to the provider or
-client it wraps. Embedding
-`DefaultContextDataDeserializer`, `DefaultContextDataProvider` or `Client` does
-not opt in by itself: a type that embeds one and overrides only `Deserialize`
-or `GetContextData` keeps that override in use, as in v1.2.0.
+`ContextData` gained a `Holdouts` field and `Experiment` a `HoldoutIds` field,
+so unkeyed (positional) literals of `jsonmodels.ContextData` must become keyed
+(`jsonmodels.ContextData{Experiments: experiments}`), as for `Experiment`.
 
 ### Switchback Experiments
 
-Switchback serving needs v1.3.0 or later. Earlier versions ignore the
+Switchback serving needs v1.4.0 or later. Earlier versions ignore the
 switchback fields and serve such an experiment as a unit experiment on its
 `unitType`, which does not follow the schedule.
 
 A switchback experiment randomizes over *clusters* and time rather than over
 units: every unit in the same cluster (for example a store's city) gets the
 same variant within a period, and the variant changes on a fixed time grid.
-The context payload marks it with `ExperimentData.RandomizationType ==
-"switchback"`; nothing needs to be configured beyond giving the context the
-full payload (see [Holdouts](#holdouts)). The SDK serves it as the
+The context payload marks it with `Experiment.RandomizationType ==
+"switchback"`; nothing needs to be configured. The SDK serves it as the
 collector and the other ABsmartly SDKs do (see the Java SDK's
 [`SWITCHBACK.md`](https://github.com/absmartly/java-sdk/blob/main/SWITCHBACK.md)
 for the full rules):
 
-- `ExperimentData.SwitchbackClusters` lists, in order, the unit types linked to
+- `Experiment.SwitchbackClusters` lists, in order, the unit types linked to
   the experiment and the attribute path holding each one's cluster value
   (`"city"`, `"geo/city"`, `"items/0/city"`). For each linked type in that
   order, the context's unit of that type reads the attribute at its path. The
@@ -668,7 +638,7 @@ for the full rules):
   struct (written as `3`) keys a cluster.
 - With no unit of a linked type set, the experiment does not apply. When no
   unit yields a value, linked units disagree, or the value is not in
-  `ExperimentData.SwitchbackClusterValues`, the unit gets variant `0` and no
+  `Experiment.SwitchbackClusterValues`, the unit gets variant `0` and no
   exposure is published; only an override (`SetOverride`) still applies.
 - Otherwise overrides, assignment rules, strict audiences, full-on, traffic
   (on the serving unit) and custom assignments apply as for a unit
@@ -692,8 +662,8 @@ the arm cached at the first read stays for the rest of the period, and the
 change takes effect from the next period. Set the cluster attributes before
 the first read of each period. Payloads without switchback
 experiments are served and published exactly as before, and cached reads and
-exposures allocate as before (the decoded experiment structs are a little
-wider). An attribute value with its own `MarshalJSON` or `MarshalText` is read
+exposures allocate as before (`jsonmodels.Experiment` is a little wider: it
+carries the switchback fields). An attribute value with its own `MarshalJSON` or `MarshalText` is read
 through that encoding under the context lock, so the marshaler must not call
 back into the context.
 

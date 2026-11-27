@@ -17,33 +17,24 @@ type DefaultContextDataDeserializer struct {
 }
 
 func (d DefaultContextDataDeserializer) Deserialize(bytes []byte) (jsonmodels.ContextData, error) {
-	var payload, err = DeserializeContextPayload(bytes)
-	return payload.ContextData(), err
-}
-
-// DeserializeContextPayload decodes the full context payload as
-// DefaultContextDataDeserializer does, with holdouts and each experiment's
-// holdout and switchback fields. It is a function, not a method of the
-// default deserializer, so a type embedding that deserializer does not become
-// a ContextPayloadDeserializer by promotion (see there).
-func DeserializeContextPayload(bytes []byte) (jsonmodels.ContextPayload, error) {
 	var wire wireContextData
 	if json.Unmarshal(bytes, &wire) == nil {
-		return wire.contextPayload(), nil
+		return wire.contextData(), nil
 	}
 	// The payload is invalid somewhere other than assignmentRules. Decode the
 	// caller's bytes into v1.1.1's model, which has no assignmentRules field,
 	// so the partial data and the error (text and offset) are v1.1.1's.
 	var legacy v111.ContextData
 	var err = json.Unmarshal(bytes, &legacy)
-	return jsonmodels.PayloadOf(legacy.Public()), err
+	return legacy.Public(), err
 }
 
 // wireContextData is the context payload as the default deserializer decodes
-// it. It differs from jsonmodels.ContextPayload only in accepting any JSON value
-// for an experiment's assignmentRules, holdoutIds and the holdouts list, so a
-// malformed value drops that experiment's rules, that holdout id or that
-// holdout instead of failing the whole payload. Keeping this here,
+// it. It differs from jsonmodels.ContextData only in accepting any JSON value
+// for an experiment's assignmentRules, holdoutIds and switchback fields and
+// the holdouts list, so a malformed value drops that experiment's rules, that
+// holdout id, that switchback field or that holdout instead of failing the
+// whole payload. Keeping this here,
 // rather than in an UnmarshalJSON method on the public model, leaves the
 // encoding/json behaviour of jsonmodels.Experiment, and of customer structs
 // that embed it, unchanged.
@@ -70,12 +61,12 @@ type wireExperiment struct {
 	SwitchbackEstimand            json.RawMessage `json:"switchbackEstimand"`
 }
 
-func (w wireContextData) contextPayload() jsonmodels.ContextPayload {
-	var data jsonmodels.ContextPayload
+func (w wireContextData) contextData() jsonmodels.ContextData {
+	var data jsonmodels.ContextData
 	if w.Experiments != nil {
-		data.Experiments = make([]jsonmodels.ExperimentData, len(w.Experiments))
+		data.Experiments = make([]jsonmodels.Experiment, len(w.Experiments))
 		for i, experiment := range w.Experiments {
-			data.Experiments[i].Experiment = experiment.Experiment
+			data.Experiments[i] = experiment.Experiment
 			data.Experiments[i].AssignmentRules = wireScalarText(experiment.AssignmentRules)
 			data.Experiments[i].HoldoutIds = holdoutIds(experiment.HoldoutIds)
 			data.Experiments[i].SwitchbackClusters = experiment.SwitchbackClusters
@@ -239,7 +230,7 @@ func wireScalarText(raw json.RawMessage) string {
 // unit experiment. The allow-list is the exception, because an empty one
 // allows every value: a value that is not an array, and an entry that is
 // not a scalar, allow nothing rather than everything.
-func (w wireExperiment) switchbackFields(experiment *jsonmodels.ExperimentData) {
+func (w wireExperiment) switchbackFields(experiment *jsonmodels.Experiment) {
 	experiment.RandomizationType = jsonString(w.RandomizationType)
 	experiment.SwitchbackClusterValues = switchbackClusterValues(w.SwitchbackClusterValues)
 	experiment.SwitchbackStartAt = jsonInt64(w.SwitchbackStartAt)

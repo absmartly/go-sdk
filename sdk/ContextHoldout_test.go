@@ -50,17 +50,17 @@ const (
 
 var hoThreeArmSplit = []float64{0.3, 0.3, 0.4}
 
-func hoExperiment(id int, name string, unitType string, fullOnVariant int, holdoutIds ...int) jsonmodels.ExperimentData {
+func hoExperiment(id int, name string, unitType string, fullOnVariant int, holdoutIds ...int) jsonmodels.Experiment {
 	var variants = []jsonmodels.ExperimentVariant{{Name: "A"}, {Name: "B"}}
 	if fullOnVariant >= 2 {
 		variants = append(variants, jsonmodels.ExperimentVariant{Name: "C"})
 	}
-	return jsonmodels.ExperimentData{Experiment: jsonmodels.Experiment{
+	return jsonmodels.Experiment{
 		Id: id, Name: name, UnitType: unitType, Iteration: 1, SeedHi: 100, SeedLo: 200,
 		Split: []float64{0.5, 0.5}, TrafficSeedHi: 1, TrafficSeedLo: 2, TrafficSplit: []float64{0, 1},
 		FullOnVariant: fullOnVariant, Applications: []jsonmodels.ExperimentApplication{{Name: "website"}},
-		Variants: variants,
-	}, HoldoutIds: holdoutIds}
+		Variants: variants, HoldoutIds: holdoutIds,
+	}
 }
 
 func hoHoldout(id int, name string, unitType string, seedHi int, seedLo int) jsonmodels.Holdout {
@@ -75,8 +75,8 @@ func hoThreeArm(id int, name string, seedLo int) jsonmodels.Holdout {
 	return holdout
 }
 
-func hoData(holdouts []jsonmodels.Holdout, experiments ...jsonmodels.ExperimentData) jsonmodels.ContextPayload {
-	return jsonmodels.ContextPayload{Experiments: experiments, Holdouts: holdouts}
+func hoData(holdouts []jsonmodels.Holdout, experiments ...jsonmodels.Experiment) jsonmodels.ContextData {
+	return jsonmodels.ContextData{Experiments: experiments, Holdouts: holdouts}
 }
 
 func hoExposure(unitType string, id int, name string, variant int) jsonmodels.Exposure {
@@ -104,7 +104,7 @@ func (p *hoPublisher) Publish(_ Context, event jsonmodels.PublishEvent) *future.
 
 type hoProvider struct {
 	mu   sync.Mutex
-	next jsonmodels.ContextPayload
+	next jsonmodels.ContextData
 }
 
 func (p *hoProvider) GetContextData() *future.Future {
@@ -153,7 +153,7 @@ func hoPublishDelay(delay int64) hoOption {
 }
 
 // hoCreate creates a ready context with the given units (nil for none).
-func hoCreate(t *testing.T, units map[string]string, data jsonmodels.ContextPayload, options ...hoOption) *hoContext {
+func hoCreate(t *testing.T, units map[string]string, data jsonmodels.ContextData, options ...hoOption) *hoContext {
 	t.Helper()
 	var config = CreateDefaultContextConfig()
 	config.PublishDelay_ = -1
@@ -180,7 +180,7 @@ func hoCreate(t *testing.T, units map[string]string, data jsonmodels.ContextPayl
 	return h
 }
 
-func hoCreateFor(t *testing.T, uid string, data jsonmodels.ContextPayload, options ...hoOption) *hoContext {
+func hoCreateFor(t *testing.T, uid string, data jsonmodels.ContextData, options ...hoOption) *hoContext {
 	t.Helper()
 	return hoCreate(t, map[string]string{hoUnitType: uid}, data, options...)
 }
@@ -221,7 +221,7 @@ func (h *hoContext) peekVariable(key string) interface{} {
 	return value
 }
 
-func (h *hoContext) refresh(data jsonmodels.ContextPayload) {
+func (h *hoContext) refresh(data jsonmodels.ContextData) {
 	h.t.Helper()
 	h.provider.mu.Lock()
 	h.provider.next = data
@@ -1079,7 +1079,7 @@ func TestHoldout_MalformedHoldoutEntriesAreIgnored(t *testing.T) {
 		var payload = `{"experiments":[{"id":1,"name":"exp_malformed","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
 			"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"fullOnVariant":0,
 			"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],"holdouts":` + holdouts + `}`
-		var data, err = DeserializeContextPayload([]byte(payload))
+		var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
 		if err != nil {
 			t.Fatalf("%s: %v", holdouts, err)
 		}
@@ -1229,7 +1229,7 @@ func TestHoldout_HeldOutUnitIsSuppressedAgainWhenTheRuleStopsMatching(t *testing
 	h.expectPending(2)
 }
 
-func hoWithVariables(experiment jsonmodels.ExperimentData, key string) jsonmodels.ExperimentData {
+func hoWithVariables(experiment jsonmodels.Experiment, key string) jsonmodels.Experiment {
 	experiment.Variants = []jsonmodels.ExperimentVariant{
 		{Name: "A", Config: `{"` + key + `":"control"}`}, {Name: "B", Config: `{"` + key + `":"treatment"}`}}
 	return experiment
@@ -1397,7 +1397,7 @@ func TestHoldout_DefaultDecoderIgnoresUnknownHoldoutFields(t *testing.T) {
 		],
 		"futureHoldoutRoot":{"nested":[1]}
 	}`
-	var data, err = DeserializeContextPayload([]byte(payload))
+	var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1420,15 +1420,15 @@ func TestHoldout_DefaultDecoderIgnoresUnknownHoldoutFields(t *testing.T) {
 // Holdout models round-trip with encoding/json, and a ContextData without
 // holdouts marshals exactly as before (no new keys).
 func TestHoldout_ModelJSON(t *testing.T) {
-	var raw, _ = json.Marshal(jsonmodels.ContextPayload{Experiments: []jsonmodels.ExperimentData{}})
+	var raw, _ = json.Marshal(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{}})
 	expectValue(t, `{"experiments":[]}`, string(raw))
-	raw, _ = json.Marshal(jsonmodels.ExperimentData{Experiment: jsonmodels.Experiment{Id: 1}})
+	raw, _ = json.Marshal(jsonmodels.Experiment{Id: 1})
 	var fields map[string]interface{}
 	_ = json.Unmarshal(raw, &fields)
 	if _, found := fields["holdoutIds"]; found {
 		t.Fatalf("holdoutIds marshalled when empty: %s", raw)
 	}
-	var data jsonmodels.ContextPayload
+	var data jsonmodels.ContextData
 	if err := json.Unmarshal([]byte(`{"holdouts":[{"id":3,"name":"h","unitType":"u","iteration":2,"seedHi":1,"seedLo":2,"split":[0.5,0.5],"holdoutType":"full","x":1}],"experiments":[{"id":1,"holdoutIds":[3]}]}`), &data); err != nil {
 		t.Fatal(err)
 	}
@@ -1439,7 +1439,7 @@ func TestHoldout_ModelJSON(t *testing.T) {
 
 // hoPublishProbe treats every experiment of a payload with no holdouts for a
 // few units and returns each publish body as JSON, units sorted.
-func hoPublishProbe(t *testing.T, data jsonmodels.ContextPayload) string {
+func hoPublishProbe(t *testing.T, data jsonmodels.ContextData) string {
 	t.Helper()
 	var out []byte
 	for _, uid := range []string{"bleh@absmartly.com", "façade", "🚀rocket", hoUID, hoUIDNotHeldOut} {
@@ -1469,7 +1469,7 @@ func hoPublishProbe(t *testing.T, data jsonmodels.ContextPayload) string {
 // this probe at main 54b4e8a.
 func TestHoldout_PublishWithoutHoldoutsIsUnchanged(t *testing.T) {
 	var raw, _ = os.ReadFile("testAssets/context.json")
-	var data, err = DeserializeContextPayload(raw)
+	var data, err = DefaultContextDataDeserializer{}.Deserialize(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1480,7 +1480,7 @@ func TestHoldout_PublishWithoutHoldoutsIsUnchanged(t *testing.T) {
 	}
 }
 
-func hoBenchContext(b *testing.B, data jsonmodels.ContextPayload) *Context {
+func hoBenchContext(b *testing.B, data jsonmodels.ContextData) *Context {
 	var config = CreateDefaultContextConfig()
 	config.Units_ = map[string]string{hoUnitType: hoUID}
 	config.PublishDelay_ = -1
@@ -1494,7 +1494,7 @@ func hoBenchContext(b *testing.B, data jsonmodels.ContextPayload) *Context {
 	return ctx
 }
 
-func benchmarkCachedTreatment(b *testing.B, data jsonmodels.ContextPayload) {
+func benchmarkCachedTreatment(b *testing.B, data jsonmodels.ContextData) {
 	var ctx = hoBenchContext(b, data)
 	ctx.GetTreatment("exp")
 	b.ReportAllocs()
@@ -1558,7 +1558,7 @@ func TestHoldout_MalformedHoldoutEntryDoesNotDropTheOthers(t *testing.T) {
 		"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"fullOnVariant":0,
 		"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
 		"holdouts":[null,5,"x",{"id":"bad"},{"id":11,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":[0.1,0.9]}]}`
-	var data, err = DeserializeContextPayload([]byte(payload))
+	var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1715,7 +1715,7 @@ func TestHoldout_IntegralHoldoutIdsInAnyNotation(t *testing.T) {
 		"holdouts":[{"id":11.0,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":[0.1,0.9]},
 		{"id":1.2e1,"name":"holdout_b","iteration":1,"seedHi":1,"seedLo":222,"split":[0.1,0.9]},
 		{"id":"13","name":"holdout_string","iteration":1,"seedHi":13,"seedLo":111,"split":[0.1,0.9]}]}`
-	var data, err = DeserializeContextPayload([]byte(payload))
+	var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1775,7 +1775,7 @@ func TestHoldout_WronglyTypedHoldoutTypeIsIgnored(t *testing.T) {
 		var payload = `{"experiments":[{"id":1,"name":"exp","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
 			"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
 			"holdouts":[{"id":11,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":[0.1,0.9],"holdoutType":` + holdoutType + `}]}`
-		var data, err = DeserializeContextPayload([]byte(payload))
+		var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1886,7 +1886,7 @@ func TestHoldout_WronglyTypedUnitTypeOrIterationIsIgnored(t *testing.T) {
 		var payload = `{"experiments":[{"id":1,"name":"exp","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
 			"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
 			"holdouts":[{"id":11,"name":"holdout_a",` + fields + `,"seedHi":13,"seedLo":111,"split":[0.1,0.9]}]}`
-		var data, err = DeserializeContextPayload([]byte(payload))
+		var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1911,7 +1911,7 @@ func TestHoldout_WronglyTypedUnitTypeOrIterationIsIgnored(t *testing.T) {
 // holdout iteration beside the coverage of another.
 func TestHoldout_RefreshAndResolutionUseOneGeneration(t *testing.T) {
 	var experiment = hoExperiment(1, "exp", hoUnitType, 0, 11)
-	var payload = func(iteration int) jsonmodels.ContextPayload {
+	var payload = func(iteration int) jsonmodels.ContextData {
 		var holdout = hoHoldoutA()
 		holdout.Iteration = iteration
 		return hoData([]jsonmodels.Holdout{holdout}, experiment)
@@ -1924,7 +1924,7 @@ func TestHoldout_RefreshAndResolutionUseOneGeneration(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 2; i < 3000; i++ {
-			h.ctx.SetPayload(payload(i))
+			h.ctx.SetData(payload(i))
 		}
 	}()
 	var mixed = 0
@@ -1952,7 +1952,7 @@ func TestHoldout_RefreshAndResolutionUseOneGeneration(t *testing.T) {
 func TestHoldout_SetDataThroughACopyActsOnTheLiveContext(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData(nil, hoExperiment(1, "exp", hoUnitType, 0)))
 	var snapshot = h.ctx.WaitUntilReady()
-	snapshot.SetPayload(hoData(nil, hoExperiment(1, "exp", hoUnitType, 0), hoExperiment(2, "exp2", hoUnitType, 0)))
+	snapshot.SetData(hoData(nil, hoExperiment(1, "exp", hoUnitType, 0), hoExperiment(2, "exp2", hoUnitType, 0)))
 	var names, _ = h.ctx.GetExperiments()
 	sort.Strings(names)
 	expectValue(t, []string{"exp", "exp2"}, names)
@@ -2182,7 +2182,7 @@ func TestHoldout_RetirementSurvivesASecondReplacement(t *testing.T) {
 				experiment.HoldoutIds = []int{11}
 			}
 			experiment.Iteration = i + 2
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
 			h.ctx.GetAssignment("exp")
 		}
 		h.ctx.Closing_.Store(true)
@@ -2255,13 +2255,13 @@ func TestHoldout_PopulatedModelRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var decoded jsonmodels.ContextPayload
+	var decoded jsonmodels.ContextData
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatal(err)
 	}
 	expectValue(t, data.Holdouts, decoded.Holdouts)
 	expectValue(t, data.Experiments[0].HoldoutIds, decoded.Experiments[0].HoldoutIds)
-	var viaSDK, sdkErr = DeserializeContextPayload(raw)
+	var viaSDK, sdkErr = DefaultContextDataDeserializer{}.Deserialize(raw)
 	if sdkErr != nil {
 		t.Fatal(sdkErr)
 	}
@@ -2309,7 +2309,7 @@ func TestHoldout_RejectedSameNameAssignmentDoesNotEvictTheExposedEntry(t *testin
 func TestHoldout_HeldAssignmentQueuedAfterHoldoutsRemoved(t *testing.T) {
 	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 	var stale = h.ctx.GetAssignment("exp")
-	h.ctx.SetPayload(hoData(nil, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+	h.ctx.SetData(hoData(nil, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 	h.ctx.QueueExposure(stale)
 	h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
 }
@@ -2398,12 +2398,12 @@ func TestHoldout_CoveredAdmissionReadsTheClockOutsideEventLock(t *testing.T) {
 // (1 as 1.0, 13 as 1.3e1) keeps the same epoch and arm: nothing is exposed
 // twice. A real iteration bump still re-exposes.
 func TestHoldout_EquivalentJSONNumbersKeepTheEpoch(t *testing.T) {
-	var payload = func(iteration string, seedHi string) jsonmodels.ContextPayload {
+	var payload = func(iteration string, seedHi string) jsonmodels.ContextData {
 		var raw = `{"experiments":[{"id":1,"name":"exp","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
 			"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
 			"holdouts":[{"id":11,"name":"holdout_a","unitType":"session_id","iteration":` + iteration + `,"seedHi":` + seedHi +
 			`,"seedLo":1.11e2,"split":[0.1,0.9]}]}`
-		var data, err = DeserializeContextPayload([]byte(raw))
+		var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(raw))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2463,7 +2463,7 @@ func TestHoldout_ClaimAndReplacementNeverInterleave(t *testing.T) {
 		var stale = entry.assignment
 		var claimed = make(chan bool)
 		go func() { claimed <- hoClaim(h, entry) }()
-		h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
+		h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoExperiment(1, "exp", hoUnitType, 0, 11)))
 		h.ctx.GetAssignment("exp")
 		if !<-claimed {
 			continue
@@ -2589,7 +2589,7 @@ func TestHoldout_SeedPayloadDecoding(t *testing.T) {
 	} {
 		t.Run(tc.raw, func(t *testing.T) {
 			var payload = `{"holdouts":[{"id":11,"seedHi":` + tc.raw + `,"seedLo":` + tc.raw + `}]}`
-			var data, err = DeserializeContextPayload([]byte(payload))
+			var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
 			if err != nil || len(data.Holdouts) != 1 {
 				t.Fatalf("decode: %+v, %v", data, err)
 			}
@@ -2731,7 +2731,7 @@ func TestHoldout_MalformedDuplicateDoesNotCancelAValidHoldout(t *testing.T) {
 			var payload = `{"experiments":[{"id":1,"name":"exp","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
 				"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
 				"holdouts":[` + holdouts + `]}`
-			var data, err = DeserializeContextPayload([]byte(payload))
+			var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2777,7 +2777,7 @@ func TestHoldout_ClaimReplacedBeforeCommitStillPublishes(t *testing.T) {
 		replacement.Iteration = 2
 		replacement.Split = []float64{0, 1}
 		var clock = hoReplacingClock{armed: &armed, replace: func() {
-			ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
+			ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
 			ctx.GetAssignment("exp")
 		}}
 		var config = CreateDefaultContextConfig()
@@ -2821,7 +2821,7 @@ func TestHoldout_ClaimReplacedBeforeCommitStillPublishes(t *testing.T) {
 func TestHoldout_NullSplitAndNullElementsAreKept(t *testing.T) {
 	var decode = func(split string) []jsonmodels.Holdout {
 		var payload = `{"holdouts":[{"id":11,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":` + split + `}]}`
-		var data, err = DeserializeContextPayload([]byte(payload))
+		var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2842,7 +2842,7 @@ func TestHoldout_NullSplitAndNullElementsAreKept(t *testing.T) {
 		var payload = `{"experiments":[{"id":1,"name":"exp","unitType":"session_id","iteration":1,"seedHi":100,"seedLo":200,
 			"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
 			"holdouts":[{"id":11,"name":"holdout_a","unitType":"session_id","iteration":1,"seedHi":13,"seedLo":111,"split":` + c.split + `}]}`
-		var data, err = DeserializeContextPayload([]byte(payload))
+		var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2873,7 +2873,7 @@ func TestHoldout_ClaimedDecisionServedByASecondReadIsPublished(t *testing.T) {
 		} else {
 			expectInt(t, 0, h.treatment("exp"))
 		}
-		h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
+		h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
 		h.ctx.PeekTreatment("exp")
 		if got := h.ctx.admitExposure(entry.assignment, entry); got != exposureQueued {
 			t.Fatalf("the first read's admission reported %v, want queued", got)
@@ -2905,7 +2905,7 @@ func TestHoldout_ReadReplacedAfterItsClaimServesItsClaim(t *testing.T) {
 			replacement.Split = []float64{0, 1}
 			replacement.HoldoutIds = []int{11}
 			var clock = hoReplacingClock{armed: &armed, replace: func() {
-				ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
+				ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
 				ctx.GetAssignment("exp")
 			}}
 			var config = CreateDefaultContextConfig()
@@ -2960,7 +2960,7 @@ func TestHoldout_RetiredReadRetriesAreBounded(t *testing.T) {
 		claims++
 		var next = experiment
 		next.Iteration = 1 + claims
-		h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, next))
+		h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, next))
 		h.ctx.GetAssignment("exp")
 	}
 	defer func() { beforeSettleClaim = nil }()
@@ -2995,7 +2995,7 @@ func TestHoldout_ReplacementBeforeTheClaimServesTheReplacement(t *testing.T) {
 			beforeSettleClaim = func() {
 				if armed {
 					armed = false
-					h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
+					h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
 					h.ctx.GetAssignment("exp")
 				}
 			}
@@ -3220,7 +3220,7 @@ func TestHoldout_ClaimLosingToAReplacementSeesTheRetirement(t *testing.T) {
 	}
 	var replacement = hoExperiment(1, "exp", hoUnitType, 0, 11)
 	replacement.Iteration = 2
-	h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
+	h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
 	h.ctx.GetAssignment("exp")
 	afterReplacementClaim = nil
 	if !ran {
@@ -3250,7 +3250,7 @@ func TestHoldout_ReplacementBeforeTheExposedCheckServesTheReplacement(t *testing
 		afterReadResolve = func() {
 			if armed {
 				armed = false
-				h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
+				h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
 				h.ctx.PeekTreatment("exp")
 			}
 		}
@@ -3279,7 +3279,7 @@ func TestHoldout_VariableRetryDoesNotExposeARemovedExperiment(t *testing.T) {
 	beforeSettleClaim = func() {
 		if armed {
 			armed = false
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}))
 			h.ctx.GetAssignment("a")
 		}
 	}
@@ -3326,7 +3326,7 @@ func TestHoldout_RetirementIsStoredBeforeTheClaim(t *testing.T) {
 	}
 	var replacement = hoExperiment(1, "exp", hoUnitType, 0, 11)
 	replacement.Iteration = 2
-	h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
+	h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
 	h.ctx.GetAssignment("exp")
 	beforeReplacementClaim = nil
 	if !ran {
@@ -3369,7 +3369,7 @@ func TestHoldout_VariableRetryDoesNotExposeAnExperimentWithoutTheKey(t *testing.
 	beforeSettleClaim = func() {
 		if armed {
 			armed = false
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement))
 			h.ctx.GetAssignment("a")
 		}
 	}
@@ -3388,7 +3388,7 @@ func TestHoldout_VariableRetryDoesNotExposeAnExperimentWithoutTheKey(t *testing.
 // adds the key makes it eligible, and an experiment that is not installed is
 // never eligible.
 func TestHoldout_VariableEligibilityIsJudgedByTheInstalledDefinition(t *testing.T) {
-	var version = func(iteration int, config string) jsonmodels.ExperimentData {
+	var version = func(iteration int, config string) jsonmodels.Experiment {
 		var experiment = hoExperiment(1, "a", hoUnitType, 0, 11)
 		experiment.Iteration = iteration
 		experiment.Variants[0].Config = config
@@ -3458,7 +3458,7 @@ func TestHoldout_VariableRetryChecksTheKeyOnTheSameExperiment(t *testing.T) {
 	beforeSettleClaim = func() {
 		if armed {
 			armed = false
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement, b))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement, b))
 			h.ctx.GetAssignment("a")
 		}
 	}
@@ -3538,12 +3538,12 @@ func TestHoldout_CachedEntryReleasesTheOldDefinition(t *testing.T) {
 		config.RefreshInterval_ = -1
 		var ft, done = future.New()
 		done(hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment), nil)
-		experiment = jsonmodels.ExperimentData{}
+		experiment = jsonmodels.Experiment{}
 		var ctx = CreateContext(internal.FixedClock{Millis_: hoMillis}, config, ft, &hoProvider{}, &hoPublisher{}, nil,
 			c.parser, AudienceMatcher{DefaultAudienceDeserializer{}})
 		ctx.WaitUntilReady()
 		var entry = ctx.getAssignment("a")
-		ctx.SetPayload(hoData(nil))
+		ctx.SetData(hoData(nil))
 		var retained = int64(heap()) - int64(before)
 		runtime.KeepAlive(entry)
 		runtime.KeepAlive(ctx)
@@ -3567,7 +3567,7 @@ func TestHoldout_VariableKeySetOnceHoldoutsWereSeen(t *testing.T) {
 	for i := 2; i <= 3; i++ {
 		var next = experiment
 		next.Iteration = i
-		h.ctx.SetPayload(hoData(nil, next))
+		h.ctx.SetData(hoData(nil, next))
 	}
 	if !hoKeyed(h.ctx) || !hoInstalledDefines(h.ctx, "a", "v") || hoInstalledDefines(h.ctx, "a", "w") {
 		t.Fatal("key set lost after holdouts left")
@@ -3590,7 +3590,7 @@ func TestHoldout_SplitRuleEvictionRetryWithoutHoldoutsChecksTheKey(t *testing.T)
 	beforeSettleClaim = func() {
 		if armed {
 			armed = false
-			h.ctx.SetPayload(hoData(nil, replacement))
+			h.ctx.SetData(hoData(nil, replacement))
 			h.setUnit("user_id", hoUID)
 		}
 	}
@@ -3610,13 +3610,13 @@ func TestHoldout_SetDataFailedKeepsTheKeySetGate(t *testing.T) {
 	var experiment = hoWithVariables(hoExperiment(1, "a", hoUnitType, 0), "v")
 	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, experiment))
 	h.ctx.SetDataFailed(errors.New("boom"))
-	h.ctx.SetPayload(hoData(nil, experiment))
+	h.ctx.SetData(hoData(nil, experiment))
 	if !hoKeyed(h.ctx) {
 		t.Fatal("SetDataFailed reset the key set gate")
 	}
 	var plain = hoCreateFor(t, hoUIDNotHeldOut, hoData(nil, experiment))
 	plain.ctx.SetDataFailed(errors.New("boom"))
-	plain.ctx.SetPayload(hoData(nil, experiment))
+	plain.ctx.SetData(hoData(nil, experiment))
 	if hoKeyed(plain.ctx) {
 		t.Fatal("SetDataFailed turned the key set gate on")
 	}
@@ -3632,13 +3632,13 @@ func TestHoldout_RulesInALaterInstallTurnTheKeySetGateOn(t *testing.T) {
 	replacement.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"w":"a"}`}, {Name: "B", Config: `{"w":"b"}`},
 		{Name: "C", Config: `{"w":"c"}`}}
 	var h = hoCreate(t, map[string]string{}, hoData(nil, plain))
-	h.ctx.SetPayload(hoData(nil, ruled))
+	h.ctx.SetData(hoData(nil, ruled))
 	h.ctx.GetAssignment("exp")
 	var armed = true
 	beforeSettleClaim = func() {
 		if armed {
 			armed = false
-			h.ctx.SetPayload(hoData(nil, replacement))
+			h.ctx.SetData(hoData(nil, replacement))
 			h.setUnit("user_id", hoUID)
 		}
 	}
@@ -3687,14 +3687,14 @@ func TestHoldout_ConcurrentInstallKeepsTheKeySetGate(t *testing.T) {
 	var finished = make(chan struct{})
 	go func() {
 		defer close(finished)
-		ctx.SetPayload(hoData(nil, plain))
+		ctx.SetData(hoData(nil, plain))
 	}()
 	select {
 	case <-parser.parsing:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the plain install never parsed its variants")
 	}
-	ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoWithVariables(hoExperiment(1, "a", hoUnitType, 0, 11), "v")))
+	ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, hoWithVariables(hoExperiment(1, "a", hoUnitType, 0, 11), "v")))
 	close(parser.release)
 	<-finished
 	if index := ctx.state().loadIndex(); index == nil || !index.keyed {
@@ -3738,7 +3738,7 @@ func TestHoldout_SharedKeyReadSkipsACandidateRefreshedWithoutTheKey(t *testing.T
 	afterReadResolve = func() {
 		if armed {
 			armed = false
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{holdout}, a, refreshed, c))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{holdout}, a, refreshed, c))
 		}
 	}
 	defer func() { afterReadResolve = nil }()
@@ -3798,7 +3798,7 @@ func TestHoldout_SharedKeyReadExposesACachedExperimentRefreshedWithTheKey(t *tes
 	var after = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")
 	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, before))
 	h.peek("e")
-	h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, after))
+	h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, after))
 	h.variable("v")
 	var exposed = false
 	for _, exposure := range queuedExposures(h.ctx) {
@@ -3828,7 +3828,7 @@ func TestHoldout_SkippedRetryDoesNotTakeTheSuppressedFallback(t *testing.T) {
 	beforeSettleClaim = func() {
 		if armed {
 			armed = false
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement, b))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, replacement, b))
 			h.ctx.GetAssignment("a")
 		}
 	}
@@ -3850,7 +3850,7 @@ func TestHoldout_SharedKeyReadSkipsAnExperimentRefreshedAway(t *testing.T) {
 	afterReadResolve = func() {
 		if armed {
 			armed = false
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, f))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, f))
 		}
 	}
 	defer func() { afterReadResolve = nil }()
@@ -3883,10 +3883,10 @@ func TestHoldout_RefreshRightBeforeTheClaimIsChecked(t *testing.T) {
 		beforeSettleClaim = func() {
 			claims++
 			if retry && claims == 1 {
-				h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, kept, f))
+				h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, kept, f))
 				h.ctx.GetAssignment("e")
 			} else if claims == 1 || (retry && claims == 2) {
-				h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, dropped, f))
+				h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, dropped, f))
 			}
 		}
 		var got = h.variable("v")
@@ -3931,7 +3931,7 @@ func TestHoldout_EntryCachedBeforeHoldoutsIsChecked(t *testing.T) {
 	afterReadResolve = func() {
 		if armed {
 			armed = false
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, f))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, f))
 		}
 	}
 	defer func() { afterReadResolve = nil }()
@@ -3967,7 +3967,7 @@ func TestHoldout_TakenClaimIsHonouredAfterTheKeyIsDropped(t *testing.T) {
 				if !hoClaim(h, entry) {
 					t.Error("the other read did not claim")
 				}
-				h.ctx.SetPayload(hoData([]jsonmodels.Holdout{freshHoldout}, dropped))
+				h.ctx.SetData(hoData([]jsonmodels.Holdout{freshHoldout}, dropped))
 			}
 		}
 		defer func() { beforeSettleClaim = nil }()
@@ -4061,7 +4061,7 @@ func TestHoldout_CheckAndClaimAreOneCriticalSection(t *testing.T) {
 		seen = h.ctx.state().loadIndex()
 		go func() {
 			defer close(done)
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, without))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, without))
 		}()
 		var deadline = time.Now().Add(5 * time.Second)
 		// A queued writer blocks new readers.
@@ -4125,7 +4125,7 @@ func TestHoldout_RestoredKeyDoesNotAuthorizeAnIntermediateIteration(t *testing.T
 				afterReadResolve = func() {
 					if armed {
 						armed = false
-						h.ctx.SetPayload(hoData([]jsonmodels.Holdout{intermediate}, middle))
+						h.ctx.SetData(hoData([]jsonmodels.Holdout{intermediate}, middle))
 						h.ctx.GetAssignment("b")
 					}
 				}
@@ -4133,7 +4133,7 @@ func TestHoldout_RestoredKeyDoesNotAuthorizeAnIntermediateIteration(t *testing.T
 				beforeSettleClaim = func() {
 					claims++
 					if claims == 2 {
-						h.ctx.SetPayload(hoData([]jsonmodels.Holdout{restored}, last))
+						h.ctx.SetData(hoData([]jsonmodels.Holdout{restored}, last))
 					}
 				}
 				expectValue(t, "control", h.variable("v"))
@@ -4166,7 +4166,7 @@ func TestHoldout_UnclaimedOverrideRefreshResolvesCurrentIdentity(t *testing.T) {
 			fresh.Iteration++
 		}
 		fresh.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"v":"refreshed"}`}, {Name: "B", Config: `{"v":"other"}`}}
-		h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, fresh))
+		h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, fresh))
 		for i := 0; i < 3; i++ {
 			expectValue(t, "refreshed", h.variable("v"))
 		}
@@ -4186,7 +4186,7 @@ func TestHoldout_IdentityChangeAtVariableClaimIsRejected(t *testing.T) {
 		if armed {
 			armed = false
 			e.Id++
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
 		}
 	}
 	defer func() { beforeSettleClaim = nil }()
@@ -4229,7 +4229,7 @@ func TestHoldout_PlainUnclaimedOverrideKeepsItsValuesAcrossARefresh(t *testing.T
 	var fresh = e
 	fresh.Iteration++
 	fresh.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"v":"new"}`}, {Name: "B", Config: `{"v":"other"}`}}
-	h.ctx.SetPayload(hoData(nil, fresh))
+	h.ctx.SetData(hoData(nil, fresh))
 	expectValue(t, "control", h.variable("v"))
 }
 
@@ -4249,7 +4249,7 @@ func TestHoldout_ExposedOverrideIsKeptAcrossAnIdentityRefresh(t *testing.T) {
 			fresh.Iteration++
 		}
 		fresh.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"v":"new"}`}, {Name: "B", Config: `{"v":"other"}`}}
-		h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, fresh))
+		h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, fresh))
 		for i := 0; i < 3; i++ {
 			expectValue(t, "control", h.variable("v"))
 		}
@@ -4278,7 +4278,7 @@ func TestHoldout_RestoredKeyDoesNotAuthorizeADifferentFullOnDecision(t *testing.
 	afterReadResolve = func() {
 		if armed {
 			armed = false
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{three}, middle))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{three}, middle))
 			h.ctx.GetAssignment("b")
 		}
 	}
@@ -4286,7 +4286,7 @@ func TestHoldout_RestoredKeyDoesNotAuthorizeADifferentFullOnDecision(t *testing.
 	beforeSettleClaim = func() {
 		claims++
 		if claims == 2 {
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{three}, last))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{three}, last))
 		}
 	}
 	expectValue(t, "control", h.variable("v"))
@@ -4315,7 +4315,7 @@ func TestHoldout_StaleUnreplacedCandidateIsResolvedAgain(t *testing.T) {
 			armed = false
 			var traffic = e
 			traffic.TrafficSplit = []float64{0, 1, 0}
-			h.ctx.SetPayload(hoData(nil, traffic, r))
+			h.ctx.SetData(hoData(nil, traffic, r))
 		}
 	}
 	defer func() { beforeSettleClaim = nil }()
@@ -4401,7 +4401,7 @@ func TestHoldout_ReplacedUnretiredEntryIsResolvedAgain(t *testing.T) {
 			armed = false
 			var traffic = e
 			traffic.TrafficSplit = []float64{0, 1, 0}
-			h.ctx.SetPayload(hoData(nil, traffic, r))
+			h.ctx.SetData(hoData(nil, traffic, r))
 			h.ctx.GetAssignment("e")
 		}
 	}
@@ -4435,7 +4435,7 @@ func TestHoldout_VariableReadServesTheLastDecisionWhenRetriesRunOut(t *testing.T
 		next.Split = []float64{0, 0, 0, 0}
 		next.Split[(claims%3)+1] = 1
 		next.TrafficSplit = []float64{0, 1, float64(claims)}
-		h.ctx.SetPayload(hoData(nil, next, r))
+		h.ctx.SetData(hoData(nil, next, r))
 	}
 	expectValue(t, "d", h.variable("v"))
 	beforeSettleClaim = nil
@@ -4471,18 +4471,18 @@ func TestHoldout_ChangedCustomAssignmentStillRebuilds(t *testing.T) {
 func TestHoldout_CustomBecomingApplicableDuringAReadIsResolvedAgain(t *testing.T) {
 	for _, c := range []struct {
 		name   string
-		setup  func(*jsonmodels.ExperimentData)
-		mutate func(*hoContext, jsonmodels.ExperimentData, jsonmodels.ExperimentData)
+		setup  func(*jsonmodels.Experiment)
+		mutate func(*hoContext, jsonmodels.Experiment, jsonmodels.Experiment)
 	}{
-		{"traffic refresh", func(e *jsonmodels.ExperimentData) { e.TrafficSplit = []float64{1, 0} },
-			func(h *hoContext, e jsonmodels.ExperimentData, r jsonmodels.ExperimentData) {
+		{"traffic refresh", func(e *jsonmodels.Experiment) { e.TrafficSplit = []float64{1, 0} },
+			func(h *hoContext, e jsonmodels.Experiment, r jsonmodels.Experiment) {
 				e.TrafficSplit = []float64{0, 1}
-				h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, e, r))
+				h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, e, r))
 			}},
-		{"strict audience attribute", func(e *jsonmodels.ExperimentData) {
+		{"strict audience attribute", func(e *jsonmodels.Experiment) {
 			e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
 			e.AudienceStrict = true
-		}, func(h *hoContext, _ jsonmodels.ExperimentData, _ jsonmodels.ExperimentData) {
+		}, func(h *hoContext, _ jsonmodels.Experiment, _ jsonmodels.Experiment) {
 			h.setAttribute("country", "GB")
 		}},
 	} {
@@ -4572,7 +4572,7 @@ func TestHoldout_RestoredKeyDoesNotAuthorizeADecisionBeforeAStrictAudience(t *te
 	afterReadResolve = func() {
 		if armed {
 			armed = false
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{three}, middle))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{three}, middle))
 			h.ctx.GetAssignment("b")
 		}
 	}
@@ -4580,7 +4580,7 @@ func TestHoldout_RestoredKeyDoesNotAuthorizeADecisionBeforeAStrictAudience(t *te
 	beforeSettleClaim = func() {
 		claims++
 		if claims == 2 {
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{three}, last))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{three}, last))
 		}
 	}
 	h.variable("v")
@@ -4648,11 +4648,11 @@ func TestHoldout_AudienceEditRebuildsAnUnexposedKeyedDecision(t *testing.T) {
 	var us = `{"filter":[{"eq":[{"var":"country"},{"value":"US"}]}]}`
 	for _, c := range []struct {
 		name   string
-		edit   func(*jsonmodels.ExperimentData)
+		edit   func(*jsonmodels.Experiment)
 		strict bool
 	}{
-		{"expression", func(e *jsonmodels.ExperimentData) { e.Audience = us }, false},
-		{"strictness", func(e *jsonmodels.ExperimentData) { e.AudienceStrict = true }, false},
+		{"expression", func(e *jsonmodels.Experiment) { e.Audience = us }, false},
+		{"strictness", func(e *jsonmodels.Experiment) { e.AudienceStrict = true }, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0), "v")
@@ -4664,7 +4664,7 @@ func TestHoldout_AudienceEditRebuildsAnUnexposedKeyedDecision(t *testing.T) {
 			h.peek("e")
 			var edited = e
 			c.edit(&edited)
-			h.ctx.SetPayload(hoData(nil, edited, r))
+			h.ctx.SetData(hoData(nil, edited, r))
 			for i := 0; i < 3; i++ {
 				h.variable("v")
 			}
@@ -4691,7 +4691,7 @@ func TestHoldout_RestoredKeyDoesNotAuthorizeADecisionBeforeAnAudienceEdit(t *tes
 	afterReadResolve = func() {
 		if armed {
 			armed = false
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{three}, middle))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{three}, middle))
 			h.ctx.GetAssignment("b")
 		}
 	}
@@ -4699,7 +4699,7 @@ func TestHoldout_RestoredKeyDoesNotAuthorizeADecisionBeforeAnAudienceEdit(t *tes
 	beforeSettleClaim = func() {
 		claims++
 		if claims == 2 {
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{three}, last))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{three}, last))
 		}
 	}
 	h.variable("v")
@@ -4726,7 +4726,7 @@ func TestHoldout_AudienceEditKeepsAnExposedKeyedDecision(t *testing.T) {
 	var before = h.ctx.getAssignment("e")
 	var edited = e
 	edited.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"US"}]}]}`
-	h.ctx.SetPayload(hoData(nil, edited, r))
+	h.ctx.SetData(hoData(nil, edited, r))
 	h.variable("v")
 	h.treatment("e")
 	if h.ctx.getAssignment("e") != before {
@@ -4749,7 +4749,7 @@ func TestHoldout_AudienceEditKeepsAPlainUnexposedDecision(t *testing.T) {
 	var before = h.ctx.getAssignment("e")
 	var strict = e
 	strict.AudienceStrict = true
-	h.ctx.SetPayload(hoData(nil, strict))
+	h.ctx.SetData(hoData(nil, strict))
 	h.variable("v")
 	if h.ctx.getAssignment("e") != before {
 		t.Fatal("the plain unexposed decision was rebuilt")
@@ -4797,7 +4797,7 @@ func TestHoldout_AudienceRebuildRetiresTheSupersededAssignment(t *testing.T) {
 	var old = h.ctx.GetAssignment("e")
 	var strict = e
 	strict.AudienceStrict = true
-	h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, strict, r))
+	h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, strict, r))
 	expectValue(t, "default", h.variable("v"))
 	h.expectPending(0)
 	expectInt(t, 0, h.treatment("e"))
@@ -4819,7 +4819,7 @@ func TestHoldout_RebuildReleasesTheWriteLockOnPanic(t *testing.T) {
 	h.peek("e")
 	var edited = e
 	edited.Audience = `{"filter":[{"eq":[{"var":"nested/country"},{"value":"GB"}]}]}`
-	h.ctx.SetPayload(hoData(nil, edited, r))
+	h.ctx.SetData(hoData(nil, edited, r))
 	func() {
 		defer func() { _ = recover() }()
 		h.ctx.GetVariableValue("v", "default")
@@ -4842,7 +4842,7 @@ func TestHoldout_AudienceEditKeepsARuleWin(t *testing.T) {
 	var before = h.ctx.getAssignment("e")
 	var edited = e
 	edited.AudienceStrict = true
-	h.ctx.SetPayload(hoData(nil, edited))
+	h.ctx.SetData(hoData(nil, edited))
 	var claims = 0
 	beforeSettleClaim = func() { claims++ }
 	defer func() { beforeSettleClaim = nil }()
@@ -4868,7 +4868,7 @@ func TestHoldout_AudienceRebuildKeepsAnAlreadyExposedRead(t *testing.T) {
 			var strict = e
 			strict.Iteration++
 			strict.AudienceStrict = true
-			h.ctx.SetPayload(hoData(nil, strict, r))
+			h.ctx.SetData(hoData(nil, strict, r))
 			h.peek("e")
 		}
 	}
@@ -4897,14 +4897,14 @@ func TestHoldout_VariableClaimDoesNotBorrowAnotherIteration(t *testing.T) {
 				afterReadResolve = nil
 				var next = e
 				next.Iteration++
-				h.ctx.SetPayload(hoData(nil, next, r))
+				h.ctx.SetData(hoData(nil, next, r))
 				if claimed {
 					expectInt(t, 1, h.treatment("e"))
 				} else {
 					expectInt(t, 1, h.peek("e"))
 				}
 				cached = h.ctx.state().assignmentCache_["e"]
-				h.ctx.SetPayload(hoData(nil, e, r))
+				h.ctx.SetData(hoData(nil, e, r))
 			}
 			t.Cleanup(func() { afterReadResolve = nil })
 			expectValue(t, "treatment", h.variable("v"))
@@ -4996,7 +4996,7 @@ func TestHoldout_AudienceRebuildRetiresOlderEquivalentCopies(t *testing.T) {
 	}
 	var strict = e
 	strict.AudienceStrict = true
-	h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, strict, r))
+	h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, strict, r))
 	expectValue(t, "default", h.variable("v"))
 	h.expectPending(0)
 	expectInt(t, 0, h.treatment("e"))
@@ -5029,7 +5029,7 @@ func TestHoldout_EquivalentAudienceRebuildHonorsATakenClaim(t *testing.T) {
 	}
 	var strict = e
 	strict.AudienceStrict = true
-	h.ctx.SetPayload(hoData(nil, strict, r))
+	h.ctx.SetData(hoData(nil, strict, r))
 	expectValue(t, "default", h.variable("v"))
 	h.expectPending(0)
 	expectInt(t, 0, h.treatment("e"))
@@ -5055,7 +5055,7 @@ func TestHoldout_EquivalentRebuildRefreshesVariablesAndRuleStamps(t *testing.T) 
 	var next = e
 	next.AssignmentRules = " " + hoUSRule
 	next.Variants = []jsonmodels.ExperimentVariant{{Name: "A"}, {Name: "B", Config: `{"v":"updated","added":42}`}}
-	h.ctx.SetPayload(hoData(nil, next))
+	h.ctx.SetData(hoData(nil, next))
 	h.peek("e")
 	var rebuilt = h.ctx.state().assignmentCache_["e"]
 	if rebuilt == first || rebuilt.rules == first.rules || rebuilt.assignment.Exposed != copy.Exposed {
@@ -5086,7 +5086,7 @@ func TestHoldout_RebuildSharingIsScopedToTheExperimentRun(t *testing.T) {
 			var first = h.ctx.getAssignment("e")
 			var next = e
 			next.Iteration++
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, next, r))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, next, r))
 			var second = h.ctx.getAssignment("e")
 			if second.assignment.Exposed == first.assignment.Exposed || second.retirement == first.retirement {
 				t.Fatal("distinct iterations shared exposure identity")
@@ -5227,7 +5227,7 @@ func TestHoldout_NonParticipantFastPathTakesNoLock(t *testing.T) {
 	for _, rules := range []bool{false, true} {
 		t.Run(fmt.Sprintf("rules=%v", rules), func(t *testing.T) {
 			var user = hoWithVariables(hoExperiment(1, "exp_user", "user_id", 0), "color")
-			var experiments = []jsonmodels.ExperimentData{user}
+			var experiments = []jsonmodels.Experiment{user}
 			if rules {
 				var r = hoExperiment(2, "r", hoUnitType, 0)
 				r.AssignmentRules = hoUSRule
@@ -5256,7 +5256,7 @@ func TestHoldout_InformationalFieldOfTheWrongTypeKeepsTheHoldout(t *testing.T) {
 			"split":[0.5,0.5],"trafficSeedHi":1,"trafficSeedLo":2,"trafficSplit":[0,1],"fullOnVariant":0,
 			"variants":[{"name":"A"},{"name":"B"}],"holdoutIds":[11]}],
 			"holdouts":[{"id":11,"iteration":1,"seedHi":13,"seedLo":111,"split":[0.1,0.9],` + field + `}]}`
-		var data, err = DeserializeContextPayload([]byte(payload))
+		var data, err = DefaultContextDataDeserializer{}.Deserialize([]byte(payload))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -5288,7 +5288,7 @@ func TestHoldout_RulesOnlyContextKeepsCachedDecisionsAsInV120(t *testing.T) {
 		expectInt(t, 1, h.peek("e"))
 		var strict = e
 		strict.AudienceStrict = true
-		h.ctx.SetPayload(hoData(nil, strict, r))
+		h.ctx.SetData(hoData(nil, strict, r))
 		expectInt(t, 1, h.peek("e"))
 		expectInt(t, 1, h.treatment("e"))
 		var own = hoOwn(hoUnitType, 1, "e", 1)
@@ -5305,7 +5305,7 @@ func TestHoldout_RulesOnlyContextKeepsCachedDecisionsAsInV120(t *testing.T) {
 		var next = e
 		next.Iteration++
 		next.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"v":"new"}`}, {Name: "B", Config: `{"v":"other"}`}}
-		h.ctx.SetPayload(hoData(nil, next, r))
+		h.ctx.SetData(hoData(nil, next, r))
 		expectValue(t, "control", h.peekVariable("v"))
 		expectValue(t, "control", h.variable("v"))
 		var own = hoOwn(hoUnitType, 1, "e", 0)
@@ -5319,13 +5319,13 @@ func TestHoldout_RulesOnlyContextKeepsCachedDecisionsAsInV120(t *testing.T) {
 // holdout's exposure.
 func TestHoldout_LiteralIndexEditKeepsHoldoutCoverage(t *testing.T) {
 	var e = hoWithVariables(hoExperiment(1, "exp", hoUnitType, 0, 11), "v")
-	var literal = audienceLiteral(e.Experiment)
+	var literal = audienceLiteral(e)
 	literal.Units_ = map[string]string{hoUnitType: hoUID}
-	literal.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
+	literal.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
 	expectInt(t, 0, treatmentPeek(t, literal, "exp"))
 	var next = e
 	next.Iteration = 2
-	literal.Index_["exp"] = ExperimentVariables{Data: next.Experiment, Variables: literal.Index_["exp"].Variables}
+	literal.Index_["exp"] = ExperimentVariables{Data: next, Variables: literal.Index_["exp"].Variables}
 	var variant, err = literal.GetTreatment("exp")
 	if err != nil {
 		t.Fatal(err)
@@ -5357,11 +5357,11 @@ func TestHoldout_SeenHoldoutsStaysOnAcrossInstalls(t *testing.T) {
 			if failed {
 				h.ctx.SetDataFailed(errors.New("load failed"))
 			}
-			h.ctx.SetPayload(hoData(nil, e))
+			h.ctx.SetData(hoData(nil, e))
 			expectInt(t, 1, h.peek("e"))
 			var strict = e
 			strict.AudienceStrict = true
-			h.ctx.SetPayload(hoData(nil, strict))
+			h.ctx.SetData(hoData(nil, strict))
 			expectInt(t, 0, h.peek("e"))
 		})
 	}
@@ -5382,7 +5382,7 @@ func TestHoldout_RulesOnlyAudienceRebuildKeepsTheOldCopyQueueable(t *testing.T) 
 	var strict = e
 	strict.Audience = `{"filter":[{"eq":[{"var":"tier"},{"value":"silver"}]}]}`
 	strict.AudienceStrict = true
-	h.ctx.SetPayload(hoData(nil, strict, r))
+	h.ctx.SetData(hoData(nil, strict, r))
 	h.setAttribute("tier", "bronze")
 	expectInt(t, 0, h.treatment("e"))
 	h.ctx.QueueExposure(old)
@@ -5449,7 +5449,7 @@ func TestHoldout_HeldOutContextUnclaimedOverrideResolvesCurrentIdentity(t *testi
 				fresh.UnitType = "user_id"
 			}
 			fresh.Variants = []jsonmodels.ExperimentVariant{{Name: "A", Config: `{"v":"new"}`}, {Name: "B", Config: `{"v":"other"}`}}
-			h.ctx.SetPayload(hoData([]jsonmodels.Holdout{hoHoldoutA()}, fresh, r))
+			h.ctx.SetData(hoData([]jsonmodels.Holdout{hoHoldoutA()}, fresh, r))
 			expectValue(t, "new", h.variable("v"))
 			h.ctx.QueueExposure(old)
 			h.ctx.QueueExposure(&retainedCopy)
@@ -5503,7 +5503,7 @@ func TestHoldout_SeenSwitchbackTurnsOnTheRebuildGate(t *testing.T) {
 	expectInt(t, 1, h.peek("e"))
 	var strict = e
 	strict.AudienceStrict = true
-	h.ctx.SetPayload(hoData(nil, strict))
+	h.ctx.SetData(hoData(nil, strict))
 	if !h.ctx.state().loadIndex().heldOut {
 		t.Fatal("the rebuild gate was dropped by a refresh without switchbacks")
 	}

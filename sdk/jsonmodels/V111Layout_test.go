@@ -4,6 +4,8 @@ package jsonmodels
 // as a v1.1.1 caller would (see sdk/V111Consumer_test.go). They live in this
 // package so plain `go vet ./...` accepts them; a field added, removed or
 // reordered still fails to compile here exactly as it would for a caller.
+// Experiment and Exposure gained wire fields in v1.2.0 (assignment rules), and
+// ContextData in v1.3.0 (holdouts), so they are not listed; see the CHANGELOG.
 var (
 	_ = PublishEvent{true, nil, 0, nil, nil, nil}
 	_ = Unit{"session_id", "uid"}
@@ -12,5 +14,4 @@ var (
 	_ = CustomFieldValue{"name", "string", "value"}
 	_ = ExperimentVariant{"A", "{}"}
 	_ = ExperimentApplication{"website"}
-	_ = ContextData{nil}
 )

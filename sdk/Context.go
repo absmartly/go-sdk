@@ -131,13 +131,6 @@ type contextState struct {
 	// it, in experiment-id order. Guarded by DataLock.
 	indexVariables_ map[string][]ExperimentVariables
 
-	// payloadExperiments_ and payloadHoldouts_ are the installed payload, as
-	// GetPayload returns it, when payloadInstalled_ is set; it is clear when a
-	// plain ContextData was installed. Guarded by DataLock.
-	payloadInstalled_   bool
-	payloadExperiments_ []jsonmodels.ExperimentData
-	payloadHoldouts_    []jsonmodels.Holdout
-
 	// index_ is the installed experiment index and parsed assignment rules,
 	// replaced as a whole by setData under DataLock. The assignment read path
 	// loads it atomically instead of taking DataLock, so a cached read costs
@@ -448,7 +441,8 @@ func (c *Context) literalState() *contextState {
 	for name, experiment := range c.Index_ {
 		// Manually supplied v1.1.1 indexes have no parsed-rule metadata.
 		// SetData installs it; don't call a user deserializer under this lock.
-		indexed[name] = &indexedExperiment{experiment: experiment}
+		indexed[name] = &indexedExperiment{experiment: experiment,
+			holdoutIds: append([]int(nil), experiment.Data.HoldoutIds...)}
 	}
 	state.index_.Store(&contextIndex{experiments: indexed})
 	for name, assignment := range c.AssignmentCache {
@@ -578,9 +572,10 @@ type indexedExperiment struct {
 	// switchback is set for a switchback experiment only. Holdouts never
 	// cover one.
 	switchback *switchbackDefinition
-	// payload holds the experiment's holdout and switchback fields, which
-	// jsonmodels.Experiment does not carry; nil when it has none.
-	payload *jsonmodels.ExperimentData
+	// holdoutIds is a private copy of the HoldoutIds the coverage was
+	// resolved from. experiment shares the caller's backing array, so a
+	// literal's in-place edit to Index_ is seen only against this copy.
+	holdoutIds []int
 }
 
 type holdoutKey struct {
@@ -877,9 +872,9 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 		var tmp = &cntx
 		dataFuture.Listen(func(val future.Value, err error) {
 			if err == nil {
-				var result, ok = contextInputOf(val)
+				var result, ok = val.(jsonmodels.ContextData)
 				if !ok {
-					var invalid = &TypeError{Expected: "jsonmodels.ContextData or jsonmodels.ContextPayload", Actual: val}
+					var invalid = &TypeError{Expected: "jsonmodels.ContextData", Actual: val}
 					tmp.SetDataFailed(invalid)
 					tmp.LogError(invalid)
 					return
@@ -892,7 +887,7 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 					return
 				}
 				tmp.dispatchDiagnostics(diagnostics)
-				tmp.LogEvent(Ready, result.data)
+				tmp.LogEvent(Ready, result)
 			} else {
 				tmp.SetDataFailed(err)
 				tmp.LogError(err)
@@ -923,9 +918,9 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 			atomic.StoreUint64(state.readyDeliverer_, goroutineID())
 			defer atomic.StoreUint64(state.readyDeliverer_, 0)
 			if err == nil {
-				result, ok := contextInputOf(val)
+				result, ok := val.(jsonmodels.ContextData)
 				if !ok {
-					fail(&TypeError{Expected: "jsonmodels.ContextData or jsonmodels.ContextPayload", Actual: val}, nil, executed)
+					fail(&TypeError{Expected: "jsonmodels.ContextData", Actual: val}, nil, executed)
 					return
 				}
 				var diagnostics, panicErr = tmp.applyRefreshedData(result)
@@ -936,7 +931,7 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 				// Log before settling, so WaitUntilReady returns after the
 				// logger has seen the ready event.
 				tmp.dispatchDiagnostics(diagnostics)
-				tmp.LogEvent(Ready, result.data)
+				tmp.LogEvent(Ready, result)
 				// Finish everything that reads the context before releasing
 				// waiters: once WaitUntilReady returns, the caller may replace
 				// Clock_. ReadyFuture_ stays installed until then, so a waiter
@@ -946,7 +941,7 @@ func createContext(clock internal.Clock, config ContextConfig, dataFuture *futur
 				}
 				cntx.setReadyFutureWith(state, nil)
 				executed()
-				readyFutureDone(result.data, nil)
+				readyFutureDone(result, nil)
 			} else {
 				fail(err, nil, executed)
 			}
@@ -1103,54 +1098,13 @@ func (c *Context) GetData() (jsonmodels.ContextData, error) {
 
 }
 
-// GetPayload is GetData for the full context payload, with holdouts and each
-// experiment's holdout and switchback fields, as installed: pass it to
-// CreateContextWithPayload or SetPayload to hand the context's data over
-// without losing them. After a plain ContextData was installed (SetData,
-// CreateContextWith, or a provider without GetContextPayload) it is that
-// data with no holdouts or switchbacks. It fails as GetData does.
-//
-// The experiment and holdout slices are copies, but, as with GetData, the
-// values inside them (variants, splits, holdout ids, schedule numbers and
-// cluster maps) are shared with the context and must not be modified.
-func (c *Context) GetPayload() (jsonmodels.ContextPayload, error) {
-	c = c.live()
-	if err := c.CheckReady(true); err != nil {
-		return jsonmodels.ContextPayload{}, err
-	}
-	var st = c.state()
-	c.DataLock.RLock()
-	defer c.DataLock.RUnlock()
-	if !st.payloadInstalled_ {
-		return jsonmodels.PayloadOf(c.Data_), nil
-	}
-	// An installed empty list stays empty, so it encodes as [] and not null.
-	return jsonmodels.ContextPayload{Experiments: copyExperimentData(st.payloadExperiments_),
-		Holdouts: copyHoldouts(st.payloadHoldouts_)}, nil
-}
-
-// copyFloat64, copyExperimentData and copyHoldouts copy a slice, keeping nil
-// nil and empty empty: a copied payload encodes as the original did, and a
+// copyFloat64 copies a slice, keeping nil nil and empty empty, so a
 // switchback's split snapshot compares equal to the split it was taken from.
 func copyFloat64(values []float64) []float64 {
 	if values == nil {
 		return nil
 	}
 	return append(make([]float64, 0, len(values)), values...)
-}
-
-func copyExperimentData(experiments []jsonmodels.ExperimentData) []jsonmodels.ExperimentData {
-	if experiments == nil {
-		return nil
-	}
-	return append(make([]jsonmodels.ExperimentData, 0, len(experiments)), experiments...)
-}
-
-func copyHoldouts(holdouts []jsonmodels.Holdout) []jsonmodels.Holdout {
-	if holdouts == nil {
-		return nil
-	}
-	return append(make([]jsonmodels.Holdout, 0, len(holdouts)), holdouts...)
 }
 
 // SetOverride is allowed after the context is finalized, like the other
@@ -2533,13 +2487,13 @@ func (c *Context) refreshAsync() (*future.Future, *refreshOperation) {
 		var executed = st.customAudiences.execute(&op.gate)
 		defer executed()
 		var outcome = err
-		var result contextInput
+		var result jsonmodels.ContextData
 		var diagnostics []bufferedEvent
 		if outcome == nil {
 			var ok bool
-			result, ok = contextInputOf(value)
+			result, ok = value.(jsonmodels.ContextData)
 			if !ok {
-				outcome = &TypeError{Expected: "jsonmodels.ContextData or jsonmodels.ContextPayload", Actual: value}
+				outcome = &TypeError{Expected: "jsonmodels.ContextData", Actual: value}
 			} else {
 				var panicErr error
 				diagnostics, panicErr = c.applyRefreshedData(result)
@@ -2562,7 +2516,7 @@ func (c *Context) refreshAsync() (*future.Future, *refreshOperation) {
 		// settlement local, and preserve logger-before-return ordering.
 		c.dispatchDiagnostics(diagnostics)
 		if outcome == nil {
-			c.LogEvent(Refresh, result.data)
+			c.LogEvent(Refresh, result)
 		} else {
 			c.LogError(outcome)
 		}
@@ -2574,37 +2528,7 @@ func (c *Context) refreshAsync() (*future.Future, *refreshOperation) {
 	return tempfuture, op
 }
 
-// contextInput is data to install: the v1.2.0 ContextData, and for a
-// ContextPayload its experiments with the holdout and switchback fields
-// (experiments[i].Experiment is data.Experiments[i]) and its holdouts. A
-// plain ContextData has neither and installs with no conversion.
-type contextInput struct {
-	payload     bool // a ContextPayload, which GetPayload returns as installed
-	data        jsonmodels.ContextData
-	experiments []jsonmodels.ExperimentData
-	holdouts    []jsonmodels.Holdout
-}
-
-func payloadInput(payload jsonmodels.ContextPayload) contextInput {
-	return contextInput{payload: true, data: payload.ContextData(), experiments: payload.Experiments,
-		holdouts: payload.Holdouts}
-}
-
-// contextInputOf normalises a value a data future delivered: a
-// jsonmodels.ContextData (v1.2.0 and custom providers) or a
-// jsonmodels.ContextPayload (holdouts and switchbacks). It reports false for
-// anything else.
-func contextInputOf(value future.Value) (contextInput, bool) {
-	switch data := value.(type) {
-	case jsonmodels.ContextPayload:
-		return payloadInput(data), true
-	case jsonmodels.ContextData:
-		return contextInput{data: data}, true
-	}
-	return contextInput{}, false
-}
-
-func (c *Context) applyRefreshedData(data contextInput) (diagnostics []bufferedEvent, panicErr error) {
+func (c *Context) applyRefreshedData(data jsonmodels.ContextData) (diagnostics []bufferedEvent, panicErr error) {
 	var buffer = &diagnosticBuffer{}
 	defer func() {
 		if r := recover(); r != nil {
@@ -3739,14 +3663,13 @@ func (c *Context) syncLiteralExperiment(st *contextState, experimentName string)
 	if installed {
 		current, rules = installedEntry.experiment, installedEntry.rules
 	}
-	if found == installed && (!found || sameLiteralEntry(current, experiment)) {
+	if found == installed && (!found || sameLiteralEntry(current, experiment) &&
+		sameHoldoutIds(installedEntry.holdoutIds, experiment.Data.HoldoutIds)) {
 		return
 	}
 	var indexed = map[string]*indexedExperiment{}
-	// The edited entry keeps the installed holdouts, its payload's coverage
-	// and the gates, so an Index_ edit never drops holdout coverage.
-	// jsonmodels.Experiment carries no HoldoutIds: coverage comes from the
-	// payload SetPayload installed for the experiment.
+	// The edited entry keeps the installed holdouts and the gates, so an
+	// Index_ edit never drops holdout coverage.
 	var next = &contextIndex{experiments: indexed}
 	if previous := st.loadIndex(); previous != nil {
 		for name, entry := range previous.experiments {
@@ -3758,12 +3681,11 @@ func (c *Context) syncLiteralExperiment(st *contextState, experimentName string)
 		rules = nil
 	}
 	if found {
-		var entry = &indexedExperiment{experiment: experiment, rules: rules}
-		if installed {
-			entry.payload = installedEntry.payload
-		}
-		if entry.payload != nil && !isSwitchback(entry.payload) && len(next.holdouts) > 0 {
-			entry.holdouts = coveringHoldouts(entry.payload.HoldoutIds, next.holdouts)
+		var entry = &indexedExperiment{experiment: experiment, rules: rules,
+			holdoutIds: append([]int(nil), experiment.Data.HoldoutIds...)}
+		// Holdouts never cover a switchback.
+		if !isSwitchback(&experiment.Data) && len(next.holdouts) > 0 {
+			entry.holdouts = coveringHoldouts(experiment.Data.HoldoutIds, next.holdouts)
 		}
 		if next.keyed {
 			entry.variableKeys = variableKeysOf(experiment)
@@ -3789,6 +3711,20 @@ func sameLiteralEntry(a, b ExperimentVariables) bool {
 		x.AssignmentRules == y.AssignmentRules &&
 		len(x.Variants) == len(y.Variants) && (len(x.Variants) == 0 || &x.Variants[0] == &y.Variants[0]) &&
 		len(a.Variables) == len(b.Variables) && (len(a.Variables) == 0 || &a.Variables[0] == &b.Variables[0])
+}
+
+// sameHoldoutIds compares holdout ids element by element, without reflection
+// on the cached read path.
+func sameHoldoutIds(a []int, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // variableKeysOf returns the variable keys an experiment defines in any
@@ -3919,16 +3855,6 @@ func (c *Context) CheckReady(expectNotClosed bool) error {
 }
 
 func (c *Context) SetData(data jsonmodels.ContextData) {
-	c.installData(contextInput{data: data})
-}
-
-// SetPayload is SetData for a full context payload, with holdouts and each
-// experiment's holdout and switchback fields.
-func (c *Context) SetPayload(data jsonmodels.ContextPayload) {
-	c.installData(payloadInput(data))
-}
-
-func (c *Context) installData(data contextInput) {
 	var receiver, root = c, c.live()
 	var buffer = &diagnosticBuffer{}
 	root.setData(data, buffer)
@@ -3993,8 +3919,7 @@ func (c *Context) dispatchDiagnostics(events []bufferedEvent) {
 	}
 }
 
-func (c *Context) setData(input contextInput, buffer *diagnosticBuffer) {
-	var data = input.data
+func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer) {
 	c = c.live()
 	var st = c.state()
 	var self = c.snapshot()
@@ -4004,11 +3929,10 @@ func (c *Context) setData(input contextInput, buffer *diagnosticBuffer) {
 	var contextCustomFields = map[string]map[string]ContextCustomFieldValue{}
 	var rules = map[string]*experimentRules{}
 	var holdoutsById map[int]*jsonmodels.Holdout
-	// A copy, so assignments and GetPayload keep the holdouts as installed
-	// even if the caller reuses its slice.
-	var installedHoldouts = copyHoldouts(input.holdouts)
-	if len(input.holdouts) > 0 {
-		var installed = installedHoldouts
+	if len(data.Holdouts) > 0 {
+		// A copy, so assignments pin the holdouts as installed even if the
+		// caller reuses its slice.
+		var installed = append([]jsonmodels.Holdout(nil), data.Holdouts...)
 		holdoutsById = make(map[int]*jsonmodels.Holdout, len(installed))
 		// An id defined more than once with definitions that draw different
 		// arms (iteration, seeds or split) covers nothing, so the outcome never
@@ -4052,24 +3976,7 @@ func (c *Context) setData(input contextInput, buffer *diagnosticBuffer) {
 		return nil
 	}
 
-	// The holdout and switchback fields of each experiment, attached to its
-	// index entry below; none for a plain ContextData. The copy keeps the
-	// installed definitions apart from the caller's slice.
-	var extendedAt = copyExperimentData(input.experiments)
-	var payloads map[string]*jsonmodels.ExperimentData
-	for i, experiment := range data.Experiments {
-		var extended *jsonmodels.ExperimentData
-		if extendedAt != nil {
-			extended = &extendedAt[i]
-			// A private copy, so an in-place edit of the caller's slice never
-			// changes the coverage installed (or recomputed) from it.
-			extended.HoldoutIds = append([]int(nil), extended.HoldoutIds...)
-			// By name as index is, so a repeated name keeps the last.
-			if payloads == nil {
-				payloads = make(map[string]*jsonmodels.ExperimentData, len(extendedAt))
-			}
-			payloads[experiment.Name] = extended
-		}
+	for _, experiment := range data.Experiments {
 		var experiemntVariables = ExperimentVariables{}
 		var experimentCustomFields = map[string]ContextCustomFieldValue{}
 		experiemntVariables.Data = experiment
@@ -4123,13 +4030,13 @@ func (c *Context) setData(input contextInput, buffer *diagnosticBuffer) {
 		if len(experiment.AssignmentRules) > 0 {
 			rules[experiment.Name] = c.experimentRulesFor(previousRules(experiment.Name), experiment.AssignmentRules)
 		}
-		if isSwitchback(extended) {
+		if isSwitchback(&experiment) {
 			if switchbacks == nil {
 				switchbacks = map[string]*switchbackDefinition{}
 			}
-			switchbacks[experiment.Name] = newSwitchbackDefinition(extended.SwitchbackClusters)
-		} else if extended != nil && len(extended.HoldoutIds) > 0 && len(holdoutsById) > 0 {
-			if covering := coveringHoldouts(extended.HoldoutIds, holdoutsById); len(covering) > 0 {
+			switchbacks[experiment.Name] = newSwitchbackDefinition(experiment.SwitchbackClusters)
+		} else if len(experiment.HoldoutIds) > 0 && len(holdoutsById) > 0 {
+			if covering := coveringHoldouts(experiment.HoldoutIds, holdoutsById); len(covering) > 0 {
 				if coverage == nil {
 					coverage = map[string][]*jsonmodels.Holdout{}
 				}
@@ -4175,7 +4082,7 @@ func (c *Context) setData(input contextInput, buffer *diagnosticBuffer) {
 			keys = variableKeysOf(experiment)
 		}
 		indexed[name] = &indexedExperiment{experiment: experiment, rules: rules[name], holdouts: coverage[name], variableKeys: keys,
-			switchback: switchbacks[name], payload: payloads[name]}
+			switchback: switchbacks[name], holdoutIds: append([]int(nil), experiment.Data.HoldoutIds...)}
 	}
 	if switchbacks != nil {
 		// Under ContextLock_, so the generations follow the index this
@@ -4191,8 +4098,6 @@ func (c *Context) setData(input contextInput, buffer *diagnosticBuffer) {
 	st.indexVariables_ = indexVariables
 	c.IndexVariables_ = legacyIndexVariables(indexVariables)
 	c.Data_ = data
-	st.payloadInstalled_ = input.payload
-	st.payloadExperiments_, st.payloadHoldouts_ = extendedAt, installedHoldouts
 	c.Ready_.Store(true)
 
 	c.setRefreshTimer(st)
@@ -4303,7 +4208,6 @@ func (c *Context) SetDataFailed(err error) {
 	st.indexVariables_ = map[string][]ExperimentVariables{}
 	c.IndexVariables_ = map[interface{}]interface{}{}
 	c.Data_ = jsonmodels.ContextData{}
-	st.payloadInstalled_, st.payloadExperiments_, st.payloadHoldouts_ = false, nil, nil
 	c.Ready_.Store(true)
 	c.Failed_.Store(true)
 	c.DataLock.Unlock()
@@ -4573,7 +4477,7 @@ func (c *Context) callDataProvider() (loaded *future.Future) {
 			loaded = failed
 		}
 	}()
-	loaded = contextPayloadFuture(c.DataProvider_)
+	loaded = c.DataProvider_.GetContextData()
 	if loaded == nil {
 		var failed, fail = future.New()
 		fail(nil, errors.New("data provider returned no future"))

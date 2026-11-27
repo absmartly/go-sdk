@@ -98,17 +98,17 @@ func sbClusters(entries ...string) jsonmodels.SwitchbackClusters {
 	return clusters
 }
 
-func sbExperiment(id int, name string, armCount int, periodMs int64) jsonmodels.ExperimentData {
+func sbExperiment(id int, name string, armCount int, periodMs int64) jsonmodels.Experiment {
 	var split = make([]float64, armCount)
 	var variants = make([]jsonmodels.ExperimentVariant, armCount)
 	for i := 0; i < armCount; i++ {
 		split[i] = 1.0 / float64(armCount)
 		variants[i] = jsonmodels.ExperimentVariant{Name: string(rune('A' + i)), Config: fmt.Sprintf(`{"sb.arm":%d}`, i)}
 	}
-	return jsonmodels.ExperimentData{Experiment: jsonmodels.Experiment{
+	return jsonmodels.Experiment{
 		Id: id, Name: name, UnitType: sbUnitType, Iteration: 1, SeedHi: sbSeedHi, SeedLo: sbSeedLo, Split: split,
 		TrafficSeedHi: 1, TrafficSeedLo: 2, TrafficSplit: []float64{0, 1},
-		Applications: []jsonmodels.ExperimentApplication{{Name: "website"}}, Variants: variants},
+		Applications: []jsonmodels.ExperimentApplication{{Name: "website"}}, Variants: variants,
 		RandomizationType: "switchback", SwitchbackClusters: sbClusters(sbUnitType, sbClusterPath),
 		SwitchbackStartAt: sbInt64(sbAnchor), SwitchbackPeriodMs: sbInt64(periodMs),
 		SwitchbackCarryoverDurationMs: sbInt64(0), SwitchbackBurnInDurationMs: sbInt64(0), SwitchbackBurnOutDurationMs: sbInt64(0),
@@ -116,12 +116,12 @@ func sbExperiment(id int, name string, armCount int, periodMs int64) jsonmodels.
 	}
 }
 
-func sbDefault(armCount int, periodMs int64) jsonmodels.ExperimentData {
+func sbDefault(armCount int, periodMs int64) jsonmodels.Experiment {
 	return sbExperiment(1, "exp_sb", armCount, periodMs)
 }
 
 // sbUnit turns a switchback fixture into a unit experiment.
-func sbUnit(experiment jsonmodels.ExperimentData) jsonmodels.ExperimentData {
+func sbUnit(experiment jsonmodels.Experiment) jsonmodels.Experiment {
 	experiment.RandomizationType = ""
 	experiment.SwitchbackClusters = nil
 	experiment.SwitchbackStartAt = nil
@@ -129,8 +129,8 @@ func sbUnit(experiment jsonmodels.ExperimentData) jsonmodels.ExperimentData {
 	return experiment
 }
 
-func sbData(experiments ...jsonmodels.ExperimentData) jsonmodels.ContextPayload {
-	return jsonmodels.ContextPayload{Experiments: experiments}
+func sbData(experiments ...jsonmodels.Experiment) jsonmodels.ContextData {
+	return jsonmodels.ContextData{Experiments: experiments}
 }
 
 func sbExposure(id int, name string, variant int, exposedAt int64, assigned bool, eligible bool) jsonmodels.Exposure {
@@ -173,7 +173,7 @@ func sbNoClusterAttribute() sbOption {
 
 // sbCreateAt creates a ready context at the clock reading now, with the units
 // (nil for none) and the cluster attribute set at creation.
-func sbCreateAt(t *testing.T, now int64, units map[string]string, data jsonmodels.ContextPayload, options ...sbOption) *sbContext {
+func sbCreateAt(t *testing.T, now int64, units map[string]string, data jsonmodels.ContextData, options ...sbOption) *sbContext {
 	t.Helper()
 	var config = CreateDefaultContextConfig()
 	config.PublishDelay_ = -1
@@ -201,7 +201,7 @@ func sbCreateAt(t *testing.T, now int64, units map[string]string, data jsonmodel
 	return h
 }
 
-func sbCreate(t *testing.T, data jsonmodels.ContextPayload, options ...sbOption) *sbContext {
+func sbCreate(t *testing.T, data jsonmodels.ContextData, options ...sbOption) *sbContext {
 	t.Helper()
 	return sbCreateAt(t, sbAnchor, map[string]string{sbUnitType: sbUID}, data, options...)
 }
@@ -256,12 +256,12 @@ func sbNumber(value interface{}) interface{} {
 	return value
 }
 
-func (h *sbContext) refresh(experiments ...jsonmodels.ExperimentData) {
+func (h *sbContext) refresh(experiments ...jsonmodels.Experiment) {
 	h.t.Helper()
 	h.refreshData(sbData(experiments...))
 }
 
-func (h *sbContext) refreshData(data jsonmodels.ContextPayload) {
+func (h *sbContext) refreshData(data jsonmodels.ContextData) {
 	h.t.Helper()
 	h.provider.mu.Lock()
 	h.provider.next = data
@@ -462,7 +462,7 @@ func TestSwitchback_UnservableScheduleIsIneligibleAndNeverFallsBackToUnitAssignm
 	var negativePeriod = sbDefault(2, -sbHour)
 	var oneArm = sbDefault(2, sbHour)
 	oneArm.Split = []float64{1}
-	for _, experiment := range []jsonmodels.ExperimentData{noStart, noPeriod, zeroPeriod, negativePeriod, oneArm} {
+	for _, experiment := range []jsonmodels.Experiment{noStart, noPeriod, zeroPeriod, negativePeriod, oneArm} {
 		var h = sbCreate(t, sbData(experiment))
 		for i := int64(0); i < 4; i++ {
 			h.at(sbAnchor + i*sbHour)
@@ -958,34 +958,34 @@ func TestSwitchback_StrictMismatchedSwitchbackAloneOnAVariableKeyReturnsTheDefau
 func TestSwitchback_ExposureFlagsMatchAUnitExperimentForEveryBranch(t *testing.T) {
 	type branch struct {
 		name      string
-		configure func(*jsonmodels.ExperimentData)
+		configure func(*jsonmodels.Experiment)
 		options   []sbOption
 		// assigned, eligible, overridden, fullOn, custom, audienceMismatch, ruleOverride
 		flags   [7]bool
 		variant int
 		draws   bool
 	}
-	var strict = func(e *jsonmodels.ExperimentData) { e.Audience, e.AudienceStrict = sbStrictGoldAudience, true }
-	var rule = func(e *jsonmodels.ExperimentData) { e.AssignmentRules = sbAssignVariant2 }
+	var strict = func(e *jsonmodels.Experiment) { e.Audience, e.AudienceStrict = sbStrictGoldAudience, true }
+	var rule = func(e *jsonmodels.Experiment) { e.AssignmentRules = sbAssignVariant2 }
 	var override = []sbOption{sbOverride("exp_parity", 2)}
-	var none = func(*jsonmodels.ExperimentData) {}
+	var none = func(*jsonmodels.Experiment) {}
 	// Period 2's 3-arm draw is 1; override, rule, full-on and custom force 2.
 	expectInt(t, 1, sbExpected3Arms[2])
 	for _, b := range []branch{
 		{"override", none, override, [7]bool{false, true, true, false, false, false, false}, 2, false},
 		{"override over strict mismatch", strict, override, [7]bool{false, true, true, false, false, false, false}, 2, false},
 		{"rule", rule, nil, [7]bool{false, true, false, false, false, false, true}, 2, false},
-		{"rule over strict mismatch", func(e *jsonmodels.ExperimentData) { strict(e); rule(e) }, nil, [7]bool{false, true, false, false, false, false, true}, 2, false},
+		{"rule over strict mismatch", func(e *jsonmodels.Experiment) { strict(e); rule(e) }, nil, [7]bool{false, true, false, false, false, false, true}, 2, false},
 		{"strict mismatch", strict, nil, [7]bool{false, true, false, false, false, true, false}, 0, false},
-		{"strict mismatch over full-on", func(e *jsonmodels.ExperimentData) { strict(e); e.FullOnVariant = 2 }, nil, [7]bool{false, true, false, false, false, true, false}, 0, false},
-		{"strict mismatch over traffic miss", func(e *jsonmodels.ExperimentData) { strict(e); e.TrafficSplit = []float64{1, 0} }, nil, [7]bool{false, true, false, false, false, true, false}, 0, false},
-		{"non-strict mismatch", func(e *jsonmodels.ExperimentData) { e.Audience = sbStrictGoldAudience }, nil, [7]bool{true, true, false, false, false, true, false}, sbExpected3Arms[2], true},
-		{"full-on", func(e *jsonmodels.ExperimentData) { e.FullOnVariant = 2 }, nil, [7]bool{true, true, false, true, false, false, false}, 2, false},
-		{"traffic miss", func(e *jsonmodels.ExperimentData) { e.TrafficSplit = []float64{1, 0} }, nil, [7]bool{true, false, false, false, false, false, false}, 0, false},
+		{"strict mismatch over full-on", func(e *jsonmodels.Experiment) { strict(e); e.FullOnVariant = 2 }, nil, [7]bool{false, true, false, false, false, true, false}, 0, false},
+		{"strict mismatch over traffic miss", func(e *jsonmodels.Experiment) { strict(e); e.TrafficSplit = []float64{1, 0} }, nil, [7]bool{false, true, false, false, false, true, false}, 0, false},
+		{"non-strict mismatch", func(e *jsonmodels.Experiment) { e.Audience = sbStrictGoldAudience }, nil, [7]bool{true, true, false, false, false, true, false}, sbExpected3Arms[2], true},
+		{"full-on", func(e *jsonmodels.Experiment) { e.FullOnVariant = 2 }, nil, [7]bool{true, true, false, true, false, false, false}, 2, false},
+		{"traffic miss", func(e *jsonmodels.Experiment) { e.TrafficSplit = []float64{1, 0} }, nil, [7]bool{true, false, false, false, false, false, false}, 0, false},
 		{"custom", none, []sbOption{sbCustom("exp_parity", 2)}, [7]bool{true, true, false, false, true, false, false}, 2, false},
 		{"draw", none, nil, [7]bool{true, true, false, false, false, false, false}, sbExpected3Arms[2], true},
 	} {
-		var expose = func(experiment jsonmodels.ExperimentData) jsonmodels.Exposure {
+		var expose = func(experiment jsonmodels.Experiment) jsonmodels.Exposure {
 			b.configure(&experiment)
 			var h = sbCreateAt(t, sbAnchor+2*sbHour+3, map[string]string{sbUnitType: sbUID}, sbData(experiment), b.options...)
 			h.treatment("exp_parity")
@@ -1503,7 +1503,7 @@ func TestSwitchback_ExperimentJSONRoundTripKeepsTheClusterOrder(t *testing.T) {
 	if !strings.Contains(string(encoded), `"switchbackClusters":{"z_type":"a","a_type":"b","m_type":"c"}`) {
 		t.Fatalf("%s", encoded)
 	}
-	var decoded jsonmodels.ExperimentData
+	var decoded jsonmodels.Experiment
 	if err := json.Unmarshal(encoded, &decoded); err != nil {
 		t.Fatal(err)
 	}
@@ -1929,7 +1929,7 @@ func TestSwitchback_InFlightDecisionReplacedByASwitchbackStaysRetired(t *testing
 // without holdouts does: QueueExposure still publishes it.
 func TestSwitchback_ReplacementAcrossRandomizationWithoutHoldoutsStillPublishes(t *testing.T) {
 	for _, c := range []struct {
-		from, to jsonmodels.ExperimentData
+		from, to jsonmodels.Experiment
 	}{
 		{sbUnit(sbDefault(2, sbHour)), sbDefault(2, sbHour)},
 		{sbDefault(2, sbHour), sbUnit(sbDefault(2, sbHour))},
@@ -2313,9 +2313,9 @@ func TestSwitchback_VariableReadIgnoresAUnitTypeOnlyRefresh(t *testing.T) {
 // exposure never claims the superseded slot: it resolves again, then serves
 // and exposes the replacement once, under the new identity.
 func TestSwitchback_VariableClaimServesTheReplacementOfARefreshedSlot(t *testing.T) {
-	for name, edit := range map[string]func(*jsonmodels.ExperimentData){
-		"iteration": func(e *jsonmodels.ExperimentData) { e.Iteration++ },
-		"id":        func(e *jsonmodels.ExperimentData) { e.Id = 77 },
+	for name, edit := range map[string]func(*jsonmodels.Experiment){
+		"iteration": func(e *jsonmodels.Experiment) { e.Iteration++ },
+		"id":        func(e *jsonmodels.Experiment) { e.Id = 77 },
 	} {
 		var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
 		h.at(sbAnchor + 5)
@@ -2376,7 +2376,7 @@ func TestSwitchback_VariableClaimDeclinesASupersededGeneration(t *testing.T) {
 	unit.UnitType = "user_id"
 	unit.Split = []float64{0, 1}
 	for name, c := range map[string]struct {
-		refreshed jsonmodels.ExperimentData
+		refreshed jsonmodels.Experiment
 		value     interface{}
 		unit      string
 	}{
@@ -2608,11 +2608,11 @@ func TestSwitchback_VariableRetryResolvesAtAFreshReading(t *testing.T) {
 func TestSwitchback_LiteralIndexEditTakesNoHoldoutCoverage(t *testing.T) {
 	var sb = sbDefault(2, sbHour)
 	sb.HoldoutIds = []int{11}
-	var literal = audienceLiteral(sb.Experiment)
+	var literal = audienceLiteral(sb)
 	literal.Clock_ = &sbClock{now: sbAnchor + 5}
 	literal.Units_ = map[string]string{sbUnitType: sbUID}
 	literal.Attributes_ = []interface{}{}
-	literal.SetPayload(jsonmodels.ContextPayload{Experiments: []jsonmodels.ExperimentData{sb},
+	literal.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{sb},
 		Holdouts: []jsonmodels.Holdout{hoHoldoutA()}})
 	if err := literal.SetAttribute(sbClusterPath, sbClusterKey); err != nil {
 		t.Fatal(err)

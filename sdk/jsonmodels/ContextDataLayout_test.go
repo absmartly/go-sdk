@@ -6,27 +6,25 @@ import (
 	"testing"
 )
 
-// ContextData and Experiment keep their v1.2.0 layouts: holdouts and
-// switchbacks travel in ContextPayload and ExperimentData instead, so a
-// caller's positional literal of either keeps compiling. These literals fail
-// to compile, as the caller's would, if a field is added, removed or
-// reordered.
-var (
-	_ = ContextData{nil}
-	_ = Experiment{0, "", "", 0, 0, 0, nil, 0, 0, nil, 0, nil, nil, nil, false, "", ""}
-)
-
-func TestContextDataKeepsTheV120Layout(t *testing.T) {
+// v1.4.0 keeps v1.3.0's ContextData and adds only the switchback wire fields
+// to Experiment, after v1.3.0's last field, HoldoutIds (CHANGELOG, v1.4.0
+// Changed). Any other change to either layout would break more callers than
+// the CHANGELOG lists.
+func TestContextDataLayoutIsV130PlusSwitchbackFields(t *testing.T) {
 	for _, tc := range []struct {
 		value interface{}
 		want  []string
 	}{
-		{ContextData{}, []string{"Experiments []jsonmodels.Experiment"}},
+		{ContextData{}, []string{"Experiments []jsonmodels.Experiment", "Holdouts []jsonmodels.Holdout"}},
 		{Experiment{}, []string{"Id int", "Name string", "UnitType string", "Iteration int", "SeedHi int",
 			"SeedLo int", "Split []float64", "TrafficSeedHi int", "TrafficSeedLo int", "TrafficSplit []float64",
 			"FullOnVariant int", "Applications []jsonmodels.ExperimentApplication",
 			"Variants []jsonmodels.ExperimentVariant", "CustomFieldValues []jsonmodels.CustomFieldValue",
-			"AudienceStrict bool", "Audience string", "AssignmentRules string"}},
+			"AudienceStrict bool", "Audience string", "AssignmentRules string", "HoldoutIds []int",
+			"RandomizationType string", "SwitchbackClusters jsonmodels.SwitchbackClusters",
+			"SwitchbackClusterValues []string", "SwitchbackStartAt *int64", "SwitchbackPeriodMs *int64",
+			"SwitchbackCarryoverDurationMs *int64", "SwitchbackBurnInDurationMs *int64",
+			"SwitchbackBurnOutDurationMs *int64", "SwitchbackDesignType string", "SwitchbackEstimand string"}},
 	} {
 		var fields []string
 		var typ = reflect.TypeOf(tc.value)
@@ -37,59 +35,37 @@ func TestContextDataKeepsTheV120Layout(t *testing.T) {
 			t.Errorf("%s fields %v, want %v", typ.Name(), fields, tc.want)
 		}
 	}
+	var _ = ContextData{Experiments: nil, Holdouts: nil}
 }
 
-// A ContextPayload decodes the collector's JSON with the experiment fields
-// flattened into each ExperimentData, and encodes back to the same keys.
-func TestContextPayloadJSONRoundTrip(t *testing.T) {
-	var raw = `{"experiments":[{"id":1,"name":"exp","unitType":"session_id","iteration":2,"seedHi":3,"seedLo":4,` +
-		`"split":[0.5,0.5],"trafficSeedHi":5,"trafficSeedLo":6,"trafficSplit":[0,1],"fullOnVariant":0,` +
-		`"applications":[{"name":"website"}],"variants":[{"name":"A","config":null},{"name":"B","config":null}],` +
-		`"customFieldValues":null,"audienceStrict":false,"audience":"","holdoutIds":[11],` +
-		`"randomizationType":"switchback","switchbackStartAt":1000,"switchbackPeriodMs":3600000}],` +
-		`"holdouts":[{"id":11,"name":"h","unitType":"session_id","iteration":1,"seedHi":1,"seedLo":2,` +
-		`"split":[0.1,0.9],"holdoutType":"full"}]}`
-	var payload ContextPayload
-	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
-		t.Fatal(err)
+// The switchback fields use the collector's JSON names and are omitted when
+// unset, so an experiment without them encodes exactly as in v1.3.0.
+func TestExperimentSwitchbackFieldsJSON(t *testing.T) {
+	var raw, _ = json.Marshal(Experiment{Id: 1})
+	var fields map[string]interface{}
+	_ = json.Unmarshal(raw, &fields)
+	for _, name := range []string{"randomizationType", "switchbackClusters", "switchbackClusterValues",
+		"switchbackStartAt", "switchbackPeriodMs", "switchbackCarryoverDurationMs", "switchbackBurnInDurationMs",
+		"switchbackBurnOutDurationMs", "switchbackDesignType", "switchbackEstimand", "holdoutIds"} {
+		if _, found := fields[name]; found {
+			t.Errorf("%s marshalled when unset: %s", name, raw)
+		}
 	}
-	var e = payload.Experiments[0]
-	if e.Id != 1 || e.Name != "exp" || e.Iteration != 2 || len(e.Variants) != 2 || !reflect.DeepEqual(e.HoldoutIds, []int{11}) ||
-		e.RandomizationType != "switchback" || e.SwitchbackStartAt == nil || *e.SwitchbackStartAt != 1000 ||
-		e.SwitchbackPeriodMs == nil || *e.SwitchbackPeriodMs != 3600000 || len(payload.Holdouts) != 1 {
-		t.Fatalf("decoded %+v", payload)
+	var start, period = int64(1000), int64(3600000)
+	var set = Experiment{Id: 1, RandomizationType: "switchback", SwitchbackStartAt: &start, SwitchbackPeriodMs: &period,
+		SwitchbackClusters: SwitchbackClusters{{UnitType: "store_id", Path: "store"}}, SwitchbackClusterValues: []string{"a"},
+		SwitchbackDesignType: "balanced_block", SwitchbackEstimand: "global"}
+	raw, _ = json.Marshal(set)
+	var again Experiment
+	if err := json.Unmarshal(raw, &again); err != nil || !reflect.DeepEqual(again, set) {
+		t.Fatalf("round trip %s: %+v, %v", raw, again, err)
 	}
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var again ContextPayload
-	if err := json.Unmarshal(encoded, &again); err != nil || !reflect.DeepEqual(again, payload) {
-		t.Fatalf("round trip %s: %+v, %v", encoded, again, err)
-	}
-}
-
-// ContextData drops only the holdout and switchback fields, and PayloadOf
-// carries every v1.2.0 field across; nil stays nil.
-func TestContextPayloadConversions(t *testing.T) {
-	var start = int64(7)
-	var payload = ContextPayload{
-		Experiments: []ExperimentData{{Experiment: Experiment{Id: 1, Name: "a", AssignmentRules: "r"},
-			HoldoutIds: []int{11}, RandomizationType: "switchback", SwitchbackStartAt: &start}},
-		Holdouts: []Holdout{{Id: 11}},
-	}
-	var data = payload.ContextData()
-	if !reflect.DeepEqual(data, ContextData{Experiments: []Experiment{{Id: 1, Name: "a", AssignmentRules: "r"}}}) {
-		t.Fatalf("ContextData() = %+v", data)
-	}
-	var back = PayloadOf(data)
-	if !reflect.DeepEqual(back, ContextPayload{Experiments: []ExperimentData{{Experiment: data.Experiments[0]}}}) {
-		t.Fatalf("PayloadOf = %+v", back)
-	}
-	if (ContextPayload{}).ContextData().Experiments != nil || PayloadOf(ContextData{}).Experiments != nil {
-		t.Fatal("nil experiments became non-nil")
-	}
-	if got := (ContextPayload{Experiments: []ExperimentData{}}).ContextData().Experiments; got == nil || len(got) != 0 {
-		t.Fatalf("empty experiments became %#v", got)
+	fields = nil
+	_ = json.Unmarshal(raw, &fields)
+	for _, name := range []string{"randomizationType", "switchbackClusters", "switchbackClusterValues",
+		"switchbackStartAt", "switchbackPeriodMs", "switchbackDesignType", "switchbackEstimand"} {
+		if _, found := fields[name]; !found {
+			t.Errorf("%s missing from %s", name, raw)
+		}
 	}
 }
