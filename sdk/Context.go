@@ -4098,12 +4098,18 @@ func (c *Context) setData(data jsonmodels.ContextData, buffer *diagnosticBuffer)
 				experimentCustomFields[value.Name] = value
 			}
 		}
-		// A repeated name keeps the last entry, as index does: drop what an
-		// earlier entry of that name set, so a unit experiment never keeps a
+		// A repeated name serves the last entry, as index does. Where a
+		// switchback is involved (the earlier entry was one, or this one is),
+		// drop what the earlier entry set, so a unit experiment never keeps a
 		// switchback definition, nor a switchback holdout coverage or rules.
-		delete(rules, experiment.Name)
-		delete(switchbacks, experiment.Name)
-		delete(coverage, experiment.Name)
+		// A payload without switchbacks keeps v1.3.0's behaviour exactly: an
+		// earlier entry's rules and coverage survive a later entry without
+		// them.
+		if _, wasSwitchback := switchbacks[experiment.Name]; wasSwitchback || isSwitchback(&experiment) {
+			delete(rules, experiment.Name)
+			delete(switchbacks, experiment.Name)
+			delete(coverage, experiment.Name)
+		}
 		if len(experiment.AssignmentRules) > 0 {
 			rules[experiment.Name] = c.experimentRulesFor(previousRules(experiment.Name), experiment.AssignmentRules)
 		}

@@ -44,10 +44,11 @@ type clockReading struct {
 	serving *readServing
 }
 
-// readServing is a serving result for one definition generation and slot.
+// readServing is a serving result for one definition generation. That
+// identifies the slot too: generations are unique within a context, and one
+// clock reading fixes the period.
 type readServing struct {
 	generation uint64
-	key        string
 	serving    switchbackServing
 }
 
@@ -410,12 +411,12 @@ func (c *Context) newSwitchbackSlot(indexed *indexedExperiment, previous *cached
 	if previous != nil && previous.switchback != nil && previous.switchback.generation == resolved.generation &&
 		previous.switchback.serving.status != switchbackAbsent {
 		resolved.serving = previous.switchback.serving
-	} else if kept := at.serving; kept != nil && kept.generation == resolved.generation && kept.key == slot.key {
+	} else if kept := at.serving; kept != nil && kept.generation == resolved.generation {
 		// A retry of the same read, after a cold audience parse.
 		resolved.serving = kept.serving
 	} else {
 		resolved.serving = c.resolveSwitchbackServing(indexed, now)
-		at.serving = &readServing{generation: resolved.generation, key: slot.key, serving: resolved.serving}
+		at.serving = &readServing{generation: resolved.generation, serving: resolved.serving}
 	}
 	return resolved
 }

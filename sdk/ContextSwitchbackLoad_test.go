@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -441,16 +442,20 @@ func TestSwitchbackLoad_ReadsWhileTheInitialLoadIsPending(t *testing.T) {
 }
 
 // A payload that repeats an experiment name serves the last entry, as the
-// index does: a full-on unit experiment after a switchback of the same name
-// serves its full-on variant, and a switchback after a covered unit
-// experiment takes no holdout coverage from it.
+// index does, wherever a switchback is involved: a full-on unit experiment
+// after a switchback of the same name serves its full-on variant and keeps
+// no switchback rules, and a switchback after a covered unit experiment takes
+// no holdout coverage from it.
 func TestSwitchbackLoad_RepeatedNameKeepsTheLastEntrysServing(t *testing.T) {
 	t.Run("switchback then unit", func(t *testing.T) {
+		var sb = sbDefault(2, sbHour)
+		sb.AssignmentRules = `{"rules":[{"or":[{"value":true}],"variant":0,"environments":[]}]}`
 		var unit = sbUnit(sbDefault(2, sbHour))
 		unit.FullOnVariant = 1
-		var h = sbCreate(t, sbData(sbDefault(2, sbHour), unit))
-		if h.ctx.state().indexedExperiment("exp_sb").switchback != nil {
-			t.Fatal("the later unit entry kept the earlier switchback definition")
+		var h = sbCreate(t, sbData(sb, unit))
+		var indexed = h.ctx.state().indexedExperiment("exp_sb")
+		if indexed.switchback != nil || indexed.rules != nil {
+			t.Fatalf("the later unit entry kept the switchback's serving: switchback %v, rules %v", indexed.switchback, indexed.rules)
 		}
 		expectInt(t, 1, h.at(sbAnchor+5).peek("exp_sb"))
 	})
@@ -464,6 +469,30 @@ func TestSwitchbackLoad_RepeatedNameKeepsTheLastEntrysServing(t *testing.T) {
 		if indexed.switchback == nil || indexed.holdouts != nil {
 			t.Fatalf("the later switchback kept the earlier coverage: %+v", indexed.holdouts)
 		}
+	})
+}
+
+// A payload without switchbacks that repeats a name keeps v1.3.0's
+// behaviour exactly: an earlier entry's assignment rules and holdout coverage
+// survive a later entry without them.
+func TestSwitchbackLoad_RepeatedNameWithoutSwitchbacksKeepsV130(t *testing.T) {
+	t.Run("rules", func(t *testing.T) {
+		var first = ruleExperiment("dup", rulesJSON(`{"type":"assign","variant":2}`))
+		var second = ruleExperiment("dup", "")
+		var ctx, _ = newRuleContext(t, "production", withUnit(), first, second)
+		var variant, err = ctx.PeekTreatment("dup")
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectInt(t, 2, variant)
+	})
+	t.Run("coverage", func(t *testing.T) {
+		var covered = hoExperiment(1, "dup", hoUnitType, 0, 11)
+		var plain = hoExperiment(1, "dup", hoUnitType, 0)
+		var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, covered, plain))
+		expectInt(t, 0, h.peek("dup"))
+		h.treatment("dup")
+		h.expectPublished(hoExposure(hoUnitType, 11, "holdout_a", 0))
 	})
 }
 
@@ -512,6 +541,36 @@ func TestSwitchbackLoad_ExpiryKeepsASharedClaimTheCurrentSlotHolds(t *testing.T)
 	}
 	h.ctx.QueueExposure(held)
 	h.expectPending(1)
+}
+
+// The other holders of a shared flag count too: a period slot that kept the
+// flag while later periods' rebuilds push its predecessor out of the window,
+// and the slot of a read before the start (cached under the experiment's own
+// name) that kept it while rebuilds in period 0 do.
+func TestSwitchbackLoad_ExpiryKeepsASharedClaimAnotherSlotHolds(t *testing.T) {
+	for name, tc := range map[string]struct{ held, rebuilt int64 }{
+		"another period":   {sbAnchor + 5, sbAnchor + sbHour + 5},
+		"before the start": {sbAnchor - 5, sbAnchor + 5},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var experiment = sbDefault(2, sbHour)
+			experiment.FullOnVariant = 1
+			var h = sbCreateAt(t, tc.held, map[string]string{sbUnitType: sbUID}, sbData(experiment))
+			var held = h.ctx.GetAssignment("exp_sb")
+			_ = h.ctx.SetCustomAssignment("exp_sb", 0)
+			h.ctx.GetAssignment("exp_sb")
+			if held.Exposed != h.ctx.getAssignment("exp_sb").assignment.Exposed {
+				t.Fatal("fixture: the rebuild no longer shares the exposed flag")
+			}
+			h.at(tc.rebuilt)
+			for i := 0; i < switchbackRetiredSlots+2; i++ {
+				_ = h.ctx.SetCustomAssignment("exp_sb", (i+1)%2)
+				h.ctx.GetAssignment("exp_sb")
+			}
+			h.ctx.QueueExposure(held)
+			h.expectPending(1)
+		})
+	}
 }
 
 // sbResolutionKey publishes a different cluster for each cluster
@@ -589,4 +648,52 @@ func TestSwitchbackLoad_TypedNilContainerSpendsNoDepth(t *testing.T) {
 			t.Errorf("%s at the limit gave %q, want the sibling key", name, got)
 		}
 	}
+}
+
+// sbHookDeserializer runs its hook once, during the first audience parse.
+type sbHookDeserializer struct{ hook *func() }
+
+func (d sbHookDeserializer) Deserialize(bytes []byte, offset int, length int) (map[string]interface{}, error) {
+	if hook := *d.hook; hook != nil {
+		*d.hook = nil
+		hook()
+	}
+	return DefaultAudienceDeserializer{}.Deserialize(bytes, offset, length)
+}
+
+// The retry reuses the first cluster read only for the definition it was read
+// under: a refresh during the cold parse that re-points the cluster path
+// keys the slot from the new path.
+func TestSwitchbackLoad_ColdAudienceRetryReadsTheClusterOfANewDefinition(t *testing.T) {
+	var sb = sbDefault(2, sbHour)
+	sb.Audience = `{"filter":[{"value":true}]}`
+	var h = sbCreate(t, sbData(sb))
+	h.setAttribute("other_key", "store-other")
+	var hook func()
+	h.ctx.AudienceMatcher_ = AudienceMatcher{sbHookDeserializer{&hook}}
+	var moved = sb
+	moved.SwitchbackClusters = sbClusters(sbUnitType, "other_key")
+	hook = func() { h.refresh(moved) }
+	h.at(sbAnchor + 5).peek("exp_sb")
+	if hook != nil {
+		t.Fatal("fixture: the audience was not parsed")
+	}
+	if key := h.ctx.getAssignment("exp_sb").switchback.serving.clusterKey; key != "store-other" {
+		t.Fatalf("the slot is keyed %q, want the new definition's %q", key, "store-other")
+	}
+}
+
+// Brackets inside an opaque value's strings, escaped quotes included, are
+// text and spend no depth.
+func TestSwitchbackLoad_OpaqueDepthSkipsStrings(t *testing.T) {
+	var path = parseSwitchbackPath("store/Key")
+	var note = strings.Repeat("[{", 80) + `\"` + strings.Repeat("[", 80)
+	if got := path.resolveAttribute(sbOpaqueNote{Key: "store-42", Note: note}); got != "store-42" {
+		t.Fatalf("brackets inside a string gave %q", got)
+	}
+}
+
+type sbOpaqueNote struct {
+	Key  string
+	Note string
 }
