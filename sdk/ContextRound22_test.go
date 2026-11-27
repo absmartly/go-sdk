@@ -259,3 +259,29 @@ func TestRound22_HeldOutDecisionSkipsAudienceRevalidation(t *testing.T) {
 		t.Fatal("the held-out decision was recomputed after an attribute change")
 	}
 }
+
+// A read whose claim's CAS loses does not admit a second exposure. The flag is
+// set between the exposed check and the CAS, so this read's CAS fails while
+// its own checks all passed, as when a concurrent read claims first.
+func TestRound23_LostClaimCASAdmitsNoSecondExposure(t *testing.T) {
+	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")
+	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
+	var entry = h.ctx.assignmentEntry("e")
+	var eligible = h.ctx.variableEligible("e", "v")
+	var raced = false
+	var racing = func(c *cachedAssignment) exposureStatus {
+		var status = eligible(c)
+		if !raced {
+			raced = true
+			c.assignment.Exposed.Store(true)
+		}
+		return status
+	}
+	if status := h.ctx.queueEligibleExposure(entry, racing); status != exposureQueued {
+		t.Fatalf("a lost claim reported %v, want exposureQueued", status)
+	}
+	if !raced {
+		t.Fatal("the race did not run")
+	}
+	h.expectPending(0)
+}

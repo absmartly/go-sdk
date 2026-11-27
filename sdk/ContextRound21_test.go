@@ -13,9 +13,8 @@ import (
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
 
-// withinDeadline exits the test binary if f has not returned after five
-// seconds. A wedged read can hold a lock that test cleanup also needs, so
-// failing the test alone would still hang the suite.
+// withinDeadline exits rather than failing the test: test cleanup may need
+// the lock a wedged call holds.
 func withinDeadline(t *testing.T, what string, f func()) {
 	t.Helper()
 	var done = make(chan struct{})
@@ -85,9 +84,6 @@ func literalWithCachedAssignment(exposed bool) *Context {
 	return literal
 }
 
-// Imported literal assignments carry no retirement token: an exposed one is
-// served as cached, and an unclaimed one rejected by a close is rolled back
-// without panicking or leaving ContextLock_ held.
 func TestRound21_ImportedLiteralAssignmentsDoNotPanic(t *testing.T) {
 	t.Run("exposed read", func(t *testing.T) {
 		var literal = literalWithCachedAssignment(true)
