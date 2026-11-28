@@ -121,6 +121,49 @@ func TestContextValueCopiesAndSnapshotsShareLifecycle(t *testing.T) {
 	assertAny(true, snapshot.IsClosed(), t)
 }
 
+// The warmed treatment and peek fast paths read through a copy's root: an
+// override the root sets after the decision was cached is served through a
+// copy whose Overrides_ was replaced, as on the full path.
+func TestContextCopyFastPathsReadTheRootsOverride(t *testing.T) {
+	for _, read := range []string{"peek", "treatment"} {
+		t.Run(read, func(t *testing.T) {
+			var ctx, _ = newRuleContext(t, "production", withUnit(), ruleExperiment("exp", ""))
+			var before, _ = ctx.GetTreatment("exp")
+			var copied = *ctx
+			copied.Overrides_ = map[interface{}]interface{}{}
+			var want = 1 - before
+			assertAny(nil, ctx.SetOverride("exp", want), t)
+			var got int
+			if read == "peek" {
+				got, _ = copied.PeekTreatment("exp")
+			} else {
+				got, _ = copied.GetTreatment("exp")
+			}
+			assertAny(want, got, t)
+		})
+	}
+}
+
+// A variable read through a copy with its own DataLock reads the shared
+// variable index under the root's DataLock, so a concurrent SetData through
+// the root never races it (run with -race).
+func TestContextCopyVariableReadUsesTheRootsDataLock(t *testing.T) {
+	var ctx, _ = newRuleContext(t, "production", withUnit(), ruleExperiment("exp", ""))
+	var copied = *ctx
+	copied.DataLock = &sync.RWMutex{}
+	var done = make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{ruleExperiment("exp", "")}})
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		_, _ = copied.PeekVariableValue("color", "d")
+	}
+	<-done
+}
+
 func TestRuleAssignmentIdentitiesDoNotRetainAbandonedFlags(t *testing.T) {
 	var ctx, _ = newRuleContext(t, "production", withUnit(),
 		ruleExperiment("exp", rulesJSON(`{"type":"assign","variant":2,"conditions":{"eq":[{"var":"country"},{"value":"US"}]}}`)))

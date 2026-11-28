@@ -1474,8 +1474,31 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 	if err != nil {
 		return -1, err
 	}
+	// A warmed, exposed ordinary decision needs no clock and no claim, so
+	// it is served as in v1.3.0. Anything else (a switchback, a decision to
+	// build, revalidate or expose) takes resolveTreatment.
+	var entry, switchback = c.cachedOrdinaryAssignment(experimentName)
+	if entry != nil && afterReadResolve == nil && !entry.needsSettling() {
+		return entry.assignment.Variant, nil
+	}
+	return c.resolveTreatment(experimentName, entry, switchback)
+}
+
+// resolveTreatment is GetTreatment for an assignment that is not a valid,
+// exposed, cached ordinary one: a switchback, or one to build, revalidate or
+// expose.
+// cached is the valid cached ordinary entry GetTreatment found, if any;
+// switchback reports that the experiment was a switchback when it looked.
+func (c *Context) resolveTreatment(experimentName string, cached *cachedAssignment, switchback bool) (int, error) {
 	var at = clockReading{clock: c.Clock_}
-	var entry = c.getAssignmentAt(experimentName, &at)
+	var entry = cached
+	if entry == nil {
+		if switchback {
+			entry = c.switchbackAssignmentAt(experimentName, &at)
+		} else {
+			entry = c.getAssignmentAt(experimentName, &at)
+		}
+	}
 	if afterReadResolve != nil {
 		afterReadResolve()
 	}
@@ -1483,6 +1506,55 @@ func (c *Context) GetTreatment(experimentName string) (int, error) {
 		entry, _ = c.settleExposureAt(experimentName, entry, nil, &at)
 	}
 	return entry.assignment.Variant, nil
+}
+
+// cachedOrdinaryAssignment is the valid cached assignment of an experiment
+// that is not a switchback, or nil. It is v1.3.0's warmed lookup: it reads
+// no clock and takes only the read lock. It repeats getAssignmentAt's
+// ordinary branch rather than sharing it, because the extra call frame
+// measurably slows every warmed treatment read; nil sends the caller
+// through getAssignmentAt. It also reports whether the experiment was a
+// switchback, so that a switchback read goes straight to its own lookup.
+func (c *Context) cachedOrdinaryAssignment(experimentName string) (*cachedAssignment, bool) {
+	var st *contextState
+	if clock := c.ownClock(); clock != nil {
+		c, st = clock.root, clock.state
+	} else if st = c.literalState(); st.manualRoot != nil {
+		c = st.manualRoot
+	} else {
+		c.syncLiteralExperiment(st, experimentName)
+	}
+	c.ContextLock_.RLock()
+	var indexed = st.indexedExperiment(experimentName)
+	if indexed != nil && indexed.switchback != nil {
+		c.ContextLock_.RUnlock()
+		return nil, true
+	}
+	if entry := st.assignmentCache_[experimentName]; entry != nil {
+		if _, state := c.validEntry(st, experimentName, indexed, entry, false, nil); state == assignmentValid {
+			c.ContextLock_.RUnlock()
+			return entry, false
+		}
+	}
+	c.ContextLock_.RUnlock()
+	return nil, false
+}
+
+// switchbackAssignmentAt is getAssignmentAt for an experiment the caller
+// just found to be a switchback: it skips the ordinary lookup. The clock is
+// read outside ContextLock_ and the definition reloaded after it (see
+// cachedAssignmentAt), so a refresh in between is still seen.
+func (c *Context) switchbackAssignmentAt(experimentName string, at *clockReading) *cachedAssignment {
+	var st *contextState
+	if clock := c.ownClock(); clock != nil {
+		c, st = clock.root, clock.state
+	} else if st = c.literalState(); st.manualRoot != nil {
+		c = st.manualRoot
+	}
+	if entry := c.cachedAssignmentAt(st, experimentName, at); entry != nil {
+		return entry
+	}
+	return c.buildAssignment(st, experimentName, at)
 }
 
 // maxExposureAttempts bounds how many assignments a read tries to expose when
@@ -1663,6 +1735,11 @@ var (
 	beforeEligibleClaim func()
 	beforeHoldoutArms   func()
 )
+
+// onGetAssignmentAt, when set by a test, runs as getAssignmentAt starts, so a
+// test can check that GetTreatment does not repeat a lookup its fast path
+// already made.
+var onGetAssignmentAt func()
 
 // QueueExposure queues the assignment's exposure once, then the exposures of
 // the holdouts covering it that are not exposed yet, in holdout id order. A
@@ -1934,6 +2011,9 @@ func (c *Context) PeekTreatment(experimentName string) (int, error) {
 		return -1, err
 	}
 
+	if entry, _ := c.cachedOrdinaryAssignment(experimentName); entry != nil {
+		return entry.assignment.Variant, nil
+	}
 	return c.getAssignment(experimentName).assignment.Variant, nil
 }
 
@@ -2126,8 +2206,15 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 	if literal := c.legacyVariableReader(); literal != nil {
 		return literal.resolveLiteralVariableValue(key, defaultValue, expose)
 	}
-	c = c.live()
-	var st = c.state()
+	// Normalise to the root and its state with one ownClock check where
+	// live() then state() would make two; this runs on every variable read.
+	var st *contextState
+	if clock := c.ownClock(); clock != nil {
+		c, st = clock.root, clock.state
+	} else {
+		c = c.live()
+		st = c.state()
+	}
 
 	c.DataLock.RLock()
 	var experiments = st.indexVariables_[key]
@@ -2138,7 +2225,7 @@ func (c *Context) resolveVariableValue(key string, defaultValue interface{}, exp
 	var at = clockReading{clock: c.Clock_}
 	for i := range experiments {
 		var name = experiments[i].Data.Name
-		var entry = c.getAssignmentFor(st, name, &at)
+		var entry = c.getAssignmentAt(name, &at)
 		if expose {
 			if afterReadResolve != nil {
 				afterReadResolve()
@@ -3047,6 +3134,9 @@ func (c *Context) getAssignment(experimentName string) *cachedAssignment {
 // read only for a switchback experiment, and at most once. The entry's
 // assignment is shared with callers, so it is never mutated once cached.
 func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cachedAssignment {
+	if onGetAssignmentAt != nil {
+		onGetAssignmentAt()
+	}
 	var st *contextState
 	if clock := c.ownClock(); clock != nil {
 		c, st = clock.root, clock.state
@@ -3055,11 +3145,6 @@ func (c *Context) getAssignmentAt(experimentName string, at *clockReading) *cach
 	} else {
 		c.syncLiteralExperiment(st, experimentName)
 	}
-	return c.getAssignmentFor(st, experimentName, at)
-}
-
-// getAssignmentFor resolves against an already normalised live context.
-func (c *Context) getAssignmentFor(st *contextState, experimentName string, at *clockReading) *cachedAssignment {
 	// A valid cached assignment only needs the read lock, so concurrent reads
 	// of a shared context do not serialise. An ordinary experiment's lookup
 	// calls no injected code, so it stays inline with explicit unlocks; a

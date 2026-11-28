@@ -718,3 +718,59 @@ func TestSwitchbackLoad_OrdinaryToUnservableSwitchbackSameIdentity(t *testing.T)
 	h.ctx.QueueExposure(after.assignment)
 	h.expectPending(0)
 }
+
+// A warmed switchback GetTreatment is served from the cache under the read
+// lock: it completes while another reader holds ContextLock_.
+func TestSwitchbackLoad_WarmedTreatmentTakesOnlyTheReadLock(t *testing.T) {
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+	h.at(sbAnchor + 5)
+	h.treatment("exp_sb")
+	h.ctx.ContextLock_.RLock()
+	var done = make(chan int, 1)
+	go func() { v, _ := h.ctx.GetTreatment("exp_sb"); done <- v }()
+	select {
+	case <-done:
+		h.ctx.ContextLock_.RUnlock()
+	case <-time.After(time.Second):
+		h.ctx.ContextLock_.RUnlock()
+		<-done
+		t.Fatal("a warmed switchback read waited for the exclusive context lock")
+	}
+}
+
+// A switchback GetTreatment through a value copy reads its root: an override
+// set on the root after the slot was cached is served through a copy whose
+// Overrides_ was replaced.
+func TestSwitchbackLoad_CopyTreatmentReadsTheRootsOverride(t *testing.T) {
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+	h.at(sbAnchor + 5)
+	var before = h.treatment("exp_sb")
+	var copied = *h.ctx
+	copied.Overrides_ = map[interface{}]interface{}{}
+	var want = 1 - before
+	_ = h.ctx.SetOverride("exp_sb", want)
+	var got, _ = copied.GetTreatment("exp_sb")
+	expectInt(t, want, got)
+}
+
+// GetTreatment looks an experiment up once: a switchback goes straight to its
+// own lookup, and an unexposed ordinary decision the fast path found is
+// settled without being looked up again.
+func TestSwitchbackLoad_TreatmentLooksUpOnce(t *testing.T) {
+	var lookups int
+	onGetAssignmentAt = func() { lookups++ }
+	defer func() { onGetAssignmentAt = nil }()
+	var unit = sbUnit(sbDefault(2, sbHour))
+	unit.Id, unit.Name = 2, "exp_unit"
+	var h = sbCreate(t, sbData(sbDefault(2, sbHour), unit))
+	h.at(sbAnchor + 5)
+	h.treatment("exp_sb")
+	lookups = 0
+	h.treatment("exp_sb")
+	expectInt(t, 0, lookups)
+	h.peek("exp_unit")
+	lookups = 0
+	h.treatment("exp_unit")
+	expectInt(t, 0, lookups)
+	h.expectPending(2)
+}
