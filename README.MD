@@ -24,7 +24,7 @@ The finalization event is still `sdk.Close` with the value `"Close"`; `sdk.Final
 ### Install the SDK
 
 ```bash
-go get github.com/absmartly/go-sdk/sdk@v1.3.0
+go get github.com/absmartly/go-sdk/sdk@v1.4.0
 ```
 
 ### Dependencies
@@ -599,6 +599,74 @@ lock for it.
 so unkeyed (positional) literals of `jsonmodels.ContextData` must become keyed
 (`jsonmodels.ContextData{Experiments: experiments}`), as for `Experiment`.
 
+### Switchback Experiments
+
+Switchback serving needs v1.4.0 or later. Earlier versions ignore the
+switchback fields and serve such an experiment as a unit experiment on its
+`unitType`, which does not follow the schedule.
+
+A switchback experiment randomizes over *clusters* and time rather than over
+units: every unit in the same cluster (for example a store's city) gets the
+same variant within a period, and the variant changes on a fixed time grid.
+The context payload marks it with `Experiment.RandomizationType ==
+"switchback"`; nothing needs to be configured. The SDK serves it as the
+collector and the other ABsmartly SDKs do (see the Java SDK's
+[`SWITCHBACK.md`](https://github.com/absmartly/java-sdk/blob/main/SWITCHBACK.md)
+for the full rules):
+
+- `Experiment.SwitchbackClusters` lists, in order, the unit types linked to
+  the experiment and the attribute path holding each one's cluster value
+  (`"city"`, `"geo/city"`, `"items/0/city"`). For each linked type in that
+  order, the context's unit of that type reads the attribute at its path. The
+  first unit that yields a value serves the experiment and the value is the
+  cluster. Set the cluster attributes with `SetAttribute` before reading the
+  treatment.
+- A cluster value is a non-empty string, used as-is, or a whole-number
+  integer, used as its decimal text. Every floating-point number (`3.0`
+  included), boolean, map, slice, empty string and `nil` gives no value. Go
+  keeps `3` and `3.0` apart: an `int` attribute is the integer `3`, a
+  `float64` is a float even when whole. Values from a JSON document should be
+  decoded with `json.Decoder.UseNumber`, so `json.Number("3")` keys a cluster
+  and `json.Number("3.0")` does not (audiences compare a `json.Number` as the
+  number it denotes); plain `encoding/json` decodes every
+  number as a `float64`, which gives no value. Prefer integer or string
+  attributes: a whole `float64` is published as `3`, which the collector
+  reads back as an integer when it re-resolves the cluster. A value with its
+  own JSON encoding (a struct, a `json.Marshaler` or `encoding.TextMarshaler`,
+  `[]byte`, a map with non-string keys) is read from that encoding, as the
+  collector reads the published attribute, so a whole `float64` field of a
+  struct (written as `3`) keys a cluster.
+- With no unit of a linked type set, the experiment does not apply. When no
+  unit yields a value, linked units disagree, or the value is not in
+  `Experiment.SwitchbackClusterValues`, the unit gets variant `0` and no
+  exposure is published; only an override (`SetOverride`) still applies.
+- Otherwise overrides, assignment rules, strict audiences, full-on, traffic
+  (on the serving unit) and custom assignments apply as for a unit
+  experiment, and the variant is drawn from the cluster value and the period
+  `floor((now - SwitchbackStartAt) / SwitchbackPeriodMs)`. Before the start,
+  and when the schedule cannot be served (no start, a start that is not hour
+  aligned or outside `[0, 10000-01-01)`, a period of 0 or less, fewer than
+  two arms), the draw gives variant `0` with no exposure. Holdouts never
+  apply to a switchback experiment.
+- The exposure is published under the serving unit, once per period while
+  that period is retained (the last two periods per experiment; re-entering
+  an older period, after a clock rewind for example, exposes it again), and
+  is stamped with the time that chose its period. Its fields are the same as a
+  unit experiment's; the cluster attributes are published with their
+  timestamps as before.
+
+The cluster of a period is read once, at the period's first read (a peek
+included). Changing a cluster attribute mid-period is not supported, even
+before the exposure is published or while a rejected exposure is queued again:
+the arm cached at the first read stays for the rest of the period, and the
+change takes effect from the next period. Set the cluster attributes before
+the first read of each period. Payloads without switchback
+experiments are served and published exactly as before, and cached reads and
+exposures allocate as before (`jsonmodels.Experiment` is a little wider: it
+carries the switchback fields). An attribute value with its own `MarshalJSON` or `MarshalText` is read
+through that encoding under the context lock, so the marshaler must not call
+back into the context.
+
 ### Custom Assignments
 
 Sometimes it may be necessary to override the automatic selection of a
@@ -950,7 +1018,7 @@ Go modules are published by git tags. To release:
    `X-Agent` header) and move the `CHANGELOG.md` entry from unreleased to that
    version.
 2. Merge to `main`, then tag that commit and push the tag:
-   `git tag v1.3.0 && git push origin v1.3.0`.
+   `git tag vX.Y.Z && git push origin vX.Y.Z` (the version in `SDKVersion`).
 
 The `Release` workflow checks that the tag matches `SDKVersion`, runs the
 tests, creates the GitHub release and asks the Go module proxy to fetch the

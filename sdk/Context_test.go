@@ -1483,6 +1483,14 @@ func TestExperimentMatchesDefinitionFields(t *testing.T) {
 			e.AssignmentRules = "changed"
 			e.HoldoutIds = []int{11}
 		}, true},
+		{"switchback fields", func(e *jsonmodels.Experiment) {
+			var start, period = int64(1767225600000), int64(3600000)
+			e.RandomizationType = "switchback"
+			e.SwitchbackClusters = jsonmodels.SwitchbackClusters{{UnitType: "store_id", Path: "store"}}
+			e.SwitchbackClusterValues = []string{"porto"}
+			e.SwitchbackStartAt, e.SwitchbackPeriodMs = &start, &period
+			e.SwitchbackDesignType, e.SwitchbackEstimand = "balanced_block", "global_average_treatment_effect"
+		}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var definition = jsonmodels.Experiment{Id: 1, UnitType: "session_id", Iteration: 2,

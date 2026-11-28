@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"math"
+	"math/big"
 	"strconv"
+	"strings"
 
 	v111 "github.com/absmartly/go-sdk/sdk/internal/v111"
 	"github.com/absmartly/go-sdk/sdk/jsonmodels"
@@ -29,9 +31,10 @@ func (d DefaultContextDataDeserializer) Deserialize(bytes []byte) (jsonmodels.Co
 
 // wireContextData is the context payload as the default deserializer decodes
 // it. It differs from jsonmodels.ContextData only in accepting any JSON value
-// for an experiment's assignmentRules, holdoutIds and the holdouts list, so a
-// malformed value drops that experiment's rules, that holdout id or that
-// holdout instead of failing the whole payload. Keeping this here,
+// for an experiment's assignmentRules, holdoutIds and switchback fields and
+// the holdouts list, so a malformed value drops that experiment's rules, that
+// holdout id, that switchback field or that holdout instead of failing the
+// whole payload. Keeping this here,
 // rather than in an UnmarshalJSON method on the public model, leaves the
 // encoding/json behaviour of jsonmodels.Experiment, and of customer structs
 // that embed it, unchanged.
@@ -42,8 +45,20 @@ type wireContextData struct {
 
 type wireExperiment struct {
 	jsonmodels.Experiment
-	AssignmentRules json.RawMessage `json:"assignmentRules"`
-	HoldoutIds      json.RawMessage `json:"holdoutIds"`
+	SwitchbackClusters jsonmodels.SwitchbackClusters `json:"switchbackClusters"`
+	AssignmentRules    json.RawMessage               `json:"assignmentRules"`
+	HoldoutIds         json.RawMessage               `json:"holdoutIds"`
+	// The switchback fields, so a value of the wrong type drops only that
+	// field (see switchbackFields) rather than the payload.
+	RandomizationType             json.RawMessage `json:"randomizationType"`
+	SwitchbackClusterValues       json.RawMessage `json:"switchbackClusterValues"`
+	SwitchbackStartAt             json.RawMessage `json:"switchbackStartAt"`
+	SwitchbackPeriodMs            json.RawMessage `json:"switchbackPeriodMs"`
+	SwitchbackCarryoverDurationMs json.RawMessage `json:"switchbackCarryoverDurationMs"`
+	SwitchbackBurnInDurationMs    json.RawMessage `json:"switchbackBurnInDurationMs"`
+	SwitchbackBurnOutDurationMs   json.RawMessage `json:"switchbackBurnOutDurationMs"`
+	SwitchbackDesignType          json.RawMessage `json:"switchbackDesignType"`
+	SwitchbackEstimand            json.RawMessage `json:"switchbackEstimand"`
 }
 
 func (w wireContextData) contextData() jsonmodels.ContextData {
@@ -52,8 +67,10 @@ func (w wireContextData) contextData() jsonmodels.ContextData {
 		data.Experiments = make([]jsonmodels.Experiment, len(w.Experiments))
 		for i, experiment := range w.Experiments {
 			data.Experiments[i] = experiment.Experiment
-			data.Experiments[i].AssignmentRules = assignmentRulesText(experiment.AssignmentRules)
+			data.Experiments[i].AssignmentRules = wireScalarText(experiment.AssignmentRules)
 			data.Experiments[i].HoldoutIds = holdoutIds(experiment.HoldoutIds)
+			data.Experiments[i].SwitchbackClusters = experiment.SwitchbackClusters
+			experiment.switchbackFields(&data.Experiments[i])
 		}
 	}
 	data.Holdouts = holdouts(w.Holdouts)
@@ -188,11 +205,9 @@ func holdouts(raw json.RawMessage) []jsonmodels.Holdout {
 	return result
 }
 
-// assignmentRulesText returns the assignmentRules string, or "" (no rules)
-// when the field is omitted, null, an object or an array. Other scalars keep
-// their JSON text, as the Java SDK coerces them; they are not a rules document,
-// so they give no rules either.
-func assignmentRulesText(raw json.RawMessage) string {
+// wireScalarText decodes a JSON string, preserves other scalar spelling,
+// and maps absent, null and container values to empty text.
+func wireScalarText(raw json.RawMessage) string {
 	raw = bytes.TrimSpace(raw)
 	switch {
 	case len(raw) == 0 || bytes.Equal(raw, []byte("null")) || raw[0] == '{' || raw[0] == '[':
@@ -206,4 +221,90 @@ func assignmentRulesText(raw json.RawMessage) string {
 	default:
 		return string(raw)
 	}
+}
+
+// switchbackFields decodes an experiment's switchback fields. Each one that
+// is absent, null or of the wrong type is left unset (switchbackClusters
+// decodes itself, see jsonmodels.SwitchbackClusters): an unset start or
+// period makes the schedule unservable, and an unset randomizationType a
+// unit experiment. The allow-list is the exception, because an empty one
+// allows every value: a value that is not an array, and an entry that is
+// not a scalar, allow nothing rather than everything.
+func (w wireExperiment) switchbackFields(experiment *jsonmodels.Experiment) {
+	experiment.RandomizationType = jsonString(w.RandomizationType)
+	experiment.SwitchbackClusterValues = switchbackClusterValues(w.SwitchbackClusterValues)
+	experiment.SwitchbackStartAt = jsonInt64(w.SwitchbackStartAt)
+	experiment.SwitchbackPeriodMs = jsonInt64(w.SwitchbackPeriodMs)
+	experiment.SwitchbackCarryoverDurationMs = jsonInt64(w.SwitchbackCarryoverDurationMs)
+	experiment.SwitchbackBurnInDurationMs = jsonInt64(w.SwitchbackBurnInDurationMs)
+	experiment.SwitchbackBurnOutDurationMs = jsonInt64(w.SwitchbackBurnOutDurationMs)
+	experiment.SwitchbackDesignType = jsonString(w.SwitchbackDesignType)
+	experiment.SwitchbackEstimand = jsonString(w.SwitchbackEstimand)
+}
+
+// jsonString decodes a JSON string, or gives "" for anything else.
+func jsonString(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		// Before text is declared: its address escapes, so declaring it
+		// would allocate for every absent field.
+		return ""
+	}
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		return ""
+	}
+	return text
+}
+
+// jsonInt64 decodes an integral JSON number that fits an int64, or gives nil
+// for anything else.
+func jsonInt64(raw json.RawMessage) *int64 {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] == '"' {
+		return nil
+	}
+	var number json.Number
+	if json.Unmarshal(raw, &number) != nil || len(number) == 0 {
+		return nil
+	}
+	if value, err := number.Int64(); err == nil {
+		return &value
+	}
+	// A decimal or exponent spelling counts only when it is exactly integral:
+	// rounding through float64 would turn 3600000.0000000001 into 3600000.
+	// Spellings too long to hold an int64 are rejected before the exact
+	// decode, which grows with the literal and its exponent.
+	if len(number) > 48 {
+		return nil
+	}
+	if e := strings.IndexAny(string(number), "eE"); e >= 0 && len(strings.TrimLeft(string(number[e+1:]), "+-")) > 3 {
+		return nil
+	}
+	var exact, ok = new(big.Rat).SetString(number.String())
+	if !ok || !exact.IsInt() || !exact.Num().IsInt64() {
+		return nil
+	}
+	var integer = exact.Num().Int64()
+	return &integer
+}
+
+// switchbackClusterValues decodes the allow-list. A string entry is kept
+// as-is, and a number or boolean is kept as its JSON text, as the Java SDK
+// coerces them; null, an object or an array is "", which no cluster key
+// equals. Absent or null gives nil, which allows every value; any other
+// non-array allows none.
+func switchbackClusterValues(raw json.RawMessage) []string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil
+	}
+	var entries []json.RawMessage
+	if raw[0] != '[' || json.Unmarshal(raw, &entries) != nil {
+		return []string{""}
+	}
+	var values = make([]string, len(entries))
+	for i, entry := range entries {
+		values[i] = wireScalarText(entry)
+	}
+	return values
 }

@@ -1,6 +1,7 @@
 package eval
 
 import (
+	"encoding/json"
 	"errors"
 	"math"
 	"reflect"
@@ -37,6 +38,9 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 			return 0
 		}
 	}
+	// After the zero shortcut, which compares the operands as given: a
+	// json.Number zero is not the empty string.
+	lhs = numberValue(lhs)
 
 	if lhs.Kind() == reflect.Int || lhs.Kind() == reflect.Float64 {
 		var rvalue, rerror = e.NumberConvert(rhs)
@@ -88,6 +92,7 @@ func (e Evaluator) Compare(lhs reflect.Value, rhs reflect.Value) interface{} {
 }
 
 func (e Evaluator) BooleanConvert(x reflect.Value) bool {
+	x = numberValue(x)
 	if x.Kind() == reflect.Bool {
 		return x.Bool()
 	} else if x.Kind() == reflect.String {
@@ -117,6 +122,7 @@ func (e Evaluator) BooleanConvert(x reflect.Value) bool {
 }
 
 func (e Evaluator) NumberConvert(x reflect.Value) (float64, error) {
+	x = numberValue(x)
 	if x.Kind() == reflect.Bool {
 		if x.Bool() {
 			return 1.0, nil
@@ -136,6 +142,11 @@ func (e Evaluator) NumberConvert(x reflect.Value) (float64, error) {
 }
 
 func (e Evaluator) StringConvert(x reflect.Value) (string, error) {
+	if x.IsValid() && x.Type() == jsonNumberType {
+		if number := numberValue(x); number.Kind() == reflect.Float64 {
+			return jsNumberString(number.Float()), nil
+		}
+	}
 	if x.Kind() == reflect.Bool {
 		return strconv.FormatBool(x.Bool()), nil
 	} else if x.Kind() == reflect.String {
@@ -188,6 +199,25 @@ func (e Evaluator) ExtractVar(path string) interface{} {
 	return target
 }
 
+var jsonNumberType = reflect.TypeOf(json.Number(""))
+
+// numberValue is a json.Number (a value decoded with UseNumber) as the
+// float64 it denotes, as the JS SDK holds every JSON number: a literal
+// beyond float64 is ±Infinity, as in JavaScript. Any other value, and a
+// json.Number that is not a JSON number literal ("NaN", "Inf"), is returned
+// unchanged.
+func numberValue(x reflect.Value) reflect.Value {
+	if x.IsValid() && x.Type() == jsonNumberType {
+		var text = x.String()
+		if len(text) > 0 && (text[0] == '-' || text[0] >= '0' && text[0] <= '9') && json.Valid([]byte(text)) {
+			// A range error still returns the ±Inf the literal rounds to.
+			var f, _ = strconv.ParseFloat(text, 64)
+			return reflect.ValueOf(f)
+		}
+	}
+	return x
+}
+
 func unwrap(v reflect.Value) reflect.Value {
 	for v.IsValid() && (v.Kind() == reflect.Interface || v.Kind() == reflect.Ptr) {
 		if v.IsNil() {
@@ -216,8 +246,8 @@ func toFloat(v reflect.Value) (float64, bool) {
 }
 
 func deepEquals(lhs reflect.Value, rhs reflect.Value) bool {
-	lhs = unwrap(lhs)
-	rhs = unwrap(rhs)
+	lhs = numberValue(unwrap(lhs))
+	rhs = numberValue(unwrap(rhs))
 	if !lhs.IsValid() || !rhs.IsValid() {
 		return !lhs.IsValid() && !rhs.IsValid()
 	}

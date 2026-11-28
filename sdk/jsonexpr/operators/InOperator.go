@@ -1,6 +1,7 @@
 package operators
 
 import (
+	"encoding/json"
 	"github.com/absmartly/go-sdk/sdk/jsonexpr/eval"
 	"reflect"
 	"strings"
@@ -11,6 +12,10 @@ type InOperator struct {
 }
 
 func (v InOperator) Binary(evaluator eval.Evaluator, haystack interface{}, needle interface{}) interface{} {
+	if _, isNumber := haystack.(json.Number); isNumber {
+		// A json.Number is a number, not text to search, as a float64 is.
+		return nil
+	}
 	var tp = reflect.ValueOf(haystack)
 	if tp.Kind() == reflect.Array || tp.Kind() == reflect.Slice {
 		for i := 0; i < tp.Len(); i++ {

@@ -7,8 +7,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"sync"
 	"testing"
+
+	"github.com/absmartly/go-sdk/sdk/jsonmodels"
 )
 
 // The GET carries the same SDK headers as the PUT (X-API-Key, X-Agent), as
@@ -267,5 +270,88 @@ func hermeticSuppressedHoldoutExposure(t *testing.T, arm int) {
 		if got := exposure[field]; got != want {
 			t.Errorf("wire exposure %s = %v, want %v (record=%+v)", field, got, want, exposure)
 		}
+	}
+}
+
+// A switchback exposure published over HTTP is stamped with the reading that
+// selected its period, so the Collector derives the same period from
+// exposedAt. The clock crosses into the next period between the read and its
+// admission; the PUT body still carries the earlier reading.
+func TestHermeticWireSwitchbackExposureStamp(t *testing.T) {
+	var payload, err = os.ReadFile("testAssets/switchback_context.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var published []map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = w.Write(payload)
+		case http.MethodPut:
+			var body map[string]interface{}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode published JSON: %v", err)
+			}
+			mu.Lock()
+			published = append(published, body)
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{}`)
+		}
+	}))
+	defer server.Close()
+
+	sdk, err := NewBuilder().Endpoint(server.URL).ApiKey("test-api-key").Application("website").Environment("development").Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var data jsonmodels.ContextData
+	if err := json.Unmarshal(payload, &data); err != nil {
+		t.Fatal(err)
+	}
+	var experiment = data.Experiments[0]
+	var periodEnd = *experiment.SwitchbackStartAt + *experiment.SwitchbackPeriodMs
+	// Period 0's last millisecond for the read; period 1 from then on.
+	var clock = &sbClock{now: periodEnd - 1}
+	var application, environment = sdk.systemAttributes()
+	ctx := createContext(clock, ContextConfig{
+		Units_:        map[string]string{experiment.SwitchbackClusters[0].UnitType: "wire-unit"},
+		Attributes_:   map[string]interface{}{"store": map[string]interface{}{"key": "porto"}},
+		PublishDelay_: -1, RefreshInterval_: -1,
+	}, sdk.ContextDataProvider_.GetContextData(), sdk.ContextDataProvider_, sdk.ContextEventHandler_, nil,
+		sdk.VariableParser_, AudienceMatcher{sdk.AudienceDeserializer_}, application, environment)
+	t.Cleanup(func() { ctx.ClearTimeout(); ctx.ClearRefreshTimer() })
+	ctx.WaitUntilReady()
+	if !ctx.IsReady() || ctx.IsFailed() {
+		t.Fatal("HTTP context did not become ready")
+	}
+	var armed = true
+	afterReadResolve = func() {
+		if armed {
+			armed = false
+			clock.set(periodEnd)
+		}
+	}
+	_, err = ctx.GetTreatment(experiment.Name)
+	afterReadResolve = nil
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ctx.Publish(); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(published) != 1 {
+		t.Fatalf("PUT requests = %d, want 1", len(published))
+	}
+	exposures, ok := published[0]["exposures"].([]interface{})
+	if !ok || len(exposures) != 1 {
+		t.Fatalf("wire exposures = %+v, want one", published[0]["exposures"])
+	}
+	exposure := exposures[0].(map[string]interface{})
+	if exposure["name"] != experiment.Name || exposure["exposedAt"] != float64(periodEnd-1) {
+		t.Fatalf("wire exposure %+v, want %s stamped %d", exposure, experiment.Name, periodEnd-1)
 	}
 }

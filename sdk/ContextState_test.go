@@ -121,6 +121,77 @@ func TestContextValueCopiesAndSnapshotsShareLifecycle(t *testing.T) {
 	assertAny(true, snapshot.IsClosed(), t)
 }
 
+// The warmed treatment and peek fast paths read through a copy's root: an
+// override the root sets after the decision was cached is served through a
+// copy whose Overrides_ was replaced, as on the full path. That holds whether
+// the context still holds its own clock carrier or its Clock_ was replaced
+// (the copy then reaches the root through manualRoot).
+func TestContextCopyFastPathsReadTheRootsOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		read         string
+		replaceClock bool
+	}{
+		{"peek", "peek", false}, {"treatment", "treatment", false},
+		{"replaced clock peek", "peek", true}, {"replaced clock treatment", "treatment", true},
+	} {
+		var read = tc.read
+		t.Run(tc.name, func(t *testing.T) {
+			var ctx, _ = newRuleContext(t, "production", withUnit(), ruleExperiment("exp", ""))
+			if tc.replaceClock {
+				ctx.Clock_ = internal.FixedClock{Millis_: 7}
+			}
+			var before, _ = ctx.GetTreatment("exp")
+			var copied = *ctx
+			copied.Overrides_ = map[interface{}]interface{}{}
+			var want = 1 - before
+			assertAny(nil, ctx.SetOverride("exp", want), t)
+			var got int
+			if read == "peek" {
+				got, _ = copied.PeekTreatment("exp")
+			} else {
+				got, _ = copied.GetTreatment("exp")
+			}
+			assertAny(want, got, t)
+		})
+	}
+}
+
+// A variable read through a copy with its own DataLock reads the shared
+// variable index under the root's DataLock, so a concurrent SetData through
+// the root never races it (run with -race). That holds whether the context
+// still holds its own clock carrier or its Clock_ was replaced (the copy then
+// reaches the root through live(), as v1.3.0 did not).
+func TestContextCopyVariableReadUsesTheRootsDataLock(t *testing.T) {
+	for _, replaceClock := range []bool{false, true} {
+		for _, read := range []string{"peek", "get"} {
+			t.Run(fmt.Sprintf("replaced clock=%v %s", replaceClock, read), func(t *testing.T) {
+				var ctx, _ = newRuleContext(t, "production", withUnit(), ruleExperiment("exp", ""))
+				if replaceClock {
+					ctx.Clock_ = internal.FixedClock{Millis_: 7}
+				}
+				var copied = *ctx
+				copied.DataLock = &sync.RWMutex{}
+				var done = make(chan struct{})
+				go func() {
+					defer close(done)
+					for i := 0; i < 200; i++ {
+						ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{ruleExperiment("exp", "")}})
+					}
+				}()
+				for i := 0; i < 200; i++ {
+					if read == "peek" {
+						_, _ = copied.PeekVariableValue("color", "d")
+					} else {
+						_, _ = copied.GetVariableValue("color", "d")
+					}
+				}
+				<-done
+			})
+		}
+	}
+}
+
 func TestRuleAssignmentIdentitiesDoNotRetainAbandonedFlags(t *testing.T) {
 	var ctx, _ = newRuleContext(t, "production", withUnit(),
 		ruleExperiment("exp", rulesJSON(`{"type":"assign","variant":2,"conditions":{"eq":[{"var":"country"},{"value":"US"}]}}`)))

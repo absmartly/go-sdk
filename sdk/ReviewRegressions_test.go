@@ -94,9 +94,9 @@ func TestRules_RevalidationIsAcknowledged(t *testing.T) {
 func TestRules_RevalidationKeepsTheSameAssignment(t *testing.T) {
 	var ctx, _ = newRuleContext(t, "production", withUnit(),
 		ruleExperiment("exp", rulesJSON(`{"type":"assign","variant":2}`)))
-	var first = ctx.assignmentEntry("exp").assignment
+	var first = ctx.getAssignment("exp").assignment
 	assertAny(nil, ctx.SetAttribute("other", 1), t)
-	if ctx.assignmentEntry("exp").assignment != first {
+	if ctx.getAssignment("exp").assignment != first {
 		t.Error("a same-outcome revalidation replaced the cached assignment")
 	}
 }
@@ -316,7 +316,7 @@ func TestRules_HugeIntegralVariantStopsAndFallsBack(t *testing.T) {
 		if got := treatment(t, ctx, "exp"); got != 0 {
 			t.Errorf("variant %s: got %d, want the normal assignment 0", variant, got)
 		}
-		assertAny(false, ctx.assignmentEntry("exp").ruleOverride, t)
+		assertAny(false, ctx.getAssignment("exp").ruleOverride, t)
 	}
 }
 

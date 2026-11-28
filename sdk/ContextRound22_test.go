@@ -249,13 +249,13 @@ func TestRound22_HeldOutDecisionSkipsAudienceRevalidation(t *testing.T) {
 	e.Audience = `{"filter":[{"eq":[{"var":"country"},{"value":"GB"}]}]}`
 	var h = hoCreateFor(t, hoUID, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
 	expectInt(t, 0, h.peek("exp"))
-	var before = h.ctx.assignmentEntry("exp")
+	var before = h.ctx.getAssignment("exp")
 	if !before.holdouts.isSuppressed() {
 		t.Fatal("the experiment is not held out")
 	}
 	h.setAttribute("country", "GB")
 	expectInt(t, 0, h.peek("exp"))
-	if h.ctx.assignmentEntry("exp") != before {
+	if h.ctx.getAssignment("exp") != before {
 		t.Fatal("the held-out decision was recomputed after an attribute change")
 	}
 }
@@ -266,7 +266,7 @@ func TestRound22_HeldOutDecisionSkipsAudienceRevalidation(t *testing.T) {
 func TestRound23_LostClaimCASAdmitsNoSecondExposure(t *testing.T) {
 	var e = hoWithVariables(hoExperiment(1, "e", hoUnitType, 0, 11), "v")
 	var h = hoCreateFor(t, hoUIDNotHeldOut, hoData([]jsonmodels.Holdout{hoHoldoutA()}, e))
-	var entry = h.ctx.assignmentEntry("e")
+	var entry = h.ctx.getAssignment("e")
 	var eligible = h.ctx.variableEligible("e", "v")
 	var raced = false
 	var racing = func(c *cachedAssignment) exposureStatus {
@@ -277,7 +277,7 @@ func TestRound23_LostClaimCASAdmitsNoSecondExposure(t *testing.T) {
 		}
 		return status
 	}
-	if status := h.ctx.queueEligibleExposure(entry, racing); status != exposureQueued {
+	if status := h.ctx.queueEligibleExposureAt(entry, racing, nil); status != exposureQueued {
 		t.Fatalf("a lost claim reported %v, want exposureQueued", status)
 	}
 	if !raced {

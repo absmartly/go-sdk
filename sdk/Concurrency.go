@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"sync"
+	"sync/atomic"
 )
 
 func ComputeIfAbsentRW(lock *sync.RWMutex, needlock bool, maps map[interface{}]interface{}, key interface{}, computer MapperInt) interface{} {
@@ -61,3 +62,21 @@ func AddRW(lock *sync.RWMutex, list []interface{}, value interface{}) interface{
 	lock.Unlock()
 	return list
 }
+
+// atomicFlag is a boolean that is read and written atomically. The module's
+// floor is Go 1.17, before sync/atomic had atomic.Bool (Go 1.19).
+type atomicFlag struct{ v int32 }
+
+func flagValue(value bool) int32 {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func (f *atomicFlag) Load() bool { return atomic.LoadInt32(&f.v) != 0 }
+
+func (f *atomicFlag) Store(value bool) { atomic.StoreInt32(&f.v, flagValue(value)) }
+
+// Swap stores value and returns the previous value.
+func (f *atomicFlag) Swap(value bool) bool { return atomic.SwapInt32(&f.v, flagValue(value)) != 0 }

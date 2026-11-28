@@ -398,7 +398,7 @@ func TestRules_SplitWithoutUnitGivesNoUnitResultThenReResolves(t *testing.T) {
 	var variant, err = ctx.PeekTreatment("exp")
 	assertAny(nil, err, t)
 	assertAny(0, variant, t)
-	assertAny(true, ctx.assignmentEntry("exp").ruleOverride, t)
+	assertAny(true, ctx.getAssignment("exp").ruleOverride, t)
 
 	assertAny(nil, ctx.SetUnit("session_id", ruleUnit), t)
 	assertAny(2, treatment(t, ctx, "exp"), t)
@@ -418,9 +418,9 @@ func TestRules_AssignRuleKeepsCachedAssignmentWhenUnitIsSetLater(t *testing.T) {
 	var ctx, _ = newRuleContext(t, "production", map[string]string{},
 		ruleExperiment("exp", rulesJSON(`{"type":"assign","variant":2}`)))
 
-	var before = ctx.assignmentEntry("exp").assignment
+	var before = ctx.getAssignment("exp").assignment
 	assertAny(nil, ctx.SetUnit("session_id", ruleUnit), t)
-	if ctx.assignmentEntry("exp").assignment != before {
+	if ctx.getAssignment("exp").assignment != before {
 		t.Error("setting the unit rebuilt an assign-rule assignment")
 	}
 }
@@ -915,7 +915,7 @@ func TestRules_Concurrency(t *testing.T) {
 	assertAny(nil, ctx.SetAttribute("tier", "gold"), t)
 	var variant, _ = ctx.PeekTreatment("exp")
 	assertAny(splitVariant([]float64{0, 0.5, 0.5}, experiment.SeedHi, experiment.SeedLo), variant, t)
-	assertAny(true, ctx.assignmentEntry("exp").ruleOverride, t)
+	assertAny(true, ctx.getAssignment("exp").ruleOverride, t)
 
 	assertAny(nil, ctx.SetAttribute("tier", "silver"), t)
 	variant, _ = ctx.PeekTreatment("exp")
