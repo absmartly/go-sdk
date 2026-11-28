@@ -159,22 +159,37 @@ func TestContextCopyFastPathsReadTheRootsOverride(t *testing.T) {
 
 // A variable read through a copy with its own DataLock reads the shared
 // variable index under the root's DataLock, so a concurrent SetData through
-// the root never races it (run with -race).
+// the root never races it (run with -race). That holds whether the context
+// still holds its own clock carrier or its Clock_ was replaced (the copy then
+// reaches the root through live(), as v1.3.0 did not).
 func TestContextCopyVariableReadUsesTheRootsDataLock(t *testing.T) {
-	var ctx, _ = newRuleContext(t, "production", withUnit(), ruleExperiment("exp", ""))
-	var copied = *ctx
-	copied.DataLock = &sync.RWMutex{}
-	var done = make(chan struct{})
-	go func() {
-		defer close(done)
-		for i := 0; i < 200; i++ {
-			ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{ruleExperiment("exp", "")}})
+	for _, replaceClock := range []bool{false, true} {
+		for _, read := range []string{"peek", "get"} {
+			t.Run(fmt.Sprintf("replaced clock=%v %s", replaceClock, read), func(t *testing.T) {
+				var ctx, _ = newRuleContext(t, "production", withUnit(), ruleExperiment("exp", ""))
+				if replaceClock {
+					ctx.Clock_ = internal.FixedClock{Millis_: 7}
+				}
+				var copied = *ctx
+				copied.DataLock = &sync.RWMutex{}
+				var done = make(chan struct{})
+				go func() {
+					defer close(done)
+					for i := 0; i < 200; i++ {
+						ctx.SetData(jsonmodels.ContextData{Experiments: []jsonmodels.Experiment{ruleExperiment("exp", "")}})
+					}
+				}()
+				for i := 0; i < 200; i++ {
+					if read == "peek" {
+						_, _ = copied.PeekVariableValue("color", "d")
+					} else {
+						_, _ = copied.GetVariableValue("color", "d")
+					}
+				}
+				<-done
+			})
 		}
-	}()
-	for i := 0; i < 200; i++ {
-		_, _ = copied.PeekVariableValue("color", "d")
 	}
-	<-done
 }
 
 func TestRuleAssignmentIdentitiesDoNotRetainAbandonedFlags(t *testing.T) {
