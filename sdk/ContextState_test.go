@@ -123,11 +123,24 @@ func TestContextValueCopiesAndSnapshotsShareLifecycle(t *testing.T) {
 
 // The warmed treatment and peek fast paths read through a copy's root: an
 // override the root sets after the decision was cached is served through a
-// copy whose Overrides_ was replaced, as on the full path.
+// copy whose Overrides_ was replaced, as on the full path. That holds whether
+// the context still holds its own clock carrier or its Clock_ was replaced
+// (the copy then reaches the root through manualRoot).
 func TestContextCopyFastPathsReadTheRootsOverride(t *testing.T) {
-	for _, read := range []string{"peek", "treatment"} {
-		t.Run(read, func(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		read         string
+		replaceClock bool
+	}{
+		{"peek", "peek", false}, {"treatment", "treatment", false},
+		{"replaced clock peek", "peek", true}, {"replaced clock treatment", "treatment", true},
+	} {
+		var read = tc.read
+		t.Run(tc.name, func(t *testing.T) {
 			var ctx, _ = newRuleContext(t, "production", withUnit(), ruleExperiment("exp", ""))
+			if tc.replaceClock {
+				ctx.Clock_ = internal.FixedClock{Millis_: 7}
+			}
 			var before, _ = ctx.GetTreatment("exp")
 			var copied = *ctx
 			copied.Overrides_ = map[interface{}]interface{}{}

@@ -740,22 +740,31 @@ func TestSwitchbackLoad_WarmedTreatmentTakesOnlyTheReadLock(t *testing.T) {
 
 // A switchback GetTreatment through a value copy reads its root: an override
 // set on the root after the slot was cached is served through a copy whose
-// Overrides_ was replaced.
+// Overrides_ was replaced, also after the root's Clock_ was replaced (the
+// copy then reaches the root through manualRoot).
 func TestSwitchbackLoad_CopyTreatmentReadsTheRootsOverride(t *testing.T) {
-	var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
-	h.at(sbAnchor + 5)
-	var before = h.treatment("exp_sb")
-	var copied = *h.ctx
-	copied.Overrides_ = map[interface{}]interface{}{}
-	var want = 1 - before
-	_ = h.ctx.SetOverride("exp_sb", want)
-	var got, _ = copied.GetTreatment("exp_sb")
-	expectInt(t, want, got)
+	for _, replaceClock := range []bool{false, true} {
+		t.Run(fmt.Sprintf("replaced clock=%v", replaceClock), func(t *testing.T) {
+			var h = sbCreate(t, sbData(sbDefault(2, sbHour)))
+			h.at(sbAnchor + 5)
+			var before = h.treatment("exp_sb")
+			if replaceClock {
+				h.ctx.Clock_ = h.clock
+			}
+			var copied = *h.ctx
+			copied.Overrides_ = map[interface{}]interface{}{}
+			var want = 1 - before
+			_ = h.ctx.SetOverride("exp_sb", want)
+			var got, _ = copied.GetTreatment("exp_sb")
+			expectInt(t, want, got)
+		})
+	}
 }
 
 // GetTreatment looks an experiment up once: a switchback goes straight to its
 // own lookup, and an unexposed ordinary decision the fast path found is
-// settled without being looked up again.
+// settled without being looked up again. A warmed ordinary PeekTreatment is
+// served by the fast path alone.
 func TestSwitchbackLoad_TreatmentLooksUpOnce(t *testing.T) {
 	var lookups int
 	onGetAssignmentAt = func() { lookups++ }
@@ -770,6 +779,8 @@ func TestSwitchbackLoad_TreatmentLooksUpOnce(t *testing.T) {
 	expectInt(t, 0, lookups)
 	h.peek("exp_unit")
 	lookups = 0
+	h.peek("exp_unit")
+	expectInt(t, 0, lookups)
 	h.treatment("exp_unit")
 	expectInt(t, 0, lookups)
 	h.expectPending(2)
